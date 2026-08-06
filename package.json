@@ -1,0 +1,61 @@
+{
+  "name": "encephalon",
+  "version": "0.1.0",
+  "description": "Repository-local, durable knowledge for coding agents",
+  "keywords": [
+    "agents",
+    "cli",
+    "knowledge",
+    "memory",
+    "sqlite"
+  ],
+  "homepage": "https://github.com/isaachinman/encephalon#readme",
+  "bugs": {
+    "url": "https://github.com/isaachinman/encephalon/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/isaachinman/encephalon.git"
+  },
+  "license": "MIT",
+  "author": "Isaac Hinman",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "packageManager": "bun@1.3.1",
+  "bin": {
+    "encephalon": "./dist/cli.mjs"
+  },
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "bun run test:bun && bun run test:node",
+    "test:bun": "bun test ./test/package.test.ts",
+    "test:node": "node --test test-node/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "bun run scripts/build.ts",
+    "check:package": "bun run scripts/check-package.ts",
+    "prepack": "bun run build && bun run check:package"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "@types/node": "26.1.2",
+    "typescript": "7.0.2"
+  }
+}
