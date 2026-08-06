@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
+import { gunzipSync } from "node:zlib"
 
 const root = resolve(import.meta.dir, "..")
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "encephalon-package-check-"))
@@ -17,6 +18,25 @@ const collectFiles = (directory: string): string[] =>
     const path = resolve(directory, entry.name)
     return entry.isDirectory() ? collectFiles(path) : [path]
   })
+
+const packedMode = (tarball: string, expectedPath: string) => {
+  const archive = gunzipSync(readFileSync(tarball))
+  const field = (offset: number, length: number) =>
+    archive.subarray(offset, offset + length).toString("utf8").split("\0", 1)[0] ?? ""
+  const octal = (offset: number, length: number) => Number.parseInt(field(offset, length).trim() || "0", 8)
+  let offset = 0
+  while (offset + 512 <= archive.length) {
+    const name = field(offset, 100)
+    if (name.length === 0) return undefined
+    const prefix = field(offset + 345, 155)
+    const path = prefix.length > 0 ? `${prefix}/${name}` : name
+    const mode = octal(offset + 100, 8)
+    const size = octal(offset + 124, 12)
+    if (path === expectedPath) return mode
+    offset += 512 + Math.ceil(size / 512) * 512
+  }
+  return undefined
+}
 
 try {
   const packageJson = JSON.parse(readFileSync(resolve(root, "package.json"), "utf8")) as {
@@ -82,15 +102,16 @@ try {
     .map((file) => file.path)
     .filter((path) => !allowedRootFiles.has(path) && !path.startsWith("dist/") && !path.startsWith("skills/"))
   if (unexpected.length > 0) throw new Error(`The tarball contains unexpected files: ${unexpected.join(", ")}`)
+  const tarball = resolve(temporaryDirectory, pack.filename)
   const packedCli = pack.files.find((file) => file.path === "dist/cli.mjs")
-  if (packedCli === undefined || (packedCli.mode !== undefined && (packedCli.mode & 0o111) === 0)) {
+  const packedCliMode = packedMode(tarball, "package/dist/cli.mjs")
+  if (packedCli === undefined || packedCliMode === undefined || (packedCliMode & 0o111) === 0) {
     throw new Error("The packed CLI is missing or not executable.")
   }
 
   const consumer = resolve(temporaryDirectory, "consumer")
   mkdirSync(resolve(consumer, ".git"), { recursive: true })
   writeFileSync(resolve(consumer, "package.json"), '{"name":"encephalon-smoke","private":true,"type":"module"}\n')
-  const tarball = resolve(temporaryDirectory, pack.filename)
   run(["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-dev", tarball], consumer)
   run([
     "node",
