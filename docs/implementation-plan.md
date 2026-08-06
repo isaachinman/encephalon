@@ -1294,9 +1294,10 @@ Create a GitHub Actions matrix for Ubuntu, macOS, and Windows using Node 24. CI 
 5. Run TypeScript typechecking.
 6. Run the test suite.
 7. Build the Node ESM distribution.
-8. Inspect package contents with `npm pack --dry-run` or equivalent machine-readable output.
-9. Install the actual tarball into a temporary Git repository with scripts disabled.
-10. Run help/version, init, validate, add, prepare, list, show, search, and gather through Node.
+8. Inspect package contents with machine-readable `npm pack` output.
+9. Run `npm publish --dry-run` after the build and package inspection so npm's publish-time manifest normalisation is part of the release gate without uploading anything.
+10. Install the actual tarball into a temporary Git repository with scripts disabled.
+11. Run help/version, init, validate, add, prepare, list, show, search, and gather through Node.
 
 At least one local or CI smoke path must verify pnpm-style symlink resolution. Unit tests cover Windows path predicates even when the host filesystem cannot create reserved names.
 
@@ -1356,7 +1357,7 @@ Immediately before publication:
 1. Recheck that the unscoped npm name `encephalon` remains available or belongs to the maintainer.
 2. Confirm the merged commit and clean worktree.
 3. Build from the merged commit.
-4. Re-run package inspection and smoke installation.
+4. Re-run package inspection, smoke installation, and the npm publication dry-run.
 5. Authenticate to npm with the intended public account and 2FA.
 6. Run the manual public publish for `0.1.0`.
 7. Verify npm metadata, tarball contents, install behaviour, CLI version, and API import from the registry package.

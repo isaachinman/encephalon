@@ -175,9 +175,10 @@ bun run typecheck
 bun run test
 bun run build
 bun run check:package
+bun run check:publish
 ```
 
-`check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node.
+`check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything.
 
 ## Licence
 

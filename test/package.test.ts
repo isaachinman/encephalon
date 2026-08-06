@@ -27,17 +27,6 @@ describe("package contract", () => {
     expect(existsSync(resolve(root, "src/index.ts"))).toBe(true)
   })
 
-  test("packs successfully when invoked from an npm publish dry-run", () => {
-    const result = Bun.spawnSync({
-      cmd: [process.execPath, "run", "scripts/check-package.ts"],
-      cwd: root,
-      env: { ...process.env, npm_config_dry_run: "true" },
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    expect(result.exitCode, result.stderr.toString()).toBe(0)
-  })
-
   test("ships the generic repository-memory skill", () => {
     const skill = readFileSync(resolve(root, "skills", "encephalon", "SKILL.md"), "utf8")
     expect(skill).toContain("npx --no-install encephalon search")

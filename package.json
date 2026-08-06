@@ -51,6 +51,7 @@
     "typecheck": "tsc --noEmit",
     "build": "bun run scripts/build.ts",
     "check:package": "bun run scripts/check-package.ts",
+    "check:publish": "npm publish --dry-run --access public --json",
     "prepack": "bun run build && bun run check:package"
   },
   "devDependencies": {
