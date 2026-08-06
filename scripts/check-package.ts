@@ -105,7 +105,9 @@ try {
   const tarball = resolve(temporaryDirectory, pack.filename)
   const packedCli = pack.files.find((file) => file.path === "dist/cli.mjs")
   const packedCliMode = packedMode(tarball, "package/dist/cli.mjs")
-  if (packedCli === undefined || packedCliMode === undefined || (packedCliMode & 0o111) === 0) {
+  const lacksPackedExecutableMode =
+    process.platform !== "win32" && (packedCliMode === undefined || (packedCliMode & 0o111) === 0)
+  if (packedCli === undefined || lacksPackedExecutableMode) {
     throw new Error("The packed CLI is missing or not executable.")
   }
 
