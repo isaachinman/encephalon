@@ -54,7 +54,9 @@ try {
     if (!existsSync(resolve(root, path))) throw new Error(`Required package file ${path} is missing.`)
   })
   const cliPath = resolve(root, "dist", "cli.mjs")
-  if (!readFileSync(cliPath, "utf8").startsWith("#!/usr/bin/env node\n") || (lstatSync(cliPath).mode & 0o111) === 0) {
+  const lacksNodeShebang = !readFileSync(cliPath, "utf8").startsWith("#!/usr/bin/env node\n")
+  const lacksExecutableMode = process.platform !== "win32" && (lstatSync(cliPath).mode & 0o111) === 0
+  if (lacksNodeShebang || lacksExecutableMode) {
     throw new Error("The CLI must have a Node shebang and executable mode.")
   }
   const bundledSource = collectFiles(resolve(root, "dist"))
