@@ -5,18 +5,9 @@ import { gunzipSync } from "node:zlib"
 
 const root = resolve(import.meta.dir, "..")
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "encephalon-package-check-"))
-const subprocessEnvironment = Object.fromEntries(
-  Object.entries(process.env).filter(([name]) => name.toLowerCase() !== "npm_config_dry_run"),
-)
 
 const run = (command: string[], cwd = root) => {
-  const result = Bun.spawnSync({
-    cmd: command,
-    cwd,
-    env: subprocessEnvironment,
-    stdout: "pipe",
-    stderr: "pipe",
-  })
+  const result = Bun.spawnSync({ cmd: command, cwd, stdout: "pipe", stderr: "pipe" })
   if (result.exitCode === 0) return result.stdout.toString()
   process.stderr.write(result.stdout.toString())
   process.stderr.write(result.stderr.toString())
@@ -104,7 +95,15 @@ try {
     throw new Error("The declarations contain unresolved TypeScript source imports.")
   }
 
-  const packOutput = run(["npm", "pack", "--ignore-scripts", "--json", "--pack-destination", temporaryDirectory])
+  const packOutput = run([
+    "npm",
+    "pack",
+    "--dry-run=false",
+    "--ignore-scripts",
+    "--json",
+    "--pack-destination",
+    temporaryDirectory,
+  ])
   const pack = (JSON.parse(packOutput) as Array<{ filename: string; files: Array<{ path: string; mode?: number }> }>)[0]
   if (pack === undefined) throw new Error("npm pack did not return package metadata.")
   const allowedRootFiles = new Set(["LICENSE", "README.md", "package.json"])
@@ -124,7 +123,10 @@ try {
   const consumer = resolve(temporaryDirectory, "consumer")
   mkdirSync(resolve(consumer, ".git"), { recursive: true })
   writeFileSync(resolve(consumer, "package.json"), '{"name":"encephalon-smoke","private":true,"type":"module"}\n')
-  run(["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-dev", tarball], consumer)
+  run(
+    ["npm", "install", "--dry-run=false", "--ignore-scripts", "--no-audit", "--no-fund", "--save-dev", tarball],
+    consumer,
+  )
   run([
     "node",
     "--input-type=module",
