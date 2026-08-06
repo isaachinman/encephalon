@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tgz
+coverage/
+/encephalon/
+.DS_Store
+AGENTS.md

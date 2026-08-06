@@ -1,0 +1,70 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "extends": ["ultracite/biome/core", "ultracite/biome/vitest"],
+  "formatter": {
+    "indentWidth": 2,
+    "indentStyle": "space",
+    "lineWidth": 120
+  },
+  "javascript": {
+    "globals": [],
+    "formatter": {
+      "quoteStyle": "single",
+      "jsxQuoteStyle": "single",
+      "semicolons": "asNeeded",
+      "trailingCommas": "all",
+      "attributePosition": "multiline",
+      "arrowParentheses": "asNeeded"
+    }
+  },
+  "files": {
+    "includes": [
+      "!package.json",
+      "!**/*/package.json",
+      "!tsconfig.json",
+      "!tsconfig.build.json"
+    ]
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "useSortedKeys": "on"
+      }
+    },
+    "enabled": true
+  },
+  "linter": {
+    "rules": {
+      "performance": {
+        "noBarrelFile": "off",
+        "noNamespaceImport": "off",
+        "useTopLevelRegex": "off",
+        "noAccumulatingSpread": "off"
+      },
+      "complexity": {
+        "noExcessiveCognitiveComplexity": "off"
+      },
+      "style": {
+        "useConsistentTypeDefinitions": {
+          "level": "on",
+          "options": {
+            "style": "type"
+          }
+        }
+      },
+      "suspicious": {
+        "noMisplacedAssertion": "off",
+        "noEmptyBlockStatements": "off",
+        "noBitwiseOperators": "off"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["scripts/**/*.ts"],
+      "javascript": {
+        "globals": ["Bun"]
+      }
+    }
+  ]
+}
