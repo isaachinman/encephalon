@@ -211,7 +211,7 @@ The package manifest must contain, at minimum:
     "node": ">=24.15.0"
   },
   "bin": {
-    "encephalon": "./dist/cli.mjs"
+    "encephalon": "dist/cli.mjs"
   },
   "exports": {
     ".": {
@@ -227,6 +227,8 @@ The package manifest must contain, at minimum:
   ]
 }
 ```
+
+The binary target deliberately omits a leading `./`. npm resolves the path from the package root either way, but its publish-time manifest normaliser rewrites the prefixed form and emits a warning; the canonical manifest therefore uses the already-normalised spelling.
 
 The final manifest must also include the exact public repository URL, issue tracker, useful keywords, and a `packageManager` entry for the maintainer Bun version.
 

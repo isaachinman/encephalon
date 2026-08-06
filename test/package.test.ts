@@ -15,6 +15,7 @@ describe("package contract", () => {
     expect(packageJson.version).toBe("0.1.0")
     expect(packageJson.type).toBe("module")
     expect(packageJson.engines).toEqual({ node: ">=24.15.0" })
+    expect(packageJson.bin).toEqual({ encephalon: "dist/cli.mjs" })
     expect(packageJson.dependencies).toBeUndefined()
     expect(packageJson).not.toHaveProperty("scripts.install")
     expect(packageJson).not.toHaveProperty("scripts.preinstall")
@@ -24,6 +25,17 @@ describe("package contract", () => {
 
   test("has a side-effect-free TypeScript API entrypoint", () => {
     expect(existsSync(resolve(root, "src/index.ts"))).toBe(true)
+  })
+
+  test("packs successfully when invoked from an npm publish dry-run", () => {
+    const result = Bun.spawnSync({
+      cmd: [process.execPath, "run", "scripts/check-package.ts"],
+      cwd: root,
+      env: { ...process.env, npm_config_dry_run: "true" },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
   })
 
   test("ships the generic repository-memory skill", () => {

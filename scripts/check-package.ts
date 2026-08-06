@@ -5,10 +5,20 @@ import { gunzipSync } from "node:zlib"
 
 const root = resolve(import.meta.dir, "..")
 const temporaryDirectory = mkdtempSync(join(tmpdir(), "encephalon-package-check-"))
+const subprocessEnvironment = Object.fromEntries(
+  Object.entries(process.env).filter(([name]) => name.toLowerCase() !== "npm_config_dry_run"),
+)
 
 const run = (command: string[], cwd = root) => {
-  const result = Bun.spawnSync({ cmd: command, cwd, stdout: "pipe", stderr: "pipe" })
+  const result = Bun.spawnSync({
+    cmd: command,
+    cwd,
+    env: subprocessEnvironment,
+    stdout: "pipe",
+    stderr: "pipe",
+  })
   if (result.exitCode === 0) return result.stdout.toString()
+  process.stderr.write(result.stdout.toString())
   process.stderr.write(result.stderr.toString())
   throw new Error(`${command[0]} failed with exit code ${result.exitCode}.`)
 }
@@ -57,7 +67,7 @@ try {
     packageJson.license !== "MIT" ||
     packageJson.type !== "module" ||
     JSON.stringify(packageJson.engines) !== JSON.stringify({ node: ">=24.15.0" }) ||
-    JSON.stringify(packageJson.bin) !== JSON.stringify({ encephalon: "./dist/cli.mjs" }) ||
+    JSON.stringify(packageJson.bin) !== JSON.stringify({ encephalon: "dist/cli.mjs" }) ||
     JSON.stringify(packageJson.exports) !== JSON.stringify({ ".": { types: "./dist/index.d.ts", import: "./dist/index.mjs" } }) ||
     JSON.stringify(packageJson.files) !== JSON.stringify(["dist", "skills", "README.md", "LICENSE"]) ||
     packageJson.dependencies !== undefined
