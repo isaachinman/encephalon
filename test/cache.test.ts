@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
@@ -21,6 +21,14 @@ afterEach(() => {
 })
 
 const functionFromApi = <T>(name: string) => (api as unknown as Record<string, T>)[name] as T
+
+const waitForPath = (path: string, process: ReturnType<typeof spawn>) => {
+  const deadline = Date.now() + 5000
+  while (!existsSync(path) && process.exitCode === null && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
+  }
+  assert.equal(existsSync(path), true)
+}
 
 const cacheDatabasePath = (root: string) => join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
 
@@ -243,6 +251,123 @@ describe('SQLite cache and reads', () => {
     const prepare = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
+  })
+
+  test('rebuilds an empty read-only cache file through writer preparation', {
+    skip: process.platform === 'win32' ? 'Windows read-only file replacement semantics differ.' : false,
+  }, () => {
+    const root = createRoot()
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon'), {
+      recursive: true,
+    })
+    writeFileSync(cachePath, '')
+    chmodSync(cachePath, 0o444)
+
+    const prepare = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')
+    assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
+    assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
+  })
+
+  test('reads a fresh cache without touching the database file', () => {
+    const root = createRoot()
+    const record = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'read-only-cache-record',
+      kind: 'context',
+      payload: { summary: 'Read-only cache access' },
+      root,
+      searchText: 'stable reader metadata',
+      source: 'agent',
+      subject: 'cache.reader',
+    })
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const before = statSync(cachePath, { bigint: true }).mtimeNs
+
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    const showRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown> | null>('showRecord')
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+    assert.equal(listRecords({ root })[0]?.id, record.id)
+    assert.equal(showRecord({ id: record.id, root })?.id, record.id)
+    assert.equal(searchRecords({ query: 'stable metadata', root })[0]?.id, record.id)
+    assert.equal(
+      (
+        gatherRecords({ root, searches: ['stable reader'], shows: [record.id] }) as {
+          records: Array<{ record: { id: string } | null }>
+        }
+      ).records[0]?.record?.id,
+      record.id,
+    )
+
+    assert.equal(statSync(cachePath, { bigint: true }).mtimeNs, before)
+  })
+
+  test('waits for a concurrent SQLite writer before reading', async () => {
+    const root = createRoot()
+    const record = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'read-after-sqlite-writer',
+      kind: 'context',
+      payload: { summary: 'Read waits for writer' },
+      root,
+      source: 'agent',
+      subject: 'cache.reader',
+    })
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const readyPath = join(root, 'cache-writer-ready')
+    const holder = spawn(
+      process.execPath,
+      [join(import.meta.dirname, 'fixtures', 'hold-cache-database-lock.ts'), cachePath, readyPath, '250'],
+      { stdio: 'inherit' },
+    )
+    waitForPath(readyPath, holder)
+
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    assert.equal(listRecords({ root })[0]?.id, record.id)
+    if (holder.exitCode === null) {
+      await once(holder, 'exit')
+    }
+    assert.equal(holder.exitCode, 0)
+  })
+
+  test('returns a bounded error when a SQLite writer outlives the reader timeout', async () => {
+    const root = createRoot()
+    functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'blocked-by-sqlite-writer',
+      kind: 'context',
+      payload: { summary: 'Writer outlives reader timeout' },
+      root,
+      source: 'agent',
+      subject: 'cache.reader',
+    })
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const readyPath = join(root, 'cache-writer-timeout-ready')
+    const holder = spawn(
+      process.execPath,
+      [join(import.meta.dirname, 'fixtures', 'hold-cache-database-lock.ts'), cachePath, readyPath, '4500'],
+      { stdio: 'inherit' },
+    )
+    waitForPath(readyPath, holder)
+
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    const startedAt = Date.now()
+    assert.throws(
+      () => listRecords({ root }),
+      (error: unknown) => {
+        const candidate = error as { cause?: unknown; code?: unknown; message?: unknown }
+        const cause = candidate.cause as { message?: unknown } | undefined
+        assert.equal(candidate.code, 'IO_ERROR')
+        assert.match(`${String(candidate.message)} ${String(cause?.message)}`, /locked|busy/i)
+        return true
+      },
+    )
+    const elapsed = Date.now() - startedAt
+    assert.ok(elapsed >= 800)
+    assert.ok(elapsed < 4000)
+    if (holder.exitCode === null) {
+      await once(holder, 'exit')
+    }
+    assert.equal(holder.exitCode, 0)
   })
 
   const readRecoveryCases = [
