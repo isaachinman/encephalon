@@ -93,9 +93,15 @@ try {
     dependencies?: unknown
     scripts?: Record<string, unknown>
   }
+  if (typeof packageJson.version !== 'string') {
+    throw new Error('Package version must be a string.')
+  }
+  const generatedVersionSource = readFileSync(resolve(root, 'src', 'generated', 'version.ts'), 'utf8')
+  if (!generatedVersionSource.includes(`PACKAGE_VERSION = ${JSON.stringify(packageJson.version)}`)) {
+    throw new Error('Generated runtime package version is stale.')
+  }
   if (
     packageJson.name !== 'encephalon' ||
-    packageJson.version !== '0.1.0' ||
     packageJson.license !== 'MIT' ||
     packageJson.type !== 'module' ||
     JSON.stringify(packageJson.engines) !== JSON.stringify({ node: '>=24.15.0' }) ||
@@ -148,6 +154,10 @@ try {
     .join('\n')
   if (/from\s+["'][^"']+\.ts["']/.test(declarations)) {
     throw new Error('The declarations contain unresolved TypeScript source imports.')
+  }
+  const cliVersion = run(['node', resolve(root, 'dist', 'cli.mjs'), '--version'])
+  if (cliVersion !== `${packageJson.version}\n`) {
+    throw new Error('The built CLI reports a stale package version.')
   }
 
   const packOutput = run([
