@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symli
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
+import { cacheReadTestHooks } from '../src/cache.ts'
 import * as api from '../src/index.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
@@ -168,6 +169,240 @@ describe('SQLite cache and reads', () => {
       subject: 'no.summary',
     })
     assert.equal(searchCompactRecords({ query: 'searchable marker', root })[0]?.summary, null)
+  })
+
+  test('gather reads every item from one cache snapshot', () => {
+    const root = createRoot()
+    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
+    const firstId = 'snapshot-v1'
+    addRecord({
+      id: firstId,
+      kind: 'context',
+      payload: { summary: 'Snapshot generation one' },
+      root,
+      source: 'agent',
+      subject: 'cache.snapshot',
+    })
+    const replacement = {
+      createdAt: '2026-08-08T00:00:01.000Z',
+      id: 'snapshot-v2',
+      kind: 'context',
+      path: 'encephalon/context/snapshot-v2.json',
+      payload: { summary: 'Snapshot generation two' },
+      source: 'agent',
+      subject: 'cache.snapshot',
+      supersedes: [firstId],
+    }
+    let mutatedBetweenItems = false
+
+    cacheReadTestHooks.afterShowRead = () => {
+      if (!mutatedBetweenItems) {
+        mutatedBetweenItems = true
+        const database = new DatabaseSync(cacheDatabasePath(root))
+        try {
+          database.exec('BEGIN IMMEDIATE')
+          database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
+          database
+            .prepare(`
+              INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `)
+            .run(
+              replacement.id,
+              replacement.kind,
+              replacement.subject,
+              replacement.source,
+              replacement.createdAt,
+              replacement.path,
+              1,
+              'Snapshot generation two',
+              JSON.stringify(replacement),
+            )
+          database
+            .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
+            .run(replacement.id, 'Snapshot generation two')
+          database.exec('COMMIT')
+        } catch (error) {
+          try {
+            database.exec('ROLLBACK')
+          } catch {}
+          throw error
+        } finally {
+          database.close()
+        }
+      }
+    }
+
+    try {
+      const gatherRecords =
+        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+      const gathered = gatherRecords({ root, shows: [firstId, firstId] }) as {
+        records: Array<{ id: string; record: { id: string } | null }>
+      }
+      assert.equal(mutatedBetweenItems, true)
+      assert.deepEqual(
+        gathered.records.map(entry => [entry.id, entry.record?.id ?? null]),
+        [
+          [firstId, firstId],
+          [firstId, firstId],
+        ],
+      )
+    } finally {
+      cacheReadTestHooks.afterShowRead = undefined
+    }
+  })
+
+  test('gather reads every search from one cache snapshot', () => {
+    const root = createRoot()
+    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
+    const firstId = 'search-snapshot-v1'
+    addRecord({
+      id: firstId,
+      kind: 'context',
+      payload: { summary: 'Search snapshot generation one' },
+      root,
+      searchText: 'snapshot searchable generation one',
+      source: 'agent',
+      subject: 'cache.search-snapshot',
+    })
+    const replacement = {
+      createdAt: '2026-08-08T00:00:01.000Z',
+      id: 'search-snapshot-v2',
+      kind: 'context',
+      path: 'encephalon/context/search-snapshot-v2.json',
+      payload: { summary: 'Search snapshot generation two' },
+      searchText: 'snapshot searchable generation two',
+      source: 'agent',
+      subject: 'cache.search-snapshot',
+      supersedes: [firstId],
+    }
+    let mutatedBetweenSearches = false
+
+    cacheReadTestHooks.afterCompactSearchRead = () => {
+      if (!mutatedBetweenSearches) {
+        mutatedBetweenSearches = true
+        const database = new DatabaseSync(cacheDatabasePath(root))
+        try {
+          database.exec('BEGIN IMMEDIATE')
+          database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
+          database
+            .prepare(`
+              INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `)
+            .run(
+              replacement.id,
+              replacement.kind,
+              replacement.subject,
+              replacement.source,
+              replacement.createdAt,
+              replacement.path,
+              1,
+              'Search snapshot generation two',
+              JSON.stringify(replacement),
+            )
+          database
+            .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
+            .run(replacement.id, replacement.searchText)
+          database.exec('COMMIT')
+        } catch (error) {
+          try {
+            database.exec('ROLLBACK')
+          } catch {}
+          throw error
+        } finally {
+          database.close()
+        }
+      }
+    }
+
+    try {
+      const gatherRecords =
+        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+      const gathered = gatherRecords({
+        root,
+        searches: ['snapshot searchable', 'snapshot searchable'],
+      }) as {
+        searches: Array<{ results: Array<{ id: string }> }>
+      }
+      assert.equal(mutatedBetweenSearches, true)
+      assert.deepEqual(
+        gathered.searches.map(entry => entry.results.map(result => result.id)),
+        [[firstId], [firstId]],
+      )
+    } finally {
+      cacheReadTestHooks.afterCompactSearchRead = undefined
+    }
+  })
+
+  test('gather preserves duplicate order while reusing show and search statements', () => {
+    const root = createRoot()
+    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
+    const first = addRecord({
+      id: 'reuse-v1',
+      kind: 'decision',
+      payload: { summary: 'First reusable decision' },
+      root,
+      source: 'agent',
+      subject: 'cache.reuse',
+    })
+    const second = addRecord({
+      id: 'reuse-v2',
+      kind: 'decision',
+      payload: { summary: 'Second reusable decision' },
+      root,
+      searchText: 'statement reuse marker',
+      source: 'agent',
+      subject: 'cache.reuse',
+      supersedes: [first.id],
+    })
+    let showPrepareCount = 0
+    let searchPrepareCount = 0
+    let compactSearchSelectedRecordJson = false
+
+    cacheReadTestHooks.onShowPrepare = () => {
+      showPrepareCount += 1
+    }
+    cacheReadTestHooks.onCompactSearchPrepare = source => {
+      searchPrepareCount += 1
+      compactSearchSelectedRecordJson ||= source.includes('records.record_json')
+    }
+
+    try {
+      const gatherRecords =
+        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+      const gathered = gatherRecords({
+        root,
+        searches: ['statement reuse marker', 'statement reuse marker', '   '],
+        shows: [second.id, second.id, first.id],
+      }) as {
+        records: Array<{ id: string; record: { id: string } | null }>
+        searches: Array<{ query: string; results: Array<{ id: string }> }>
+      }
+      assert.deepEqual(
+        gathered.records.map(entry => [entry.id, entry.record?.id ?? null]),
+        [
+          [second.id, second.id],
+          [second.id, second.id],
+          [first.id, null],
+        ],
+      )
+      assert.deepEqual(
+        gathered.searches.map(entry => [entry.query, entry.results.map(result => result.id)]),
+        [
+          ['statement reuse marker', [second.id]],
+          ['statement reuse marker', [second.id]],
+          ['   ', []],
+        ],
+      )
+    } finally {
+      cacheReadTestHooks.onShowPrepare = undefined
+      cacheReadTestHooks.onCompactSearchPrepare = undefined
+    }
+
+    assert.equal(showPrepareCount, 1)
+    assert.equal(searchPrepareCount, 1)
+    assert.equal(compactSearchSelectedRecordJson, false)
   })
 
   test('tracks record and referenced-artifact freshness', () => {

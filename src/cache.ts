@@ -79,10 +79,21 @@ type CompactRow = {
   snippet: unknown
 }
 
+type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind' | 'limit'>
+
+type CacheReadTestHooks = {
+  afterCompactSearchRead?: ((query: string) => void) | undefined
+  afterShowRead?: ((id: string) => void) | undefined
+  onCompactSearchPrepare?: ((source: string) => void) | undefined
+  onShowPrepare?: ((source: string) => void) | undefined
+}
+
 class CacheSchemaMismatch extends Error {}
 
 let sqliteModule: SQLiteModule | undefined
 let sqliteFeaturesVerified = false
+
+export const cacheReadTestHooks: CacheReadTestHooks = {}
 
 const loadSQLite = () => {
   if (sqliteModule === undefined) {
@@ -860,6 +871,20 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
     .all(...parameters) as Array<RecordRow & CompactRow>
 }
 
+const compactText = (value: unknown, field: string) => {
+  if (typeof value === 'string') {
+    return value
+  }
+  throw new CacheSchemaMismatch(`Cached compact ${field} must be text.`)
+}
+
+const compactSummary = (value: unknown) => {
+  if (value === null || typeof value === 'string') {
+    return value
+  }
+  throw new CacheSchemaMismatch('Cached compact summary must be text or null.')
+}
+
 const compactRank = (value: unknown) => {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value
@@ -874,24 +899,92 @@ const compactSnippet = (value: unknown) => {
   throw new CacheSchemaMismatch('Cached search snippet must be text.')
 }
 
+const compactRecordFromRow = (row: CompactRow): CompactBrainRecord => ({
+  id: compactText(row.id, 'id'),
+  kind: compactText(row.kind, 'kind'),
+  path: compactText(row.path, 'path'),
+  rank: compactRank(row.rank),
+  snippet: compactSnippet(row.snippet),
+  subject: compactText(row.subject, 'subject'),
+  summary: compactSummary(row.summary),
+})
+
+const createCompactSearchReader = (database: DatabaseSync, input: SearchStatementInput) => {
+  const conditions = [
+    'record_search MATCH ?',
+    input.includeSuperseded === true ? undefined : 'records.active = 1',
+    input.kind === undefined ? undefined : 'records.kind = ?',
+  ].filter((value): value is string => value !== undefined)
+  const kindParameters = input.kind === undefined ? [] : [input.kind]
+  const limit = positiveLimit(input.limit)
+  const source = `
+    SELECT
+      records.id,
+      records.kind,
+      records.subject,
+      records.path,
+      records.summary,
+      bm25(record_search) AS rank,
+      snippet(record_search, 1, '[', ']', '...', 16) AS snippet
+    FROM record_search
+    JOIN records ON records.id = record_search.id
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY rank ASC, records.created_at DESC, records.id DESC
+    LIMIT ?
+  `
+  cacheReadTestHooks.onCompactSearchPrepare?.(source)
+  const statement = database.prepare(source)
+  return (query: string) => {
+    const match = literalMatchQuery(query)
+    if (match.length === 0) {
+      return []
+    }
+    const records = (statement.all(match, ...kindParameters, limit) as CompactRow[]).map(compactRecordFromRow)
+    cacheReadTestHooks.afterCompactSearchRead?.(query)
+    return records
+  }
+}
+
 export const searchRecords = (input: SearchRecordsInput): BrainRecord[] =>
   withPreparedDatabase(input, database => searchRows(database, input).map(parseRecordRow))
 
 export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] =>
-  withPreparedDatabase(input, database =>
-    searchRows(database, input).map(row => {
-      const record = parseRecordRow(row)
-      return {
-        id: record.id,
-        kind: record.kind,
-        path: record.path,
-        rank: compactRank(row.rank),
-        snippet: compactSnippet(row.snippet),
-        subject: record.subject,
-        summary: summaryForRecord(record),
-      }
-    }),
-  )
+  withPreparedDatabase(input, database => createCompactSearchReader(database, input)(input.query))
+
+const createShowReader = (database: DatabaseSync, includeSuperseded: boolean | undefined) => {
+  const activeClause = includeSuperseded === true ? '' : ' AND active = 1'
+  const source = `SELECT record_json FROM records WHERE id = ?${activeClause}`
+  cacheReadTestHooks.onShowPrepare?.(source)
+  const statement = database.prepare(source)
+  return (id: string) => {
+    const row = statement.get(id) as RecordRow | undefined
+    cacheReadTestHooks.afterShowRead?.(id)
+    return row === undefined ? null : parseRecordRow(row)
+  }
+}
+
+const readFreshTransaction = <Result>(root: string, read: (database: DatabaseSync) => Result) => {
+  const database = openReaderDatabase(root)
+  try {
+    database.exec('BEGIN')
+    const metadata = readMetadata(database)
+    if (!metadataIsFresh(root, database, metadata)) {
+      throw new CacheSchemaMismatch('The cache is stale before read.')
+    }
+    const result = read(database)
+    database.exec('ROLLBACK')
+    return result
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK')
+    } catch {
+      // The original read failure is more useful than a secondary rollback failure.
+    }
+    throw error
+  } finally {
+    database.close()
+  }
+}
 
 const readGatherFromDatabase = (
   database: DatabaseSync,
@@ -900,30 +993,15 @@ const readGatherFromDatabase = (
 ): GatherResult => {
   const searches = input.searches ?? []
   const shows = input.shows ?? []
+  const showRecordForId = shows.length === 0 ? () => null : createShowReader(database, input.includeSuperseded)
+  const searchCompactRecordsForQuery = searches.length === 0 ? () => [] : createCompactSearchReader(database, input)
   return {
     hydrated,
-    records: shows.map(id => {
-      const activeClause = input.includeSuperseded === true ? '' : ' AND active = 1'
-      const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(id) as
-        | RecordRow
-        | undefined
-      return { id, record: row === undefined ? null : parseRecordRow(row) }
-    }),
+    records: shows.map(id => ({ id, record: showRecordForId(id) })),
     searches: searches.map(query => ({
       kind: input.kind ?? null,
       query,
-      results: searchRows(database, { ...input, query }).map(row => {
-        const record = parseRecordRow(row)
-        return {
-          id: record.id,
-          kind: record.kind,
-          path: record.path,
-          rank: compactRank(row.rank),
-          snippet: compactSnippet(row.snippet),
-          subject: record.subject,
-          summary: summaryForRecord(record),
-        }
-      }),
+      results: searchCompactRecordsForQuery(query),
     })),
   }
 }
@@ -951,7 +1029,7 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
         field: 'shows',
       })
     }
-    return readFreshDatabase(root, database => readGatherFromDatabase(database, input, hydrated))
+    return readFreshTransaction(root, database => readGatherFromDatabase(database, input, hydrated))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -959,7 +1037,7 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
     if (isRecoverableCacheFailure(error)) {
       const recovered = withOperationLock(root, () => rebuildCache(root))
       try {
-        return readFreshDatabase(root, database =>
+        return readFreshTransaction(root, database =>
           readGatherFromDatabase(
             database,
             input,
