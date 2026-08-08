@@ -215,14 +215,73 @@ try {
     ],
     consumer,
   )
-  const prepared = JSON.parse(
-    run(
-      ['node', resolve(consumer, 'node_modules', 'encephalon', 'dist', 'cli.mjs'), '--root', consumer, 'prepare'],
-      consumer,
-    ),
-  ) as { hydrated?: unknown; recordsIndexed?: unknown }
+  const installedCli = resolve(consumer, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
+  const cli = (arguments_: string[]) => run(['node', installedCli, ...arguments_], consumer)
+  const cliJson = (arguments_: string[]) => JSON.parse(cli(arguments_)) as unknown
+
+  if (!/^Usage: encephalon/m.test(cli(['--help'])) || cli(['--version']) !== '0.1.0\n') {
+    throw new Error('The packed Node-only CLI help/version contract failed.')
+  }
+
+  const prepared = cliJson(['--root', consumer, 'prepare']) as { hydrated?: unknown; recordsIndexed?: unknown }
   if (prepared.hydrated !== true || prepared.recordsIndexed !== 0) {
-    throw new Error('The packed Node-only CLI smoke test returned an unexpected result.')
+    throw new Error('The packed Node-only CLI prepare command returned an unexpected result.')
+  }
+  const initialised = cliJson(['init', '--root', consumer]) as { recordsCreated?: unknown }
+  if (!Array.isArray(initialised.recordsCreated) || initialised.recordsCreated.length !== 3) {
+    throw new Error('The packed Node-only CLI init command returned an unexpected result.')
+  }
+  const added = cliJson([
+    'add',
+    '--root',
+    consumer,
+    '--id',
+    'packed-cli-record',
+    '--kind',
+    'decision',
+    '--subject',
+    'packed.cli',
+    '--source',
+    'package-contract',
+    '--data',
+    '{"summary":"Packed CLI record"}',
+    '--text',
+    'packed-contract-marker',
+  ]) as { id?: unknown }
+  if (added.id !== 'packed-cli-record') {
+    throw new Error('The packed Node-only CLI add command returned an unexpected result.')
+  }
+  const hydrated = cliJson(['hydrate', '--root', consumer]) as { recordsIndexed?: unknown }
+  if (hydrated.recordsIndexed !== 4) {
+    throw new Error('The packed Node-only CLI hydrate command returned an unexpected result.')
+  }
+  const validated = cliJson(['validate', '--root', consumer]) as { valid?: unknown }
+  if (validated.valid !== true) {
+    throw new Error('The packed Node-only CLI validate command returned an unexpected result.')
+  }
+  const listed = cliJson(['list', '--root', consumer, '--include-superseded', '--limit=10']) as unknown[]
+  if (!listed.some(record => (record as { id?: unknown }).id === 'packed-cli-record')) {
+    throw new Error('The packed Node-only CLI list command returned an unexpected result.')
+  }
+  const shown = cliJson(['show', '--root', consumer, '--id', 'packed-cli-record']) as { id?: unknown }
+  if (shown.id !== 'packed-cli-record') {
+    throw new Error('The packed Node-only CLI show command returned an unexpected result.')
+  }
+  const searched = cliJson(['search', '--root', consumer, '--compact', '--', 'packed-contract-marker']) as unknown[]
+  if (!searched.some(record => (record as { id?: unknown }).id === 'packed-cli-record')) {
+    throw new Error('The packed Node-only CLI search command returned an unexpected result.')
+  }
+  const gathered = cliJson([
+    'gather',
+    '--root',
+    consumer,
+    '--search',
+    'packed-contract-marker',
+    '--show',
+    'packed-cli-record',
+  ]) as { records?: unknown; searches?: unknown }
+  if (!(Array.isArray(gathered.records) && Array.isArray(gathered.searches))) {
+    throw new Error('The packed Node-only CLI gather command returned an unexpected result.')
   }
 } finally {
   rmSync(temporaryDirectory, { force: true, recursive: true })
