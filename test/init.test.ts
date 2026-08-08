@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
+import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -46,6 +47,44 @@ const createDeletePlan = (root: string) => {
   const [agentsPlan] = planInstructionChanges(root, true)
   assert.equal(agentsPlan?.action, 'delete')
   return agentsPlan
+}
+
+const recordsForSubject = (root: string, subject: string) =>
+  api.listRecords({ includeSuperseded: true, limit: 50, root }).filter(record => record.subject === subject)
+
+const activeRecordsForSubject = (root: string, subject: string) =>
+  api.listRecords({ limit: 50, root }).filter(record => record.subject === subject)
+
+const readRecordFile = (root: string, record: BrainRecord): BrainRecordFile =>
+  JSON.parse(readFileSync(join(root, record.path), 'utf8')) as BrainRecordFile
+
+const writeRecordFile = (root: string, record: BrainRecordFile) => {
+  const path = join(root, 'encephalon', record.kind, `${record.id}.json`)
+  ensureParent(path)
+  writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`)
+}
+
+const rawRecordFilesForSubject = (root: string, kind: string, subject: string) =>
+  readdirSync(join(root, 'encephalon', kind))
+    .filter(name => name.endsWith('.json'))
+    .map(name => JSON.parse(readFileSync(join(root, 'encephalon', kind, name), 'utf8')) as BrainRecordFile)
+    .filter(record => record.subject === subject)
+
+const cloneBaselineRecord = (
+  root: string,
+  subject: string,
+  id: string,
+  overrides: Partial<Pick<BrainRecordFile, 'payload' | 'source' | 'supersedes'>> = {},
+) => {
+  const [record] = recordsForSubject(root, subject)
+  assert.ok(record)
+  const cloned = {
+    ...readRecordFile(root, record),
+    id,
+    ...overrides,
+  }
+  writeRecordFile(root, cloned)
+  return { cloned, original: record }
 }
 
 afterEach(() => {
@@ -149,6 +188,149 @@ describe('initialisation', () => {
     assert.match(JSON.stringify(workflow[0]?.payload), /npm run lint/)
     assert.doesNotMatch(JSON.stringify(workflow[0]?.payload), /lint-private-body/)
     assert.equal(api.listRecords({ limit: 20, root }).length, 3)
+  })
+
+  test('refresh resolves equivalent generated baseline heads from branch merges', () => {
+    const root = createRoot()
+    api.initEncephalon({ root })
+    const subject = 'encephalon:init/repository-overview'
+    const { cloned, original } = cloneBaselineRecord(root, subject, 'parallel-overview')
+
+    const refreshed = api.initEncephalon({ refreshBaseline: true, root })
+
+    assert.equal(refreshed.recordsCreated.length, 1)
+    const [resolver] = refreshed.recordsCreated
+    assert.ok(resolver)
+    assert.equal(resolver.subject, subject)
+    assert.deepEqual(
+      resolver.supersedes,
+      [cloned.id, original.id].sort((first, second) => first.localeCompare(second)),
+    )
+    assert.equal(api.validateRecords({ root }).valid, true)
+    assert.equal(activeRecordsForSubject(root, subject).length, 1)
+    assert.equal(recordsForSubject(root, subject).length, 3)
+  })
+
+  test('refresh resolves differing generated baseline heads', () => {
+    const root = createRoot()
+    api.initEncephalon({ root })
+    const subject = 'encephalon:init/tooling-layout'
+    const { cloned, original } = cloneBaselineRecord(root, subject, 'parallel-tooling', {
+      payload: {
+        summary: 'Branch-specific generated tooling payload.',
+      },
+    })
+
+    const refreshed = api.initEncephalon({ refreshBaseline: true, root })
+
+    assert.equal(refreshed.recordsCreated.length, 1)
+    const [resolver] = refreshed.recordsCreated
+    assert.ok(resolver)
+    assert.equal(resolver.subject, subject)
+    assert.deepEqual(
+      resolver.supersedes,
+      [cloned.id, original.id].sort((first, second) => first.localeCompare(second)),
+    )
+    assert.equal(api.validateRecords({ root }).valid, true)
+    assert.equal(activeRecordsForSubject(root, subject).length, 1)
+  })
+
+  test('refresh returns a structured conflict for a single human-owned baseline head', () => {
+    const root = createRoot()
+    api.addRecord({
+      id: 'human-overview',
+      kind: 'context',
+      payload: { summary: 'Curated overview' },
+      root,
+      source: 'human',
+      subject: 'encephalon:init/repository-overview',
+    })
+
+    const refreshed = api.initEncephalon({ refreshBaseline: true, root })
+
+    assert.deepEqual(
+      refreshed.recordsCreated.map(record => record.subject).sort((first, second) => first.localeCompare(second)),
+      ['encephalon:init/commands-ci', 'encephalon:init/tooling-layout'],
+    )
+    assert.deepEqual(refreshed.skippedConflicts, [
+      {
+        activeRecordIds: ['human-overview'],
+        kind: 'context',
+        subject: 'encephalon:init/repository-overview',
+      },
+    ])
+  })
+
+  test('refresh rejects mixed generated and human baseline heads without repairing them', () => {
+    const root = createRoot()
+    api.initEncephalon({ root })
+    const subject = 'encephalon:init/repository-overview'
+    cloneBaselineRecord(root, subject, 'human-parallel-overview', { source: 'human' })
+    const before = rawRecordFilesForSubject(root, 'context', subject).length
+
+    assert.throws(
+      () => api.initEncephalon({ refreshBaseline: true, root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+        return true
+      },
+    )
+    assert.equal(rawRecordFilesForSubject(root, 'context', subject).length, before)
+  })
+
+  test('refresh rejects unrelated active-head conflicts while repairing no baseline subject', () => {
+    const root = createRoot()
+    api.initEncephalon({ root })
+    api.addRecord({
+      id: 'custom-head-one',
+      kind: 'decision',
+      payload: { summary: 'One' },
+      root,
+      source: 'human',
+      subject: 'custom.subject',
+    })
+    const [custom] = api
+      .listRecords({ includeSuperseded: true, limit: 50, root })
+      .filter(record => record.id === 'custom-head-one')
+    assert.ok(custom)
+    writeRecordFile(root, {
+      ...readRecordFile(root, custom),
+      id: 'custom-head-two',
+    })
+
+    assert.throws(
+      () => api.initEncephalon({ refreshBaseline: true, root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+        return true
+      },
+    )
+    assert.equal(api.validateRecords({ root }).valid, false)
+  })
+
+  test('refresh rejects malformed supersession graphs while repairing no baseline subject', () => {
+    const root = createRoot()
+    api.initEncephalon({ root })
+    const subject = 'encephalon:init/commands-ci'
+    cloneBaselineRecord(root, subject, 'parallel-commands')
+    writeRecordFile(root, {
+      createdAt: '2026-08-08T00:00:00.000Z',
+      id: 'missing-supersedes-target',
+      kind: 'decision',
+      payload: { summary: 'Broken graph' },
+      source: 'human',
+      subject: 'broken.graph',
+      supersedes: ['does-not-exist'],
+    })
+
+    assert.throws(
+      () => api.initEncephalon({ refreshBaseline: true, root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+        return true
+      },
+    )
+    assert.equal(rawRecordFilesForSubject(root, 'workflow', subject).length, 2)
   })
 
   test('skips a reserved subject owned by an agent-authored active record', () => {
