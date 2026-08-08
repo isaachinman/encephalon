@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-08T12:21:31.412Z",
+  "id": "a440a95c-6327-42ac-b5da-375bde4d868e",
+  "kind": "review",
+  "payload": {
+    "summary": "Validation corpus budgets must be enforced on write paths before canonical publication, not only during scans.",
+    "lessons": [
+      "When adding corpus-wide limits, validate candidate writes against record-count and aggregate-byte budgets before staging or hard-link publication.",
+      "scanCanonicalRecords can stop safely at scan-time limits, but addRecord must still evaluate the already-scanned corpus plus the formatted candidate bytes.",
+      "Regression tests should assert the rejected candidate file does not appear on disk for both count and aggregate-byte overflows."
+    ],
+    "verification": [
+      "Before pushing validation-budget changes, test the 1001st addRecord attempt and a near-limit corpus whose candidate exceeds aggregate bytes."
+    ]
+  },
+  "searchText": "validation corpus budgets addRecord write path candidate formatted bytes before publication Pullfrog",
+  "source": "agent",
+  "subject": "review.corpus-budget-write-validation"
+}
