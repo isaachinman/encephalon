@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T10:09:54.763Z",
+  "id": "f1a1a9f6-77d5-40cc-922d-9e86fbcffdc5",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Pullfrog PR #13 found that disposable SQLite cache validation must cover cell types and duplicated query columns, not only record_json shape.",
+    "lessons": [
+      "Treat SQLite cell types as untrusted even when table schema declares TEXT; validate type before byte-length checks, JSON parsing, or returning values.",
+      "When a cache table stores duplicated query/filter columns alongside canonical record_json, validate those columns against the parsed canonical record before trusting filters, ordering, or active-state reads.",
+      "Recoverable cache corruption can be observed after prepare and before the read query; read paths should re-check freshness/consistency or normalize validation failures into cache rebuilds.",
+      "Review-body feedback can identify actionable gaps even when GitHub cannot anchor an inline comment to the current diff."
+    ],
+    "verification": [
+      "Add regression tests for non-text SQLite cells and for cache columns that disagree with validated record_json.",
+      "Before resolving Pullfrog threads, inspect both unresolved review threads and the latest review body for dropped or unanchored comments."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.cache-disposable-state"
+}

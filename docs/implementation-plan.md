@@ -462,6 +462,7 @@ export type BrainRecord = BrainRecordFile & {
 - Is required and may be any valid `JsonValue`.
 - Runtime validation rejects `undefined`, `bigint`, functions, symbols, non-finite numbers, cyclic values, sparse arrays, non-plain objects, accessors, Maps, Sets, Dates, and typed arrays.
 - Objects must have `Object.prototype` or a null prototype and enumerable string keys whose values are valid JSON.
+- Payload validation accepts at most 64 nested levels and 10,000 JSON nodes, counting the root value, arrays, objects, and primitive values.
 - The final formatted record file must not exceed 1 MiB.
 
 `searchText`:
@@ -859,23 +860,32 @@ Use Node's built-in `util.parseArgs`; do not retain Commander or add another par
 
 - Optional: `--kind`, `--limit`, `--include-superseded`.
 - Default limit: 20.
+- Full-record result limit: 50.
+- Full-record responses fail before returning more than 4 MiB of aggregate record JSON.
 
 `encephalon show`
 
 - Required: `--id`.
 - Optional: `--active-only`.
+- The single returned record is counted against the full-record response budget.
 
 `encephalon search <query...>`
 
 - Optional: `--kind`, `--limit`, `--include-superseded`, `--compact`.
 - Join positional query terms with spaces before tokenisation.
 - Default limit: 20.
+- Query limit: 1,024 UTF-8 bytes and 32 literal terms after tokenisation.
+- Full search result limit: 50 records and the 4 MiB aggregate full-record response budget.
+- Compact search result limit: 100 records.
 
 `encephalon gather`
 
 - Repeated: `--search <query>`, `--show <id>`.
 - Optional: `--kind`, `--limit`, `--include-superseded`, `--hydrate`.
 - Preserve request order and `--hydrate` compatibility.
+- Request limit: 16 searches and 64 shows.
+- Gather searches use compact result limits. Gather shows preserve duplicate order and share the 4 MiB aggregate full-record response budget.
+- Callers should narrow `kind`, reduce `limit`, or use compact search when full-record budgets are exceeded.
 
 ### 14.3 Streams and exit codes
 
@@ -948,8 +958,8 @@ Persistable facts:
 
 - Safe top-level file and directory names, excluding secret-prone hidden paths.
 - Recognised root manifest, lockfile, and configuration filenames.
-- Root `package.json` package name, `packageManager`, workspace presence, and script keys.
-- Derived package script invocations such as `npm run test`; never the script body.
+- Root `package.json` package name, `packageManager`, workspace presence, and discovery-only script keys.
+- Derived package script invocations as structured `{ executable, arguments, scriptKey }` argv data; never shell command strings or the script body. Script keys beginning with `-` remain discoverable in `scriptKeys` but do not produce runnable invocations.
 - CI workflow filenames under `.github/workflows`; never YAML content, triggers, jobs, steps, secrets, or environment values.
 - Recognised language/file counts derived from extensions.
 - Repository identity derived from a safe root package name, or the root directory basename when no manifest provides a name.
@@ -980,7 +990,7 @@ Generate no more than these subjects:
    - Recognised languages and counts.
    - Manifest, lockfile, workspace, and configuration presence.
 3. Kind `workflow`, subject `encephalon:init/commands-ci`.
-   - Package script keys and safe derived invocations.
+   - Package script keys as discovery-only data and safe derived structured invocations as the only execution source of truth.
    - CI workflow filenames.
 
 All use `source: "encephalon:init"`. Payload keys and arrays are emitted in a stable order so canonical deep comparison is deterministic.
@@ -1048,6 +1058,7 @@ Before changing either file:
 
 - Read raw bytes when it exists.
 - Reject NUL-containing or invalid UTF-8 text.
+- Reject instruction files larger than 1 MiB before rewriting them.
 - Detect the file's existing line ending without normalising content.
 - Detect zero, one, or multiple marker pairs.
 - Reject duplicate, nested, reversed, or unmatched markers.

@@ -26,7 +26,9 @@ npm install --save-dev encephalon
 npx --no-install encephalon init
 ```
 
-`init` safely scans derived repository metadata, creates up to three baseline records, builds the local cache, and adds a reversible managed block to root `AGENTS.md` and `CLAUDE.md`. It never reads source bodies, instruction-file text, README content, environment files, registry configuration, Git history, Git remotes, or CI workflow contents.
+`init` safely scans derived repository metadata, creates up to three baseline records, builds the local cache, and adds a reversible managed block to root `AGENTS.md` and `CLAUDE.md`. It does not record source bodies, instruction-file text, README content, environment files, registry configuration, Git history, Git remotes, or CI workflow contents.
+
+Existing instruction files must be valid UTF-8, NUL-free, regular non-symlink files no larger than 1 MiB. Invalid files are rejected before either instruction file is changed.
 
 The result includes a `nextAction` asking an agent to read the installed skill and optionally enrich the baseline semantically.
 
@@ -71,6 +73,8 @@ npx --no-install encephalon validate
 ```
 
 Active records are returned by default. Add `--include-superseded` to `list`, `search`, or `gather` when historical records are needed. Missing `show` results are `null`, and empty searches are `[]`.
+
+Search queries may contain at most 1,024 UTF-8 bytes and 32 literal terms. Full-record APIs return at most 50 records and stop once the aggregate JSON response would exceed 4 MiB; compact search returns at most 100 results. One `gather` request may include at most 16 searches and 64 shows. Narrow the kind/query or request compact results when a full-record response exceeds these budgets.
 
 ## Add durable knowledge
 
@@ -120,6 +124,8 @@ type BrainRecord = BrainRecordFile & { path: string };
 ```
 
 The v0.x canonical corpus may contain at most 1,000 records, 8 MiB of aggregate record JSON, 1,000 supersession edges, and 1,000 artifact references. Validation returns at most 100 issues; when more issues exist, the result sets `truncated: true` and ends with a `VALIDATION_ISSUES_TRUNCATED` sentinel.
+
+Payload values are validated without invoking accessors. They may contain at most 64 nested levels and 10,000 JSON nodes, counting the root value, arrays, objects, and primitive values.
 
 The disposable cache lives at `node_modules/.cache/encephalon/brain.sqlite` and should not be committed. It uses SQLite WAL mode, FTS5, a repository-scoped operation lock, manifest-based freshness, and transactional table rebuilds. Canonical records remain the source of truth.
 
