@@ -74,6 +74,7 @@ export type ValidateResult = {
   valid: boolean
   recordsChecked: number
   errors: ValidationIssue[]
+  truncated: boolean
 }
 
 export type ListRecordsInput = RootInput & {
