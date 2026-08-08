@@ -3,6 +3,13 @@ import { existsSync, lstatSync, readdirSync, realpathSync, rmSync, statSync } fr
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
+import {
+  parseGatherInput,
+  parseListRecordsInput,
+  parseRootInput,
+  parseSearchRecordsInput,
+  parseShowRecordInput,
+} from './api-input.ts'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
 import { cacheDirectory, withOperationLock } from './lock.ts'
 import { canonicalRecordPath, readRecords } from './records.ts'
@@ -726,7 +733,7 @@ export const hydrateResolvedRepository = (root: string, lock = true): PrepareRes
   lock ? withOperationLock(root, () => rebuildCache(root)) : rebuildCache(root)
 
 export const prepare = (input: RootInput = {}): PrepareResult => {
-  const root = resolveRepository(input)
+  const root = resolveRepository(parseRootInput(input, 'prepare'))
   try {
     return prepareResolved(root)
   } catch (error) {
@@ -738,7 +745,7 @@ export const prepare = (input: RootInput = {}): PrepareResult => {
 }
 
 export const hydrate = (input: RootInput = {}): HydrateResult => {
-  const root = resolveRepository(input)
+  const root = resolveRepository(parseRootInput(input, 'hydrate'))
   try {
     const result = hydrateResolvedRepository(root)
     return { recordsIndexed: result.recordsIndexed }
@@ -797,17 +804,18 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
 
 const parseRecordRow = (row: RecordRow) => parseCachedRecord(row.record_json)
 
-export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] =>
-  withPreparedDatabase(input, database => {
+export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] => {
+  const parsed = parseListRecordsInput(input)
+  return withPreparedDatabase(parsed, database => {
     const conditions = [
-      input.includeSuperseded === true ? undefined : 'active = 1',
-      input.kind === undefined ? undefined : 'kind = ?',
-      input.subject === undefined ? undefined : 'subject = ?',
+      parsed.includeSuperseded === true ? undefined : 'active = 1',
+      parsed.kind === undefined ? undefined : 'kind = ?',
+      parsed.subject === undefined ? undefined : 'subject = ?',
     ].filter((value): value is string => value !== undefined)
     const parameters = [
-      ...(input.kind === undefined ? [] : [input.kind]),
-      ...(input.subject === undefined ? [] : [input.subject]),
-      positiveLimit(input.limit),
+      ...(parsed.kind === undefined ? [] : [parsed.kind]),
+      ...(parsed.subject === undefined ? [] : [parsed.subject]),
+      positiveLimit(parsed.limit),
     ]
     const where = conditions.length === 0 ? '' : `WHERE ${conditions.join(' AND ')}`
     const rows = database
@@ -815,20 +823,18 @@ export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] =>
       .all(...parameters) as RecordRow[]
     return rows.map(parseRecordRow)
   })
+}
 
-export const showRecord = (input: ShowRecordInput): BrainRecord | null =>
-  withPreparedDatabase(input, database => {
-    if (typeof input.id !== 'string' || input.id.length === 0) {
-      return fail('INVALID_ARGUMENT', 'id must be a non-empty string.', {
-        field: 'id',
-      })
-    }
-    const activeClause = input.activeOnly === true ? ' AND active = 1' : ''
-    const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(input.id) as
+export const showRecord = (input: ShowRecordInput): BrainRecord | null => {
+  const parsed = parseShowRecordInput(input)
+  return withPreparedDatabase(parsed, database => {
+    const activeClause = parsed.activeOnly === true ? ' AND active = 1' : ''
+    const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(parsed.id) as
       | RecordRow
       | undefined
     return row === undefined ? null : parseRecordRow(row)
   })
+}
 
 const literalMatchQuery = (query: unknown) => {
   if (typeof query !== 'string') {
@@ -945,11 +951,15 @@ const createCompactSearchReader = (database: DatabaseSync, input: SearchStatemen
   }
 }
 
-export const searchRecords = (input: SearchRecordsInput): BrainRecord[] =>
-  withPreparedDatabase(input, database => searchRows(database, input).map(parseRecordRow))
+export const searchRecords = (input: SearchRecordsInput): BrainRecord[] => {
+  const parsed = parseSearchRecordsInput(input)
+  return withPreparedDatabase(parsed, database => searchRows(database, parsed).map(parseRecordRow))
+}
 
-export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] =>
-  withPreparedDatabase(input, database => createCompactSearchReader(database, input)(input.query))
+export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] => {
+  const parsed = parseSearchRecordsInput(input)
+  return withPreparedDatabase(parsed, database => createCompactSearchReader(database, parsed)(parsed.query))
+}
 
 const createShowReader = (database: DatabaseSync, includeSuperseded: boolean | undefined) => {
   const activeClause = includeSuperseded === true ? '' : ' AND active = 1'
@@ -1007,29 +1017,18 @@ const readGatherFromDatabase = (
 }
 
 export const gatherRecords = (input: GatherInput): GatherResult => {
-  const root = resolveRepository(input)
+  const parsed = parseGatherInput(input)
+  const root = resolveRepository(parsed)
   try {
     let hydrated: HydrateResult | null = null
-    if (input.hydrate === true) {
+    if (parsed.hydrate === true) {
       hydrated = {
         recordsIndexed: hydrateResolvedRepository(root).recordsIndexed,
       }
     } else {
       prepareResolved(root)
     }
-    const searches = input.searches ?? []
-    const shows = input.shows ?? []
-    if (!(Array.isArray(searches) && searches.every(query => typeof query === 'string'))) {
-      return fail('INVALID_ARGUMENT', 'searches must be an array of strings.', {
-        field: 'searches',
-      })
-    }
-    if (!(Array.isArray(shows) && shows.every(id => typeof id === 'string'))) {
-      return fail('INVALID_ARGUMENT', 'shows must be an array of strings.', {
-        field: 'shows',
-      })
-    }
-    return readFreshTransaction(root, database => readGatherFromDatabase(database, input, hydrated))
+    return readFreshTransaction(root, database => readGatherFromDatabase(database, parsed, hydrated))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -1040,8 +1039,8 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
         return readFreshTransaction(root, database =>
           readGatherFromDatabase(
             database,
-            input,
-            input.hydrate === true ? { recordsIndexed: recovered.recordsIndexed } : null,
+            parsed,
+            parsed.hydrate === true ? { recordsIndexed: recovered.recordsIndexed } : null,
           ),
         )
       } catch (retryError) {

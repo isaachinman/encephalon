@@ -17,6 +17,7 @@ import {
 } from 'node:fs'
 import { basename, join, relative, resolve } from 'node:path'
 import { TextDecoder } from 'node:util'
+import { parseAddRecordInput, parseRootInput } from './api-input.ts'
 import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
@@ -542,7 +543,7 @@ export const validateRecordsResolved = (root: string, options: ValidateRecordsOp
 }
 
 export const validateRecords = (input: RootInput = {}): ValidateResult => {
-  const root = resolveRepository(input)
+  const root = resolveRepository(parseRootInput(input, 'validateRecords'))
   return validateRecordsResolved(root)
 }
 
@@ -581,8 +582,11 @@ export const readRecordsAllowingGeneratedMultiHeads = (input: RootInput, allowed
   })
 }
 
-export const addRecordResolved = (root: string, input: AddRecordInput, options: AddRecordOptions = {}): BrainRecord => {
-  const recordFile = createRecordFile(input)
+const addRecordFileResolved = (
+  root: string,
+  recordFile: BrainRecordFile,
+  options: AddRecordOptions = {},
+): BrainRecord => {
   const relativePath = `encephalon/${recordFile.kind}/${recordFile.id}.json`
   const path = resolve(root, ...relativePath.split('/'))
   if (existsSync(path)) {
@@ -683,10 +687,14 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
   return candidate
 }
 
+export const addRecordResolved = (root: string, input: AddRecordInput, options: AddRecordOptions = {}): BrainRecord =>
+  addRecordFileResolved(root, createRecordFile(input), options)
+
 export const addRecord = (input: AddRecordInput): BrainRecord => {
-  const root = resolveRepository(input)
+  const parsed = parseAddRecordInput(input)
+  const root = resolveRepository(parsed)
   try {
-    return withOperationLock(root, () => addRecordResolved(root, input))
+    return withOperationLock(root, () => addRecordFileResolved(root, parsed.recordFile))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error

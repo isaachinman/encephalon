@@ -55,6 +55,124 @@ const mutateCache = (root: string, mutation: (database: DatabaseSync) => void) =
 }
 
 describe('SQLite cache and reads', () => {
+  test('rejects invalid public API inputs before repository side effects', () => {
+    const cases: [string, (root: string) => void][] = [
+      [
+        'list includeSuperseded',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({
+            includeSuperseded: 'yes',
+            root,
+          })
+        },
+      ],
+      [
+        'list limit',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ limit: 0, root })
+        },
+      ],
+      [
+        'show id',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('showRecord')({ id: '../bad', root })
+        },
+      ],
+      [
+        'show activeOnly',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('showRecord')({
+            activeOnly: 'yes',
+            id: 'record-1',
+            root,
+          })
+        },
+      ],
+      [
+        'search query',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('searchRecords')({ query: 42, root })
+        },
+      ],
+      [
+        'search kind',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('searchCompactRecords')({
+            kind: '../bad',
+            query: 'safe',
+            root,
+          })
+        },
+      ],
+      [
+        'gather hydrate searches',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({
+            hydrate: true,
+            root,
+            searches: 'safe',
+          })
+        },
+      ],
+      [
+        'gather show id',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({
+            root,
+            shows: ['../bad'],
+          })
+        },
+      ],
+      [
+        'add kind',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')({
+            kind: '../bad',
+            payload: null,
+            root,
+            source: 'agent',
+            subject: 'cache.validation',
+          })
+        },
+      ],
+      [
+        'add root',
+        () => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')({
+            kind: 'context',
+            payload: null,
+            root: 123,
+            source: 'agent',
+            subject: 'cache.validation',
+          })
+        },
+      ],
+      [
+        'init booleans',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('initEncephalon')({
+            refreshBaseline: 'yes',
+            root,
+          })
+        },
+      ],
+    ]
+
+    for (const [name, action] of cases) {
+      const root = createRoot()
+      assert.throws(
+        () => action(root),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'INVALID_ARGUMENT', name)
+          return true
+        },
+      )
+      assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon')), false, name)
+      assert.equal(existsSync(join(root, 'AGENTS.md')), false, name)
+      assert.equal(existsSync(join(root, 'CLAUDE.md')), false, name)
+    }
+  })
+
   test('prepares an empty repository before a cache directory exists', () => {
     const root = createRoot()
     const prepare =
