@@ -268,6 +268,10 @@ const validateJsonValueAt = (
             target: { container: result, key },
             value: descriptor.value,
           })
+        } else {
+          return fail('INVALID_ARGUMENT', 'payload contains an invalid property descriptor.', {
+            field: path,
+          })
         }
       }
       return assigned
