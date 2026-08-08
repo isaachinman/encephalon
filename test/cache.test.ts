@@ -830,22 +830,10 @@ describe('SQLite cache and reads', () => {
         token: 'stale-live-pid-owner',
       })}\n`,
     )
-    const startedAt = Date.now()
-    const originalNow = Date.now
-    let nowCalls = 0
-    Date.now = () => {
-      const elapsed = nowCalls > 2 ? 60_001 : 0
-      nowCalls += 1
-      return startedAt + elapsed
-    }
-    try {
-      assert.equal(
-        withOperationLock(root, () => 'entered'),
-        'entered',
-      )
-    } finally {
-      Date.now = originalNow
-    }
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
     assert.equal(existsSync(lockPath), false)
   })
 
