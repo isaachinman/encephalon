@@ -1,0 +1,27 @@
+{
+  "createdAt": "2026-08-08T08:32:36.870Z",
+  "id": "bb3e1dcf-4d78-4740-9cde-2e1563b89d5f",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Consolidated PR review hardening lessons for Encephalon instruction and record publication, including Pullfrog PR #9 restore-race feedback.",
+    "lessons": [
+      "For managed instruction-file publication, do not rely on a preflight-only snapshot before replacing a user-owned file; capture and revalidate the current target at publication time so concurrent edits return REPOSITORY_CHANGED instead of being overwritten.",
+      "After renaming a user-owned file to a backup or quarantine path, treat that inode as still mutable through existing open descriptors; revalidate it before cleanup and leave changed bytes recoverable if validation fails.",
+      "When restoring a moved-aside backup or quarantined delete before the commit point, use create-if-absent publication for regular files instead of check-then-rename so recovery cannot overwrite a target recreated by another writer.",
+      "Validate the live public instruction path immediately before quarantining it; otherwise a directory, symlink, or different inode created after preflight can be moved aside and become impossible to restore safely.",
+      "For append-only canonical record publication, treat successful hard-link creation as the commit point. Post-publication cleanup, hydration, or directory fsync failures must not make callers observe a failed mutation that will collide on retry."
+    ],
+    "verification": [
+      "Add regression tests for each review comment when possible.",
+      "Use one commit per review-comment fix so replies can point to the exact change.",
+      "For deletion quarantine paths, test failures before unlink and races inside restore windows to prove replacements are preserved and quarantines remain recoverable."
+    ]
+  },
+  "searchText": "Consolidated PR review hardening lessons with quarantined delete restore races",
+  "source": "agent",
+  "subject": "review.github-pr-feedback",
+  "supersedes": [
+    "1fbe2c64-d1b7-4517-b640-35db963bb6e3",
+    "e49b75d4-bfea-470e-9f5b-ce645b483940"
+  ]
+}
