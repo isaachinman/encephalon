@@ -1,19 +1,22 @@
 import { randomUUID } from 'node:crypto'
+import type { Stats } from 'node:fs'
 import {
   closeSync,
   constants,
   existsSync,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
-  readFileSync,
+  readSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
 import { basename, join, relative, resolve } from 'node:path'
+import { TextDecoder } from 'node:util'
 import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
@@ -33,6 +36,11 @@ type RecordScan = {
   errors: ValidationIssue[]
 }
 
+type FileIdentity = {
+  dev: number
+  ino: number
+}
+
 type RecordWriteFault =
   | 'after-publication'
   | 'before-publication'
@@ -45,15 +53,26 @@ type RecordWriteHooks = {
   fault?: (point: RecordWriteFault) => void
 }
 
+type RecordReadFault = 'after-record-fstat' | 'after-record-lstat' | 'after-record-open'
+
+type RecordReadHooks = {
+  fault?: (point: RecordReadFault, path: string) => void
+}
+
 type AddRecordOptions = {
   hooks?: RecordWriteHooks
   hydrate?: boolean
+}
+
+type ValidateRecordsOptions = {
+  hooks?: RecordReadHooks
 }
 
 const STAGING_DIRECTORY = '_staging'
 const RESERVED_DIRECTORIES = new Set(['_artifacts', STAGING_DIRECTORY])
 const directoryFlag = constants.O_DIRECTORY ?? 0
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
+const decoder = new TextDecoder('utf-8', { fatal: true })
 
 const posixRelative = (root: string, path: string) => relative(root, path).replaceAll('\\', '/')
 
@@ -65,6 +84,21 @@ const issue = (code: string, message: string, path?: string, recordId?: string):
 })
 
 const fault = (hooks: RecordWriteHooks | undefined, point: RecordWriteFault) => hooks?.fault?.(point)
+
+const readFault = (hooks: RecordReadHooks | undefined, point: RecordReadFault, path: string) => {
+  hooks?.fault?.(point, path)
+}
+
+const identityFor = (metadata: Stats): FileIdentity => ({ dev: metadata.dev, ino: metadata.ino })
+
+const sameIdentity = (first: FileIdentity, second: FileIdentity) => first.dev === second.dev && first.ino === second.ino
+
+const sameStableMetadata = (first: Stats, second: Stats) =>
+  sameIdentity(identityFor(first), identityFor(second)) &&
+  first.size === second.size &&
+  first.mode === second.mode &&
+  first.mtimeMs === second.mtimeMs &&
+  first.ctimeMs === second.ctimeMs
 
 const assertRealDirectory = (root: string, path: string) => {
   const metadata = lstatSync(path)
@@ -121,20 +155,105 @@ const cleanupStagingDirectory = (root: string, hooks?: RecordWriteHooks) => {
   }
 }
 
-const readRecord = (root: string, path: string): BrainRecord => {
-  const relativePath = posixRelative(root, path)
+const assertParentIdentity = (root: string, path: string, expected: FileIdentity) => {
   const metadata = lstatSync(path)
-  if (metadata.size > MAX_RECORD_BYTES) {
-    return fail('INVALID_ARGUMENT', 'Record file exceeds the 1 MiB limit.', {
-      path: relativePath,
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameIdentity(identityFor(metadata), expected)) {
+    return fail('INVALID_ARGUMENT', 'Record parent directory changed while canonical records were being read.', {
+      path: posixRelative(root, path),
     })
   }
-  const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown
-  const record = parseRecordFile(parsed)
-  return { ...record, path: relativePath }
 }
 
-const scanCanonicalRecords = (root: string): RecordScan => {
+const readBoundedDescriptor = (descriptor: number, size: number) => {
+  const buffer = Buffer.alloc(size)
+  let offset = 0
+  while (offset < size) {
+    const bytesRead = readSync(descriptor, buffer, offset, size - offset, offset)
+    if (bytesRead === 0) {
+      return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
+    }
+    offset += bytesRead
+  }
+  const extra = Buffer.alloc(1)
+  if (readSync(descriptor, extra, 0, 1, size) > 0) {
+    return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
+  }
+  return buffer
+}
+
+const decodeRecordBytes = (bytes: Buffer) => {
+  try {
+    return decoder.decode(bytes)
+  } catch {
+    return fail('INVALID_ARGUMENT', 'Record file is not valid UTF-8.')
+  }
+}
+
+const parseRecordJson = (content: string) => {
+  try {
+    return JSON.parse(content) as unknown
+  } catch {
+    return fail('INVALID_ARGUMENT', 'Record file contains invalid JSON.')
+  }
+}
+
+const readRecord = (
+  root: string,
+  path: string,
+  kindPath: string,
+  kindIdentity: FileIdentity,
+  hooks?: RecordReadHooks,
+): BrainRecord => {
+  const relativePath = posixRelative(root, path)
+  const pathMetadata = lstatSync(path)
+  readFault(hooks, 'after-record-lstat', path)
+  let descriptor: number | undefined
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
+    readFault(hooks, 'after-record-open', path)
+    const metadata = fstatSync(descriptor)
+    assertParentIdentity(root, kindPath, kindIdentity)
+    if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink() || !metadata.isFile()) {
+      return fail('INVALID_ARGUMENT', 'Record file must be a regular non-symlink JSON file.', {
+        path: relativePath,
+      })
+    }
+    if (!sameIdentity(identityFor(pathMetadata), identityFor(metadata))) {
+      return fail('INVALID_ARGUMENT', 'Record file changed while canonical records were being read.', {
+        path: relativePath,
+      })
+    }
+    if (metadata.size > MAX_RECORD_BYTES) {
+      return fail('INVALID_ARGUMENT', 'Record file exceeds the 1 MiB limit.', {
+        path: relativePath,
+      })
+    }
+    readFault(hooks, 'after-record-fstat', path)
+    const bytes = readBoundedDescriptor(descriptor, metadata.size)
+    const finalMetadata = fstatSync(descriptor)
+    if (!sameStableMetadata(metadata, finalMetadata)) {
+      return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.', {
+        path: relativePath,
+      })
+    }
+    const parsed = parseRecordJson(decodeRecordBytes(bytes))
+    const record = parseRecordFile(parsed)
+    return { ...record, path: relativePath }
+  } catch (error) {
+    if (error instanceof EncephalonError) {
+      throw error
+    }
+    return fail('INVALID_ARGUMENT', 'Record file must be a readable regular non-symlink JSON file.', {
+      path: relativePath,
+    })
+  } finally {
+    if (descriptor !== undefined) {
+      closeSync(descriptor)
+    }
+  }
+}
+
+const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}): RecordScan => {
   const brainDirectory = resolve(root, 'encephalon')
   if (existsSync(brainDirectory)) {
     const rootMetadata = lstatSync(brainDirectory)
@@ -166,6 +285,21 @@ const scanCanonicalRecords = (root: string): RecordScan => {
           }
           const kindPath = join(brainDirectory, kindEntry.name)
           if (!kindEntry.name.startsWith('_') && kindEntry.isDirectory() && !kindEntry.isSymbolicLink()) {
+            const kindMetadata = lstatSync(kindPath)
+            if (!kindMetadata.isDirectory() || kindMetadata.isSymbolicLink()) {
+              return {
+                errors: [
+                  ...result.errors,
+                  issue(
+                    'INVALID_RECORD_LAYOUT',
+                    'The brain root may contain only kind directories and reserved internal directories.',
+                    posixRelative(root, kindPath),
+                  ),
+                ],
+                records: result.records,
+              }
+            }
+            const kindIdentity = identityFor(kindMetadata)
             return readdirSync(kindPath, { withFileTypes: true })
               .sort((first, second) => first.name.localeCompare(second.name))
               .reduce<RecordScan>((kindResult, recordEntry) => {
@@ -173,7 +307,7 @@ const scanCanonicalRecords = (root: string): RecordScan => {
                 const relativePath = posixRelative(root, recordPath)
                 if (recordEntry.isFile() && !recordEntry.isSymbolicLink() && recordEntry.name.endsWith('.json')) {
                   try {
-                    const record = readRecord(root, recordPath)
+                    const record = readRecord(root, recordPath, kindPath, kindIdentity, options.hooks)
                     const expectedName = `${record.id}.json`
                     const pathErrors = [
                       ...(recordEntry.name === expectedName && record.kind === kindEntry.name
@@ -365,16 +499,20 @@ const validateScanned = (root: string, scan: RecordScan): ValidateResult => {
   }
 }
 
-export const validateRecords = (input: RootInput = {}): ValidateResult => {
-  const root = resolveRepository(input)
+export const validateRecordsResolved = (root: string, options: ValidateRecordsOptions = {}): ValidateResult => {
   try {
-    return validateScanned(root, scanCanonicalRecords(root))
+    return validateScanned(root, scanCanonicalRecords(root, options))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
     }
     return wrapIo('Unable to validate Encephalon records.', error)
   }
+}
+
+export const validateRecords = (input: RootInput = {}): ValidateResult => {
+  const root = resolveRepository(input)
+  return validateRecordsResolved(root)
 }
 
 export const readRecords = (input: RootInput = {}) => {
