@@ -14,6 +14,5 @@
   },
   "searchText": "Encephalon dogfooding gitignore state records visible git staging",
   "source": "agent",
-  "subject": "workflow.gitignore-dogfooding",
-  "supersedes": []
+  "subject": "workflow.gitignore-dogfooding"
 }

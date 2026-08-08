@@ -333,6 +333,7 @@ type AtomicWriteFault =
   | 'after-final-backup-validation'
   | 'after-plan-validation'
   | 'before-deletion'
+  | 'during-quarantine-restore'
   | 'before-temp-create'
   | 'during-backup-restore'
   | 'during-file-flush'
@@ -426,10 +427,12 @@ const assertBackupUnchanged = (backupPath: string, plan: FilePlan) => {
   return metadata
 }
 
-const restoreQuarantinedFile = (path: string, quarantinePath: string) => {
+const restoreQuarantinedFile = (path: string, quarantinePath: string, hooks: AtomicWriteHooks | undefined) => {
   try {
     if (lstatIfExists(path) === undefined && lstatIfExists(quarantinePath) !== undefined) {
-      renameSync(quarantinePath, path)
+      fault(hooks, 'during-quarantine-restore')
+      linkSync(quarantinePath, path)
+      rmSync(quarantinePath, { force: true })
     }
   } catch {
     // Keep the quarantined file in place so the inspected bytes remain recoverable.
@@ -454,6 +457,7 @@ const deletePlan = (path: string, plan: FilePlan, hooks: AtomicWriteHooks | unde
   let quarantined = false
   try {
     fault(hooks, 'before-deletion')
+    assertQuarantinedDeleteTarget(path, plan)
     renameSync(path, quarantinePath)
     quarantined = true
     fault(hooks, 'after-delete-quarantine')
@@ -463,7 +467,7 @@ const deletePlan = (path: string, plan: FilePlan, hooks: AtomicWriteHooks | unde
     fsyncDirectory(dirname(path))
   } catch (error) {
     if (quarantined) {
-      restoreQuarantinedFile(path, quarantinePath)
+      restoreQuarantinedFile(path, quarantinePath, hooks)
     }
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)

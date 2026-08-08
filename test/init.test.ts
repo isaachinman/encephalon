@@ -668,6 +668,36 @@ describe('initialisation', () => {
     assert.equal(readFileSync(join(root, backupName), 'utf8'), original)
   })
 
+  test('does not overwrite files created while restoring a quarantined delete', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const original = readFileSync(path, 'utf8')
+    const replacement = '# Concurrent delete restore guidance\n'
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-delete-verification') {
+              throw new Error('Injected deletion failure')
+            }
+            if (point === 'during-quarantine-restore') {
+              writeFileSync(path, replacement)
+            }
+          },
+        }),
+      'IO_ERROR',
+    )
+
+    const [quarantineName] = readdirSync(root).filter(
+      name => name.startsWith('.AGENTS.md.') && name.endsWith('.delete'),
+    )
+    assert.ok(quarantineName)
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+    assert.equal(readFileSync(join(root, quarantineName), 'utf8'), original)
+  })
+
   test('reports old-descriptor mode changes after backup validation', {
     skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
   }, () => {
