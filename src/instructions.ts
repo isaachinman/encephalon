@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { Stats } from 'node:fs'
+import type { BigIntStats } from 'node:fs'
 import {
   chmodSync,
   closeSync,
@@ -43,9 +43,15 @@ type FilePlan = {
 }
 
 type FileIdentity = {
-  dev: number
-  ino: number
+  birthtimeNs: string
+  ctimeNs: string
+  dev: string
+  ino: string
+  mtimeNs: string
+  size: string
 }
+
+type StableFileIdentity = Omit<FileIdentity, 'ctimeNs'>
 
 const ALLOWED_SEPARATORS = new Set(['', '\n', '\n\n', '\r\n', '\r\n\r\n'])
 const MODE_BITS = 0o7777
@@ -54,13 +60,19 @@ const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFO
 const directoryFlag = typeof constants.O_DIRECTORY === 'number' ? constants.O_DIRECTORY : 0
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
-const identityFor = (metadata: Stats): FileIdentity => ({
-  dev: metadata.dev,
-  ino: metadata.ino,
+const identityFor = (metadata: BigIntStats): FileIdentity => ({
+  birthtimeNs: metadata.birthtimeNs.toString(),
+  ctimeNs: metadata.ctimeNs.toString(),
+  dev: metadata.dev.toString(),
+  ino: metadata.ino.toString(),
+  mtimeNs: metadata.mtimeNs.toString(),
+  size: metadata.size.toString(),
 })
 
-const sameIdentity = (left: FileIdentity | undefined, right: FileIdentity) =>
-  left !== undefined && left.dev === right.dev && left.ino === right.ino
+const stableIdentity = ({ ctimeNs: _ctimeNs, ...identity }: FileIdentity): StableFileIdentity => identity
+
+const sameIdentity = <Identity extends Record<string, string>>(left: Identity | undefined, right: Identity) =>
+  left !== undefined && Object.entries(right).every(([key, value]) => left[key] === value)
 
 const lstatIfExists = (path: string) => {
   try {
@@ -71,6 +83,33 @@ const lstatIfExists = (path: string) => {
     }
     throw error
   }
+}
+
+const lstatIdentityIfExists = (path: string) => {
+  try {
+    return lstatSync(path, { bigint: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return
+    }
+    throw error
+  }
+}
+
+const identityForPath = (path: string) => {
+  const metadata = lstatIdentityIfExists(path)
+  if (metadata === undefined) {
+    return
+  }
+  return identityFor(metadata)
+}
+
+const requiredIdentityForPath = (path: string, filename: (typeof FILENAMES)[number]) => {
+  const identity = identityForPath(path)
+  if (identity === undefined) {
+    return fail('REPOSITORY_CHANGED', `${filename} changed after it was preflighted.`)
+  }
+  return identity
 }
 
 const encodeMetadata = (metadata: BlockMetadata) => Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64url')
@@ -230,7 +269,7 @@ const additionPlan = (root: string, filename: (typeof FILENAMES)[number]): FileP
       originalBytes,
       originalContent: content,
       originalFileExisted: existed,
-      ...(existingMetadata === undefined ? {} : { originalIdentity: identityFor(existingMetadata) }),
+      ...(existingMetadata === undefined ? {} : { originalIdentity: requiredIdentityForPath(path, filename) }),
     }
   }
   const lineEnding = lineEndingFor(content)
@@ -252,7 +291,7 @@ const additionPlan = (root: string, filename: (typeof FILENAMES)[number]): FileP
     contentBytes: nextBytes,
     filename,
     originalBytes,
-    ...(existingMetadata === undefined ? {} : { originalIdentity: identityFor(existingMetadata) }),
+    ...(existingMetadata === undefined ? {} : { originalIdentity: requiredIdentityForPath(path, filename) }),
     originalContent: content,
     originalFileExisted: existed,
   }
@@ -283,7 +322,7 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
       originalBytes,
       originalContent: content,
       originalFileExisted: true,
-      originalIdentity: identityFor(fileMetadata),
+      originalIdentity: requiredIdentityForPath(path, filename),
     }
   }
   const contentWithoutBlock = `${content.slice(0, installed.start - installed.separator.length)}${content.slice(installed.end)}`
@@ -294,7 +333,7 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
       originalBytes,
       originalContent: content,
       originalFileExisted: true,
-      originalIdentity: identityFor(fileMetadata),
+      originalIdentity: requiredIdentityForPath(path, filename),
     }
   }
   const nextBytes = Buffer.from(contentWithoutBlock, 'utf8')
@@ -306,7 +345,7 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
     originalBytes,
     originalContent: content,
     originalFileExisted: true,
-    originalIdentity: identityFor(fileMetadata),
+    originalIdentity: requiredIdentityForPath(path, filename),
   }
 }
 
@@ -440,12 +479,26 @@ const restoreQuarantinedFile = (path: string, quarantinePath: string, hooks: Ato
   }
 }
 
-const assertQuarantinedDeleteTarget = (quarantinePath: string, plan: FilePlan) => {
-  const metadata = lstatIfExists(quarantinePath)
+const assertOriginalDeleteTarget = (path: string, plan: FilePlan) => {
+  const metadata = lstatIdentityIfExists(path)
   if (metadata === undefined || metadata.isSymbolicLink() || !metadata.isFile()) {
     return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
   }
   if (!sameIdentity(plan.originalIdentity, identityFor(metadata))) {
+    return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+  }
+  if (!readRegularFileBytes(path, plan.filename).equals(plan.originalBytes)) {
+    return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+  }
+}
+
+const assertQuarantinedDeleteTarget = (quarantinePath: string, plan: FilePlan) => {
+  const metadata = lstatIdentityIfExists(quarantinePath)
+  if (metadata === undefined || metadata.isSymbolicLink() || !metadata.isFile()) {
+    return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+  }
+  const originalIdentity = plan.originalIdentity === undefined ? undefined : stableIdentity(plan.originalIdentity)
+  if (!sameIdentity(originalIdentity, stableIdentity(identityFor(metadata)))) {
     return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
   }
   if (!readRegularFileBytes(quarantinePath, plan.filename).equals(plan.originalBytes)) {
@@ -458,7 +511,7 @@ const deletePlan = (path: string, plan: FilePlan, hooks: AtomicWriteHooks | unde
   let quarantined = false
   try {
     fault(hooks, 'before-deletion')
-    assertQuarantinedDeleteTarget(path, plan)
+    assertOriginalDeleteTarget(path, plan)
     renameSync(path, quarantinePath)
     quarantined = true
     fault(hooks, 'after-delete-quarantine')

@@ -1061,6 +1061,26 @@ describe('initialisation', () => {
     })
   }
 
+  test('detects byte-identical instruction replacement when inode identity is reused', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const plannedIdentity = (agentsPlan as { originalIdentity?: { dev: string; ino: string } }).originalIdentity
+    assert.ok(plannedIdentity)
+    const replacement = readFileSync(path, 'utf8')
+    rmSync(path)
+    writeFileSync(path, replacement)
+    const replacementMetadata = statSync(path, { bigint: true })
+    ;(agentsPlan as { originalIdentity?: { dev: string; ino: string } }).originalIdentity = {
+      ...plannedIdentity,
+      dev: replacementMetadata.dev.toString(),
+      ino: replacementMetadata.ino.toString(),
+    }
+
+    assertErrorCode(() => applyInstructionChanges(root, [agentsPlan]), 'REPOSITORY_CHANGED')
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+  })
+
   test('does not delete a replacement created after deletion quarantine', () => {
     const root = createRoot()
     const path = join(root, 'AGENTS.md')
