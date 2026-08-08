@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
+import { withOperationLock } from '../src/lock.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -230,6 +231,49 @@ describe('SQLite cache and reads', () => {
     writeFileSync(join(lockPath, 'owner.json'), 'not-json')
     const prepare = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
+  })
+
+  test('ignores stale owner metadata with a reused live PID after acquiring the gate', () => {
+    const root = createRoot()
+    const lockPath = join(root, 'node_modules', '.cache', 'encephalon', 'operation.lock')
+    mkdirSync(lockPath, { recursive: true })
+    writeFileSync(
+      join(lockPath, 'owner.json'),
+      `${JSON.stringify({
+        acquiredAt: '2026-08-06T10:00:00.000Z',
+        pid: process.pid,
+        token: 'stale-live-pid-owner',
+      })}\n`,
+    )
+    const startedAt = Date.now()
+    const originalNow = Date.now
+    let nowCalls = 0
+    Date.now = () => {
+      const elapsed = nowCalls > 2 ? 60_001 : 0
+      nowCalls += 1
+      return startedAt + elapsed
+    }
+    try {
+      assert.equal(
+        withOperationLock(root, () => 'entered'),
+        'entered',
+      )
+    } finally {
+      Date.now = originalNow
+    }
+    assert.equal(existsSync(lockPath), false)
+  })
+
+  test('recovers a malformed disposable operation gate database', () => {
+    const root = createRoot()
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon')
+    mkdirSync(cachePath, { recursive: true })
+    writeFileSync(join(cachePath, 'operation-lock.sqlite'), 'not a sqlite database')
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
   })
 
   test('serialises two contenders that both observed the same stale lock', async () => {

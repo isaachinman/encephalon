@@ -5,7 +5,6 @@ import { DatabaseSync } from 'node:sqlite'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 
 const LOCK_WAIT_MILLISECONDS = 60_000
-const POLL_MILLISECONDS = 50
 
 type LockOwner = {
   token: string
@@ -15,19 +14,6 @@ type LockOwner = {
 
 type LockTestHooks = {
   afterStaleObservation?: () => void
-}
-
-const sleep = (milliseconds: number) => {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds)
-}
-
-const processExists = (pid: number) => {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM'
-  }
 }
 
 const readOwner = (path: string): LockOwner | undefined => {
@@ -61,6 +47,16 @@ const sqliteBusy = (error: unknown) => {
   )
 }
 
+const sqliteCorrupt = (error: unknown) => {
+  const candidate = error as { errcode?: unknown; message?: unknown }
+  return (
+    candidate.errcode === 11 ||
+    candidate.errcode === 26 ||
+    (typeof candidate.message === 'string' &&
+      /database disk image is malformed|file is not a database|malformed database schema/i.test(candidate.message))
+  )
+}
+
 export const cacheDirectory = (root: string) => resolve(root, 'node_modules', '.cache', 'encephalon')
 
 export const withOperationLock = <Result>(
@@ -77,6 +73,26 @@ export const withOperationLock = <Result>(
   let gate: DatabaseSync | undefined
   let gateTransaction = false
 
+  const remainingMilliseconds = () => Math.max(0, LOCK_WAIT_MILLISECONDS - (Date.now() - startedAt))
+
+  const removeGate = () => {
+    for (const candidate of [gatePath, `${gatePath}-wal`, `${gatePath}-shm`, `${gatePath}-journal`]) {
+      rmSync(candidate, { force: true })
+    }
+  }
+
+  const beginGateTransaction = () => {
+    gate = new DatabaseSync(gatePath, { timeout: remainingMilliseconds() })
+    try {
+      gate.exec('BEGIN IMMEDIATE')
+      gateTransaction = true
+    } catch (error) {
+      gate.close()
+      gate = undefined
+      throw error
+    }
+  }
+
   try {
     mkdirSync(directory, { recursive: true })
     mkdirSync(candidatePath)
@@ -87,43 +103,49 @@ export const withOperationLock = <Result>(
     }
     writeFileSync(resolve(candidatePath, 'owner.json'), `${JSON.stringify(candidateOwner)}\n`, { flag: 'wx' })
 
-    const observedOwner = existsSync(lockPath) ? readOwner(lockPath) : undefined
-    if (existsSync(lockPath) && (observedOwner === undefined || !processExists(observedOwner.pid))) {
+    if (existsSync(lockPath)) {
       testHooks.afterStaleObservation?.()
     }
 
-    const remaining = Math.max(0, LOCK_WAIT_MILLISECONDS - (Date.now() - startedAt))
-    gate = new DatabaseSync(gatePath, { timeout: remaining })
     try {
-      gate.exec('BEGIN IMMEDIATE')
-      gateTransaction = true
+      beginGateTransaction()
     } catch (error) {
       if (sqliteBusy(error)) {
         return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
           timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
         })
       }
-      throw error
+      if (!sqliteCorrupt(error)) {
+        throw error
+      }
+      removeGate()
+      try {
+        beginGateTransaction()
+      } catch (retryError) {
+        if (sqliteBusy(retryError)) {
+          return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
+            timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
+          })
+        }
+        throw retryError
+      }
     }
 
-    while (existsSync(lockPath)) {
-      const owner = readOwner(lockPath)
-      if (owner === undefined || !processExists(owner.pid)) {
-        rmSync(lockPath, { force: true, recursive: true })
-      } else if (Date.now() - startedAt <= LOCK_WAIT_MILLISECONDS) {
-        sleep(POLL_MILLISECONDS)
-      } else {
-        return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
-          timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
-        })
-      }
+    // The SQLite transaction is the authoritative operation lock. A valid owner
+    // must still hold that gate, so any directory metadata seen here is orphaned.
+    if (existsSync(lockPath)) {
+      rmSync(lockPath, { force: true, recursive: true })
     }
 
     renameSync(candidatePath, lockPath)
     try {
       return operation()
     } finally {
-      releaseOwnedLock(lockPath, token)
+      try {
+        releaseOwnedLock(lockPath, token)
+      } catch {
+        // The SQLite gate is authoritative; stale metadata is removed by the next holder.
+      }
     }
   } catch (error) {
     if (error instanceof EncephalonError) {
@@ -139,6 +161,10 @@ export const withOperationLock = <Result>(
       }
     }
     gate?.close()
-    rmSync(candidatePath, { force: true, recursive: true })
+    try {
+      rmSync(candidatePath, { force: true, recursive: true })
+    } catch {
+      // Candidate cleanup must not mask the operation outcome.
+    }
   }
 }
