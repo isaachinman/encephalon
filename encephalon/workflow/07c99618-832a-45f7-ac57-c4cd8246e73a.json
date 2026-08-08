@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-08T09:57:33.060Z",
+  "id": "07c99618-832a-45f7-ac57-c4cd8246e73a",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Check Encephalon before Git commands that may create commits automatically.",
+    "lessons": [
+      "The pre-commit Encephalon gate applies to any command that can create a commit object, including git merge without --no-commit and git commit --amend, not only direct git commit invocations.",
+      "Before merging main into a ticket branch, query Encephalon first or use a no-commit merge form so the lookup happens before the eventual commit.",
+      "After an accidental local auto-commit, do not push it as-is; perform an Encephalon lookup and amend the local commit before pushing if the subject or gate requirements were missed."
+    ],
+    "verification": [
+      "Before running git merge on a PR branch, confirm the Encephalon commit-gate lookup has already been recorded in working notes.",
+      "Inspect git log before pushing to verify every local commit subject starts with the Linear ticket."
+    ]
+  },
+  "source": "agent",
+  "subject": "workflow.git-auto-commit-gate"
+}

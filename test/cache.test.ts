@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
@@ -22,7 +22,35 @@ afterEach(() => {
 
 const functionFromApi = <T>(name: string) => (api as unknown as Record<string, T>)[name] as T
 
+const waitForPath = (path: string, process: ReturnType<typeof spawn>) => {
+  const deadline = Date.now() + 5000
+  while (!existsSync(path) && process.exitCode === null && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
+  }
+  assert.equal(existsSync(path), true)
+}
+
 const cacheDatabasePath = (root: string) => join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+
+const addCacheRecord = (root: string) =>
+  functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+    id: 'cache-record',
+    kind: 'context',
+    payload: { detail: 'cache corruption marker', summary: 'Cache record' },
+    root,
+    searchText: 'recoverable cache row',
+    source: 'agent',
+    subject: 'cache.validation',
+  })
+
+const mutateCache = (root: string, mutation: (database: DatabaseSync) => void) => {
+  const database = new DatabaseSync(cacheDatabasePath(root))
+  try {
+    mutation(database)
+  } finally {
+    database.close()
+  }
+}
 
 type SQLitePrototype = {
   prepare: (source: string) => unknown
@@ -276,7 +304,7 @@ describe('SQLite cache and reads', () => {
       if (source.includes('SELECT record_json FROM records WHERE id = ?')) {
         showPrepareCount += 1
       }
-      if (source.includes('FROM record_search') && source.includes('JOIN records')) {
+      if (source.includes('bm25(record_search)')) {
         searchPrepareCount += 1
         compactSearchSelectedRecordJson ||= source.includes('records.record_json')
       }
@@ -389,17 +417,337 @@ describe('SQLite cache and reads', () => {
 
   test('rebuilds a disposable cache with an incompatible table schema', () => {
     const root = createRoot()
-    const cachePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const path = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
     mkdirSync(join(root, 'node_modules', '.cache', 'encephalon'), {
       recursive: true,
     })
-    const database = new DatabaseSync(cachePath)
+    const database = new DatabaseSync(path)
     database.exec('CREATE TABLE metadata (wrong_column TEXT)')
     database.close()
 
     const prepare = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
+  })
+
+  test('rebuilds an empty read-only cache file through writer preparation', {
+    skip: process.platform === 'win32' ? 'Windows read-only file replacement semantics differ.' : false,
+  }, () => {
+    const root = createRoot()
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon'), {
+      recursive: true,
+    })
+    writeFileSync(cachePath, '')
+    chmodSync(cachePath, 0o444)
+
+    const prepare = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')
+    assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
+    assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
+  })
+
+  test('reads a fresh cache without touching the database file', () => {
+    const root = createRoot()
+    const record = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'read-only-cache-record',
+      kind: 'context',
+      payload: { summary: 'Read-only cache access' },
+      root,
+      searchText: 'stable reader metadata',
+      source: 'agent',
+      subject: 'cache.reader',
+    })
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const before = statSync(cachePath, { bigint: true }).mtimeNs
+
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    const showRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown> | null>('showRecord')
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+    assert.equal(listRecords({ root })[0]?.id, record.id)
+    assert.equal(showRecord({ id: record.id, root })?.id, record.id)
+    assert.equal(searchRecords({ query: 'stable metadata', root })[0]?.id, record.id)
+    assert.equal(
+      (
+        gatherRecords({ root, searches: ['stable reader'], shows: [record.id] }) as {
+          records: Array<{ record: { id: string } | null }>
+        }
+      ).records[0]?.record?.id,
+      record.id,
+    )
+
+    assert.equal(statSync(cachePath, { bigint: true }).mtimeNs, before)
+  })
+
+  test('waits for a concurrent SQLite writer before reading', async () => {
+    const root = createRoot()
+    const record = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'read-after-sqlite-writer',
+      kind: 'context',
+      payload: { summary: 'Read waits for writer' },
+      root,
+      source: 'agent',
+      subject: 'cache.reader',
+    })
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const readyPath = join(root, 'cache-writer-ready')
+    const holder = spawn(
+      process.execPath,
+      [join(import.meta.dirname, 'fixtures', 'hold-cache-database-lock.ts'), cachePath, readyPath, '250'],
+      { stdio: 'inherit' },
+    )
+    waitForPath(readyPath, holder)
+
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    assert.equal(listRecords({ root })[0]?.id, record.id)
+    if (holder.exitCode === null) {
+      await once(holder, 'exit')
+    }
+    assert.equal(holder.exitCode, 0)
+  })
+
+  test('returns a bounded error when a SQLite writer outlives the reader timeout', async () => {
+    const root = createRoot()
+    functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'blocked-by-sqlite-writer',
+      kind: 'context',
+      payload: { summary: 'Writer outlives reader timeout' },
+      root,
+      source: 'agent',
+      subject: 'cache.reader',
+    })
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const readyPath = join(root, 'cache-writer-timeout-ready')
+    const holder = spawn(
+      process.execPath,
+      [join(import.meta.dirname, 'fixtures', 'hold-cache-database-lock.ts'), cachePath, readyPath, '4500'],
+      { stdio: 'inherit' },
+    )
+    waitForPath(readyPath, holder)
+
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    const startedAt = Date.now()
+    assert.throws(
+      () => listRecords({ root }),
+      (error: unknown) => {
+        const candidate = error as { cause?: unknown; code?: unknown; message?: unknown }
+        const cause = candidate.cause as { message?: unknown } | undefined
+        assert.equal(candidate.code, 'IO_ERROR')
+        assert.match(`${String(candidate.message)} ${String(cause?.message)}`, /locked|busy/i)
+        return true
+      },
+    )
+    const elapsed = Date.now() - startedAt
+    assert.ok(elapsed >= 800)
+    assert.ok(elapsed < 4000)
+    if (holder.exitCode === null) {
+      await once(holder, 'exit')
+    }
+    assert.equal(holder.exitCode, 0)
+  })
+
+  const readRecoveryCases = [
+    {
+      name: 'list',
+      read: (root: string, record: Record<string, unknown>) => {
+        const result = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
+          root,
+        })
+        assert.deepEqual(
+          result.map(entry => entry.id),
+          [record.id],
+        )
+      },
+    },
+    {
+      name: 'show',
+      read: (root: string, record: Record<string, unknown>) => {
+        const result = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown> | null>(
+          'showRecord',
+        )({
+          id: record.id,
+          root,
+        })
+        assert.equal(result?.id, record.id)
+      },
+    },
+    {
+      name: 'full search',
+      read: (root: string, record: Record<string, unknown>) => {
+        const result = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')({
+          query: 'recoverable cache row',
+          root,
+        })
+        assert.deepEqual(
+          result.map(entry => entry.id),
+          [record.id],
+        )
+      },
+    },
+    {
+      name: 'compact search',
+      read: (root: string, record: Record<string, unknown>) => {
+        const result = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>(
+          'searchCompactRecords',
+        )({
+          query: 'recoverable cache row',
+          root,
+        })
+        assert.deepEqual(
+          result.map(entry => entry.id),
+          [record.id],
+        )
+      },
+    },
+    {
+      name: 'gather',
+      read: (root: string, record: Record<string, unknown>) => {
+        const result = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')({
+          root,
+          searches: ['recoverable cache row'],
+          shows: [record.id],
+        }) as {
+          records: Array<{ record: { id: unknown } | null }>
+          searches: Array<{ results: Array<{ id: unknown }> }>
+        }
+        assert.equal(result.records[0]?.record?.id, record.id)
+        assert.equal(result.searches[0]?.results[0]?.id, record.id)
+      },
+    },
+  ] as const
+
+  for (const { name, read } of readRecoveryCases) {
+    test(`rebuilds invalid cached row JSON during ${name}`, () => {
+      const root = createRoot()
+      const record = addCacheRecord(root)
+      mutateCache(root, database => {
+        database.prepare('UPDATE records SET record_json = ? WHERE id = ?').run('{not-json', String(record.id))
+      })
+
+      read(root, record)
+    })
+  }
+
+  test('rebuilds non-text cached record JSON before reading it', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    mutateCache(root, database => {
+      database.prepare('UPDATE records SET record_json = ? WHERE id = ?').run(42, String(record.id))
+    })
+
+    assert.deepEqual(
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root }).map(
+        entry => entry.id,
+      ),
+      [record.id],
+    )
+  })
+
+  test('rebuilds cached records with invalid shapes and runtime paths', () => {
+    const invalidRecordJson = (record: Record<string, unknown>) => [
+      JSON.stringify({ ...record, unexpected: true }),
+      JSON.stringify({ ...record, path: '/tmp/elsewhere.json' }),
+      JSON.stringify({ ...record, path: '../elsewhere.json' }),
+    ]
+
+    for (const recordJson of invalidRecordJson(addCacheRecord(createRoot()))) {
+      const root = roots.at(-1)
+      assert.ok(root)
+      mutateCache(root, database => {
+        database.prepare('UPDATE records SET record_json = ?').run(recordJson)
+      })
+      const records = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
+        root,
+      })
+      assert.deepEqual(
+        records.map(record => record.id),
+        ['cache-record'],
+      )
+    }
+  })
+
+  test('rebuilds cached record columns that disagree with validated JSON', () => {
+    const root = createRoot()
+    const oldRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'old-cache-record',
+      kind: 'context',
+      payload: { summary: 'Old cache record' },
+      root,
+      source: 'agent',
+      subject: 'cache.validation',
+    })
+    const newRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'new-cache-record',
+      kind: 'context',
+      payload: { summary: 'New cache record' },
+      root,
+      source: 'agent',
+      subject: 'cache.validation',
+      supersedes: [oldRecord.id],
+    })
+    mutateCache(root, database => {
+      database.prepare('UPDATE records SET kind = ? WHERE id = ?').run('decision', String(newRecord.id))
+      database.prepare('UPDATE records SET active = 1 WHERE id = ?').run(String(oldRecord.id))
+    })
+
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    assert.deepEqual(listRecords({ kind: 'decision', root }), [])
+    assert.deepEqual(
+      listRecords({ root }).map(record => record.id),
+      [newRecord.id],
+    )
+  })
+
+  test('rebuilds invalid cache metadata instead of trusting it', () => {
+    const metadataCases = [
+      ['artifactPaths', JSON.stringify(['../outside'])],
+      ['recordsIndexed', '-1'],
+      ['recordsIndexed', String(Number.MAX_SAFE_INTEGER + 1)],
+      ['artifactPaths', JSON.stringify(['x'.repeat(1024 * 1024 + 1)])],
+    ] as const
+
+    for (const [key, value] of metadataCases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, database => {
+        database.prepare('UPDATE metadata SET value = ? WHERE key = ?').run(value, key)
+      })
+      assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+        hydrated: true,
+        recordsIndexed: 1,
+      })
+    }
+
+    const root = createRoot()
+    addCacheRecord(root)
+    mutateCache(root, database => {
+      database.prepare('INSERT INTO metadata(key, value) VALUES (?, ?)').run('unexpected', 'value')
+    })
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 1,
+    })
+  })
+
+  test('rebuilds missing and duplicate FTS rows', () => {
+    for (const duplicate of [false, true]) {
+      const root = createRoot()
+      const record = addCacheRecord(root)
+      mutateCache(root, database => {
+        if (duplicate) {
+          database
+            .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
+            .run(String(record.id), 'duplicate search row')
+        } else {
+          database.prepare('DELETE FROM record_search WHERE id = ?').run(String(record.id))
+        }
+      })
+      assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+        hydrated: true,
+        recordsIndexed: 1,
+      })
+    }
   })
 
   test('recovers an ownerless or malformed operation lock', () => {
