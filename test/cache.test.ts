@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
 import { cacheReadTestHooks } from '../src/cache.ts'
+import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
@@ -194,6 +195,31 @@ describe('SQLite cache and reads', () => {
       >('prepare')
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
+  })
+
+  test('uses schema version rather than package version for cache compatibility', () => {
+    const root = createRoot()
+    const prepare =
+      functionFromApi<
+        (input: Record<string, unknown>) => {
+          hydrated: boolean
+          recordsIndexed: number
+        }
+      >('prepare')
+    assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
+    const database = new DatabaseSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'))
+    const metadata = database.prepare("SELECT value FROM metadata WHERE key = 'packageVersion'").get()
+    assert.equal(metadata?.value, PACKAGE_VERSION)
+    database.prepare("UPDATE metadata SET value = '9.9.9' WHERE key = 'packageVersion'").run()
+    database.close()
+
+    assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
+
+    const schemaDatabase = new DatabaseSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'))
+    schemaDatabase.prepare("UPDATE metadata SET value = '0' WHERE key = 'schemaVersion'").run()
+    schemaDatabase.close()
+
+    assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
   })
 
   test('automatically prepares active list, show, search, compact search, and gather reads', () => {

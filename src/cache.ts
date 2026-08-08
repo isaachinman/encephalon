@@ -11,6 +11,7 @@ import {
   parseShowRecordInput,
 } from './api-input.ts'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
+import { PACKAGE_VERSION } from './generated/version.ts'
 import { cacheDirectory, withOperationLock } from './lock.ts'
 import { canonicalRecordPath, readRecords } from './records.ts'
 import { resolveRepository } from './repository.ts'
@@ -28,7 +29,6 @@ import type {
   ShowRecordInput,
 } from './types.ts'
 
-const PACKAGE_VERSION = '0.1.0'
 const SCHEMA_VERSION = '1'
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
 const DATABASE_FILENAME = 'brain.sqlite'
@@ -544,7 +544,6 @@ const metadataIsFresh = (
   const fresh =
     metadata !== undefined &&
     metadata.schemaVersion === SCHEMA_VERSION &&
-    metadata.packageVersion === PACKAGE_VERSION &&
     metadata.manifest === repositoryManifest(root, metadata.artifactPaths)
   if (fresh) {
     assertCacheContentConsistent(database, metadata)
