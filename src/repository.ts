@@ -110,6 +110,13 @@ export const assertRootInstallation = (root: string) => {
         if (packageJson.name === 'encephalon' && packageJson.version === PACKAGE_VERSION) {
           return installedRoot
         }
+        if (packageJson.name === 'encephalon') {
+          const installedVersion = typeof packageJson.version === 'string' ? packageJson.version : 'unknown'
+          return fail(
+            'ROOT_INSTALL_REQUIRED',
+            `Root Encephalon package version ${installedVersion} does not match executing version ${PACKAGE_VERSION}. Rebuild or reinstall Encephalon at the repository root before running this command.`,
+          )
+        }
       }
     } catch (error) {
       return wrapIo('Unable to verify the root Encephalon installation.', error)
