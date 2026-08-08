@@ -573,6 +573,31 @@ describe('initialisation', () => {
     assert.equal(readFileSync(path, 'utf8'), replacement)
   })
 
+  test('restores the quarantined instruction file when final unlink fails', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const original = readFileSync(path, 'utf8')
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-delete-verification') {
+              throw new Error('Injected final unlink failure')
+            }
+          },
+        }),
+      'IO_ERROR',
+    )
+
+    assert.equal(readFileSync(path, 'utf8'), original)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
   test('keeps old-descriptor writes recoverable after backup validation', {
     skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
   }, () => {

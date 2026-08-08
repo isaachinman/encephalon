@@ -452,19 +452,17 @@ const assertQuarantinedDeleteTarget = (quarantinePath: string, plan: FilePlan) =
 const deletePlan = (path: string, plan: FilePlan, hooks: AtomicWriteHooks | undefined) => {
   const quarantinePath = tempPathFor(path, 'delete')
   let quarantined = false
-  let verified = false
   try {
     fault(hooks, 'before-deletion')
     renameSync(path, quarantinePath)
     quarantined = true
     fault(hooks, 'after-delete-quarantine')
     assertQuarantinedDeleteTarget(quarantinePath, plan)
-    verified = true
     fault(hooks, 'after-delete-verification')
     rmSync(quarantinePath, { force: true })
     fsyncDirectory(dirname(path))
   } catch (error) {
-    if (quarantined && !verified) {
+    if (quarantined) {
       restoreQuarantinedFile(path, quarantinePath)
     }
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
