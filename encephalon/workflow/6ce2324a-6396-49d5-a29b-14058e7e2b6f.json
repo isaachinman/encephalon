@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T10:57:18.028Z",
+  "id": "6ce2324a-6396-49d5-a29b-14058e7e2b6f",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Pullfrog PR #15 found that gather cache tests should not patch DatabaseSync.prototype globally and snapshot coverage must exercise both show and compact search reads.",
+    "mistake": "Global SQLite prototype patches in tests can leak across node --test file concurrency, and show-only snapshot tests do not prove FTS gather reads share the same transaction snapshot.",
+    "guidance": [
+      "Use scoped Encephalon cache test hooks instead of mutating DatabaseSync.prototype.",
+      "When changing gather snapshot behaviour, include separate coverage for show reads and compact search/FTS reads.",
+      "Keep Pullfrog review fixes as individual commits and query Encephalon immediately before each commit."
+    ],
+    "verification": [
+      "Run node --test test/cache.test.ts after cache test-hook changes.",
+      "Run full lint, typecheck, test, validate, build, and package checks before pushing."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.cache-gather-test-hooks"
+}

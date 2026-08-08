@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T11:55:16.632Z",
+  "id": "8c2a847d-2333-4c6c-b88e-759a47ae4150",
+  "kind": "review",
+  "payload": {
+    "summary": "Payload validation must fail closed for object descriptors that are enumerable but lack a data value, matching sparse-array handling.",
+    "lessons": [
+      "After rejecting accessor payload properties, object traversal should still require every enumerable descriptor to carry a data value before queueing it for validation.",
+      "Keep array and object descriptor handling symmetric: invalid or value-less descriptors must produce INVALID_ARGUMENT rather than silently dropping payload keys.",
+      "Hostile descriptor tests are the right place to verify future changes around accessor-free payload traversal."
+    ],
+    "verification": [
+      "When editing validateJsonValueAt, inspect both the array descriptor branch and the object descriptor branch for equivalent fail-closed behavior.",
+      "Run records tests that cover payload accessors and hostile payload descriptors before committing schema validation changes."
+    ]
+  },
+  "searchText": "payload property descriptor validation object array symmetry Pullfrog",
+  "source": "agent",
+  "subject": "review.payload-descriptor-validation"
+}

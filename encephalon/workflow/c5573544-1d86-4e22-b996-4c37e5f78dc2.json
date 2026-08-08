@@ -1,0 +1,21 @@
+{
+  "createdAt": "2026-08-08T10:19:14.678Z",
+  "id": "c5573544-1d86-4e22-b996-4c37e5f78dc2",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Pullfrog PR #13 found that every disposable SQLite cache read surface, including gather, must re-check cache freshness and canonical consistency immediately before query execution.",
+    "lessons": [
+      "Treat SQLite cell types as untrusted even when table schema declares TEXT; validate type before byte-length checks, JSON parsing, or returning values.",
+      "When a cache table stores duplicated query/filter columns alongside canonical record_json, validate those columns against the parsed canonical record before trusting filters, ordering, active-state reads, or gather results.",
+      "Prepare or hydrate is not a sufficient read gate by itself: a recoverable cache corruption can be observed after prepare and before the read query, so each cache-backed read surface should use the same freshness/consistency gate immediately before querying.",
+      "When adding a shared read gate, include all public cache reads in the audit: list, show, search, compact search, and gather."
+    ],
+    "verification": [
+      "Before resolving Pullfrog cache threads, inspect all public read surfaces for post-prepare consistency checks, not just the paths covered by helper APIs.",
+      "Dogfood Encephalon search before commits to catch cache regressions caused by the branch itself."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.cache-disposable-state",
+  "supersedes": ["f1a1a9f6-77d5-40cc-922d-9e86fbcffdc5"]
+}
