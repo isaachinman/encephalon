@@ -30,3 +30,20 @@ jobs:
       - run: bun run lint
       - run: bun run benchmark:check
       - run: bun run build
+      - run: bun run check:package
+      - name: Create release-equivalent package artifact
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          mkdir -p package-artifacts
+          npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts > package-artifacts/npm-pack.json
+      - name: Upload release-equivalent package artifact
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: encephalon-npm-package
+          path: package-artifacts/*
+          if-no-files-found: error
+      - name: Check npm publish dry run
+        if: matrix.os == 'ubuntu-latest'
+        run: bun run check:publish

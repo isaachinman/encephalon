@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { fail } from './errors.ts'
+import { cliErrorResponse, fail } from './errors.ts'
+import { PACKAGE_VERSION } from './generated/version.ts'
 import {
   addRecord,
   EncephalonError,
@@ -16,7 +17,6 @@ import {
 } from './index.ts'
 import type { JsonValue } from './types.ts'
 
-const VERSION = '0.1.0'
 const HELP = `Usage: encephalon [--root <path>] <command> [options]
 
 Commands:
@@ -160,7 +160,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
     return { value: HELP }
   }
   if (arguments_.includes('--version') || arguments_.includes('-v')) {
-    return { value: `${VERSION}\n` }
+    return { value: `${PACKAGE_VERSION}\n` }
   }
   const extracted = extractRoot(arguments_)
   const [command, ...commandArguments] = extracted.remaining
@@ -340,14 +340,9 @@ export const runCli = (arguments_: string[] = process.argv.slice(2)) => {
     return result.exitCode ?? 0
   } catch (error) {
     if (error instanceof EncephalonError) {
-      writeJson(process.stderr, {
-        error: {
-          code: error.code,
-          details: error.details,
-          message: error.message,
-        },
-      })
-      return 2
+      const response = cliErrorResponse(error)
+      writeJson(process.stderr, response.body)
+      return response.exitCode
     }
     writeJson(process.stderr, {
       error: {
