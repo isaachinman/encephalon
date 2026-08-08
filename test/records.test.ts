@@ -266,6 +266,44 @@ describe('canonical records', () => {
     assert.deepEqual(readdirSync(join(root, 'encephalon', '_staging')), [])
   })
 
+  test('does not misreport cache hydration failure after canonical publication', () => {
+    const root = createRoot()
+    const record = addRecordResolved(
+      root,
+      {
+        id: 'hydration-failure',
+        kind: 'decision',
+        payload: { summary: 'Published' },
+        source: 'agent',
+        subject: 'hydration.failure',
+      },
+      {
+        hooks: {
+          fault: point => {
+            if (point === 'during-hydration') {
+              throw new Error('Injected hydration failure')
+            }
+          },
+        },
+      },
+    )
+
+    assert.equal(record.id, 'hydration-failure')
+    assert.equal(existsSync(join(root, record.path)), true)
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: record.id,
+          kind: 'decision',
+          payload: { summary: 'Retry' },
+          root,
+          source: 'agent',
+          subject: 'hydration.failure',
+        }),
+      'RECORD_EXISTS',
+    )
+  })
+
   test('validates supersession graphs and permits a multi-head resolver', () => {
     const root = createRoot()
     const first = api.addRecord({

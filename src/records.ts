@@ -37,6 +37,7 @@ type RecordWriteFault =
   | 'after-publication'
   | 'before-publication'
   | 'during-cleanup'
+  | 'during-hydration'
   | 'during-publication-flush'
   | 'during-staging-write'
 
@@ -483,7 +484,12 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
     throw cleanupError
   }
   if (options.hydrate !== false) {
-    hydrateResolvedRepository(root, false)
+    try {
+      fault(options.hooks, 'during-hydration')
+      hydrateResolvedRepository(root, false)
+    } catch {
+      // Cache rebuild is derived state after the record commit point; the next read can rebuild it.
+    }
   }
   return candidate
 }
