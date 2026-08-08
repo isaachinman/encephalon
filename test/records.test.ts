@@ -25,6 +25,42 @@ const createRoot = () => {
   return root
 }
 
+const timestampAt = (index: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, 0, index)).toISOString()
+
+const writeCanonicalRecord = (
+  root: string,
+  record: {
+    id: string
+    kind?: string
+    subject?: string
+    payload?: Record<string, unknown>
+    supersedes?: string[]
+    artifacts?: string[]
+    createdAt?: string
+  },
+) => {
+  const kind = record.kind ?? 'decision'
+  const path = join(root, 'encephalon', kind, `${record.id}.json`)
+  ensureParent(path)
+  writeFileSync(
+    path,
+    `${JSON.stringify(
+      {
+        createdAt: record.createdAt ?? timestampAt(0),
+        id: record.id,
+        kind,
+        payload: record.payload ?? {},
+        source: 'test',
+        subject: record.subject ?? 'validation.corpus',
+        ...(record.artifacts === undefined ? {} : { artifacts: record.artifacts }),
+        ...(record.supersedes === undefined ? {} : { supersedes: record.supersedes }),
+      },
+      null,
+      2,
+    )}\n`,
+  )
+}
+
 const assertErrorCode = (operation: () => unknown, code: string) => {
   assert.throws(operation, (error: unknown) => {
     assert.equal((error as { code?: unknown }).code, code)
@@ -358,6 +394,111 @@ describe('canonical records', () => {
       supersedes: [second.id, 'record-c'],
     })
     assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('validates a corpus at the record limit with an iterative supersession chain', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 1000 }, (_, value) => value)) {
+      writeCanonicalRecord(root, {
+        createdAt: timestampAt(index),
+        id: `chain-${index}`,
+        ...(index === 0 ? {} : { supersedes: [`chain-${index - 1}`] }),
+      })
+    }
+
+    const result = api.validateRecords({ root }) as { truncated?: boolean } & ReturnType<typeof api.validateRecords>
+    assert.equal(result.valid, true)
+    assert.equal(result.recordsChecked, 1000)
+    assert.equal(result.errors.length, 0)
+    assert.equal(result.truncated, false)
+  })
+
+  test('reports corpus budget overflows deterministically', () => {
+    const recordCountRoot = createRoot()
+    for (const index of Array.from({ length: 1001 }, (_, value) => value)) {
+      writeCanonicalRecord(recordCountRoot, {
+        createdAt: timestampAt(index),
+        id: `count-${index}`,
+        subject: `validation.count.${index}`,
+      })
+    }
+    const recordCountResult = api.validateRecords({ root: recordCountRoot })
+    assert.equal(recordCountResult.valid, false)
+    assert.equal(recordCountResult.errors[0]?.code, 'CORPUS_RECORD_LIMIT')
+    assert.equal(recordCountResult.recordsChecked, 1000)
+
+    const byteRoot = createRoot()
+    for (const index of Array.from({ length: 10 }, (_, value) => value)) {
+      writeCanonicalRecord(byteRoot, {
+        createdAt: timestampAt(index),
+        id: `bytes-${index}`,
+        payload: { text: 'x'.repeat(900 * 1024) },
+        subject: `validation.bytes.${index}`,
+      })
+    }
+    const byteResult = api.validateRecords({ root: byteRoot })
+    assert.equal(byteResult.valid, false)
+    assert.equal(byteResult.errors[0]?.code, 'CORPUS_BYTE_LIMIT')
+
+    const edgeRoot = createRoot()
+    writeCanonicalRecord(edgeRoot, {
+      id: 'too-many-edges',
+      supersedes: Array.from({ length: 1001 }, (_, index) => `missing-${index}`),
+    })
+    const edgeResult = api.validateRecords({ root: edgeRoot })
+    assert.equal(edgeResult.valid, false)
+    assert.equal(edgeResult.errors[0]?.code, 'CORPUS_SUPERSEDES_LIMIT')
+
+    const artifactRoot = createRoot()
+    for (const recordIndex of Array.from({ length: 201 }, (_, value) => value)) {
+      const id = `artifact-${recordIndex}`
+      writeCanonicalRecord(artifactRoot, {
+        artifacts: Array.from(
+          { length: 5 },
+          (_, artifactIndex) => `_artifacts/decision/${id}/file-${artifactIndex}.txt`,
+        ),
+        id,
+        subject: `validation.artifacts.${recordIndex}`,
+      })
+    }
+    const artifactResult = api.validateRecords({ root: artifactRoot })
+    assert.equal(artifactResult.valid, false)
+    assert.equal(artifactResult.errors[0]?.code, 'CORPUS_ARTIFACT_LIMIT')
+  })
+
+  test('detects a long supersession cycle without recursive stack growth', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 1000 }, (_, value) => value)) {
+      writeCanonicalRecord(root, {
+        createdAt: timestampAt(index),
+        id: `cycle-${index}`,
+        supersedes: index === 0 ? ['cycle-999'] : [`cycle-${index - 1}`],
+      })
+    }
+
+    assert.doesNotThrow(() => api.validateRecords({ root }))
+    const result = api.validateRecords({ root })
+    assert.equal(result.valid, false)
+    assert.equal(
+      result.errors.some(error => error.code === 'SUPERSEDES_CYCLE'),
+      true,
+    )
+  })
+
+  test('truncates validation issues with a deterministic sentinel', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 105 }, (_, value) => value)) {
+      const path = join(root, 'encephalon', 'decision', `invalid-${String(index).padStart(3, '0')}.json`)
+      ensureParent(path)
+      writeFileSync(path, '{invalid')
+    }
+
+    const result = api.validateRecords({ root }) as { truncated?: boolean } & ReturnType<typeof api.validateRecords>
+    assert.equal(result.valid, false)
+    assert.equal(result.truncated, true)
+    assert.equal(result.errors.length, 100)
+    assert.equal(result.errors[0]?.path, 'encephalon/decision/invalid-000.json')
+    assert.equal(result.errors.at(-1)?.code, 'VALIDATION_ISSUES_TRUNCATED')
   })
 
   test('rejects non-JSON payloads and unsafe portable paths', () => {

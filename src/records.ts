@@ -54,6 +54,11 @@ const STAGING_DIRECTORY = '_staging'
 const RESERVED_DIRECTORIES = new Set(['_artifacts', STAGING_DIRECTORY])
 const directoryFlag = constants.O_DIRECTORY ?? 0
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
+export const MAX_CANONICAL_RECORDS = 1000
+export const MAX_CANONICAL_RECORD_BYTES = 8 * 1024 * 1024
+export const MAX_SUPERSESSION_EDGES = 1000
+export const MAX_ARTIFACT_REFERENCES = 1000
+export const MAX_VALIDATION_ISSUES = 100
 
 const posixRelative = (root: string, path: string) => relative(root, path).replaceAll('\\', '/')
 
@@ -63,6 +68,8 @@ const issue = (code: string, message: string, path?: string, recordId?: string):
   ...(path === undefined ? {} : { path }),
   ...(recordId === undefined ? {} : { recordId }),
 })
+
+const corpusIssue = (code: string, message: string, path = 'encephalon') => issue(code, message, path)
 
 const fault = (hooks: RecordWriteHooks | undefined, point: RecordWriteFault) => hooks?.fault?.(point)
 
@@ -145,87 +152,106 @@ const scanCanonicalRecords = (root: string): RecordScan => {
       }
     }
 
-    const scanned = readdirSync(brainDirectory, { withFileTypes: true })
-      .sort((first, second) => first.name.localeCompare(second.name))
-      .reduce<RecordScan>(
-        (result, kindEntry) => {
-          if (RESERVED_DIRECTORIES.has(kindEntry.name)) {
-            return kindEntry.isDirectory() && !kindEntry.isSymbolicLink()
-              ? result
-              : {
-                  errors: [
-                    ...result.errors,
+    const scanned: RecordScan = { errors: [], records: [] }
+    let recordBytes = 0
+    let stopScanning = false
+    const addScanError = (validationIssue: ValidationIssue) => {
+      scanned.errors.push(validationIssue)
+      if (scanned.errors.length > MAX_VALIDATION_ISSUES) {
+        stopScanning = true
+      }
+    }
+    for (const kindEntry of readdirSync(brainDirectory, { withFileTypes: true }).sort((first, second) =>
+      first.name.localeCompare(second.name),
+    )) {
+      if (stopScanning) {
+        break
+      }
+      if (RESERVED_DIRECTORIES.has(kindEntry.name)) {
+        if (!(kindEntry.isDirectory() && !kindEntry.isSymbolicLink())) {
+          addScanError(
+            issue(
+              'INVALID_RECORD_LAYOUT',
+              `${kindEntry.name} must be a real directory.`,
+              `encephalon/${kindEntry.name}`,
+            ),
+          )
+        }
+      } else {
+        const kindPath = join(brainDirectory, kindEntry.name)
+        if (!kindEntry.name.startsWith('_') && kindEntry.isDirectory() && !kindEntry.isSymbolicLink()) {
+          for (const recordEntry of readdirSync(kindPath, { withFileTypes: true }).sort((first, second) =>
+            first.name.localeCompare(second.name),
+          )) {
+            if (stopScanning) {
+              break
+            }
+            const recordPath = join(kindPath, recordEntry.name)
+            const relativePath = posixRelative(root, recordPath)
+            if (recordEntry.isFile() && !recordEntry.isSymbolicLink() && recordEntry.name.endsWith('.json')) {
+              const metadata = lstatSync(recordPath)
+              if (scanned.records.length >= MAX_CANONICAL_RECORDS) {
+                addScanError(
+                  corpusIssue(
+                    'CORPUS_RECORD_LIMIT',
+                    `Canonical corpus may contain at most ${MAX_CANONICAL_RECORDS} records.`,
+                    relativePath,
+                  ),
+                )
+                stopScanning = true
+                break
+              }
+              if (recordBytes + metadata.size > MAX_CANONICAL_RECORD_BYTES) {
+                addScanError(
+                  corpusIssue(
+                    'CORPUS_BYTE_LIMIT',
+                    `Canonical corpus may contain at most ${MAX_CANONICAL_RECORD_BYTES} bytes of record JSON.`,
+                    relativePath,
+                  ),
+                )
+                stopScanning = true
+                break
+              }
+              recordBytes += metadata.size
+              try {
+                const record = readRecord(root, recordPath)
+                const expectedName = `${record.id}.json`
+                if (!(recordEntry.name === expectedName && record.kind === kindEntry.name)) {
+                  addScanError(
                     issue(
-                      'INVALID_RECORD_LAYOUT',
-                      `${kindEntry.name} must be a real directory.`,
-                      `encephalon/${kindEntry.name}`,
-                    ),
-                  ],
-                  records: result.records,
-                }
-          }
-          const kindPath = join(brainDirectory, kindEntry.name)
-          if (!kindEntry.name.startsWith('_') && kindEntry.isDirectory() && !kindEntry.isSymbolicLink()) {
-            return readdirSync(kindPath, { withFileTypes: true })
-              .sort((first, second) => first.name.localeCompare(second.name))
-              .reduce<RecordScan>((kindResult, recordEntry) => {
-                const recordPath = join(kindPath, recordEntry.name)
-                const relativePath = posixRelative(root, recordPath)
-                if (recordEntry.isFile() && !recordEntry.isSymbolicLink() && recordEntry.name.endsWith('.json')) {
-                  try {
-                    const record = readRecord(root, recordPath)
-                    const expectedName = `${record.id}.json`
-                    const pathErrors = [
-                      ...(recordEntry.name === expectedName && record.kind === kindEntry.name
-                        ? []
-                        : [
-                            issue(
-                              'RECORD_PATH_MISMATCH',
-                              'Record filename and parent kind must match its envelope.',
-                              relativePath,
-                              record.id,
-                            ),
-                          ]),
-                    ]
-                    return {
-                      errors: [...kindResult.errors, ...pathErrors],
-                      records: [...kindResult.records, record],
-                    }
-                  } catch (error) {
-                    const message = error instanceof Error ? error.message : 'Record could not be parsed.'
-                    return {
-                      errors: [...kindResult.errors, issue('INVALID_RECORD', message, relativePath)],
-                      records: kindResult.records,
-                    }
-                  }
-                }
-                return {
-                  errors: [
-                    ...kindResult.errors,
-                    issue(
-                      'INVALID_RECORD_LAYOUT',
-                      'Kind directories may contain only direct regular JSON files.',
+                      'RECORD_PATH_MISMATCH',
+                      'Record filename and parent kind must match its envelope.',
                       relativePath,
+                      record.id,
                     ),
-                  ],
-                  records: kindResult.records,
+                  )
                 }
-              }, result)
+                scanned.records.push(record)
+              } catch (error) {
+                const message = error instanceof Error ? error.message : 'Record could not be parsed.'
+                addScanError(issue('INVALID_RECORD', message, relativePath))
+              }
+            } else {
+              addScanError(
+                issue(
+                  'INVALID_RECORD_LAYOUT',
+                  'Kind directories may contain only direct regular JSON files.',
+                  relativePath,
+                ),
+              )
+            }
           }
-          return {
-            errors: [
-              ...result.errors,
-              issue(
-                'INVALID_RECORD_LAYOUT',
-                'The brain root may contain only kind directories and reserved internal directories.',
-                posixRelative(root, kindPath),
-              ),
-            ],
-            records: result.records,
-          }
-        },
-        { errors: [], records: [] },
-      )
+        } else {
+          addScanError(
+            issue(
+              'INVALID_RECORD_LAYOUT',
+              'The brain root may contain only kind directories and reserved internal directories.',
+              posixRelative(root, kindPath),
+            ),
+          )
+        }
+      }
+    }
     return {
       errors: scanned.errors,
       records: scanned.records.sort(
@@ -258,6 +284,15 @@ const duplicateAndCaseIssues = (records: BrainRecord[]) => {
 
 const supersessionIssues = (records: BrainRecord[]) => {
   const byId = new Map(records.map(record => [record.id, record]))
+  const edgeCount = records.reduce((count, record) => count + (record.supersedes?.length ?? 0), 0)
+  if (edgeCount > MAX_SUPERSESSION_EDGES) {
+    return [
+      corpusIssue(
+        'CORPUS_SUPERSEDES_LIMIT',
+        `Canonical corpus may contain at most ${MAX_SUPERSESSION_EDGES} supersession edges.`,
+      ),
+    ]
+  }
   const edgeIssues = records.flatMap(record =>
     (record.supersedes ?? []).flatMap(targetId => {
       const target = byId.get(targetId)
@@ -282,27 +317,43 @@ const supersessionIssues = (records: BrainRecord[]) => {
   )
 
   const cycleIssues: ValidationIssue[] = []
-  const visiting = new Set<string>()
-  const visited = new Set<string>()
-  const visit = (record: BrainRecord) => {
-    if (!visited.has(record.id)) {
-      if (visiting.has(record.id)) {
-        cycleIssues.push(issue('SUPERSEDES_CYCLE', 'The supersession graph contains a cycle.', record.path, record.id))
-      } else {
-        visiting.add(record.id)
-        for (const targetId of record.supersedes ?? []) {
+  const state = new Map<string, 'visited' | 'visiting'>()
+  for (const record of records) {
+    if (state.has(record.id)) {
+      continue
+    }
+    const stack = [{ index: 0, record }]
+    state.set(record.id, 'visiting')
+    while (stack.length > 0) {
+      const frame = stack.at(-1)
+      if (frame !== undefined) {
+        const targets = frame.record.supersedes ?? []
+        if (frame.index >= targets.length) {
+          state.set(frame.record.id, 'visited')
+          stack.pop()
+        } else {
+          const targetId = targets[frame.index] ?? ''
+          frame.index += 1
           const target = byId.get(targetId)
           if (target !== undefined) {
-            visit(target)
+            const targetState = state.get(target.id)
+            if (targetState === 'visiting') {
+              cycleIssues.push(
+                issue(
+                  'SUPERSEDES_CYCLE',
+                  'The supersession graph contains a cycle.',
+                  frame.record.path,
+                  frame.record.id,
+                ),
+              )
+            } else if (targetState !== 'visited') {
+              state.set(target.id, 'visiting')
+              stack.push({ index: 0, record: target })
+            }
           }
         }
-        visiting.delete(record.id)
-        visited.add(record.id)
       }
     }
-  }
-  for (const record of records) {
-    visit(record)
   }
 
   const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
@@ -329,6 +380,15 @@ const supersessionIssues = (records: BrainRecord[]) => {
 }
 
 const artifactIssues = (root: string, records: BrainRecord[]) => {
+  const artifactCount = records.reduce((count, record) => count + (record.artifacts?.length ?? 0), 0)
+  if (artifactCount > MAX_ARTIFACT_REFERENCES) {
+    return [
+      corpusIssue(
+        'CORPUS_ARTIFACT_LIMIT',
+        `Canonical corpus may contain at most ${MAX_ARTIFACT_REFERENCES} artifact references.`,
+      ),
+    ]
+  }
   const brainDirectory = resolve(root, 'encephalon')
   const paths = new Map<string, string>()
   return records.flatMap(record =>
@@ -351,16 +411,35 @@ const artifactIssues = (root: string, records: BrainRecord[]) => {
   )
 }
 
+const truncateValidationIssues = (errors: ValidationIssue[]) => {
+  if (errors.length <= MAX_VALIDATION_ISSUES) {
+    return { errors, truncated: false }
+  }
+  return {
+    errors: [
+      ...errors.slice(0, MAX_VALIDATION_ISSUES - 1),
+      issue(
+        'VALIDATION_ISSUES_TRUNCATED',
+        `Validation stopped reporting after ${MAX_VALIDATION_ISSUES} issues.`,
+        'encephalon',
+      ),
+    ],
+    truncated: true,
+  }
+}
+
 const validateScanned = (root: string, scan: RecordScan): ValidateResult => {
-  const errors = [
+  const collectedErrors = [
     ...scan.errors,
     ...duplicateAndCaseIssues(scan.records),
     ...supersessionIssues(scan.records),
     ...artifactIssues(root, scan.records),
   ]
+  const { errors, truncated } = truncateValidationIssues(collectedErrors)
   return {
     errors,
     recordsChecked: scan.records.length,
+    truncated,
     valid: errors.length === 0,
   }
 }

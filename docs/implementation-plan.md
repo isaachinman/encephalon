@@ -446,6 +446,7 @@ export type BrainRecord = BrainRecordFile & {
 - The current record may not supersede itself.
 - Every target must have the same `kind` and exactly the same trimmed `subject`.
 - The graph must contain no cycle.
+- The whole corpus may contain at most 1,000 supersession edges.
 
 `artifacts`:
 
@@ -454,6 +455,7 @@ export type BrainRecord = BrainRecordFile & {
 - May contain at most 256 entries.
 - Each path may contain at most 1,024 UTF-8 bytes.
 - Each path must satisfy the artifact rules below.
+- The whole corpus may contain at most 1,000 artifact references.
 
 `payload`:
 
@@ -469,6 +471,8 @@ export type BrainRecord = BrainRecordFile & {
 - Supplements, rather than replaces, indexed kind/subject/source/payload text.
 
 Unknown top-level fields and a canonical `path` field are validation errors. Optional fields are omitted rather than serialized as `null`.
+
+The v0.x canonical corpus may contain at most 1,000 records and 8 MiB of aggregate record JSON. Validation stops scanning when these hard corpus budgets are exceeded.
 
 ### 9.5 Append-only and supersession semantics
 
@@ -764,6 +768,7 @@ export type ValidateResult = {
   valid: boolean
   recordsChecked: number
   errors: ValidationIssue[]
+  truncated: boolean
 }
 
 export type GatherResult = {
@@ -780,7 +785,7 @@ export type GatherResult = {
 }
 ```
 
-Validation issues should use stable structured fields such as `code`, `message`, and optional repository-relative `path`/`recordId`, rather than unstructured strings alone.
+Validation issues should use stable structured fields such as `code`, `message`, and optional repository-relative `path`/`recordId`, rather than unstructured strings alone. A validation result returns at most 100 issues; when additional issues exist, `truncated` is `true` and the final returned issue has code `VALIDATION_ISSUES_TRUNCATED`.
 
 ### 13.1 Error type
 
