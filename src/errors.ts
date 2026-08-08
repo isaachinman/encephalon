@@ -38,11 +38,16 @@ const MAX_CLI_STRING_LENGTH = 256
 const MAX_CLI_ARRAY_LENGTH = 25
 const MAX_CLI_OBJECT_KEYS = 25
 const MAX_CLI_NUMBER_MAGNITUDE = 1_000_000_000_000
-const ABSOLUTE_PATH_PATTERN = /(^|[\s("'=])(?:\/|[A-Za-z]:[\\/]|\\\\)/
 const UNSAFE_CLI_DETAIL_KEYS = new Set(['cause', 'stack'])
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && !Array.isArray(value) && typeof value === 'object'
+
+const containsAbsolutePath = (value: string) =>
+  /(^|[\s("'=:;,])(\/|[A-Za-z]:[\\/]|\\\\)/.test(value) ||
+  /(^|[\s("'=:;,])\\[A-Za-z]/.test(value) ||
+  /(^|[\s("'=:;,])file:\/\//i.test(value) ||
+  /^[a-z][a-z0-9+.-]*:\//i.test(value)
 
 const isRecognizedFilesystemError = (error: unknown) => {
   if (!isRecord(error)) {
@@ -69,7 +74,7 @@ const errorCodeForCause = (cause: unknown): EncephalonErrorCode =>
   isRecognizedFilesystemError(cause) || isRecognizedSQLiteError(cause) ? 'IO_ERROR' : 'INTERNAL_ERROR'
 
 const isCliSafeString = (value: string) =>
-  value.length <= MAX_CLI_STRING_LENGTH && !/[\r\n]/.test(value) && !ABSOLUTE_PATH_PATTERN.test(value)
+  value.length <= MAX_CLI_STRING_LENGTH && !/[\r\n]/.test(value) && !containsAbsolutePath(value)
 
 const cliSafeValue = (value: JsonValue): JsonValue | undefined => {
   if (value === null || typeof value === 'boolean') {
@@ -82,14 +87,12 @@ const cliSafeValue = (value: JsonValue): JsonValue | undefined => {
     return isCliSafeString(value) ? value : undefined
   }
   if (Array.isArray(value)) {
-    if (value.length > MAX_CLI_ARRAY_LENGTH) {
-      return
+    const withinLimit = value.length <= MAX_CLI_ARRAY_LENGTH
+    const projected = withinLimit ? value.map(item => cliSafeValue(item)) : undefined
+    if (projected?.every(item => item !== undefined)) {
+      return projected as JsonValue[]
     }
-    const safeValues = value.flatMap(item => {
-      const safe = cliSafeValue(item)
-      return safe === undefined ? [] : [safe]
-    })
-    return safeValues
+    return
   }
   const safeEntries = Object.entries(value)
     .slice(0, MAX_CLI_OBJECT_KEYS)

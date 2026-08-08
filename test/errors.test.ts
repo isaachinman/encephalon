@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
-import { wrapIo } from '../src/errors.ts'
+import { cliErrorResponse, EncephalonError, wrapIo } from '../src/errors.ts'
 import type { EncephalonErrorCode } from '../src/types.ts'
 
 const assertWrappedCode = (cause: unknown, code: EncephalonErrorCode) => {
@@ -34,5 +34,38 @@ describe('error classification', () => {
       Object.assign(new Error('file is not a database'), { code: 'ERR_SQLITE_ERROR', errcode: 26 }),
       'IO_ERROR',
     )
+  })
+
+  test('classifies plain errors without errno as internal defects', () => {
+    assertWrappedCode(new Error('Unable to write file.'), 'INTERNAL_ERROR')
+  })
+})
+
+describe('CLI error projection', () => {
+  test('uses exit 2 for expected errors and exit 1 for internal defects', () => {
+    assert.equal(cliErrorResponse(new EncephalonError('IO_ERROR', 'Disk full.')).exitCode, 2)
+    assert.equal(cliErrorResponse(new EncephalonError('INTERNAL_ERROR', 'Boom.')).exitCode, 1)
+  })
+
+  test('redacts absolute, URL-like, and Windows path shapes from CLI details', () => {
+    const response = cliErrorResponse(
+      new EncephalonError('CACHE_SCOPE_MISMATCH', 'Wrong cache.', {
+        cachedRepository: 'file:///home/secret/repo',
+        csvPath: 'path,/var/lib/x',
+        openPath: 'open:/tmp/secret',
+        relative: 'records/foo.json',
+        windowsPath: '\\Users\\secret\\repo',
+      }),
+    )
+    assert.deepEqual(response.body.error.details, { relative: 'records/foo.json' })
+  })
+
+  test('drops detail arrays that contain any unsafe element', () => {
+    const response = cliErrorResponse(
+      new EncephalonError('VALIDATION_FAILED', 'Bad input.', {
+        paths: ['records/a.json', '/etc/passwd', 'records/b.json'],
+      }),
+    )
+    assert.deepEqual(response.body.error.details, {})
   })
 })
