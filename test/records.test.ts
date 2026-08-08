@@ -238,6 +238,34 @@ describe('canonical records', () => {
     assert.equal(readdirSync(join(root, 'encephalon', '_staging')).length, 1)
   })
 
+  test('does not misreport directory flush failure after canonical publication', () => {
+    const root = createRoot()
+    const record = addRecordResolved(
+      root,
+      {
+        id: 'flush-failure',
+        kind: 'decision',
+        payload: { summary: 'Published' },
+        source: 'agent',
+        subject: 'flush.failure',
+      },
+      {
+        hooks: {
+          fault: point => {
+            if (point === 'during-publication-flush') {
+              throw new Error('Injected directory flush failure')
+            }
+          },
+        },
+        hydrate: false,
+      },
+    )
+
+    assert.equal(record.id, 'flush-failure')
+    assert.equal(existsSync(join(root, record.path)), true)
+    assert.deepEqual(readdirSync(join(root, 'encephalon', '_staging')), [])
+  })
+
   test('validates supersession graphs and permits a multi-head resolver', () => {
     const root = createRoot()
     const first = api.addRecord({

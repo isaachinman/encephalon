@@ -33,7 +33,12 @@ type RecordScan = {
   errors: ValidationIssue[]
 }
 
-type RecordWriteFault = 'after-publication' | 'before-publication' | 'during-cleanup' | 'during-staging-write'
+type RecordWriteFault =
+  | 'after-publication'
+  | 'before-publication'
+  | 'during-cleanup'
+  | 'during-publication-flush'
+  | 'during-staging-write'
 
 type RecordWriteHooks = {
   fault?: (point: RecordWriteFault) => void
@@ -447,13 +452,18 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
     try {
       linkSync(stagingPath, path)
       published = true
-      fault(options.hooks, 'after-publication')
-      fsyncDirectory(kindDirectory)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
         return fail('RECORD_EXISTS', `Record ${recordFile.id} already exists.`, { path: relativePath })
       }
       throw error
+    }
+    try {
+      fault(options.hooks, 'after-publication')
+      fault(options.hooks, 'during-publication-flush')
+      fsyncDirectory(kindDirectory)
+    } catch {
+      // The canonical hard link is already visible; do not report a committed mutation as failed.
     }
   } catch (error) {
     operationFailed = true
