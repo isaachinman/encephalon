@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-08T09:52:42.451Z",
+  "id": "6fda301b-ba7f-41fe-aa73-06d433bc4c60",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Check Encephalon state before every commit in this repository, not only before push or merge.",
+    "lessons": [
+      "Before creating any commit in this repository, query Encephalon directly for relevant workflow, review, and ticket learnings.",
+      "Treat the Encephalon lookup as part of the commit gate: do it after deciding the intended commit scope and before running git commit.",
+      "If the lookup reveals a missing durable workflow rule, add it through Encephalon before committing so future commits can retrieve the rule."
+    ],
+    "verification": [
+      "Record the Encephalon search output in working notes before each git commit.",
+      "Do not rely on earlier conversation memory or a prior push-gate search as a substitute for the immediate pre-commit lookup."
+    ]
+  },
+  "source": "agent",
+  "subject": "workflow.encephalon-commit-gate"
+}
