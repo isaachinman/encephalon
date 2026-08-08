@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T11:39:11.931Z",
+  "id": "21c4b7fa-0cd5-4c22-98bb-1d461fbd773d",
+  "kind": "review",
+  "payload": {
+    "summary": "Public addRecord parsing must validate root before repository discovery and must not discard generated BrainRecordFile values.",
+    "lessons": [
+      "When a public parser calls an impure normaliser such as createRecordFile, thread the generated value into the write path or use a pure validator; never call it only as a probe and then recreate the record later.",
+      "Keep addRecord root validation aligned with the other public API parsers by applying rootProperties before resolveRepository can perform filesystem discovery.",
+      "Side-effect guard tests should include addRecord root validation, not only record schema fields."
+    ],
+    "verification": [
+      "Before committing addRecord parser changes, check tests that invalid public inputs do not create cache or instruction side effects.",
+      "Review parseAddRecordInput for generated ids/timestamps being preserved across the public add path."
+    ]
+  },
+  "searchText": "addRecord input validation createRecordFile root public parser Pullfrog",
+  "source": "agent",
+  "subject": "review.add-record-input-validation"
+}

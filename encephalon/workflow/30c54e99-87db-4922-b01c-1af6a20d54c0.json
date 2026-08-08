@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T08:33:42.663Z",
+  "id": "30c54e99-87db-4922-b01c-1af6a20d54c0",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Pullfrog PR #9 found that delete quarantine must be revalidated immediately before unlinking it.",
+    "lessons": [
+      "Verification before a fault-injection or callback boundary is not enough when the quarantined inode can still be mutated through an existing descriptor.",
+      "For quarantined instruction deletes, revalidate the quarantined inode identity and bytes immediately before the unlink commit point, after any hook or callback that could allow concurrent mutation.",
+      "If final revalidation fails, restore the changed quarantine to the public path when possible or leave the changed quarantine recoverable; do not silently discard descriptor writes."
+    ],
+    "verification": [
+      "Add POSIX descriptor-race tests that mutate the quarantined instruction file after delete verification and assert REPOSITORY_CHANGED with changed bytes still recoverable."
+    ]
+  },
+  "searchText": "Instruction delete final revalidation learning",
+  "source": "agent",
+  "subject": "review.github-pr-feedback",
+  "supersedes": ["bb3e1dcf-4d78-4740-9cde-2e1563b89d5f"]
+}
