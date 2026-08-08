@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   closeSync,
+  constants,
   existsSync,
   fsyncSync,
   linkSync,
@@ -32,6 +33,28 @@ type RecordScan = {
   errors: ValidationIssue[]
 }
 
+type RecordWriteFault =
+  | 'after-publication'
+  | 'before-publication'
+  | 'during-cleanup'
+  | 'during-hydration'
+  | 'during-publication-flush'
+  | 'during-staging-write'
+
+type RecordWriteHooks = {
+  fault?: (point: RecordWriteFault) => void
+}
+
+type AddRecordOptions = {
+  hooks?: RecordWriteHooks
+  hydrate?: boolean
+}
+
+const STAGING_DIRECTORY = '_staging'
+const RESERVED_DIRECTORIES = new Set(['_artifacts', STAGING_DIRECTORY])
+const directoryFlag = constants.O_DIRECTORY ?? 0
+const noFollowFlag = constants.O_NOFOLLOW ?? 0
+
 const posixRelative = (root: string, path: string) => relative(root, path).replaceAll('\\', '/')
 
 const issue = (code: string, message: string, path?: string, recordId?: string): ValidationIssue => ({
@@ -40,6 +63,63 @@ const issue = (code: string, message: string, path?: string, recordId?: string):
   ...(path === undefined ? {} : { path }),
   ...(recordId === undefined ? {} : { recordId }),
 })
+
+const fault = (hooks: RecordWriteHooks | undefined, point: RecordWriteFault) => hooks?.fault?.(point)
+
+const assertRealDirectory = (root: string, path: string) => {
+  const metadata = lstatSync(path)
+  if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+    return
+  }
+  return fail('VALIDATION_FAILED', `${posixRelative(root, path)} must be a real non-symlink directory.`)
+}
+
+const ensureDirectoryChain = (root: string, segments: string[]) => {
+  let current = root
+  for (const segment of segments) {
+    current = resolve(current, segment)
+    try {
+      mkdirSync(current)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw error
+      }
+    }
+    assertRealDirectory(root, current)
+  }
+  return current
+}
+
+const fsyncDirectory = (path: string) => {
+  if (process.platform !== 'win32') {
+    let descriptor: number | undefined
+    try {
+      descriptor = openSync(path, constants.O_RDONLY | directoryFlag)
+      fsyncSync(descriptor)
+    } catch (error) {
+      const { code } = error as NodeJS.ErrnoException
+      if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'EPERM') {
+        throw error
+      }
+    } finally {
+      if (descriptor !== undefined) {
+        closeSync(descriptor)
+      }
+    }
+  }
+}
+
+const cleanupStagingDirectory = (root: string, hooks?: RecordWriteHooks) => {
+  const stagingDirectory = resolve(root, 'encephalon', STAGING_DIRECTORY)
+  if (existsSync(stagingDirectory)) {
+    assertRealDirectory(root, stagingDirectory)
+    for (const entry of readdirSync(stagingDirectory, { withFileTypes: true })) {
+      fault(hooks, 'during-cleanup')
+      rmSync(resolve(stagingDirectory, entry.name), { force: true, recursive: true })
+    }
+    fsyncDirectory(stagingDirectory)
+  }
+}
 
 const readRecord = (root: string, path: string): BrainRecord => {
   const relativePath = posixRelative(root, path)
@@ -69,13 +149,17 @@ const scanCanonicalRecords = (root: string): RecordScan => {
       .sort((first, second) => first.name.localeCompare(second.name))
       .reduce<RecordScan>(
         (result, kindEntry) => {
-          if (kindEntry.name === '_artifacts') {
+          if (RESERVED_DIRECTORIES.has(kindEntry.name)) {
             return kindEntry.isDirectory() && !kindEntry.isSymbolicLink()
               ? result
               : {
                   errors: [
                     ...result.errors,
-                    issue('INVALID_RECORD_LAYOUT', '_artifacts must be a real directory.', 'encephalon/_artifacts'),
+                    issue(
+                      'INVALID_RECORD_LAYOUT',
+                      `${kindEntry.name} must be a real directory.`,
+                      `encephalon/${kindEntry.name}`,
+                    ),
                   ],
                   records: result.records,
                 }
@@ -133,7 +217,7 @@ const scanCanonicalRecords = (root: string): RecordScan => {
               ...result.errors,
               issue(
                 'INVALID_RECORD_LAYOUT',
-                'The brain root may contain only kind directories and the reserved _artifacts directory.',
+                'The brain root may contain only kind directories and reserved internal directories.',
                 posixRelative(root, kindPath),
               ),
             ],
@@ -308,11 +392,7 @@ export const readRecords = (input: RootInput = {}) => {
   })
 }
 
-export const addRecordResolved = (
-  root: string,
-  input: AddRecordInput,
-  options: { hydrate?: boolean } = {},
-): BrainRecord => {
+export const addRecordResolved = (root: string, input: AddRecordInput, options: AddRecordOptions = {}): BrainRecord => {
   const recordFile = createRecordFile(input)
   const relativePath = `encephalon/${recordFile.kind}/${recordFile.id}.json`
   const path = resolve(root, ...relativePath.split('/'))
@@ -322,6 +402,7 @@ export const addRecordResolved = (
     })
   }
 
+  cleanupStagingDirectory(root, options.hooks)
   const scan = scanCanonicalRecords(root)
   if (scan.errors.length > 0) {
     return fail('VALIDATION_FAILED', 'Existing canonical records are invalid.', {
@@ -346,32 +427,69 @@ export const addRecordResolved = (
   }
 
   const formatted = formatRecordFile(recordFile)
-  const kindDirectory = resolve(root, 'encephalon', recordFile.kind)
-  const stagingDirectory = resolve(root, 'encephalon', '_artifacts', recordFile.kind, recordFile.id)
-  const stagingPath = resolve(stagingDirectory, `.encephalon-record-${randomUUID()}.tmp`)
-  mkdirSync(kindDirectory, { recursive: true })
-  mkdirSync(stagingDirectory, { recursive: true })
+  const kindDirectory = ensureDirectoryChain(root, ['encephalon', recordFile.kind])
+  const stagingDirectory = ensureDirectoryChain(root, ['encephalon', STAGING_DIRECTORY])
+  const stagingPath = resolve(stagingDirectory, `record-${process.pid}-${randomUUID()}.tmp`)
+  let published = false
+  let operationFailed = false
+  let cleanupError: unknown
   try {
-    const descriptor = openSync(stagingPath, 'wx', 0o644)
+    assertRealDirectory(root, stagingDirectory)
+    const descriptor = openSync(
+      stagingPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | noFollowFlag,
+      0o644,
+    )
     try {
+      fault(options.hooks, 'during-staging-write')
       writeFileSync(descriptor, formatted, 'utf8')
       fsyncSync(descriptor)
     } finally {
       closeSync(descriptor)
     }
+    fault(options.hooks, 'before-publication')
+    assertRealDirectory(root, kindDirectory)
+    assertRealDirectory(root, stagingDirectory)
     try {
       linkSync(stagingPath, path)
+      published = true
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
         return fail('RECORD_EXISTS', `Record ${recordFile.id} already exists.`, { path: relativePath })
       }
       throw error
     }
+    try {
+      fault(options.hooks, 'after-publication')
+      fault(options.hooks, 'during-publication-flush')
+      fsyncDirectory(kindDirectory)
+    } catch {
+      // The canonical hard link is already visible; do not report a committed mutation as failed.
+    }
+  } catch (error) {
+    operationFailed = true
+    throw error
   } finally {
-    rmSync(stagingPath, { force: true })
+    try {
+      fault(options.hooks, 'during-cleanup')
+      rmSync(stagingPath, { force: true })
+      fsyncDirectory(stagingDirectory)
+    } catch (error) {
+      if (!(operationFailed || published)) {
+        cleanupError = error
+      }
+    }
+  }
+  if (cleanupError !== undefined) {
+    throw cleanupError
   }
   if (options.hydrate !== false) {
-    hydrateResolvedRepository(root, false)
+    try {
+      fault(options.hooks, 'during-hydration')
+      hydrateResolvedRepository(root, false)
+    } catch {
+      // Cache rebuild is derived state after the record commit point; the next read can rebuild it.
+    }
   }
   return candidate
 }
