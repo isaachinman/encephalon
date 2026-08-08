@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T08:34:50.524Z",
+  "id": "a412b9a9-157d-4418-8c3d-e1f67bd1c097",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Pullfrog PR #9 found that instruction delete must not report post-unlink directory flush failures as failed mutations.",
+    "lessons": [
+      "For quarantined instruction deletes, successful unlink of the quarantine is the deletion commit point.",
+      "After the unlink commit point, directory fsync and other durability cleanup should be best-effort; do not throw an IO_ERROR that makes callers observe a failed mutation when retry would find the instruction file already absent.",
+      "Keep pre-commit unlink failures distinct from post-commit flush failures: pre-commit errors restore or preserve quarantine, post-commit errors do not roll back the committed delete."
+    ],
+    "verification": [
+      "Add regression coverage that injects a directory flush failure after quarantine unlink and asserts the delete call succeeds with no public path or stranded quarantine."
+    ]
+  },
+  "searchText": "Instruction delete commit point learning",
+  "source": "agent",
+  "subject": "review.github-pr-feedback",
+  "supersedes": ["30c54e99-87db-4922-b01c-1af6a20d54c0"]
+}
