@@ -269,6 +269,32 @@ describe('initialisation', () => {
     assert.equal(readFileSync(path, 'utf8'), changed)
   })
 
+  test('does not overwrite instruction-file changes made during atomic publication', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = '# Existing guidance\n'
+    const changed = '# Concurrent guidance during publication\n'
+    writeFileSync(path, original)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'during-publication') {
+              writeFileSync(path, changed)
+            }
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(readFileSync(path, 'utf8'), changed)
+  })
+
   const faultPoints = [
     ['before-temp-create', 'old'],
     ['during-temp-write', 'old'],

@@ -325,20 +325,61 @@ const fsyncDirectory = (path: string) => {
   }
 }
 
-const tempPathFor = (path: string) => join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`)
+const tempPathFor = (path: string, suffix = 'tmp') =>
+  join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.${suffix}`)
+
+const restoreBackupFile = (path: string, backupPath: string) => {
+  try {
+    if (lstatIfExists(path) === undefined) {
+      renameSync(backupPath, path)
+    }
+  } catch {
+    // Keep the backup file in place so the pre-publication bytes remain recoverable.
+  }
+}
 
 const publishTempFile = (path: string, tempPath: string, plan: FilePlan) => {
-  if (plan.originalFileExisted) {
-    renameSync(tempPath, path)
+  if (!plan.originalFileExisted) {
+    try {
+      linkSync(tempPath, path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+      }
+      throw error
+    }
     return
   }
+
+  const backupPath = tempPathFor(path, 'backup')
+  let backupCreated = false
+  let published = false
   try {
+    renameSync(path, backupPath)
+    backupCreated = true
+    const backupMetadata = lstatIfExists(backupPath)
+    if (backupMetadata === undefined || backupMetadata.isSymbolicLink() || !backupMetadata.isFile()) {
+      return fail('VALIDATION_FAILED', `${plan.filename} must remain a regular non-symlink file.`)
+    }
+    if (readRegularFile(backupPath) !== plan.originalContent) {
+      return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+    }
     linkSync(tempPath, path)
+    published = true
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
       return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
     }
     throw error
+  } finally {
+    if (backupCreated) {
+      if (!published) {
+        restoreBackupFile(path, backupPath)
+      }
+      if (published || lstatIfExists(backupPath) === undefined) {
+        rmSync(backupPath, { force: true })
+      }
+    }
   }
 }
 
