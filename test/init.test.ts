@@ -1,5 +1,18 @@
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fchmodSync,
+  ftruncateSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
@@ -310,6 +323,70 @@ describe('initialisation', () => {
       },
     )
     assert.equal(readFileSync(path, 'utf8'), changed)
+  })
+
+  test('keeps old-descriptor writes recoverable after backup validation', {
+    skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = '# Existing guidance\n'
+    const changed = '# Descriptor edit\n'
+    writeFileSync(path, original)
+    const descriptor = openSync(path, 'r+')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    try {
+      assert.throws(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'after-backup-validation') {
+                ftruncateSync(descriptor, 0)
+                writeSync(descriptor, changed, 0, 'utf8')
+              }
+            },
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+    } finally {
+      closeSync(descriptor)
+    }
+
+    const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
+    assert.ok(backupName)
+    assert.equal(readFileSync(join(root, backupName), 'utf8'), changed)
+  })
+
+  test('preserves old-descriptor mode changes after backup validation', {
+    skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    chmodSync(path, 0o600)
+    const descriptor = openSync(path, 'r+')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    try {
+      applyInstructionChanges(root, [agentsPlan], {
+        fault: point => {
+          if (point === 'after-backup-validation') {
+            fchmodSync(descriptor, 0o744)
+          }
+        },
+      })
+    } finally {
+      closeSync(descriptor)
+    }
+
+    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
+    assert.equal(statSync(path).mode & 0o777, 0o744)
   })
 
   const faultPoints = [

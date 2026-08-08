@@ -7,6 +7,7 @@
     "lessons": [
       "For managed instruction-file publication, do not rely on a preflight-only snapshot before replacing a user-owned file; capture and revalidate the current target at publication time so concurrent edits return REPOSITORY_CHANGED instead of being overwritten.",
       "Preserve mutable filesystem metadata from the file captured at publication time, not from the earlier plan, because owners can change permissions without changing bytes.",
+      "After renaming a user-owned file to a backup path, treat that backup inode as still mutable through existing open descriptors; revalidate it before cleanup and leave it recoverable if the bytes changed.",
       "When adding repository workflow guidance, keep Git commit subjects and PR titles prefixed with the Linear ticket in square brackets, for example [MAR-1234] Describe the change."
     ],
     "verification": [

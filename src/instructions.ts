@@ -263,6 +263,7 @@ const assertPlanIsCurrent = (root: string, plan: FilePlan) => {
 
 type AtomicWriteFault =
   | 'after-publication'
+  | 'after-backup-validation'
   | 'before-temp-create'
   | 'during-file-flush'
   | 'during-publication'
@@ -344,7 +345,18 @@ const restoreBackupFile = (path: string, backupPath: string) => {
   }
 }
 
-const publishTempFile = (path: string, tempPath: string, plan: FilePlan) => {
+const assertBackupUnchanged = (backupPath: string, plan: FilePlan) => {
+  const metadata = lstatIfExists(backupPath)
+  if (metadata === undefined || metadata.isSymbolicLink() || !metadata.isFile()) {
+    return fail('VALIDATION_FAILED', `${plan.filename} must remain a regular non-symlink file.`)
+  }
+  if (readRegularFile(backupPath) !== plan.originalContent) {
+    return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+  }
+  return metadata
+}
+
+const publishTempFile = (path: string, tempPath: string, plan: FilePlan, hooks: AtomicWriteHooks | undefined) => {
   if (!plan.originalFileExisted) {
     try {
       linkSync(tempPath, path)
@@ -360,20 +372,19 @@ const publishTempFile = (path: string, tempPath: string, plan: FilePlan) => {
   const backupPath = tempPathFor(path, 'backup')
   let backupCreated = false
   let published = false
+  let removeBackup = false
   try {
     renameSync(path, backupPath)
     backupCreated = true
-    const backupMetadata = lstatIfExists(backupPath)
-    if (backupMetadata === undefined || backupMetadata.isSymbolicLink() || !backupMetadata.isFile()) {
-      return fail('VALIDATION_FAILED', `${plan.filename} must remain a regular non-symlink file.`)
-    }
-    if (readRegularFile(backupPath) !== plan.originalContent) {
-      return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
-    }
+    const backupMetadata = assertBackupUnchanged(backupPath, plan)
     chmodSync(tempPath, backupMetadata.mode & MODE_BITS)
     fsyncFile(tempPath)
+    fault(hooks, 'after-backup-validation')
     linkSync(tempPath, path)
     published = true
+    const finalBackupMetadata = assertBackupUnchanged(backupPath, plan)
+    chmodSync(path, finalBackupMetadata.mode & MODE_BITS)
+    removeBackup = true
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
       return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
@@ -384,7 +395,7 @@ const publishTempFile = (path: string, tempPath: string, plan: FilePlan) => {
       if (!published) {
         restoreBackupFile(path, backupPath)
       }
-      if (published || lstatIfExists(backupPath) === undefined) {
+      if (removeBackup || lstatIfExists(backupPath) === undefined) {
         rmSync(backupPath, { force: true })
       }
     }
@@ -418,7 +429,7 @@ const writePlan = (root: string, path: string, plan: FilePlan, hooks?: AtomicWri
     descriptor = undefined
     assertPlanIsCurrent(root, plan)
     fault(hooks, 'during-publication')
-    publishTempFile(path, tempPath, plan)
+    publishTempFile(path, tempPath, plan, hooks)
     fault(hooks, 'after-publication')
     fsyncDirectory(dirname(path))
   } catch (error) {
