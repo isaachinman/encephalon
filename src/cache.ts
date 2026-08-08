@@ -850,9 +850,9 @@ const parseRecordRowWithinBudget = (row: RecordRow, budget: FullResponseBudget) 
   return parseRecordRow(row)
 }
 
-const parseRecordRowsWithinBudget = (rows: RecordRow[]) => {
+const parseRecordRowsWithinBudget = (rows: Iterable<RecordRow>) => {
   const budget = { bytes: 0 }
-  return rows.map(row => parseRecordRowWithinBudget(row, budget))
+  return Array.from(rows, row => parseRecordRowWithinBudget(row, budget))
 }
 
 export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] => {
@@ -874,7 +874,7 @@ export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] => {
       .prepare(
         `SELECT record_json, length(cast(record_json AS BLOB)) AS record_bytes FROM records ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
       )
-      .all(...parameters) as RecordRow[]
+      .iterate(...parameters) as Iterable<RecordRow>
     return parseRecordRowsWithinBudget(rows)
   })
 }
@@ -932,21 +932,14 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput, match: st
     .prepare(`
     SELECT
       records.record_json,
-      length(cast(records.record_json AS BLOB)) AS record_bytes,
-      records.id,
-      records.kind,
-      records.subject,
-      records.path,
-      records.summary,
-      bm25(record_search) AS rank,
-      snippet(record_search, 1, '[', ']', '...', 16) AS snippet
+      length(cast(records.record_json AS BLOB)) AS record_bytes
     FROM record_search
     JOIN records ON records.id = record_search.id
     WHERE ${conditions.join(' AND ')}
-    ORDER BY rank ASC, records.created_at DESC, records.id DESC
+    ORDER BY bm25(record_search) ASC, records.created_at DESC, records.id DESC
     LIMIT ?
   `)
-    .all(...parameters) as Array<RecordRow & CompactRow>
+    .iterate(...parameters) as Iterable<RecordRow>
 }
 
 const compactText = (value: unknown, field: string) => {
