@@ -1,3 +1,4 @@
+import { parseInitInput } from './api-input.ts'
 import { canonicalPayload, scanBaseline } from './baseline.ts'
 import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
@@ -97,7 +98,7 @@ const initResolved = (input: InitEncephalonInput): InitEncephalonResult => {
 
 export const initEncephalon = (input: InitEncephalonInput = {}): InitEncephalonResult => {
   try {
-    return initResolved(input)
+    return initResolved(parseInitInput(input))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error

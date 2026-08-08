@@ -14,6 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { basename, join, relative, resolve } from 'node:path'
+import { parseAddRecordInput, parseRootInput } from './api-input.ts'
 import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
@@ -366,7 +367,7 @@ const validateScanned = (root: string, scan: RecordScan): ValidateResult => {
 }
 
 export const validateRecords = (input: RootInput = {}): ValidateResult => {
-  const root = resolveRepository(input)
+  const root = resolveRepository(parseRootInput(input, 'validateRecords'))
   try {
     return validateScanned(root, scanCanonicalRecords(root))
   } catch (error) {
@@ -495,9 +496,10 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
 }
 
 export const addRecord = (input: AddRecordInput): BrainRecord => {
-  const root = resolveRepository(input)
+  const parsed = parseAddRecordInput(input)
+  const root = resolveRepository(parsed)
   try {
-    return withOperationLock(root, () => addRecordResolved(root, input))
+    return withOperationLock(root, () => addRecordResolved(root, parsed))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
