@@ -1,9 +1,13 @@
-import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readFileSync } from 'node:fs'
 import { extname, resolve } from 'node:path'
 import type { AddRecordInput, JsonValue } from './types.ts'
 
 const MAX_SCANNED_FILES = 100_000
+const MAX_SCANNED_DIRECTORIES = 10_000
+const MAX_SCAN_DEPTH = 20
+const MAX_DIRECTORY_ENTRIES = 512
 const MAX_PACKAGE_BYTES = 1024 * 1024
+const noFollowFlag = constants.O_NOFOLLOW ?? 0
 const EXCLUDED_DIRECTORIES = new Set([
   '.git',
   '.hg',
@@ -96,9 +100,10 @@ type PackageFacts = {
 }
 
 type ScanState = {
+  directoriesSeen: number
   filesSeen: number
-  truncated: boolean
   languageCounts: Map<string, number>
+  truncationReasons: Set<string>
 }
 
 const hasControlCharacters = (value: string) =>
@@ -140,97 +145,126 @@ const safeWorkspacePattern = (value: unknown): value is string =>
 
 const readPackageFacts = (root: string): PackageFacts => {
   const path = resolve(root, 'package.json')
-  if (
-    existsSync(path) &&
-    lstatSync(path).isFile() &&
-    !lstatSync(path).isSymbolicLink() &&
-    lstatSync(path).size <= MAX_PACKAGE_BYTES
-  ) {
+  try {
+    const descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
     try {
-      const value = JSON.parse(readFileSync(path, 'utf8')) as {
-        name?: unknown
-        packageManager?: unknown
-        scripts?: unknown
-        workspaces?: unknown
-      }
-      let workspaceValue: unknown = []
-      if (Array.isArray(value.workspaces)) {
-        workspaceValue = value.workspaces
-      } else if (value.workspaces !== null && typeof value.workspaces === 'object' && 'packages' in value.workspaces) {
-        workspaceValue = (value.workspaces as { packages?: unknown }).packages
-      }
-      return {
-        ...(typeof value.name === 'string' && safeName(value.name) ? { name: value.name } : {}),
-        ...(typeof value.packageManager === 'string' &&
-        PACKAGE_MANAGERS.has(value.packageManager.split('@')[0]?.toLowerCase() ?? '')
-          ? {
-              packageManager: value.packageManager.split('@')[0]?.toLowerCase(),
-            }
-          : {}),
-        scriptKeys:
-          value.scripts !== null && typeof value.scripts === 'object' && !Array.isArray(value.scripts)
-            ? Object.keys(value.scripts)
-                .filter(safeName)
-                .sort((first, second) => first.localeCompare(second))
+      const metadata = fstatSync(descriptor)
+      if (metadata.isFile() && metadata.size <= MAX_PACKAGE_BYTES) {
+        const value = JSON.parse(readFileSync(descriptor, 'utf8')) as {
+          name?: unknown
+          packageManager?: unknown
+          scripts?: unknown
+          workspaces?: unknown
+        }
+        let workspaceValue: unknown = []
+        if (Array.isArray(value.workspaces)) {
+          workspaceValue = value.workspaces
+        } else if (
+          value.workspaces !== null &&
+          typeof value.workspaces === 'object' &&
+          'packages' in value.workspaces
+        ) {
+          workspaceValue = (value.workspaces as { packages?: unknown }).packages
+        }
+        return {
+          ...(typeof value.name === 'string' && safeName(value.name) ? { name: value.name } : {}),
+          ...(typeof value.packageManager === 'string' &&
+          PACKAGE_MANAGERS.has(value.packageManager.split('@')[0]?.toLowerCase() ?? '')
+            ? {
+                packageManager: value.packageManager.split('@')[0]?.toLowerCase(),
+              }
+            : {}),
+          scriptKeys:
+            value.scripts !== null && typeof value.scripts === 'object' && !Array.isArray(value.scripts)
+              ? Object.keys(value.scripts)
+                  .filter(safeName)
+                  .sort((first, second) => first.localeCompare(second))
+              : [],
+          workspacePatterns: Array.isArray(workspaceValue)
+            ? workspaceValue.filter(safeWorkspacePattern).sort((first, second) => first.localeCompare(second))
             : [],
-        workspacePatterns: Array.isArray(workspaceValue)
-          ? workspaceValue.filter(safeWorkspacePattern).sort((first, second) => first.localeCompare(second))
-          : [],
+        }
       }
-    } catch {
-      return { scriptKeys: [], workspacePatterns: [] }
+    } finally {
+      closeSync(descriptor)
     }
+  } catch {
+    return { scriptKeys: [], workspacePatterns: [] }
   }
   return { scriptKeys: [], workspacePatterns: [] }
 }
 
 const scanLanguages = (root: string) => {
   const initial: ScanState = {
+    directoriesSeen: 0,
     filesSeen: 0,
     languageCounts: new Map(),
-    truncated: false,
+    truncationReasons: new Set(),
   }
-  const visit = (directory: string, state: ScanState): ScanState => {
-    if (state.truncated) {
-      return state
+  const queue = [{ depth: 0, directory: root }]
+  for (const { depth, directory } of queue) {
+    if (initial.directoriesSeen >= MAX_SCANNED_DIRECTORIES) {
+      initial.truncationReasons.add('directory-limit')
+      break
     }
-    return readdirSync(directory, { withFileTypes: true })
-      .sort((first, second) => first.name.localeCompare(second.name))
-      .reduce<ScanState>((current, entry) => {
-        if (
-          current.truncated ||
-          !safeName(entry.name) ||
-          entry.isSymbolicLink() ||
-          EXCLUDED_FILES.has(entry.name.toLowerCase())
-        ) {
-          return current
-        }
-        const path = resolve(directory, entry.name)
-        if (entry.isDirectory()) {
-          return EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase()) ? current : visit(path, current)
-        }
-        if (entry.isFile()) {
-          const filesSeen = current.filesSeen + 1
-          const language = LANGUAGE_BY_EXTENSION.get(extname(entry.name).toLowerCase())
-          const languageCounts = new Map(current.languageCounts)
-          if (language !== undefined) {
-            languageCounts.set(language, (languageCounts.get(language) ?? 0) + 1)
+    try {
+      const metadata = lstatSync(directory)
+      if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+        initial.directoriesSeen += 1
+        try {
+          const entries = readdirSync(directory, { withFileTypes: true }).sort((first, second) =>
+            first.name.localeCompare(second.name),
+          )
+          const acceptedEntries = entries.filter(
+            entry =>
+              safeName(entry.name) &&
+              !entry.isSymbolicLink() &&
+              !EXCLUDED_FILES.has(entry.name.toLowerCase()) &&
+              !(entry.isDirectory() && EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())),
+          )
+          if (acceptedEntries.length > MAX_DIRECTORY_ENTRIES) {
+            initial.truncationReasons.add('directory-entry-limit')
           }
-          return {
-            filesSeen,
-            languageCounts,
-            truncated: filesSeen >= MAX_SCANNED_FILES,
+          for (const entry of acceptedEntries.slice(0, MAX_DIRECTORY_ENTRIES)) {
+            const path = resolve(directory, entry.name)
+            if (entry.isDirectory()) {
+              if (depth >= MAX_SCAN_DEPTH) {
+                initial.truncationReasons.add('max-depth')
+                continue
+              }
+              queue.push({ depth: depth + 1, directory: path })
+            } else if (entry.isFile()) {
+              if (initial.filesSeen >= MAX_SCANNED_FILES) {
+                initial.truncationReasons.add('regular-file-limit')
+                continue
+              }
+              initial.filesSeen += 1
+              const language = LANGUAGE_BY_EXTENSION.get(extname(entry.name).toLowerCase())
+              if (language !== undefined) {
+                initial.languageCounts.set(language, (initial.languageCounts.get(language) ?? 0) + 1)
+              }
+            }
           }
-        }
-        return current
-      }, state)
+        } catch {}
+      }
+    } catch {}
   }
-  return visit(root, initial)
+  return initial
 }
+
+const safeDirectory = (root: string, segments: string[]) =>
+  segments.every((_, index) => {
+    try {
+      const metadata = lstatSync(resolve(root, ...segments.slice(0, index + 1)))
+      return metadata.isDirectory() && !metadata.isSymbolicLink()
+    } catch {
+      return false
+    }
+  })
 
 const workflowFiles = (root: string) => {
   const directory = resolve(root, '.github', 'workflows')
-  if (!(existsSync(directory) && lstatSync(directory).isDirectory()) || lstatSync(directory).isSymbolicLink()) {
+  if (!safeDirectory(root, ['.github', 'workflows'])) {
     return []
   }
   return readdirSync(directory, { withFileTypes: true })
@@ -282,7 +316,8 @@ export const scanBaseline = (root: string): AddRecordInput[] => {
         languageCounts: languages,
         recognisedTopLevelFiles: layout.recognisedFiles,
         scannedRegularFiles: scan.filesSeen,
-        scanTruncated: scan.truncated,
+        scanTruncated: scan.truncationReasons.size > 0,
+        scanTruncationReasons: [...scan.truncationReasons].sort((first, second) => first.localeCompare(second)),
         sources: safeSources,
         summary: 'Derived repository overview captured during Encephalon initialisation.',
         topLevelDirectories: layout.directories,

@@ -27,6 +27,14 @@ const createRoot = () => {
   return root
 }
 
+const generatedRecord = (root: string, subject: string) => {
+  const record = api
+    .listRecords({ includeSuperseded: true, limit: 20, root })
+    .find(candidate => candidate.subject === subject)
+  assert.ok(record)
+  return record
+}
+
 afterEach(() => {
   roots.splice(0).forEach(removeTestRepository)
 })
@@ -155,6 +163,49 @@ describe('initialisation', () => {
         .filter(record => record.subject === 'encephalon:init/repository-overview').length,
       1,
     )
+  })
+
+  test('bounds baseline scanning and records deterministic truncation reasons', () => {
+    const root = createRoot()
+    for (let index = 0; index < 600; index += 1) {
+      writeFileSync(join(root, `file-${String(index).padStart(3, '0')}.ts`), 'export {}\n')
+    }
+
+    api.initEncephalon({ root })
+    const overview = generatedRecord(root, 'encephalon:init/repository-overview')
+
+    assert.equal((overview.payload as { scannedRegularFiles?: unknown }).scannedRegularFiles, 512)
+    assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, [
+      'directory-entry-limit',
+    ])
+  })
+
+  test('bounds baseline scanner depth without following deep chains forever', () => {
+    const root = createRoot()
+    let current = root
+    for (let index = 0; index < 30; index += 1) {
+      current = join(current, `level-${String(index).padStart(2, '0')}`)
+      ensureParent(join(current, 'placeholder'))
+    }
+    writeFileSync(join(current, 'deep.ts'), 'export {}\n')
+
+    api.initEncephalon({ root })
+    const overview = generatedRecord(root, 'encephalon:init/repository-overview')
+
+    assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, ['max-depth'])
+  })
+
+  test('does not enumerate workflows through a symlinked .github ancestor', () => {
+    const root = createRoot()
+    const outside = createRoot()
+    ensureParent(join(outside, '.github', 'workflows', 'leaked.yml'))
+    writeFileSync(join(outside, '.github', 'workflows', 'leaked.yml'), 'name: leaked\n')
+    symlinkSync(join(outside, '.github'), join(root, '.github'))
+
+    api.initEncephalon({ root })
+    const workflow = generatedRecord(root, 'encephalon:init/commands-ci')
+
+    assert.deepEqual((workflow.payload as { workflowFiles?: unknown }).workflowFiles, [])
   })
 
   test('preflights both instruction files before writing anything', () => {
