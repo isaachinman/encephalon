@@ -327,6 +327,21 @@ describe('SQLite cache and reads', () => {
     })
   }
 
+  test('rebuilds non-text cached record JSON before reading it', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    mutateCache(root, database => {
+      database.prepare('UPDATE records SET record_json = ? WHERE id = ?').run(42, String(record.id))
+    })
+
+    assert.deepEqual(
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root }).map(
+        entry => entry.id,
+      ),
+      [record.id],
+    )
+  })
+
   test('rebuilds cached records with invalid shapes and runtime paths', () => {
     const invalidRecordJson = (record: Record<string, unknown>) => [
       JSON.stringify({ ...record, unexpected: true }),

@@ -59,7 +59,7 @@ type ManifestEntry = {
 }
 
 type RecordRow = {
-  record_json: string
+  record_json: unknown
 }
 
 type CompactRow = {
@@ -281,13 +281,16 @@ const repositoryManifest = (root: string, artifactPaths: string[]) => {
 
 const byteLength = (value: string) => Buffer.byteLength(value, 'utf8')
 
-const assertCacheValueSize = (value: string, maximum: number) => {
+function assertCacheValueSize(value: unknown, maximum: number): asserts value is string {
+  if (typeof value !== 'string') {
+    throw new CacheSchemaMismatch('Cached values must be text.')
+  }
   if (byteLength(value) > maximum) {
     throw new CacheSchemaMismatch('A cached value exceeds its size limit.')
   }
 }
 
-const parseCacheJson = (value: string, maximum: number) => {
+const parseCacheJson = (value: unknown, maximum: number) => {
   assertCacheValueSize(value, maximum)
   try {
     return JSON.parse(value) as unknown
@@ -311,7 +314,7 @@ const validateCachedArtifactPath = (value: unknown) => {
   }
 }
 
-const parseCachedRecord = (value: string): BrainRecord => {
+const parseCachedRecord = (value: unknown): BrainRecord => {
   const parsed = parseCacheJson(value, MAX_CACHE_RECORD_BYTES)
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new CacheSchemaMismatch('Cached record JSON must be an object.')
@@ -329,6 +332,16 @@ const parseCachedRecord = (value: string): BrainRecord => {
     // Normalise every cached-row validation failure into disposable cache corruption.
   }
   throw new CacheSchemaMismatch('Cached record JSON does not match the canonical record schema.')
+}
+
+const summaryForRecord = (record: BrainRecord) => {
+  if (record.payload !== null && !Array.isArray(record.payload) && typeof record.payload === 'object') {
+    const { summary } = record.payload
+    if (typeof summary === 'string' && summary.trim().length > 0) {
+      return summary.trim()
+    }
+  }
+  return null
 }
 
 const readMetadata = (database: DatabaseSync): Metadata | undefined => {
@@ -442,16 +455,6 @@ const metadataIsFresh = (
     assertCacheContentConsistent(database, metadata)
   }
   return fresh
-}
-
-const summaryForRecord = (record: BrainRecord) => {
-  if (record.payload !== null && !Array.isArray(record.payload) && typeof record.payload === 'object') {
-    const { summary } = record.payload
-    if (typeof summary === 'string' && summary.trim().length > 0) {
-      return summary.trim()
-    }
-  }
-  return null
 }
 
 const searchDocumentForRecord = (record: BrainRecord) =>
