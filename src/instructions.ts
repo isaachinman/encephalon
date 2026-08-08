@@ -14,6 +14,7 @@ import {
   writeSync,
 } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
+import { TextDecoder } from 'node:util'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 
 const FILENAMES = ['AGENTS.md', 'CLAUDE.md'] as const
@@ -33,12 +34,18 @@ type FilePlan = {
   filename: (typeof FILENAMES)[number]
   action: 'delete' | 'none' | 'write'
   content?: string
+  contentBytes?: Buffer
+  originalBytes: Buffer
   originalContent: string
   originalFileExisted: boolean
 }
 
 const ALLOWED_SEPARATORS = new Set(['', '\n', '\n\n', '\r\n', '\r\n\r\n'])
 const MODE_BITS = 0o7777
+const MAX_INSTRUCTION_FILE_BYTES = 1024 * 1024
+const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
+const directoryFlag = typeof constants.O_DIRECTORY === 'number' ? constants.O_DIRECTORY : 0
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
 const lstatIfExists = (path: string) => {
   try {
@@ -71,6 +78,41 @@ const decodeMetadata = (encoded: string): BlockMetadata => {
 }
 
 const lineEndingFor = (content: string) => (content.includes('\r\n') ? '\r\n' : '\n')
+
+const decodeInstructionBytes = (filename: (typeof FILENAMES)[number], bytes: Buffer) => {
+  if (bytes.includes(0)) {
+    return fail('VALIDATION_FAILED', `${filename} contains a NUL byte.`)
+  }
+  try {
+    return utf8Decoder.decode(bytes)
+  } catch {
+    return fail('VALIDATION_FAILED', `${filename} must contain valid UTF-8.`)
+  }
+}
+
+const readRegularFileBytes = (path: string, filename: (typeof FILENAMES)[number]) => {
+  let descriptor: number
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ELOOP') {
+      return fail('VALIDATION_FAILED', `${filename} must remain a regular non-symlink file.`)
+    }
+    throw error
+  }
+  try {
+    const metadata = fstatSync(descriptor)
+    if (!metadata.isFile()) {
+      return fail('VALIDATION_FAILED', 'Managed instruction paths must remain regular files.')
+    }
+    if (metadata.size > MAX_INSTRUCTION_FILE_BYTES) {
+      return fail('VALIDATION_FAILED', `${filename} exceeds the 1 MiB instruction-file limit.`)
+    }
+    return readFileSync(descriptor)
+  } finally {
+    closeSync(descriptor)
+  }
+}
 
 const blockFor = (metadata: BlockMetadata) => {
   const lineEnding = metadata.lineEnding === 'CRLF' ? '\r\n' : '\n'
@@ -153,15 +195,14 @@ const additionPlan = (root: string, filename: (typeof FILENAMES)[number]): FileP
       return fail('VALIDATION_FAILED', `${filename} must be a regular non-symlink file.`)
     }
   }
-  const content = existed ? readFileSync(path, 'utf8') : ''
-  if (content.includes('\0')) {
-    return fail('VALIDATION_FAILED', `${filename} contains a NUL byte.`)
-  }
+  const originalBytes = existed ? readRegularFileBytes(path, filename) : Buffer.alloc(0)
+  const content = decodeInstructionBytes(filename, originalBytes)
   const installed = inspectBlock(content)
   if (installed !== undefined) {
     return {
       action: 'none',
       filename,
+      originalBytes,
       originalContent: content,
       originalFileExisted: existed,
     }
@@ -177,10 +218,13 @@ const additionPlan = (root: string, filename: (typeof FILENAMES)[number]): FileP
     originalFileExisted: existed,
     separatorBase64: Buffer.from(separator, 'utf8').toString('base64'),
   }
+  const nextContent = `${content}${separator}${blockFor(metadata)}`
   return {
     action: 'write',
-    content: `${content}${separator}${blockFor(metadata)}`,
+    content: nextContent,
+    contentBytes: Buffer.from(nextContent, 'utf8'),
     filename,
+    originalBytes,
     originalContent: content,
     originalFileExisted: existed,
   }
@@ -193,6 +237,7 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
     return {
       action: 'none',
       filename,
+      originalBytes: Buffer.alloc(0),
       originalContent: '',
       originalFileExisted: false,
     }
@@ -200,15 +245,14 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
   if (!fileMetadata.isFile() || fileMetadata.isSymbolicLink()) {
     return fail('VALIDATION_FAILED', `${filename} must be a regular non-symlink file.`)
   }
-  const content = readFileSync(path, 'utf8')
-  if (content.includes('\0')) {
-    return fail('VALIDATION_FAILED', `${filename} contains a NUL byte.`)
-  }
+  const originalBytes = readRegularFileBytes(path, filename)
+  const content = decodeInstructionBytes(filename, originalBytes)
   const installed = inspectBlock(content)
   if (installed === undefined) {
     return {
       action: 'none',
       filename,
+      originalBytes,
       originalContent: content,
       originalFileExisted: true,
     }
@@ -218,31 +262,20 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
     return {
       action: 'delete',
       filename,
+      originalBytes,
       originalContent: content,
       originalFileExisted: true,
     }
   }
+  const nextBytes = Buffer.from(contentWithoutBlock, 'utf8')
   return {
     action: 'write',
     content: contentWithoutBlock,
+    contentBytes: nextBytes,
     filename,
+    originalBytes,
     originalContent: content,
     originalFileExisted: true,
-  }
-}
-
-const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
-const directoryFlag = typeof constants.O_DIRECTORY === 'number' ? constants.O_DIRECTORY : 0
-
-const readRegularFile = (path: string) => {
-  const descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
-  try {
-    if (!fstatSync(descriptor).isFile()) {
-      return fail('VALIDATION_FAILED', 'Managed instruction paths must remain regular files.')
-    }
-    return readFileSync(descriptor, 'utf8')
-  } finally {
-    closeSync(descriptor)
   }
 }
 
@@ -256,7 +289,7 @@ const assertPlanIsCurrent = (root: string, plan: FilePlan) => {
   if (metadata?.isSymbolicLink() === true || (metadata !== undefined && !metadata.isFile())) {
     return fail('VALIDATION_FAILED', `${plan.filename} must remain a regular non-symlink file.`)
   }
-  if (exists && readRegularFile(path) !== plan.originalContent) {
+  if (exists && !readRegularFileBytes(path, plan.filename).equals(plan.originalBytes)) {
     return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
   }
 }
@@ -352,7 +385,7 @@ const assertBackupUnchanged = (backupPath: string, plan: FilePlan) => {
   if (metadata === undefined || metadata.isSymbolicLink() || !metadata.isFile()) {
     return fail('VALIDATION_FAILED', `${plan.filename} must remain a regular non-symlink file.`)
   }
-  if (readRegularFile(backupPath) !== plan.originalContent) {
+  if (!readRegularFileBytes(backupPath, plan.filename).equals(plan.originalBytes)) {
     return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
   }
   return metadata
@@ -412,8 +445,7 @@ const cleanupTempFile = (tempPath: string, hooks: AtomicWriteHooks | undefined, 
 }
 
 const writePlan = (root: string, path: string, plan: FilePlan, hooks?: AtomicWriteHooks) => {
-  const content = plan.content ?? ''
-  const bytes = Buffer.from(content, 'utf8')
+  const bytes = plan.contentBytes ?? Buffer.alloc(0)
   const tempPath = tempPathFor(path)
   let descriptor: number | undefined
   let operationFailed = false
