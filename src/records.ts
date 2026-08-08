@@ -68,6 +68,12 @@ type ValidateRecordsOptions = {
   hooks?: RecordReadHooks
 }
 
+type AllowedMultiHead = {
+  kind: string
+  source: string
+  subject: string
+}
+
 const STAGING_DIRECTORY = '_staging'
 const RESERVED_DIRECTORIES = new Set(['_artifacts', STAGING_DIRECTORY])
 const directoryFlag = constants.O_DIRECTORY ?? 0
@@ -499,6 +505,31 @@ const validateScanned = (root: string, scan: RecordScan): ValidateResult => {
   }
 }
 
+const allowedMultiHeadRecordIds = (records: BrainRecord[], allowed: AllowedMultiHead[]) => {
+  const allowedKeys = new Set(allowed.map(candidate => `${candidate.kind}\0${candidate.subject}\0${candidate.source}`))
+  const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
+  return [
+    ...records
+      .filter(record => !superseded.has(record.id))
+      .reduce<Map<string, BrainRecord[]>>((groups, record) => {
+        const key = `${record.kind}\0${record.subject}`
+        groups.set(key, [...(groups.get(key) ?? []), record])
+        return groups
+      }, new Map())
+      .values(),
+  ].reduce<Set<string>>((ids, group) => {
+    const [first] = group
+    if (
+      first !== undefined &&
+      group.length > 1 &&
+      group.every(record => allowedKeys.has(`${record.kind}\0${record.subject}\0${record.source}`))
+    ) {
+      return new Set([...ids, ...group.map(record => record.id)])
+    }
+    return ids
+  }, new Set())
+}
+
 export const validateRecordsResolved = (root: string, options: ValidateRecordsOptions = {}): ValidateResult => {
   try {
     return validateScanned(root, scanCanonicalRecords(root, options))
@@ -524,6 +555,26 @@ export const readRecords = (input: RootInput = {}) => {
   }
   return fail('VALIDATION_FAILED', 'Canonical records are invalid.', {
     errors: result.errors.map(error => ({
+      code: error.code,
+      message: error.message,
+    })),
+  })
+}
+
+export const readRecordsAllowingGeneratedMultiHeads = (input: RootInput, allowed: AllowedMultiHead[]) => {
+  const root = resolveRepository(input)
+  const scan = scanCanonicalRecords(root)
+  const result = validateScanned(root, scan)
+  const allowedIds = allowedMultiHeadRecordIds(scan.records, allowed)
+  const blockingErrors = result.errors.filter(
+    error =>
+      !(error.code === 'MULTIPLE_ACTIVE_HEADS' && error.recordId !== undefined && allowedIds.has(error.recordId)),
+  )
+  if (blockingErrors.length === 0) {
+    return scan.records
+  }
+  return fail('VALIDATION_FAILED', 'Canonical records are invalid.', {
+    errors: blockingErrors.map(error => ({
       code: error.code,
       message: error.message,
     })),
