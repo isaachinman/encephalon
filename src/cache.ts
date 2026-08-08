@@ -60,6 +60,8 @@ type CompactRow = {
   snippet: string
 }
 
+type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind' | 'limit'>
+
 class CacheSchemaMismatch extends Error {}
 
 let sqliteModule: SQLiteModule | undefined
@@ -647,21 +649,78 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
     .all(...parameters) as Array<RecordRow & CompactRow>
 }
 
+const compactRecordFromRow = (row: CompactRow): CompactBrainRecord => ({
+  id: row.id,
+  kind: row.kind,
+  path: row.path,
+  rank: row.rank,
+  snippet: row.snippet,
+  subject: row.subject,
+  summary: row.summary,
+})
+
+const createCompactSearchReader = (database: DatabaseSync, input: SearchStatementInput) => {
+  const conditions = [
+    'record_search MATCH ?',
+    input.includeSuperseded === true ? undefined : 'records.active = 1',
+    input.kind === undefined ? undefined : 'records.kind = ?',
+  ].filter((value): value is string => value !== undefined)
+  const kindParameters = input.kind === undefined ? [] : [input.kind]
+  const limit = positiveLimit(input.limit)
+  const statement = database.prepare(`
+    SELECT
+      records.id,
+      records.kind,
+      records.subject,
+      records.path,
+      records.summary,
+      bm25(record_search) AS rank,
+      snippet(record_search, 1, '[', ']', '...', 16) AS snippet
+    FROM record_search
+    JOIN records ON records.id = record_search.id
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY rank ASC, records.created_at DESC, records.id DESC
+    LIMIT ?
+  `)
+  return (query: string) => {
+    const match = literalMatchQuery(query)
+    if (match.length === 0) {
+      return []
+    }
+    return (statement.all(match, ...kindParameters, limit) as CompactRow[]).map(compactRecordFromRow)
+  }
+}
+
 export const searchRecords = (input: SearchRecordsInput): BrainRecord[] =>
   withPreparedDatabase(input, database => searchRows(database, input).map(parseRecordRow))
 
 export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] =>
-  withPreparedDatabase(input, database =>
-    searchRows(database, input).map(row => ({
-      id: row.id,
-      kind: row.kind,
-      path: row.path,
-      rank: row.rank,
-      snippet: row.snippet,
-      subject: row.subject,
-      summary: row.summary,
-    })),
-  )
+  withPreparedDatabase(input, database => createCompactSearchReader(database, input)(input.query))
+
+const createShowReader = (database: DatabaseSync, includeSuperseded: boolean | undefined) => {
+  const activeClause = includeSuperseded === true ? '' : ' AND active = 1'
+  const statement = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`)
+  return (id: string) => {
+    const row = statement.get(id) as RecordRow | undefined
+    return row === undefined ? null : parseRecordRow(row)
+  }
+}
+
+const readTransaction = <Result>(database: DatabaseSync, read: () => Result) => {
+  database.exec('BEGIN')
+  try {
+    const result = read()
+    database.exec('ROLLBACK')
+    return result
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK')
+    } catch {
+      // The original read failure is more useful than a secondary rollback failure.
+    }
+    throw error
+  }
+}
 
 export const gatherRecords = (input: GatherInput): GatherResult => {
   const root = resolveRepository(input)
@@ -688,29 +747,20 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
     }
     const database = openDatabase(root)
     try {
-      return {
-        hydrated,
-        records: shows.map(id => {
-          const activeClause = input.includeSuperseded === true ? '' : ' AND active = 1'
-          const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(id) as
-            | RecordRow
-            | undefined
-          return { id, record: row === undefined ? null : parseRecordRow(row) }
-        }),
-        searches: searches.map(query => ({
-          kind: input.kind ?? null,
-          query,
-          results: searchRows(database, { ...input, query }).map(row => ({
-            id: row.id,
-            kind: row.kind,
-            path: row.path,
-            rank: row.rank,
-            snippet: row.snippet,
-            subject: row.subject,
-            summary: row.summary,
+      return readTransaction(database, () => {
+        const showRecordForId = shows.length === 0 ? () => null : createShowReader(database, input.includeSuperseded)
+        const searchCompactRecordsForQuery =
+          searches.length === 0 ? () => [] : createCompactSearchReader(database, input)
+        return {
+          hydrated,
+          records: shows.map(id => ({ id, record: showRecordForId(id) })),
+          searches: searches.map(query => ({
+            kind: input.kind ?? null,
+            query,
+            results: searchCompactRecordsForQuery(query),
           })),
-        })),
-      }
+        }
+      })
     } finally {
       database.close()
     }

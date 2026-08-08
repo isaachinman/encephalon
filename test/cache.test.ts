@@ -22,6 +22,12 @@ afterEach(() => {
 
 const functionFromApi = <T>(name: string) => (api as unknown as Record<string, T>)[name] as T
 
+const cacheDatabasePath = (root: string) => join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+
+type SQLitePrototype = {
+  prepare: (source: string) => unknown
+}
+
 describe('SQLite cache and reads', () => {
   test('prepares an empty repository before a cache directory exists', () => {
     const root = createRoot()
@@ -138,6 +144,179 @@ describe('SQLite cache and reads', () => {
       subject: 'no.summary',
     })
     assert.equal(searchCompactRecords({ query: 'searchable marker', root })[0]?.summary, null)
+  })
+
+  test('gather reads every item from one cache snapshot', () => {
+    const root = createRoot()
+    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
+    const firstId = 'snapshot-v1'
+    addRecord({
+      id: firstId,
+      kind: 'context',
+      payload: { summary: 'Snapshot generation one' },
+      root,
+      source: 'agent',
+      subject: 'cache.snapshot',
+    })
+    const replacement = {
+      createdAt: '2026-08-08T00:00:01.000Z',
+      id: 'snapshot-v2',
+      kind: 'context',
+      path: 'encephalon/context/snapshot-v2.json',
+      payload: { summary: 'Snapshot generation two' },
+      source: 'agent',
+      subject: 'cache.snapshot',
+      supersedes: [firstId],
+    }
+    const prototype = DatabaseSync.prototype as unknown as SQLitePrototype
+    const originalPrepare = prototype.prepare
+    let mutatedBetweenItems = false
+
+    prototype.prepare = function patchedPrepare(this: unknown, source: string) {
+      const statement = originalPrepare.call(this, source) as Record<PropertyKey, unknown>
+      if (source.includes('SELECT record_json FROM records WHERE id = ?')) {
+        return new Proxy(statement, {
+          get(target, property, receiver) {
+            const value = Reflect.get(target, property, receiver)
+            if (property !== 'get' || typeof value !== 'function') {
+              return value
+            }
+            return (...parameters: unknown[]) => {
+              const result = value.apply(target, parameters)
+              if (!mutatedBetweenItems) {
+                mutatedBetweenItems = true
+                const database = new DatabaseSync(cacheDatabasePath(root))
+                try {
+                  database.exec('BEGIN IMMEDIATE')
+                  database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
+                  database
+                    .prepare(`
+                      INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `)
+                    .run(
+                      replacement.id,
+                      replacement.kind,
+                      replacement.subject,
+                      replacement.source,
+                      replacement.createdAt,
+                      replacement.path,
+                      1,
+                      'Snapshot generation two',
+                      JSON.stringify(replacement),
+                    )
+                  database
+                    .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
+                    .run(replacement.id, 'Snapshot generation two')
+                  database.exec('COMMIT')
+                } catch (error) {
+                  try {
+                    database.exec('ROLLBACK')
+                  } catch {}
+                  throw error
+                } finally {
+                  database.close()
+                }
+              }
+              return result
+            }
+          },
+        })
+      }
+      return statement
+    }
+
+    try {
+      const gatherRecords =
+        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+      const gathered = gatherRecords({ root, shows: [firstId, firstId] }) as {
+        records: Array<{ id: string; record: { id: string } | null }>
+      }
+      assert.equal(mutatedBetweenItems, true)
+      assert.deepEqual(
+        gathered.records.map(entry => [entry.id, entry.record?.id ?? null]),
+        [
+          [firstId, firstId],
+          [firstId, firstId],
+        ],
+      )
+    } finally {
+      prototype.prepare = originalPrepare
+    }
+  })
+
+  test('gather preserves duplicate order while reusing show and search statements', () => {
+    const root = createRoot()
+    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
+    const first = addRecord({
+      id: 'reuse-v1',
+      kind: 'decision',
+      payload: { summary: 'First reusable decision' },
+      root,
+      source: 'agent',
+      subject: 'cache.reuse',
+    })
+    const second = addRecord({
+      id: 'reuse-v2',
+      kind: 'decision',
+      payload: { summary: 'Second reusable decision' },
+      root,
+      searchText: 'statement reuse marker',
+      source: 'agent',
+      subject: 'cache.reuse',
+      supersedes: [first.id],
+    })
+    const prototype = DatabaseSync.prototype as unknown as SQLitePrototype
+    const originalPrepare = prototype.prepare
+    let showPrepareCount = 0
+    let searchPrepareCount = 0
+    let compactSearchSelectedRecordJson = false
+
+    prototype.prepare = function patchedPrepare(this: unknown, source: string) {
+      if (source.includes('SELECT record_json FROM records WHERE id = ?')) {
+        showPrepareCount += 1
+      }
+      if (source.includes('FROM record_search') && source.includes('JOIN records')) {
+        searchPrepareCount += 1
+        compactSearchSelectedRecordJson ||= source.includes('records.record_json')
+      }
+      return originalPrepare.call(this, source)
+    }
+
+    try {
+      const gatherRecords =
+        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+      const gathered = gatherRecords({
+        root,
+        searches: ['statement reuse marker', 'statement reuse marker', '   '],
+        shows: [second.id, second.id, first.id],
+      }) as {
+        records: Array<{ id: string; record: { id: string } | null }>
+        searches: Array<{ query: string; results: Array<{ id: string }> }>
+      }
+      assert.deepEqual(
+        gathered.records.map(entry => [entry.id, entry.record?.id ?? null]),
+        [
+          [second.id, second.id],
+          [second.id, second.id],
+          [first.id, null],
+        ],
+      )
+      assert.deepEqual(
+        gathered.searches.map(entry => [entry.query, entry.results.map(result => result.id)]),
+        [
+          ['statement reuse marker', [second.id]],
+          ['statement reuse marker', [second.id]],
+          ['   ', []],
+        ],
+      )
+    } finally {
+      prototype.prepare = originalPrepare
+    }
+
+    assert.equal(showPrepareCount, 1)
+    assert.equal(searchPrepareCount, 1)
+    assert.equal(compactSearchSelectedRecordJson, false)
   })
 
   test('tracks record and referenced-artifact freshness', () => {
