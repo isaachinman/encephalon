@@ -5,15 +5,17 @@ import {
   existsSync,
   fchmodSync,
   ftruncateSync,
+  mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
   writeSync,
 } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
@@ -25,6 +27,25 @@ const createRoot = () => {
   const root = createTestRepository()
   roots.push(root)
   return root
+}
+
+const MAX_INSTRUCTION_FILE_BYTES = 1024 * 1024
+
+const assertErrorCode = (operation: () => unknown, code: string, message?: RegExp) => {
+  assert.throws(operation, (error: unknown) => {
+    assert.equal((error as { code?: unknown }).code, code)
+    if (message) {
+      assert.match((error as Error).message, message)
+    }
+    return true
+  })
+}
+
+const createDeletePlan = (root: string) => {
+  api.initEncephalon({ root })
+  const [agentsPlan] = planInstructionChanges(root, true)
+  assert.equal(agentsPlan?.action, 'delete')
+  return agentsPlan
 }
 
 afterEach(() => {
@@ -195,6 +216,104 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'encephalon')), false)
   })
 
+  const invalidUtf8Cases = [
+    ['overlong sequence', Buffer.from([0xc0, 0xaf])],
+    ['lone continuation byte', Buffer.from([0x80])],
+    ['truncated multibyte sequence', Buffer.from([0xe2, 0x82])],
+    ['malformed surrogate encoding', Buffer.from([0xed, 0xa0, 0x80])],
+  ] as const
+
+  for (const [name, bytes] of invalidUtf8Cases) {
+    test(`rejects instruction files containing invalid UTF-8: ${name}`, () => {
+      const root = createRoot()
+      const agentsPath = join(root, 'AGENTS.md')
+      const claudePath = join(root, 'CLAUDE.md')
+      const originalAgents = Buffer.concat([Buffer.from('# Guidance\n'), bytes, Buffer.from('\n')])
+      const originalClaude = Buffer.from('untouched')
+      writeFileSync(agentsPath, originalAgents)
+      writeFileSync(claudePath, originalClaude)
+
+      assertErrorCode(() => api.initEncephalon({ root }), 'VALIDATION_FAILED')
+
+      assert.deepEqual(readFileSync(agentsPath), originalAgents)
+      assert.deepEqual(readFileSync(claudePath), originalClaude)
+      assert.equal(existsSync(join(root, 'encephalon')), false)
+    })
+  }
+
+  test('rejects embedded NUL bytes without changing either instruction file', () => {
+    const root = createRoot()
+    const agentsPath = join(root, 'AGENTS.md')
+    const claudePath = join(root, 'CLAUDE.md')
+    const originalAgents = Buffer.from('before\0after')
+    const originalClaude = Buffer.from('untouched')
+    writeFileSync(agentsPath, originalAgents)
+    writeFileSync(claudePath, originalClaude)
+
+    assertErrorCode(() => api.initEncephalon({ root }), 'VALIDATION_FAILED')
+
+    assert.deepEqual(readFileSync(agentsPath), originalAgents)
+    assert.deepEqual(readFileSync(claudePath), originalClaude)
+    assert.equal(existsSync(join(root, 'encephalon')), false)
+  })
+
+  test('rejects an instruction file that cannot fit the managed block without mutation', () => {
+    const root = createRoot()
+    const agentsPath = join(root, 'AGENTS.md')
+    const claudePath = join(root, 'CLAUDE.md')
+    const originalAgents = Buffer.alloc(MAX_INSTRUCTION_FILE_BYTES, 0x61)
+    const originalClaude = Buffer.from('untouched')
+    writeFileSync(agentsPath, originalAgents)
+    writeFileSync(claudePath, originalClaude)
+
+    assertErrorCode(
+      () => api.initEncephalon({ root }),
+      'VALIDATION_FAILED',
+      /cannot fit the Encephalon managed block within the 1 MiB instruction-file limit/,
+    )
+
+    assert.deepEqual(readFileSync(agentsPath), originalAgents)
+    assert.deepEqual(readFileSync(claudePath), originalClaude)
+    assert.equal(existsSync(join(root, 'encephalon')), false)
+  })
+
+  test('round-trips an instruction file whose managed bytes exactly reach the size limit', () => {
+    const root = createRoot()
+    const agentsPath = join(root, 'AGENTS.md')
+    writeFileSync(agentsPath, Buffer.from('a'))
+    const [samplePlan] = planInstructionChanges(root, false)
+    if (samplePlan?.action !== 'write' || samplePlan.contentBytes === undefined) {
+      assert.fail('Expected a write plan for a non-empty instruction file.')
+    }
+    const managedOverheadBytes = samplePlan.contentBytes.length - 1
+    const originalAgents = Buffer.alloc(MAX_INSTRUCTION_FILE_BYTES - managedOverheadBytes, 0x61)
+    writeFileSync(agentsPath, originalAgents)
+
+    api.initEncephalon({ root })
+
+    assert.equal(readFileSync(agentsPath).length, MAX_INSTRUCTION_FILE_BYTES)
+
+    api.initEncephalon({ remove: true, root })
+
+    assert.deepEqual(readFileSync(agentsPath), originalAgents)
+  })
+
+  test('rejects an instruction file over the preflight size limit without mutation', () => {
+    const root = createRoot()
+    const agentsPath = join(root, 'AGENTS.md')
+    const claudePath = join(root, 'CLAUDE.md')
+    const originalAgents = Buffer.alloc(MAX_INSTRUCTION_FILE_BYTES + 1, 0x61)
+    const originalClaude = Buffer.from('untouched')
+    writeFileSync(agentsPath, originalAgents)
+    writeFileSync(claudePath, originalClaude)
+
+    assertErrorCode(() => api.initEncephalon({ root }), 'VALIDATION_FAILED')
+
+    assert.deepEqual(readFileSync(agentsPath), originalAgents)
+    assert.deepEqual(readFileSync(claudePath), originalClaude)
+    assert.equal(existsSync(join(root, 'encephalon')), false)
+  })
+
   test('rejects managed metadata containing a separator Encephalon never emits', () => {
     const root = createRoot()
     const separator = 'forged-separator'
@@ -240,6 +359,18 @@ describe('initialisation', () => {
 
     api.initEncephalon({ remove: true, root })
     assert.equal(readFileSync(path, 'utf8'), `${original}User addition.\r\n`)
+  })
+
+  test('round-trips mixed line endings and no-final-newline files byte-for-byte', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = Buffer.from('\uFEFF# Existing guidance\r\nKeep café\nNo final newline')
+    writeFileSync(path, original)
+
+    api.initEncephalon({ root })
+    api.initEncephalon({ remove: true, root })
+
+    assert.deepEqual(readFileSync(path), original)
   })
 
   test('atomically publishes instruction replacements and preserves the existing file mode', () => {
@@ -325,6 +456,201 @@ describe('initialisation', () => {
     assert.equal(readFileSync(path, 'utf8'), changed)
   })
 
+  test('does not delete an instruction file replaced after global plan validation', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const replacement = '# Replacement guidance\n'
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-plan-validation') {
+              writeFileSync(path, replacement)
+            }
+          },
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+  })
+
+  const preDeletionReplacementCases = [
+    {
+      assertReplacement: (path: string, replacement: string) => assert.equal(readFileSync(path, 'utf8'), replacement),
+      name: 'regular file',
+      replace: (path: string, replacement: string) => writeFileSync(path, replacement),
+      skip: false,
+    },
+    {
+      assertReplacement: (path: string, replacement: string) => assert.equal(readFileSync(path, 'utf8'), replacement),
+      name: 'different file containing identical bytes',
+      replace: (path: string, replacement: string) => {
+        rmSync(path)
+        writeFileSync(path, replacement)
+      },
+      skip: false,
+    },
+    {
+      assertReplacement: (path: string, replacement: string) => assert.equal(readFileSync(path, 'utf8'), replacement),
+      name: 'symlink',
+      replace: (path: string, replacement: string) => {
+        const target = join(dirname(path), 'replacement-target.md')
+        rmSync(path)
+        writeFileSync(target, replacement)
+        symlinkSync(target, path)
+      },
+      skip: process.platform === 'win32',
+    },
+    {
+      assertReplacement: (path: string) => assert.equal(statSync(path).isDirectory(), true),
+      name: 'directory',
+      replace: (path: string) => {
+        rmSync(path)
+        mkdirSync(path)
+      },
+      skip: false,
+    },
+  ] as const
+
+  for (const replacementCase of preDeletionReplacementCases) {
+    test(`does not delete a ${replacementCase.name} replacement immediately before deletion`, {
+      skip: replacementCase.skip ? 'Windows runners may not permit file symlink creation.' : false,
+    }, () => {
+      const root = createRoot()
+      const path = join(root, 'AGENTS.md')
+      const agentsPlan = createDeletePlan(root)
+      const replacement =
+        replacementCase.name === 'regular file' ? '# Replacement guidance\n' : readFileSync(path, 'utf8')
+
+      assertErrorCode(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'before-deletion') {
+                replacementCase.replace(path, replacement)
+              }
+            },
+          }),
+        'REPOSITORY_CHANGED',
+      )
+      replacementCase.assertReplacement(path, replacement)
+    })
+  }
+
+  test('does not delete a replacement created after deletion quarantine', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const replacement = '# Replacement after quarantine\n'
+
+    applyInstructionChanges(root, [agentsPlan], {
+      fault: point => {
+        if (point === 'after-delete-quarantine') {
+          writeFileSync(path, replacement)
+        }
+      },
+    })
+
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+  })
+
+  test('does not delete a replacement created after deletion verification', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const replacement = '# Replacement after verification\n'
+
+    applyInstructionChanges(root, [agentsPlan], {
+      fault: point => {
+        if (point === 'after-delete-verification') {
+          writeFileSync(path, replacement)
+        }
+      },
+    })
+
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+  })
+
+  test('restores the quarantined instruction file when final unlink fails', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const original = readFileSync(path, 'utf8')
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-delete-verification') {
+              throw new Error('Injected final unlink failure')
+            }
+          },
+        }),
+      'IO_ERROR',
+    )
+
+    assert.equal(readFileSync(path, 'utf8'), original)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
+  test('keeps old-descriptor writes recoverable after delete verification', {
+    skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const changed = '# Descriptor delete edit\n'
+    const descriptor = openSync(path, 'r+')
+
+    try {
+      assertErrorCode(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'after-delete-verification') {
+                ftruncateSync(descriptor, 0)
+                writeSync(descriptor, changed, 0, 'utf8')
+              }
+            },
+          }),
+        'REPOSITORY_CHANGED',
+      )
+    } finally {
+      closeSync(descriptor)
+    }
+
+    assert.equal(readFileSync(path, 'utf8'), changed)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
+  test('does not misreport directory flush failure after committed delete', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+
+    applyInstructionChanges(root, [agentsPlan], {
+      fault: point => {
+        if (point === 'during-delete-flush') {
+          throw new Error('Injected delete flush failure')
+        }
+      },
+    })
+
+    assert.equal(existsSync(path), false)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
   test('keeps old-descriptor writes recoverable after backup validation', {
     skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
   }, () => {
@@ -393,6 +719,36 @@ describe('initialisation', () => {
     assert.ok(backupName)
     assert.equal(readFileSync(path, 'utf8'), changed)
     assert.equal(readFileSync(join(root, backupName), 'utf8'), original)
+  })
+
+  test('does not overwrite files created while restoring a quarantined delete', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const original = readFileSync(path, 'utf8')
+    const replacement = '# Concurrent delete restore guidance\n'
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-delete-verification') {
+              throw new Error('Injected deletion failure')
+            }
+            if (point === 'during-quarantine-restore') {
+              writeFileSync(path, replacement)
+            }
+          },
+        }),
+      'IO_ERROR',
+    )
+
+    const [quarantineName] = readdirSync(root).filter(
+      name => name.startsWith('.AGENTS.md.') && name.endsWith('.delete'),
+    )
+    assert.ok(quarantineName)
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+    assert.equal(readFileSync(join(root, quarantineName), 'utf8'), original)
   })
 
   test('reports old-descriptor mode changes after backup validation', {
