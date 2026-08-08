@@ -855,23 +855,32 @@ Use Node's built-in `util.parseArgs`; do not retain Commander or add another par
 
 - Optional: `--kind`, `--limit`, `--include-superseded`.
 - Default limit: 20.
+- Full-record result limit: 50.
+- Full-record responses fail before returning more than 4 MiB of aggregate record JSON.
 
 `encephalon show`
 
 - Required: `--id`.
 - Optional: `--active-only`.
+- The single returned record is counted against the full-record response budget.
 
 `encephalon search <query...>`
 
 - Optional: `--kind`, `--limit`, `--include-superseded`, `--compact`.
 - Join positional query terms with spaces before tokenisation.
 - Default limit: 20.
+- Query limit: 1,024 UTF-8 bytes and 32 literal terms after tokenisation.
+- Full search result limit: 50 records and the 4 MiB aggregate full-record response budget.
+- Compact search result limit: 100 records.
 
 `encephalon gather`
 
 - Repeated: `--search <query>`, `--show <id>`.
 - Optional: `--kind`, `--limit`, `--include-superseded`, `--hydrate`.
 - Preserve request order and `--hydrate` compatibility.
+- Request limit: 16 searches and 64 shows.
+- Gather searches use compact result limits. Gather shows preserve duplicate order and share the 4 MiB aggregate full-record response budget.
+- Callers should narrow `kind`, reduce `limit`, or use compact search when full-record budgets are exceeded.
 
 ### 14.3 Streams and exit codes
 

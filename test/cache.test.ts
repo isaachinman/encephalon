@@ -24,6 +24,14 @@ afterEach(() => {
 
 const functionFromApi = <T>(name: string) => (api as unknown as Record<string, T>)[name] as T
 
+const assertBudgetError = (operation: () => unknown, budget: string) => {
+  assert.throws(operation, (error: unknown) => {
+    assert.equal((error as { code?: unknown }).code, 'INVALID_ARGUMENT')
+    assert.equal((error as { details?: { budget?: unknown } }).details?.budget, budget)
+    return true
+  })
+}
+
 const waitForPath = (path: string, process: ReturnType<typeof spawn>) => {
   const deadline = Date.now() + 5000
   while (!existsSync(path) && process.exitCode === null && Date.now() < deadline) {
@@ -31,6 +39,8 @@ const waitForPath = (path: string, process: ReturnType<typeof spawn>) => {
   }
   assert.equal(existsSync(path), true)
 }
+
+const cacheDirectoryPath = (root: string) => join(root, 'node_modules', '.cache', 'encephalon')
 
 const cacheDatabasePath = (root: string) => join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
 
@@ -288,6 +298,100 @@ describe('SQLite cache and reads', () => {
       subject: 'no.summary',
     })
     assert.equal(searchCompactRecords({ query: 'searchable marker', root })[0]?.summary, null)
+  })
+
+  test('accepts request budget boundaries and rejects one unit over before cache I/O', () => {
+    const validRoot = createRoot()
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    const searchCompactRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+
+    assert.deepEqual(listRecords({ limit: 50, root: validRoot }), [])
+    assert.deepEqual(searchRecords({ limit: 50, query: 'x'.repeat(1024), root: validRoot }), [])
+    assert.deepEqual(
+      searchRecords({ limit: 50, query: Array.from({ length: 32 }, () => 'x').join(' '), root: validRoot }),
+      [],
+    )
+    assert.deepEqual(searchCompactRecords({ limit: 100, query: 'x', root: validRoot }), [])
+    const gathered = gatherRecords({
+      limit: 100,
+      root: validRoot,
+      searches: Array.from({ length: 16 }, () => 'x'),
+      shows: Array.from({ length: 64 }, () => 'missing'),
+    }) as {
+      records: Array<{ id: string }>
+      searches: Array<{ query: string }>
+    }
+    assert.deepEqual(
+      gathered.searches.map(search => search.query),
+      Array.from({ length: 16 }, () => 'x'),
+    )
+    assert.deepEqual(
+      gathered.records.map(record => record.id),
+      Array.from({ length: 64 }, () => 'missing'),
+    )
+
+    const invalidCases: Array<{ budget: string; run: (root: string) => void }> = [
+      { budget: 'fullResultLimit', run: root => listRecords({ limit: 51, root }) },
+      { budget: 'fullResultLimit', run: root => searchRecords({ limit: 51, query: 'x', root }) },
+      { budget: 'compactResultLimit', run: root => searchCompactRecords({ limit: 101, query: 'x', root }) },
+      { budget: 'queryBytes', run: root => searchRecords({ query: `${'x'.repeat(1024)}y`, root }) },
+      { budget: 'queryBytes', run: root => searchCompactRecords({ query: `${'x'.repeat(1024)}y`, root }) },
+      {
+        budget: 'queryTerms',
+        run: root => searchRecords({ query: Array.from({ length: 33 }, () => 'x').join(' '), root }),
+      },
+      {
+        budget: 'queryTerms',
+        run: root => searchCompactRecords({ query: Array.from({ length: 33 }, () => 'x').join(' '), root }),
+      },
+      {
+        budget: 'gatherSearches',
+        run: root => gatherRecords({ root, searches: Array.from({ length: 17 }, () => 'x') }),
+      },
+      {
+        budget: 'gatherShows',
+        run: root => gatherRecords({ root, shows: Array.from({ length: 65 }, () => 'missing') }),
+      },
+      { budget: 'compactResultLimit', run: root => gatherRecords({ limit: 101, root, searches: ['x'] }) },
+      {
+        budget: 'queryTerms',
+        run: root => gatherRecords({ root, searches: [Array.from({ length: 33 }, () => 'x').join(' ')] }),
+      },
+    ]
+
+    for (const invalidCase of invalidCases) {
+      const root = createRoot()
+      assertBudgetError(() => invalidCase.run(root), invalidCase.budget)
+      assert.equal(existsSync(cacheDirectoryPath(root)), false)
+    }
+  })
+
+  test('stops full-record responses at the aggregate byte budget while compact search remains usable', () => {
+    const root = createRoot()
+    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
+    for (const index of Array.from({ length: 5 }, (_, value) => value)) {
+      addRecord({
+        id: `large-response-${index}`,
+        kind: 'context',
+        payload: { text: 'x'.repeat(900 * 1024) },
+        root,
+        searchText: 'response budget marker',
+        source: 'agent',
+        subject: `response.budget.${index}`,
+      })
+    }
+
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    assertBudgetError(() => searchRecords({ limit: 5, query: 'response budget marker', root }), 'fullResponseBytes')
+
+    const searchCompactRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
+    assert.equal(searchCompactRecords({ limit: 5, query: 'response budget marker', root }).length, 5)
   })
 
   test('gather reads every item from one cache snapshot', () => {

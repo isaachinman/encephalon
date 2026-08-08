@@ -76,10 +76,10 @@ const optionalQuery = (value: unknown, field: string) => {
   if (value === undefined) {
     return
   }
-  if (typeof value === 'string' && Buffer.byteLength(value, 'utf8') <= MAX_TEXT_BYTES) {
+  if (typeof value === 'string') {
     return value
   }
-  return fail('INVALID_ARGUMENT', `${field} must be a string of at most 1024 UTF-8 bytes.`, { field })
+  return fail('INVALID_ARGUMENT', `${field} must be a string.`, { field })
 }
 
 const optionalStringArray = (value: unknown, field: string, item: (value: unknown) => string) => {
@@ -135,7 +135,7 @@ export const parseSearchRecordsInput = (value: unknown): SearchRecordsInput => {
   const limit = optionalLimit(input.limit)
   const query = optionalQuery(input.query, 'query')
   if (query === undefined) {
-    return fail('INVALID_ARGUMENT', 'query must be a string of at most 1024 UTF-8 bytes.', { field: 'query' })
+    return fail('INVALID_ARGUMENT', 'query must be a string.', { field: 'query' })
   }
   return {
     ...root,

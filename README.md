@@ -74,6 +74,8 @@ npx --no-install encephalon validate
 
 Active records are returned by default. Add `--include-superseded` to `list`, `search`, or `gather` when historical records are needed. Missing `show` results are `null`, and empty searches are `[]`.
 
+Search queries may contain at most 1,024 UTF-8 bytes and 32 literal terms. Full-record APIs return at most 50 records and stop once the aggregate JSON response would exceed 4 MiB; compact search returns at most 100 results. One `gather` request may include at most 16 searches and 64 shows. Narrow the kind/query or request compact results when a full-record response exceeds these budgets.
+
 ## Add durable knowledge
 
 Search the stable subject first. If the new record replaces active knowledge, repeat `--supersedes` for every active head:
