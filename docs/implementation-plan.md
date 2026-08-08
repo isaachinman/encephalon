@@ -460,6 +460,7 @@ export type BrainRecord = BrainRecordFile & {
 - Is required and may be any valid `JsonValue`.
 - Runtime validation rejects `undefined`, `bigint`, functions, symbols, non-finite numbers, cyclic values, sparse arrays, non-plain objects, accessors, Maps, Sets, Dates, and typed arrays.
 - Objects must have `Object.prototype` or a null prototype and enumerable string keys whose values are valid JSON.
+- Payload validation accepts at most 64 nested levels and 10,000 JSON nodes, counting the root value, arrays, objects, and primitive values.
 - The final formatted record file must not exceed 1 MiB.
 
 `searchText`:

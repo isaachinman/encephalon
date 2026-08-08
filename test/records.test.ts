@@ -436,6 +436,19 @@ describe('canonical records', () => {
         }),
       'INVALID_ARGUMENT',
     )
+    const cyclic: Record<string, unknown> = {}
+    cyclic.self = cyclic
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: cyclic as never,
+          root,
+          source: 'agent',
+          subject: 'x',
+        }),
+      'INVALID_ARGUMENT',
+    )
     assertErrorCode(
       () =>
         api.addRecord({
@@ -524,6 +537,145 @@ describe('canonical records', () => {
         }),
       'INVALID_ARGUMENT',
     )
+  })
+
+  test('rejects payload accessors without invoking them', () => {
+    const root = createRoot()
+    let getterCalls = 0
+    const payloadWithGetter: Record<string, unknown> = {}
+    Object.defineProperty(payloadWithGetter, 'secret', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1
+        return 'side effect'
+      },
+    })
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: payloadWithGetter as never,
+          root,
+          source: 'agent',
+          subject: 'payload.accessor',
+        }),
+      'INVALID_ARGUMENT',
+    )
+    assert.equal(getterCalls, 0)
+
+    const payloadWithSetter = {}
+    Object.defineProperty(payloadWithSetter, 'secret', {
+      enumerable: true,
+      set: () => {
+        throw new Error('setter must not run')
+      },
+    })
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: payloadWithSetter,
+          root,
+          source: 'agent',
+          subject: 'payload.setter',
+        }),
+      'INVALID_ARGUMENT',
+    )
+  })
+
+  test('returns stable invalid argument errors for hostile payload descriptors', () => {
+    const root = createRoot()
+    const throwingDescriptorProxy = new Proxy(
+      { summary: 'Hidden' },
+      {
+        getOwnPropertyDescriptor: () => {
+          throw new Error('descriptor trap must not escape')
+        },
+      },
+    )
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: throwingDescriptorProxy,
+          root,
+          source: 'agent',
+          subject: 'payload.proxy',
+        }),
+      'INVALID_ARGUMENT',
+    )
+  })
+
+  test('bounds payload depth and total node count', () => {
+    const root = createRoot()
+    const buildNestedPayload = (depth: number) =>
+      Array.from({ length: depth }).reduce<unknown>(payload => ({ child: payload }), null)
+    const buildWidePayload = (properties: number) =>
+      Object.fromEntries(Array.from({ length: properties }, (_, index) => [`k${index}`, null]))
+
+    const deepestValid = api.addRecord({
+      id: 'payload-depth-limit',
+      kind: 'decision',
+      payload: buildNestedPayload(64) as never,
+      root,
+      source: 'agent',
+      subject: 'payload.depth.valid',
+    })
+    assert.equal(existsSync(join(root, deepestValid.path)), true)
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: buildNestedPayload(65) as never,
+          root,
+          source: 'agent',
+          subject: 'payload.depth.invalid',
+        }),
+      'INVALID_ARGUMENT',
+    )
+
+    const widestValid = api.addRecord({
+      id: 'payload-node-limit',
+      kind: 'decision',
+      payload: buildWidePayload(9999),
+      root,
+      source: 'agent',
+      subject: 'payload.nodes.valid',
+    })
+    assert.equal(existsSync(join(root, widestValid.path)), true)
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: buildWidePayload(10_000),
+          root,
+          source: 'agent',
+          subject: 'payload.nodes.invalid',
+        }),
+      'INVALID_ARGUMENT',
+    )
+  })
+
+  test('normalizes negative zero payload numbers before formatting', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'payload-negative-zero',
+      kind: 'decision',
+      payload: { value: -0 },
+      root,
+      source: 'agent',
+      subject: 'payload.negative-zero',
+    })
+
+    assert.equal(Object.is((record.payload as { value: number }).value, 0), true)
+    const persisted = JSON.parse(readFileSync(join(root, record.path), 'utf8')) as { payload: { value: number } }
+    assert.equal(Object.is(persisted.payload.value, 0), true)
+    assert.deepEqual(record.payload, persisted.payload)
   })
 
   test('reports malformed files without rewriting them', () => {
