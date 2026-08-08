@@ -374,6 +374,39 @@ describe('canonical records', () => {
         }),
       'INVALID_ARGUMENT',
     )
+    const reservedArtifactNames = [
+      'con',
+      'CON',
+      'CoN.txt',
+      'prn',
+      'AUX.md',
+      'nul',
+      'COM1',
+      'com9.log',
+      'LPT1',
+      'lpt9.txt',
+      'COM¹',
+      'com².txt',
+      'CoM³.log',
+      'LPT¹',
+      'lpt².txt',
+      'LpT³.log',
+    ]
+    for (const artifactName of reservedArtifactNames) {
+      assertErrorCode(
+        () =>
+          api.addRecord({
+            artifacts: [`_artifacts/decision/record-safe/${artifactName}`],
+            id: 'record-safe',
+            kind: 'decision',
+            payload: {},
+            root,
+            source: 'agent',
+            subject: 'x',
+          }),
+        'INVALID_ARGUMENT',
+      )
+    }
     assertErrorCode(
       () =>
         api.addRecord({
@@ -524,6 +557,42 @@ describe('canonical records', () => {
         }),
       'INVALID_ARGUMENT',
     )
+  })
+
+  test('enforces portable artifact path component lengths', () => {
+    const root = createRoot()
+    const validComponent = 'a'.repeat(255)
+    const validArtifact = `_artifacts/decision/record-safe/${validComponent}`
+    const validArtifactPath = join(root, 'encephalon', ...validArtifact.split('/'))
+    ensureParent(validArtifactPath)
+    writeFileSync(validArtifactPath, 'artifact')
+
+    const record = api.addRecord({
+      artifacts: [validArtifact],
+      id: 'record-safe',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'component.length',
+    })
+    assert.deepEqual(record.artifacts, [validArtifact])
+
+    for (const artifactName of ['a'.repeat(256), 'é'.repeat(128)]) {
+      assertErrorCode(
+        () =>
+          api.addRecord({
+            artifacts: [`_artifacts/decision/too-long/${artifactName}`],
+            id: 'too-long',
+            kind: 'decision',
+            payload: {},
+            root,
+            source: 'agent',
+            subject: 'component.length',
+          }),
+        'INVALID_ARGUMENT',
+      )
+    }
   })
 
   test('reports malformed files without rewriting them', () => {

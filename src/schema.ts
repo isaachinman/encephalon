@@ -7,11 +7,14 @@ import type { AddRecordInput, BrainRecordFile, JsonValue } from './types.ts'
 export const MAX_RECORD_BYTES = 1024 * 1024
 const MAX_SEARCH_TEXT_BYTES = 256 * 1024
 const MAX_TEXT_BYTES = 1024
+// Portable path components must fit common 255-byte and 255-UTF-16-code-unit filesystem limits.
+const MAX_PATH_COMPONENT_BYTES = 255
+const MAX_PATH_COMPONENT_UTF16_UNITS = 255
 const MAX_ARTIFACTS = 256
 const KIND_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
-const RESERVED_WINDOWS_NAMES = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i
+const RESERVED_WINDOWS_NAMES = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$/i
 const hasControlCharacters = (value: string) =>
   [...value].some(character => {
     const code = character.codePointAt(0) ?? 0
@@ -33,6 +36,9 @@ let lastCreatedAtMilliseconds = 0
 
 const byteLength = (value: string) => Buffer.byteLength(value, 'utf8')
 
+const hasPortableComponentLength = (value: string) =>
+  byteLength(value) <= MAX_PATH_COMPONENT_BYTES && value.length <= MAX_PATH_COMPONENT_UTF16_UNITS
+
 const requiredText = (value: unknown, field: string) => {
   if (typeof value === 'string' && value.length > 0 && value === value.trim() && byteLength(value) <= MAX_TEXT_BYTES) {
     return value
@@ -43,7 +49,13 @@ const requiredText = (value: unknown, field: string) => {
 }
 
 const assertPortableSegment = (value: string, field: string, pattern: RegExp) => {
-  if (pattern.test(value) && !RESERVED_WINDOWS_NAMES.test(value) && !value.endsWith('.') && !value.endsWith(' ')) {
+  if (
+    pattern.test(value) &&
+    hasPortableComponentLength(value) &&
+    !RESERVED_WINDOWS_NAMES.test(value) &&
+    !value.endsWith('.') &&
+    !value.endsWith(' ')
+  ) {
     return value
   }
   return fail('INVALID_ARGUMENT', `${field} is not a portable path segment.`, {
@@ -166,6 +178,7 @@ const portableArtifactSegments = (value: unknown) => {
         segment.length > 0 &&
         segment !== '.' &&
         segment !== '..' &&
+        hasPortableComponentLength(segment) &&
         !hasControlCharacters(segment) &&
         !/[<>:"|?*]/.test(segment) &&
         !segment.endsWith('.') &&
