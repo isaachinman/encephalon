@@ -944,7 +944,7 @@ Persistable facts:
 - Safe top-level file and directory names, excluding secret-prone hidden paths.
 - Recognised root manifest, lockfile, and configuration filenames.
 - Root `package.json` package name, `packageManager`, workspace presence, and script keys.
-- Derived package script invocations such as `npm run test`; never the script body.
+- Derived package script invocations as structured `{ executable, arguments }` argv data; never shell command strings or the script body.
 - CI workflow filenames under `.github/workflows`; never YAML content, triggers, jobs, steps, secrets, or environment values.
 - Recognised language/file counts derived from extensions.
 - Repository identity derived from a safe root package name, or the root directory basename when no manifest provides a name.
@@ -975,7 +975,7 @@ Generate no more than these subjects:
    - Recognised languages and counts.
    - Manifest, lockfile, workspace, and configuration presence.
 3. Kind `workflow`, subject `encephalon:init/commands-ci`.
-   - Package script keys and safe derived invocations.
+   - Package script keys and safe derived structured invocations.
    - CI workflow filenames.
 
 All use `source: "encephalon:init"`. Payload keys and arrays are emitted in a stable order so canonical deep comparison is deterministic.
