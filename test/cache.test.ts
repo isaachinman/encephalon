@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
 import { cacheReadTestHooks } from '../src/cache.ts'
 import * as api from '../src/index.ts'
+import { withOperationLock } from '../src/lock.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -815,6 +816,102 @@ describe('SQLite cache and reads', () => {
     writeFileSync(join(lockPath, 'owner.json'), 'not-json')
     const prepare = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
+  })
+
+  test('ignores stale owner metadata with a reused live PID after acquiring the gate', () => {
+    const root = createRoot()
+    const lockPath = join(root, 'node_modules', '.cache', 'encephalon', 'operation.lock')
+    mkdirSync(lockPath, { recursive: true })
+    writeFileSync(
+      join(lockPath, 'owner.json'),
+      `${JSON.stringify({
+        acquiredAt: '2026-08-06T10:00:00.000Z',
+        pid: process.pid,
+        token: 'stale-live-pid-owner',
+      })}\n`,
+    )
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
+    assert.equal(existsSync(lockPath), false)
+  })
+
+  test('recovers a malformed disposable operation gate database', () => {
+    const root = createRoot()
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon')
+    mkdirSync(cachePath, { recursive: true })
+    writeFileSync(join(cachePath, 'operation-lock.sqlite'), 'not a sqlite database')
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
+  })
+
+  test('reclaims an abandoned operation gate recovery marker', () => {
+    const root = createRoot()
+    const recoveryPath = join(root, 'node_modules', '.cache', 'encephalon', 'operation-lock.recovery')
+    const deadProcess = spawnSync(process.execPath, ['-e', ''])
+    const deadPid = deadProcess.pid
+    assert.equal(deadProcess.status, 0)
+    assert.ok(deadPid !== undefined)
+    mkdirSync(recoveryPath, { recursive: true })
+    writeFileSync(
+      join(recoveryPath, 'owner.json'),
+      `${JSON.stringify({
+        acquiredAt: new Date().toISOString(),
+        pid: deadPid,
+        token: 'dead-recovery-owner',
+      })}\n`,
+    )
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
+    assert.equal(existsSync(recoveryPath), false)
+  })
+
+  test('serialises two contenders recovering the same malformed operation gate', async () => {
+    const root = createRoot()
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon')
+    const gatePath = join(cachePath, 'operation-lock.sqlite')
+    const releasePath = join(root, 'release-corrupt-gate-contenders')
+    const activePath = join(root, 'active-corrupt-gate-contender')
+    const firstReady = join(root, 'first-corrupt-gate-ready')
+    const secondReady = join(root, 'second-corrupt-gate-ready')
+    const firstEntered = join(root, 'first-corrupt-gate-entered')
+    const secondEntered = join(root, 'second-corrupt-gate-entered')
+    mkdirSync(cachePath, { recursive: true })
+    writeFileSync(gatePath, 'not a sqlite database')
+
+    const fixture = join(import.meta.dirname, 'fixtures', 'contend-for-corrupt-gate.ts')
+    const first = spawn(process.execPath, [fixture, root, firstReady, releasePath, activePath, firstEntered, '300'], {
+      stdio: 'inherit',
+    })
+    const second = spawn(
+      process.execPath,
+      [fixture, root, secondReady, releasePath, activePath, secondEntered, '300'],
+      {
+        stdio: 'inherit',
+      },
+    )
+
+    waitForPath(firstReady, first)
+    waitForPath(secondReady, second)
+    writeFileSync(releasePath, 'release')
+
+    if (first.exitCode === null) {
+      await once(first, 'exit')
+    }
+    if (second.exitCode === null) {
+      await once(second, 'exit')
+    }
+    assert.equal(first.exitCode, 0)
+    assert.equal(second.exitCode, 0)
+    assert.equal(existsSync(firstEntered), true)
+    assert.equal(existsSync(secondEntered), true)
   })
 
   test('serialises two contenders that both observed the same stale lock', async () => {
