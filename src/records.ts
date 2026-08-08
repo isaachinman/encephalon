@@ -18,7 +18,14 @@ import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
 import { resolveRepository } from './repository.ts'
-import { assertArtifactFile, createRecordFile, formatRecordFile, MAX_RECORD_BYTES, parseRecordFile } from './schema.ts'
+import {
+  assertArtifactFile,
+  createRecordFile,
+  formatRecordFile,
+  MAX_RECORD_BYTES,
+  parseRecordFile,
+  validateKind,
+} from './schema.ts'
 import type {
   AddRecordInput,
   BrainRecord,
@@ -134,6 +141,15 @@ const readRecord = (root: string, path: string): BrainRecord => {
   return { ...record, path: relativePath }
 }
 
+const kindDirectoryIssue = (name: string, path: string) => {
+  try {
+    validateKind(name)
+    return null
+  } catch {
+    return issue('INVALID_KIND_DIRECTORY', 'Kind directory name is not a portable kind.', path)
+  }
+}
+
 const scanCanonicalRecords = (root: string): RecordScan => {
   const brainDirectory = resolve(root, 'encephalon')
   if (existsSync(brainDirectory)) {
@@ -145,6 +161,7 @@ const scanCanonicalRecords = (root: string): RecordScan => {
       }
     }
 
+    const kindDirectoryNames = new Map<string, string>()
     const scanned = readdirSync(brainDirectory, { withFileTypes: true })
       .sort((first, second) => first.name.localeCompare(second.name))
       .reduce<RecordScan>(
@@ -166,6 +183,24 @@ const scanCanonicalRecords = (root: string): RecordScan => {
           }
           const kindPath = join(brainDirectory, kindEntry.name)
           if (!kindEntry.name.startsWith('_') && kindEntry.isDirectory() && !kindEntry.isSymbolicLink()) {
+            const relativeKindPath = posixRelative(root, kindPath)
+            const invalidKindDirectory = kindDirectoryIssue(kindEntry.name, relativeKindPath)
+            if (invalidKindDirectory !== null) {
+              result.errors.push(invalidKindDirectory)
+            }
+            const collisionKey = kindEntry.name.normalize('NFC').toLowerCase()
+            const collision = kindDirectoryNames.get(collisionKey)
+            if (collision === undefined) {
+              kindDirectoryNames.set(collisionKey, kindEntry.name)
+            } else if (collision !== kindEntry.name) {
+              result.errors.push(
+                issue(
+                  'KIND_DIRECTORY_COLLISION',
+                  'Kind directory names collide after portable normalization.',
+                  relativeKindPath,
+                ),
+              )
+            }
             return readdirSync(kindPath, { withFileTypes: true })
               .sort((first, second) => first.name.localeCompare(second.name))
               .reduce<RecordScan>((kindResult, recordEntry) => {

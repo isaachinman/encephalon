@@ -15,6 +15,7 @@ import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
 import { addRecordResolved } from '../src/records.ts'
 import { discoverRepository } from '../src/repository.ts'
+import { validateKind } from '../src/schema.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -30,6 +31,15 @@ const assertErrorCode = (operation: () => unknown, code: string) => {
     assert.equal((error as { code?: unknown }).code, code)
     return true
   })
+}
+
+const canCreateDirectory = (root: string, name: string) => {
+  try {
+    mkdirSync(join(root, 'encephalon', name), { recursive: true })
+    return readdirSync(join(root, 'encephalon')).includes(name)
+  } catch {
+    return false
+  }
 }
 
 afterEach(() => {
@@ -125,6 +135,81 @@ describe('canonical records', () => {
     assert.deepEqual(record.artifacts, [artifact])
     assert.deepEqual(readdirSync(join(root, 'encephalon', '_artifacts', 'architecture', id)), ['diagram.svg'])
     assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('uses the record kind portable path predicate for kind directories', () => {
+    for (const invalid of ['Decision', 'bad kind', 'CON', 'kind.', 'kind ']) {
+      assertErrorCode(() => validateKind(invalid), 'INVALID_ARGUMENT')
+    }
+    assert.equal(validateKind('custom_kind-1'), 'custom_kind-1')
+  })
+
+  test('validates empty invalid kind directories and valid empty custom kinds', () => {
+    const root = createRoot()
+    mkdirSync(join(root, 'encephalon'), { recursive: true })
+    const created = ['Decision', 'bad kind', 'CON', 'kind.', 'kind '].filter(name => canCreateDirectory(root, name))
+    mkdirSync(join(root, 'encephalon', 'custom_kind-1'))
+
+    const result = api.validateRecords({ root })
+    assert.equal(result.valid, false)
+    const expected = created
+      .map(name => ['INVALID_KIND_DIRECTORY', `encephalon/${name}`])
+      .sort((first, second) => String(first[1]).localeCompare(String(second[1])))
+    assert.deepEqual(
+      result.errors.map(error => [error.code, error.path]),
+      expected,
+    )
+  })
+
+  test('detects kind directory case and unicode-normalization collisions', () => {
+    const root = createRoot()
+    mkdirSync(join(root, 'encephalon', 'context'), { recursive: true })
+    const caseVariantCreated = canCreateDirectory(root, 'Context')
+    const unicodeNames = ['cafe\u0301', 'café'].filter(name => canCreateDirectory(root, name))
+    const expected = [
+      ...(caseVariantCreated
+        ? [
+            ['INVALID_KIND_DIRECTORY', 'encephalon/Context'],
+            ['KIND_DIRECTORY_COLLISION', 'encephalon/Context'],
+          ]
+        : []),
+      ...unicodeNames.map(name => ['INVALID_KIND_DIRECTORY', `encephalon/${name}`]),
+      ...(unicodeNames.length === 2 ? [['KIND_DIRECTORY_COLLISION', 'encephalon/café']] : []),
+    ]
+
+    const result = api.validateRecords({ root })
+    assert.equal(result.valid, expected.length === 0)
+    assert.deepEqual(
+      result.errors.map(error => [error.code, error.path]),
+      expected,
+    )
+  })
+
+  test('reports invalid kind directories containing records without rewriting them', () => {
+    const root = createRoot()
+    const directory = join(root, 'encephalon', 'Bad')
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(
+      join(directory, 'record-a.json'),
+      `${JSON.stringify(
+        {
+          createdAt: '2026-08-08T00:00:00.000Z',
+          id: 'record-a',
+          kind: 'context',
+          payload: { summary: 'Wrong parent' },
+          source: 'test',
+          subject: 'invalid.kind-dir',
+        },
+        null,
+        2,
+      )}\n`,
+    )
+
+    const result = api.validateRecords({ root })
+    assert.equal(result.valid, false)
+    assert.equal(result.errors[0]?.code, 'INVALID_KIND_DIRECTORY')
+    assert.equal(result.errors[0]?.path, 'encephalon/Bad')
+    assert.equal(existsSync(join(directory, 'record-a.json')), true)
   })
 
   test('rejects a symlinked internal staging directory before writing records', {
