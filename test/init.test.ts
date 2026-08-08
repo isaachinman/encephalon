@@ -631,6 +631,26 @@ describe('initialisation', () => {
     )
   })
 
+  test('does not misreport directory flush failure after committed delete', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+
+    applyInstructionChanges(root, [agentsPlan], {
+      fault: point => {
+        if (point === 'during-delete-flush') {
+          throw new Error('Injected delete flush failure')
+        }
+      },
+    })
+
+    assert.equal(existsSync(path), false)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
   test('keeps old-descriptor writes recoverable after backup validation', {
     skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
   }, () => {

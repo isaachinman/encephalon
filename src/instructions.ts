@@ -333,6 +333,7 @@ type AtomicWriteFault =
   | 'after-final-backup-validation'
   | 'after-plan-validation'
   | 'before-deletion'
+  | 'during-delete-flush'
   | 'during-quarantine-restore'
   | 'before-temp-create'
   | 'during-backup-restore'
@@ -465,7 +466,12 @@ const deletePlan = (path: string, plan: FilePlan, hooks: AtomicWriteHooks | unde
     fault(hooks, 'after-delete-verification')
     assertQuarantinedDeleteTarget(quarantinePath, plan)
     rmSync(quarantinePath, { force: true })
-    fsyncDirectory(dirname(path))
+    try {
+      fault(hooks, 'during-delete-flush')
+      fsyncDirectory(dirname(path))
+    } catch {
+      // The quarantine unlink is the deletion commit point; do not report a committed deletion as failed.
+    }
   } catch (error) {
     if (quarantined) {
       restoreQuarantinedFile(path, quarantinePath, hooks)
