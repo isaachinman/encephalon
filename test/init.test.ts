@@ -135,9 +135,22 @@ describe('initialisation', () => {
       records.every(record => record.source === 'encephalon:init'),
       true,
     )
+    const workflow = records.find(record => record.subject === 'encephalon:init/commands-ci')
+    assert.ok(workflow)
+    assert.deepEqual(workflow.payload, {
+      scriptInvocations: [
+        { arguments: ['run', 'build'], executable: 'npm', scriptKey: 'build' },
+        { arguments: ['run', 'test'], executable: 'npm', scriptKey: 'test' },
+      ],
+      scriptKeys: ['build', 'test'],
+      sources: ['package.json', '.github/workflows/checks.yml'],
+      summary:
+        'Derived package-script entry points and CI workflow filenames; use scriptInvocations as argv and treat scriptKeys as discovery-only.',
+      workflowFiles: ['.github/workflows/checks.yml'],
+    })
     const serialized = JSON.stringify(records)
     assert.doesNotMatch(serialized, /never-store-this|sensitive-command|registry\.example\.invalid|SECRET_TOKEN/)
-    assert.match(serialized, /npm run test/)
+    assert.doesNotMatch(serialized, /npm run|sensitive-command --password/)
     assert.match(serialized, /checks\.yml/)
 
     const agentsWithBlock = readFileSync(join(root, 'AGENTS.md'), 'utf8')
@@ -185,9 +198,74 @@ describe('initialisation', () => {
     const workflow = all.filter(record => record.subject === 'encephalon:init/commands-ci')
     assert.equal(workflow.length, 2)
     assert.deepEqual(workflow[0]?.supersedes, [workflow[1]?.id])
-    assert.match(JSON.stringify(workflow[0]?.payload), /npm run lint/)
+    const [refreshedWorkflow] = workflow
+    assert.ok(refreshedWorkflow)
+    assert.deepEqual((refreshedWorkflow.payload as { scriptKeys?: unknown }).scriptKeys, ['lint', 'test'])
+    assert.deepEqual((refreshedWorkflow.payload as { scriptInvocations?: unknown }).scriptInvocations, [
+      { arguments: ['run', 'lint'], executable: 'npm', scriptKey: 'lint' },
+      { arguments: ['run', 'test'], executable: 'npm', scriptKey: 'test' },
+    ])
     assert.doesNotMatch(JSON.stringify(workflow[0]?.payload), /lint-private-body/)
     assert.equal(api.listRecords({ limit: 20, root }).length, 3)
+  })
+
+  test('records package scripts as structured argv data instead of shell strings', () => {
+    const root = createRoot()
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        packageManager: 'yarn@1.22.22',
+        scripts: {
+          '--version': 'echo leading-option',
+          '`tick`': 'echo backticks',
+          '$(date)': 'echo command-substitution',
+          'ci:unit': 'echo colon',
+          'line\nbreak': 'echo control',
+          'path/name': 'echo slash',
+          'quote"key': 'echo quote',
+          'semi;colon': 'echo semicolon',
+          'space name': 'echo space',
+          test: 'node --test',
+          unicodé: 'echo unicode',
+        },
+      }),
+    )
+
+    api.initEncephalon({ root })
+
+    const [workflow] = api
+      .listRecords({ includeSuperseded: true, limit: 20, root })
+      .filter(record => record.subject === 'encephalon:init/commands-ci')
+    assert.ok(workflow)
+    const payload = workflow.payload as {
+      commands?: unknown
+      scriptInvocations?: unknown
+      scriptKeys?: unknown
+    }
+    assert.equal(payload.commands, undefined)
+    assert.deepEqual(payload.scriptKeys, [
+      '--version',
+      '`tick`',
+      '$(date)',
+      'ci:unit',
+      'path/name',
+      'quote"key',
+      'semi;colon',
+      'space name',
+      'test',
+      'unicodé',
+    ])
+    assert.deepEqual(payload.scriptInvocations, [
+      { arguments: ['run', '`tick`'], executable: 'yarn', scriptKey: '`tick`' },
+      { arguments: ['run', '$(date)'], executable: 'yarn', scriptKey: '$(date)' },
+      { arguments: ['run', 'ci:unit'], executable: 'yarn', scriptKey: 'ci:unit' },
+      { arguments: ['run', 'path/name'], executable: 'yarn', scriptKey: 'path/name' },
+      { arguments: ['run', 'quote"key'], executable: 'yarn', scriptKey: 'quote"key' },
+      { arguments: ['run', 'semi;colon'], executable: 'yarn', scriptKey: 'semi;colon' },
+      { arguments: ['run', 'space name'], executable: 'yarn', scriptKey: 'space name' },
+      { arguments: ['run', 'test'], executable: 'yarn', scriptKey: 'test' },
+      { arguments: ['run', 'unicodé'], executable: 'yarn', scriptKey: 'unicodé' },
+    ])
   })
 
   test('refresh resolves equivalent generated baseline heads from branch merges', () => {
