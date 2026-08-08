@@ -15,44 +15,44 @@
       },
       "operations": {
         "coldHydrate": {
-          "durationMs": 4.736,
-          "peakRssBytes": 95797248,
+          "durationMs": 6.399,
+          "peakRssBytes": 96649216,
           "rssDeltaBytes": 5357568
         },
         "compactSearch": {
-          "durationMs": 1.058,
-          "peakRssBytes": 97468416,
-          "rssDeltaBytes": 180224
-        },
-        "fullSearch": {
-          "durationMs": 0.915,
-          "peakRssBytes": 97583104,
-          "rssDeltaBytes": 114688
-        },
-        "gather": {
-          "durationMs": 1.01,
-          "peakRssBytes": 97681408,
+          "durationMs": 1.087,
+          "peakRssBytes": 97959936,
           "rssDeltaBytes": 98304
         },
+        "fullSearch": {
+          "durationMs": 0.998,
+          "peakRssBytes": 98041856,
+          "rssDeltaBytes": 81920
+        },
+        "gather": {
+          "durationMs": 1.091,
+          "peakRssBytes": 98156544,
+          "rssDeltaBytes": 114688
+        },
         "list": {
-          "durationMs": 1.04,
-          "peakRssBytes": 96616448,
-          "rssDeltaBytes": 311296
+          "durationMs": 1.141,
+          "peakRssBytes": 97566720,
+          "rssDeltaBytes": 737280
         },
         "show": {
-          "durationMs": 0.965,
-          "peakRssBytes": 97288192,
-          "rssDeltaBytes": 655360
+          "durationMs": 1.308,
+          "peakRssBytes": 97861632,
+          "rssDeltaBytes": 294912
         },
         "stalePrepare": {
-          "durationMs": 0.605,
-          "peakRssBytes": 96288768,
+          "durationMs": 0.55,
+          "peakRssBytes": 96813056,
           "rssDeltaBytes": 49152
         },
         "unchangedPrepare": {
-          "durationMs": 0.625,
-          "peakRssBytes": 96223232,
-          "rssDeltaBytes": 409600
+          "durationMs": 0.793,
+          "peakRssBytes": 96763904,
+          "rssDeltaBytes": 98304
         }
       }
     },
@@ -71,44 +71,44 @@
       },
       "operations": {
         "coldHydrate": {
-          "durationMs": 18.357,
-          "peakRssBytes": 104890368,
-          "rssDeltaBytes": 3932160
+          "durationMs": 20.169,
+          "peakRssBytes": 105463808,
+          "rssDeltaBytes": 4079616
         },
         "compactSearch": {
-          "durationMs": 11.088,
-          "peakRssBytes": 109985792,
-          "rssDeltaBytes": 65536
+          "durationMs": 12.185,
+          "peakRssBytes": 110641152,
+          "rssDeltaBytes": 98304
         },
         "fullSearch": {
-          "durationMs": 10.329,
-          "peakRssBytes": 110133248,
-          "rssDeltaBytes": 131072
+          "durationMs": 11.159,
+          "peakRssBytes": 110723072,
+          "rssDeltaBytes": 81920
         },
         "gather": {
-          "durationMs": 307.139,
-          "peakRssBytes": 110166016,
-          "rssDeltaBytes": 32768
+          "durationMs": 311.133,
+          "peakRssBytes": 110739456,
+          "rssDeltaBytes": 16384
         },
         "list": {
-          "durationMs": 10.111,
-          "peakRssBytes": 109887488,
-          "rssDeltaBytes": 212992
+          "durationMs": 11.29,
+          "peakRssBytes": 110526464,
+          "rssDeltaBytes": 294912
         },
         "show": {
-          "durationMs": 10.128,
-          "peakRssBytes": 109936640,
-          "rssDeltaBytes": 49152
+          "durationMs": 10.98,
+          "peakRssBytes": 110542848,
+          "rssDeltaBytes": 16384
         },
         "stalePrepare": {
-          "durationMs": 13.847,
-          "peakRssBytes": 109674496,
-          "rssDeltaBytes": 4669440
+          "durationMs": 14.928,
+          "peakRssBytes": 110247936,
+          "rssDeltaBytes": 4685824
         },
         "unchangedPrepare": {
-          "durationMs": 5.646,
-          "peakRssBytes": 105005056,
-          "rssDeltaBytes": 131072
+          "durationMs": 6.249,
+          "peakRssBytes": 105545728,
+          "rssDeltaBytes": 98304
         }
       }
     },
@@ -127,44 +127,44 @@
       },
       "operations": {
         "coldHydrate": {
-          "durationMs": 90.499,
-          "peakRssBytes": 125927424,
-          "rssDeltaBytes": 15679488
+          "durationMs": 95.271,
+          "peakRssBytes": 126337024,
+          "rssDeltaBytes": 15548416
         },
         "compactSearch": {
-          "durationMs": 687.611,
-          "peakRssBytes": 186466304,
-          "rssDeltaBytes": 180224
+          "durationMs": 685.883,
+          "peakRssBytes": 185860096,
+          "rssDeltaBytes": 147456
         },
         "fullSearch": {
-          "durationMs": 658.739,
-          "peakRssBytes": 186826752,
+          "durationMs": 687.851,
+          "peakRssBytes": 186220544,
           "rssDeltaBytes": 360448
         },
         "gather": {
-          "durationMs": 3695.658,
-          "peakRssBytes": 186990592,
-          "rssDeltaBytes": 163840
+          "durationMs": 3625.749,
+          "peakRssBytes": 186368000,
+          "rssDeltaBytes": 147456
         },
         "list": {
-          "durationMs": 646.251,
-          "peakRssBytes": 169033728,
-          "rssDeltaBytes": 17465344
+          "durationMs": 671.872,
+          "peakRssBytes": 168378368,
+          "rssDeltaBytes": 17367040
         },
         "show": {
-          "durationMs": 669.75,
-          "peakRssBytes": 186286080,
-          "rssDeltaBytes": 17252352
+          "durationMs": 686.857,
+          "peakRssBytes": 185712640,
+          "rssDeltaBytes": 17334272
         },
         "stalePrepare": {
-          "durationMs": 102.346,
-          "peakRssBytes": 151584768,
-          "rssDeltaBytes": 13238272
+          "durationMs": 119.369,
+          "peakRssBytes": 151027712,
+          "rssDeltaBytes": 13090816
         },
         "unchangedPrepare": {
-          "durationMs": 326.315,
-          "peakRssBytes": 138330112,
-          "rssDeltaBytes": 12419072
+          "durationMs": 338.358,
+          "peakRssBytes": 137920512,
+          "rssDeltaBytes": 11583488
         }
       }
     }
@@ -175,7 +175,7 @@
     "node": "v26.5.0",
     "platform": "darwin"
   },
-  "generatedAt": "2026-08-08T17:46:54.645Z",
+  "generatedAt": "2026-08-08T17:47:50.724Z",
   "profile": "baseline",
   "schemaVersion": 1
 }
