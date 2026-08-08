@@ -365,6 +365,38 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('rebuilds cached record columns that disagree with validated JSON', () => {
+    const root = createRoot()
+    const oldRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'old-cache-record',
+      kind: 'context',
+      payload: { summary: 'Old cache record' },
+      root,
+      source: 'agent',
+      subject: 'cache.validation',
+    })
+    const newRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'new-cache-record',
+      kind: 'context',
+      payload: { summary: 'New cache record' },
+      root,
+      source: 'agent',
+      subject: 'cache.validation',
+      supersedes: [oldRecord.id],
+    })
+    mutateCache(root, database => {
+      database.prepare('UPDATE records SET kind = ? WHERE id = ?').run('decision', String(newRecord.id))
+      database.prepare('UPDATE records SET active = 1 WHERE id = ?').run(String(oldRecord.id))
+    })
+
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    assert.deepEqual(listRecords({ kind: 'decision', root }), [])
+    assert.deepEqual(
+      listRecords({ root }).map(record => record.id),
+      [newRecord.id],
+    )
+  })
+
   test('rebuilds invalid cache metadata instead of trusting it', () => {
     const metadataCases = [
       ['artifactPaths', JSON.stringify(['../outside'])],

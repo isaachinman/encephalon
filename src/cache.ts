@@ -63,13 +63,13 @@ type RecordRow = {
 }
 
 type CompactRow = {
-  id: string
-  kind: string
-  subject: string
-  path: string
-  summary: string | null
-  rank: number
-  snippet: string
+  id: unknown
+  kind: unknown
+  subject: unknown
+  path: unknown
+  summary: unknown
+  rank: unknown
+  snippet: unknown
 }
 
 class CacheSchemaMismatch extends Error {}
@@ -412,6 +412,40 @@ const assertCacheScope = (root: string, metadata: Metadata | undefined) => {
 }
 
 const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata) => {
+  const recordRows = database
+    .prepare('SELECT id, kind, subject, source, created_at, path, active, summary, record_json FROM records')
+    .all() as Array<
+    RecordRow & {
+      active?: unknown
+      created_at?: unknown
+      id?: unknown
+      kind?: unknown
+      path?: unknown
+      source?: unknown
+      subject?: unknown
+      summary?: unknown
+    }
+  >
+  if (recordRows.length !== metadata.recordsIndexed || recordRows.length > MAX_CACHE_RECORDS) {
+    throw new CacheSchemaMismatch('The cache record table does not match its metadata.')
+  }
+  const records = recordRows.map(row => ({ record: parseCachedRecord(row.record_json), row }))
+  const superseded = new Set(records.flatMap(({ record }) => record.supersedes ?? []))
+  for (const { record, row } of records) {
+    const active = superseded.has(record.id) ? 0 : 1
+    if (
+      row.id !== record.id ||
+      row.kind !== record.kind ||
+      row.subject !== record.subject ||
+      row.source !== record.source ||
+      row.created_at !== record.createdAt ||
+      row.path !== record.path ||
+      row.active !== active ||
+      row.summary !== summaryForRecord(record)
+    ) {
+      throw new CacheSchemaMismatch('The cache record table does not match its canonical JSON.')
+    }
+  }
   const counts = database
     .prepare(
       `SELECT
@@ -682,6 +716,10 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
   const readOpenDatabase = () => {
     const database = openDatabase(root)
     try {
+      const metadata = readMetadata(database)
+      if (!metadataIsFresh(root, database, metadata)) {
+        throw new CacheSchemaMismatch('The cache is stale before read.')
+      }
       return read(database)
     } finally {
       database.close()
@@ -785,6 +823,20 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
     .all(...parameters) as Array<RecordRow & CompactRow>
 }
 
+const compactRank = (value: unknown) => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  throw new CacheSchemaMismatch('Cached search rank must be a finite number.')
+}
+
+const compactSnippet = (value: unknown) => {
+  if (typeof value === 'string') {
+    return value
+  }
+  throw new CacheSchemaMismatch('Cached search snippet must be text.')
+}
+
 export const searchRecords = (input: SearchRecordsInput): BrainRecord[] =>
   withPreparedDatabase(input, database => searchRows(database, input).map(parseRecordRow))
 
@@ -796,8 +848,8 @@ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRec
         id: record.id,
         kind: record.kind,
         path: record.path,
-        rank: row.rank,
-        snippet: row.snippet,
+        rank: compactRank(row.rank),
+        snippet: compactSnippet(row.snippet),
         subject: record.subject,
         summary: summaryForRecord(record),
       }
@@ -827,8 +879,8 @@ const readGatherFromDatabase = (root: string, input: GatherInput, hydrated: Hydr
             id: record.id,
             kind: record.kind,
             path: record.path,
-            rank: row.rank,
-            snippet: row.snippet,
+            rank: compactRank(row.rank),
+            snippet: compactSnippet(row.snippet),
             subject: record.subject,
             summary: summaryForRecord(record),
           }
