@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import {
+  chmodSync,
   closeSync,
   constants,
-  fchmodSync,
   fstatSync,
   fsyncSync,
   linkSync,
@@ -35,7 +35,6 @@ type FilePlan = {
   content?: string
   originalContent: string
   originalFileExisted: boolean
-  originalMode?: number
 }
 
 const ALLOWED_SEPARATORS = new Set(['', '\n', '\n\n', '\r\n', '\r\n\r\n'])
@@ -184,7 +183,6 @@ const additionPlan = (root: string, filename: (typeof FILENAMES)[number]): FileP
     filename,
     originalContent: content,
     originalFileExisted: existed,
-    ...(existingMetadata === undefined ? {} : { originalMode: existingMetadata.mode }),
   }
 }
 
@@ -213,7 +211,6 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
       filename,
       originalContent: content,
       originalFileExisted: true,
-      originalMode: fileMetadata.mode,
     }
   }
   const contentWithoutBlock = `${content.slice(0, installed.start - installed.separator.length)}${content.slice(installed.end)}`
@@ -231,7 +228,6 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
     filename,
     originalContent: content,
     originalFileExisted: true,
-    originalMode: fileMetadata.mode,
   }
 }
 
@@ -328,6 +324,15 @@ const fsyncDirectory = (path: string) => {
 const tempPathFor = (path: string, suffix = 'tmp') =>
   join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.${suffix}`)
 
+const fsyncFile = (path: string) => {
+  const descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
+  try {
+    fsyncSync(descriptor)
+  } finally {
+    closeSync(descriptor)
+  }
+}
+
 const restoreBackupFile = (path: string, backupPath: string) => {
   try {
     if (lstatIfExists(path) === undefined) {
@@ -364,6 +369,8 @@ const publishTempFile = (path: string, tempPath: string, plan: FilePlan) => {
     if (readRegularFile(backupPath) !== plan.originalContent) {
       return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
     }
+    chmodSync(tempPath, backupMetadata.mode & MODE_BITS)
+    fsyncFile(tempPath)
     linkSync(tempPath, path)
     published = true
   } catch (error) {
@@ -403,9 +410,6 @@ const writePlan = (root: string, path: string, plan: FilePlan, hooks?: AtomicWri
   try {
     fault(hooks, 'before-temp-create')
     descriptor = openSync(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o666)
-    if (plan.originalFileExisted && plan.originalMode !== undefined) {
-      fchmodSync(descriptor, plan.originalMode & MODE_BITS)
-    }
     writeAll(descriptor, bytes, plan, hooks)
     fault(hooks, 'during-file-flush')
     fsyncSync(descriptor)

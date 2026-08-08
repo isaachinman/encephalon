@@ -249,6 +249,23 @@ describe('initialisation', () => {
     )
   })
 
+  test('preserves instruction-file mode changes made after planning', {
+    skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    chmodSync(path, 0o600)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+    chmodSync(path, 0o744)
+
+    applyInstructionChanges(root, [agentsPlan])
+
+    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
+    assert.equal(statSync(path).mode & 0o777, 0o744)
+  })
+
   test('detects instruction-file changes observed before atomic publication', () => {
     const root = createRoot()
     const path = join(root, 'AGENTS.md')
