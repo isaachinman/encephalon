@@ -943,8 +943,9 @@ Persistable facts:
 
 - Safe top-level file and directory names, excluding secret-prone hidden paths.
 - Recognised root manifest, lockfile, and configuration filenames.
-- Root `package.json` package name, `packageManager`, workspace presence, and script keys.
-- Derived package script invocations such as `npm run test`; never the script body.
+- Root `package.json` package name, valid `packageManager` declaration, workspace presence, and script keys.
+- Package-manager evidence is recorded as `unknown`, `declared`, `lockfile-derived`, `declared-and-lockfile`, or `conflicted`; `packageManager` is present only when declaration and lockfile evidence identify one unambiguous manager.
+- Derived package script invocations such as `npm run test`; never the script body. These invocations are omitted when the package manager is unknown or conflicted.
 - CI workflow filenames under `.github/workflows`; never YAML content, triggers, jobs, steps, secrets, or environment values.
 - Recognised language/file counts derived from extensions.
 - Repository identity derived from a safe root package name, or the root directory basename when no manifest provides a name.

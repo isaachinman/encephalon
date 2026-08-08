@@ -27,6 +27,12 @@ const createRoot = () => {
   return root
 }
 
+const generatedPayload = (records: api.BrainRecord[], subject: string) => {
+  const payload = records.find(record => record.subject === subject)?.payload
+  assert.equal(payload !== null && typeof payload === 'object' && !Array.isArray(payload), true)
+  return payload as Record<string, unknown>
+}
+
 afterEach(() => {
   roots.splice(0).forEach(removeTestRepository)
 })
@@ -102,6 +108,7 @@ describe('initialisation', () => {
       packagePath,
       JSON.stringify({
         name: 'sample-project',
+        packageManager: 'npm@11.0.0',
         scripts: { test: 'node --test' },
       }),
     )
@@ -116,6 +123,7 @@ describe('initialisation', () => {
       packagePath,
       JSON.stringify({
         name: 'sample-project',
+        packageManager: 'npm@11.0.0',
         scripts: { lint: 'lint-private-body', test: 'node --test' },
       }),
     )
@@ -128,6 +136,171 @@ describe('initialisation', () => {
     assert.match(JSON.stringify(workflow[0]?.payload), /npm run lint/)
     assert.doesNotMatch(JSON.stringify(workflow[0]?.payload), /lint-private-body/)
     assert.equal(api.listRecords({ limit: 20, root }).length, 3)
+  })
+
+  test('records package-manager facts only when evidence supports them', () => {
+    const packageJson = {
+      name: 'sample-project',
+      scripts: { test: 'node --test' },
+    }
+    const cases = [
+      {
+        commands: [],
+        evidence: { status: 'unknown' },
+        files: { 'go.mod': 'module example.invalid/project\n' },
+        manager: undefined,
+        name: 'non-JavaScript repository',
+        scriptKeys: [],
+      },
+      {
+        commands: [],
+        evidence: { status: 'unknown' },
+        files: { 'package.json': JSON.stringify(packageJson) },
+        manager: undefined,
+        name: 'package.json without manager evidence',
+        scriptKeys: ['test'],
+      },
+      {
+        commands: ['bun run test'],
+        evidence: { lockfiles: [{ file: 'bun.lock', manager: 'bun' }], manager: 'bun', status: 'lockfile-derived' },
+        files: { 'bun.lock': '', 'package.json': JSON.stringify(packageJson) },
+        manager: 'bun',
+        name: 'bun text lockfile',
+        scriptKeys: ['test'],
+      },
+      {
+        commands: ['bun run test'],
+        evidence: { lockfiles: [{ file: 'bun.lockb', manager: 'bun' }], manager: 'bun', status: 'lockfile-derived' },
+        files: { 'bun.lockb': '', 'package.json': JSON.stringify(packageJson) },
+        manager: 'bun',
+        name: 'bun binary lockfile',
+        scriptKeys: ['test'],
+      },
+      {
+        commands: ['npm run test'],
+        evidence: {
+          lockfiles: [{ file: 'package-lock.json', manager: 'npm' }],
+          manager: 'npm',
+          status: 'lockfile-derived',
+        },
+        files: { 'package-lock.json': '{}', 'package.json': JSON.stringify(packageJson) },
+        manager: 'npm',
+        name: 'npm lockfile',
+        scriptKeys: ['test'],
+      },
+      {
+        commands: ['pnpm run test'],
+        evidence: {
+          lockfiles: [{ file: 'pnpm-lock.yaml', manager: 'pnpm' }],
+          manager: 'pnpm',
+          status: 'lockfile-derived',
+        },
+        files: { 'package.json': JSON.stringify(packageJson), 'pnpm-lock.yaml': '' },
+        manager: 'pnpm',
+        name: 'pnpm lockfile',
+        scriptKeys: ['test'],
+      },
+      {
+        commands: ['yarn test'],
+        evidence: { lockfiles: [{ file: 'yarn.lock', manager: 'yarn' }], manager: 'yarn', status: 'lockfile-derived' },
+        files: { 'package.json': JSON.stringify(packageJson), 'yarn.lock': '' },
+        manager: 'yarn',
+        name: 'yarn lockfile',
+        scriptKeys: ['test'],
+      },
+      {
+        commands: ['pnpm run test'],
+        evidence: { declared: 'pnpm', manager: 'pnpm', status: 'declared' },
+        files: { 'package.json': JSON.stringify({ ...packageJson, packageManager: 'pnpm@9.0.0' }) },
+        manager: 'pnpm',
+        name: 'valid declaration without lockfile',
+        scriptKeys: ['test'],
+      },
+      {
+        commands: ['npm run test'],
+        evidence: {
+          declared: 'npm',
+          lockfiles: [{ file: 'package-lock.json', manager: 'npm' }],
+          manager: 'npm',
+          status: 'declared-and-lockfile',
+        },
+        files: {
+          'package-lock.json': '{}',
+          'package.json': JSON.stringify({ ...packageJson, packageManager: 'npm@11.0.0' }),
+        },
+        manager: 'npm',
+        name: 'matching declaration and lockfile',
+        scriptKeys: ['test'],
+      },
+      {
+        commands: [],
+        evidence: {
+          candidates: ['npm', 'yarn'],
+          declared: 'npm',
+          lockfiles: [{ file: 'yarn.lock', manager: 'yarn' }],
+          status: 'conflicted',
+        },
+        files: { 'package.json': JSON.stringify({ ...packageJson, packageManager: 'npm@11.0.0' }), 'yarn.lock': '' },
+        manager: undefined,
+        name: 'conflicting declaration and lockfile',
+        scriptKeys: ['test'],
+      },
+      {
+        commands: [],
+        evidence: {
+          candidates: ['npm', 'pnpm'],
+          lockfiles: [
+            { file: 'package-lock.json', manager: 'npm' },
+            { file: 'pnpm-lock.yaml', manager: 'pnpm' },
+          ],
+          status: 'conflicted',
+        },
+        files: { 'package-lock.json': '{}', 'package.json': JSON.stringify(packageJson), 'pnpm-lock.yaml': '' },
+        manager: undefined,
+        name: 'multiple package-manager lockfiles',
+        scriptKeys: ['test'],
+      },
+    ] as const
+
+    for (const entry of cases) {
+      const root = createRoot()
+      for (const [path, content] of Object.entries(entry.files)) {
+        writeFileSync(join(root, path), content)
+      }
+
+      const result = api.initEncephalon({ root })
+      const architecture = generatedPayload(result.recordsCreated, 'encephalon:init/tooling-layout')
+      const workflow = generatedPayload(result.recordsCreated, 'encephalon:init/commands-ci')
+
+      assert.deepEqual(architecture.packageManagerEvidence, entry.evidence, entry.name)
+      assert.equal(architecture.packageManager, entry.manager, entry.name)
+      assert.deepEqual(workflow.scriptKeys, entry.scriptKeys, entry.name)
+      assert.deepEqual(workflow.commands, entry.commands, entry.name)
+    }
+  })
+
+  test('refreshes generated records when package-manager evidence changes', () => {
+    const root = createRoot()
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+
+    api.initEncephalon({ root })
+    writeFileSync(join(root, 'package-lock.json'), '{}')
+
+    const refreshed = api.initEncephalon({ refreshBaseline: true, root })
+    assert.deepEqual(
+      refreshed.recordsCreated.map(record => record.subject).sort((left, right) => left.localeCompare(right)),
+      ['encephalon:init/commands-ci', 'encephalon:init/repository-overview', 'encephalon:init/tooling-layout'],
+    )
+    const architecture = generatedPayload(refreshed.recordsCreated, 'encephalon:init/tooling-layout')
+    const workflow = generatedPayload(refreshed.recordsCreated, 'encephalon:init/commands-ci')
+    assert.equal(architecture.packageManager, 'npm')
+    assert.deepEqual(workflow.commands, ['npm run test'])
   })
 
   test('skips a reserved subject owned by an agent-authored active record', () => {
