@@ -1,21 +1,9 @@
 {
-	"compilerOptions": {
-		"allowImportingTsExtensions": true,
-		"declaration": true,
-		"declarationDir": "dist",
-		"emitDeclarationOnly": true,
-		"exactOptionalPropertyTypes": true,
-		"forceConsistentCasingInFileNames": true,
-		"lib": ["ES2024"],
-		"module": "NodeNext",
-		"moduleResolution": "NodeNext",
-		"noEmit": true,
-		"noFallthroughCasesInSwitch": true,
-		"noImplicitOverride": true,
-		"noUncheckedIndexedAccess": true,
-		"strict": true,
-		"target": "ES2024",
-		"types": ["bun", "node"]
-	},
-	"include": ["scripts/**/*.ts", "src/**/*.ts", "test/**/*.ts"]
+	"files": [],
+	"references": [
+		{ "path": "./tsconfig.src.json" },
+		{ "path": "./tsconfig.scripts.json" },
+		{ "path": "./tsconfig.test.json" },
+		{ "path": "./tsconfig.runtime-guard.json" }
+	]
 }

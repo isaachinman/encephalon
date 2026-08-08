@@ -9,10 +9,11 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { gunzipSync } from 'node:zlib'
 
-const root = resolve(import.meta.dir, '..')
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-check-'))
 
 const run = (command: string[], cwd = root) => {

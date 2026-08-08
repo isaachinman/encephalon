@@ -1,7 +1,8 @@
 import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const root = resolve(import.meta.dir, '..')
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const outputDirectory = resolve(root, 'dist')
 
 rmSync(outputDirectory, { force: true, recursive: true })

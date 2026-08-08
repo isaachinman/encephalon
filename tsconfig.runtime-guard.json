@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.src.json",
+  "include": ["test/types/runtime-node24.guard.ts"]
+}
