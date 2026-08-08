@@ -1,16 +1,19 @@
+import { randomUUID } from 'node:crypto'
 import {
+  chmodSync,
   closeSync,
   constants,
   fstatSync,
-  ftruncateSync,
+  fsyncSync,
+  linkSync,
   lstatSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
-  writeFileSync,
   writeSync,
 } from 'node:fs'
-import { resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 
 const FILENAMES = ['AGENTS.md', 'CLAUDE.md'] as const
@@ -35,6 +38,7 @@ type FilePlan = {
 }
 
 const ALLOWED_SEPARATORS = new Set(['', '\n', '\n\n', '\r\n', '\r\n\r\n'])
+const MODE_BITS = 0o7777
 
 const lstatIfExists = (path: string) => {
   try {
@@ -228,6 +232,7 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
 }
 
 const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
+const directoryFlag = typeof constants.O_DIRECTORY === 'number' ? constants.O_DIRECTORY : 0
 
 const readRegularFile = (path: string) => {
   const descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
@@ -256,11 +261,107 @@ const assertPlanIsCurrent = (root: string, plan: FilePlan) => {
   }
 }
 
-const writePlan = (path: string, plan: FilePlan) => {
-  const content = plan.content ?? ''
+type AtomicWriteFault =
+  | 'after-publication'
+  | 'after-backup-validation'
+  | 'after-final-backup-validation'
+  | 'before-temp-create'
+  | 'during-backup-restore'
+  | 'during-file-flush'
+  | 'during-publication'
+  | 'during-temp-cleanup'
+  | 'during-temp-write'
+
+type AtomicWriteHooks = {
+  fault?: (point: AtomicWriteFault) => void
+}
+
+const fault = (hooks: AtomicWriteHooks | undefined, point: AtomicWriteFault) => {
+  hooks?.fault?.(point)
+}
+
+const closeAfterOperation = (descriptor: number, operationFailed: boolean) => {
+  try {
+    closeSync(descriptor)
+  } catch (error) {
+    if (operationFailed) {
+      return
+    }
+    throw error
+  }
+}
+
+const writeAll = (descriptor: number, bytes: Buffer, plan: FilePlan, hooks: AtomicWriteHooks | undefined) => {
+  fault(hooks, 'during-temp-write')
+  let offset = 0
+  while (offset < bytes.length) {
+    const written = writeSync(descriptor, bytes, offset, bytes.length - offset, offset)
+    if (written <= 0) {
+      throw new Error(`Unable to write ${plan.filename}.`)
+    }
+    offset += written
+  }
+}
+
+const fsyncDirectory = (path: string) => {
+  if (process.platform !== 'win32') {
+    let descriptor: number | undefined
+    let operationFailed = false
+    try {
+      descriptor = openSync(path, constants.O_RDONLY | directoryFlag)
+      fsyncSync(descriptor)
+    } catch (error) {
+      operationFailed = true
+      const { code } = error as NodeJS.ErrnoException
+      if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'EPERM') {
+        throw error
+      }
+    } finally {
+      if (descriptor !== undefined) {
+        closeAfterOperation(descriptor, operationFailed)
+      }
+    }
+  }
+}
+
+const tempPathFor = (path: string, suffix = 'tmp') =>
+  join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.${suffix}`)
+
+const fsyncFile = (path: string) => {
+  const access = process.platform === 'win32' ? constants.O_RDWR : constants.O_RDONLY
+  const descriptor = openSync(path, access | noFollowFlag)
+  try {
+    fsyncSync(descriptor)
+  } finally {
+    closeSync(descriptor)
+  }
+}
+
+const restoreBackupFile = (path: string, backupPath: string, hooks: AtomicWriteHooks | undefined) => {
+  try {
+    fault(hooks, 'during-backup-restore')
+    linkSync(backupPath, path)
+    rmSync(backupPath, { force: true })
+  } catch {
+    // Keep the backup file in place so the pre-publication bytes remain recoverable.
+  }
+}
+
+const assertBackupUnchanged = (backupPath: string, plan: FilePlan) => {
+  const metadata = lstatIfExists(backupPath)
+  if (metadata === undefined || metadata.isSymbolicLink() || !metadata.isFile()) {
+    return fail('VALIDATION_FAILED', `${plan.filename} must remain a regular non-symlink file.`)
+  }
+  if (readRegularFile(backupPath) !== plan.originalContent) {
+    return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+  }
+  return metadata
+}
+
+const publishTempFile = (path: string, tempPath: string, plan: FilePlan, hooks: AtomicWriteHooks | undefined) => {
   if (!plan.originalFileExisted) {
     try {
-      writeFileSync(path, content, { encoding: 'utf8', flag: 'wx' })
+      linkSync(tempPath, path)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
         return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
@@ -269,23 +370,74 @@ const writePlan = (path: string, plan: FilePlan) => {
     }
     return
   }
-  const descriptor = openSync(path, constants.O_RDWR | noFollowFlag)
+
+  const backupPath = tempPathFor(path, 'backup')
+  let backupCreated = false
+  let published = false
   try {
-    if (!fstatSync(descriptor).isFile() || readFileSync(descriptor, 'utf8') !== plan.originalContent) {
+    renameSync(path, backupPath)
+    backupCreated = true
+    const backupMetadata = assertBackupUnchanged(backupPath, plan)
+    chmodSync(tempPath, backupMetadata.mode & MODE_BITS)
+    fsyncFile(tempPath)
+    fault(hooks, 'after-backup-validation')
+    linkSync(tempPath, path)
+    published = true
+    const finalBackupMetadata = assertBackupUnchanged(backupPath, plan)
+    fault(hooks, 'after-final-backup-validation')
+    if ((finalBackupMetadata.mode & MODE_BITS) !== (backupMetadata.mode & MODE_BITS)) {
       return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
     }
-    const bytes = Buffer.from(content, 'utf8')
-    ftruncateSync(descriptor, 0)
-    let offset = 0
-    while (offset < bytes.length) {
-      const written = writeSync(descriptor, bytes, offset, bytes.length - offset, offset)
-      if (written <= 0) {
-        throw new Error(`Unable to write ${plan.filename}.`)
-      }
-      offset += written
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
     }
+    throw error
   } finally {
+    if (backupCreated && !published) {
+      restoreBackupFile(path, backupPath, hooks)
+    }
+  }
+}
+
+const cleanupTempFile = (tempPath: string, hooks: AtomicWriteHooks | undefined, operationFailed: boolean) => {
+  try {
+    fault(hooks, 'during-temp-cleanup')
+    rmSync(tempPath, { force: true })
+  } catch (error) {
+    if (!operationFailed) {
+      throw error
+    }
+  }
+}
+
+const writePlan = (root: string, path: string, plan: FilePlan, hooks?: AtomicWriteHooks) => {
+  const content = plan.content ?? ''
+  const bytes = Buffer.from(content, 'utf8')
+  const tempPath = tempPathFor(path)
+  let descriptor: number | undefined
+  let operationFailed = false
+  try {
+    fault(hooks, 'before-temp-create')
+    descriptor = openSync(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o666)
+    writeAll(descriptor, bytes, plan, hooks)
+    fault(hooks, 'during-file-flush')
+    fsyncSync(descriptor)
     closeSync(descriptor)
+    descriptor = undefined
+    assertPlanIsCurrent(root, plan)
+    fault(hooks, 'during-publication')
+    publishTempFile(path, tempPath, plan, hooks)
+    fault(hooks, 'after-publication')
+    fsyncDirectory(dirname(path))
+  } catch (error) {
+    operationFailed = true
+    throw error
+  } finally {
+    if (descriptor !== undefined) {
+      closeAfterOperation(descriptor, operationFailed)
+    }
+    cleanupTempFile(tempPath, hooks, operationFailed)
   }
 }
 
@@ -300,7 +452,7 @@ export const planInstructionChanges = (root: string, remove: boolean) => {
   }
 }
 
-export const applyInstructionChanges = (root: string, plans: FilePlan[]) => {
+export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?: AtomicWriteHooks) => {
   try {
     for (const plan of plans) {
       if (plan.action !== 'none') {
@@ -313,7 +465,7 @@ export const applyInstructionChanges = (root: string, plans: FilePlan[]) => {
         rmSync(path)
       }
       if (plan.action === 'write') {
-        writePlan(path, plan)
+        writePlan(root, path, plan, hooks)
       }
     }
     return plans

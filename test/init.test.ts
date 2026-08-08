@@ -1,8 +1,22 @@
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fchmodSync,
+  ftruncateSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
+import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -227,4 +241,263 @@ describe('initialisation', () => {
     api.initEncephalon({ remove: true, root })
     assert.equal(readFileSync(path, 'utf8'), `${original}User addition.\r\n`)
   })
+
+  test('atomically publishes instruction replacements and preserves the existing file mode', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    chmodSync(path, 0o744)
+
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+    applyInstructionChanges(root, [agentsPlan])
+
+    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
+    if (process.platform !== 'win32') {
+      assert.equal(statSync(path).mode & 0o777, 0o744)
+    }
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.tmp')),
+      [],
+    )
+  })
+
+  test('preserves instruction-file mode changes made after planning', {
+    skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    chmodSync(path, 0o600)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+    chmodSync(path, 0o744)
+
+    applyInstructionChanges(root, [agentsPlan])
+
+    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
+    assert.equal(statSync(path).mode & 0o777, 0o744)
+  })
+
+  test('detects instruction-file changes observed before atomic publication', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = '# Existing guidance\n'
+    const changed = '# Concurrent guidance\n'
+    writeFileSync(path, original)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+    writeFileSync(path, changed)
+
+    assert.throws(
+      () => applyInstructionChanges(root, [agentsPlan]),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(readFileSync(path, 'utf8'), changed)
+  })
+
+  test('does not overwrite instruction-file changes made during atomic publication', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = '# Existing guidance\n'
+    const changed = '# Concurrent guidance during publication\n'
+    writeFileSync(path, original)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'during-publication') {
+              writeFileSync(path, changed)
+            }
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(readFileSync(path, 'utf8'), changed)
+  })
+
+  test('keeps old-descriptor writes recoverable after backup validation', {
+    skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = '# Existing guidance\n'
+    const changed = '# Descriptor edit\n'
+    writeFileSync(path, original)
+    const descriptor = openSync(path, 'r+')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    try {
+      assert.throws(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'after-backup-validation') {
+                ftruncateSync(descriptor, 0)
+                writeSync(descriptor, changed, 0, 'utf8')
+              }
+            },
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+    } finally {
+      closeSync(descriptor)
+    }
+
+    const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
+    assert.ok(backupName)
+    assert.equal(readFileSync(join(root, backupName), 'utf8'), changed)
+  })
+
+  test('does not overwrite files created while restoring a backup', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = '# Existing guidance\n'
+    const changed = '# Concurrent restore guidance\n'
+    writeFileSync(path, original)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-backup-validation') {
+              throw new Error('Injected publication failure')
+            }
+            if (point === 'during-backup-restore') {
+              writeFileSync(path, changed)
+            }
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        return true
+      },
+    )
+
+    const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
+    assert.ok(backupName)
+    assert.equal(readFileSync(path, 'utf8'), changed)
+    assert.equal(readFileSync(join(root, backupName), 'utf8'), original)
+  })
+
+  test('reports old-descriptor mode changes after backup validation', {
+    skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    chmodSync(path, 0o600)
+    const descriptor = openSync(path, 'r+')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    try {
+      assert.throws(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'after-backup-validation') {
+                fchmodSync(descriptor, 0o744)
+              }
+            },
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+    } finally {
+      closeSync(descriptor)
+    }
+
+    const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
+    assert.ok(backupName)
+    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
+    assert.equal(statSync(join(root, backupName)).mode & 0o777, 0o744)
+  })
+
+  test('does not overwrite mode changes after final backup validation', {
+    skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    chmodSync(path, 0o600)
+    const descriptor = openSync(path, 'r+')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    try {
+      applyInstructionChanges(root, [agentsPlan], {
+        fault: point => {
+          if (point === 'after-final-backup-validation') {
+            fchmodSync(descriptor, 0o744)
+          }
+        },
+      })
+    } finally {
+      closeSync(descriptor)
+    }
+
+    const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
+    assert.ok(backupName)
+    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
+    assert.equal(statSync(path).mode & 0o777, 0o600)
+    assert.equal(statSync(join(root, backupName)).mode & 0o777, 0o744)
+  })
+
+  const faultPoints = [
+    ['before-temp-create', 'old'],
+    ['during-temp-write', 'old'],
+    ['during-file-flush', 'old'],
+    ['during-publication', 'old'],
+    ['after-publication', 'new'],
+    ['during-temp-cleanup', 'new'],
+  ] as const
+
+  for (const [faultPoint, expectedContent] of faultPoints) {
+    test(`keeps instruction writes whole when fault injection fails ${faultPoint}`, () => {
+      const root = createRoot()
+      const path = join(root, 'AGENTS.md')
+      const original = '# Existing guidance\n'
+      writeFileSync(path, original)
+      const [agentsPlan] = planInstructionChanges(root, false)
+      assert.ok(agentsPlan?.content)
+
+      assert.throws(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === faultPoint) {
+                throw new Error(`Injected ${point}`)
+              }
+            },
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+          return true
+        },
+      )
+
+      const content = readFileSync(path, 'utf8')
+      assert.equal(content, expectedContent === 'old' ? original : agentsPlan.content)
+      assert.notEqual(content, '')
+      assert.notEqual(content, original.slice(0, 4))
+    })
+  }
 })

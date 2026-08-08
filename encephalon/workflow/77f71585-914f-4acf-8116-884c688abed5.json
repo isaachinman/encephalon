@@ -1,0 +1,23 @@
+{
+  "createdAt": "2026-08-08T00:46:37.357Z",
+  "id": "77f71585-914f-4acf-8116-884c688abed5",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Prevent repeat PR review issues found on MAR-2509.",
+    "lessons": [
+      "For managed instruction-file publication, do not rely on a preflight-only snapshot before replacing a user-owned file; capture and revalidate the current target at publication time so concurrent edits return REPOSITORY_CHANGED instead of being overwritten.",
+      "Preserve mutable filesystem metadata from the file captured at publication time, not from the earlier plan, because owners can change permissions without changing bytes.",
+      "After renaming a user-owned file to a backup path, treat that backup inode as still mutable through existing open descriptors; revalidate it before cleanup and leave it recoverable if the bytes changed.",
+      "When restoring a moved-aside backup after a failed publication, use create-if-absent publication instead of check-then-rename so recovery cannot overwrite a target recreated by another writer.",
+      "Do not apply a final permission snapshot after publication if the source inode can still be changed through old descriptors; report pre-final mode drift and leave post-final drift recoverable on the backup instead.",
+      "When adding repository workflow guidance, keep Git commit subjects and PR titles prefixed with the Linear ticket in square brackets, for example [MAR-1234] Describe the change."
+    ],
+    "verification": [
+      "Search Encephalon before adding durable workflow lessons.",
+      "Add regression tests for each review comment when possible.",
+      "Use one commit per review-comment fix so replies can point to the exact change."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.github-pr-feedback"
+}
