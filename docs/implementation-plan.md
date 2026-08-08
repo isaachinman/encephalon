@@ -1,16 +1,18 @@
 # Encephalon v0.1.0 — Complete Implementation Plan
 
-Status: approved for implementation  
+Status: historical design input; not the maintained normative contract
 Target repository: `git@github.com:isaachinman/encephalon.git`  
 Local implementation repository: the dedicated checkout of `isaachinman/encephalon`  
 Initial npm package: `encephalon@0.1.0`  
 License: MIT  
 Runtime: Node.js 24.15.0 or newer  
 Maintainer toolchain: TypeScript and Bun  
+Audited implementation snapshot: `514f444fdaf428c2e41124020b40b7568af66b6b` on 2026-08-08
+Current maintained contract: [`docs/contract.md`](./contract.md), the README, package checks, and executable tests
 
 ## 1. Purpose of this document
 
-This document is the authoritative implementation specification for Encephalon v0.1.0. It expands every product, architecture, compatibility, security, testing, repository, and release decision into concrete implementation work. An engineer or coding agent should be able to implement the package from this document without inventing behaviour, revisiting settled architectural questions, or referring to private source-project records.
+This document is preserved as historical implementation input for Encephalon v0.1.0. It is not the maintained normative contract for the current codebase. When this document conflicts with [`docs/contract.md`](./contract.md), the README, package checks, or executable tests, the maintained contract wins.
 
 The implementation must satisfy two simultaneous goals:
 
@@ -326,13 +328,13 @@ npm install --save-dev encephalon
 npx --no-install encephalon init
 ```
 
-The packaged agent skill must invoke the installed binary through:
+Historical note: the maintained current contract uses the package-manager binary form after installation:
 
 ```bash
-node ./node_modules/encephalon/dist/cli.mjs
+npx --no-install encephalon <command>
 ```
 
-It must not use unqualified `npx`, which could access the network or run an ephemeral version.
+The direct Node entrypoint remains an implementation detail that package smoke tests exercise against the packed tarball. User and packaged-skill guidance uses `npx --no-install`, and runtime root-install verification rejects execution that is not the root `node_modules/encephalon` installation.
 
 ### 8.5 Package-manager support
 
@@ -1103,7 +1105,7 @@ The body must teach the following behaviour:
 ### 17.1 Query before assumptions
 
 - Confirm the current repository contains the managed Encephalon instruction and root package installation.
-- Use `node ./node_modules/encephalon/dist/cli.mjs gather` or compact search before loading full records.
+- Use `npx --no-install encephalon gather` or compact search before loading full records.
 - Search broadly first, then show only relevant IDs.
 - Treat active records as durable repository knowledge while acknowledging that repository state may have changed after the record.
 - Cite record ID or subject when using stored knowledge.

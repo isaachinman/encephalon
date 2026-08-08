@@ -38,6 +38,10 @@
   "files": [
     "dist",
     "skills",
+    "assets/encephalon.png",
+    "docs/performance.md",
+    "docs/performance-baseline.json",
+    "docs/performance-budgets.json",
     "README.md",
     "LICENSE"
   ],
