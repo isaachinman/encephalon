@@ -571,6 +571,7 @@ describe('canonical records', () => {
     assert.equal(result.errors.length, 100)
     assert.equal(result.errors[0]?.path, 'encephalon/decision/invalid-000.json')
     assert.equal(result.errors.at(-1)?.code, 'VALIDATION_ISSUES_TRUNCATED')
+    assert.equal(result.errors.at(-1)?.message, 'Validation stopped reporting after 99 concrete issues.')
   })
 
   test('rejects non-JSON payloads and unsafe portable paths', () => {

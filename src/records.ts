@@ -561,7 +561,7 @@ const truncateValidationIssues = (errors: ValidationIssue[]) => {
       ...errors.slice(0, MAX_VALIDATION_ISSUES - 1),
       issue(
         'VALIDATION_ISSUES_TRUNCATED',
-        `Validation stopped reporting after ${MAX_VALIDATION_ISSUES} issues.`,
+        `Validation stopped reporting after ${MAX_VALIDATION_ISSUES - 1} concrete issues.`,
         'encephalon',
       ),
     ],
