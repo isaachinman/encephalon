@@ -5,8 +5,9 @@ import { resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
 import { cacheDirectory, withOperationLock } from './lock.ts'
-import { readRecords } from './records.ts'
+import { canonicalRecordPath, readRecords } from './records.ts'
 import { resolveRepository } from './repository.ts'
+import { MAX_RECORD_BYTES, parseRecordFile, validateArtifactPath } from './schema.ts'
 import type {
   BrainRecord,
   CompactBrainRecord,
@@ -24,6 +25,17 @@ const PACKAGE_VERSION = '0.1.0'
 const SCHEMA_VERSION = '1'
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
 const DATABASE_FILENAME = 'brain.sqlite'
+const MAX_CACHE_METADATA_BYTES = 1024 * 1024
+const MAX_CACHE_RECORD_BYTES = MAX_RECORD_BYTES + 4096
+const MAX_CACHE_RECORDS = 100_000
+const METADATA_KEYS = [
+  'artifactPaths',
+  'manifest',
+  'packageVersion',
+  'recordsIndexed',
+  'repositoryRealpath',
+  'schemaVersion',
+] as const
 
 type SQLiteModule = {
   DatabaseSync: new (path: string) => DatabaseSync
@@ -112,7 +124,7 @@ const assertTableColumns = (database: DatabaseSync, table: string, expected: str
 
 const removeCorruptCache = (root: string) => {
   const path = databasePath(root)
-  for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+  for (const candidate of [path, `${path}-wal`, `${path}-shm`, `${path}-journal`]) {
     rmSync(candidate, { force: true })
   }
 }
@@ -267,40 +279,105 @@ const repositoryManifest = (root: string, artifactPaths: string[]) => {
   return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
 }
 
+const byteLength = (value: string) => Buffer.byteLength(value, 'utf8')
+
+const assertCacheValueSize = (value: string, maximum: number) => {
+  if (byteLength(value) > maximum) {
+    throw new CacheSchemaMismatch('A cached value exceeds its size limit.')
+  }
+}
+
+const parseCacheJson = (value: string, maximum: number) => {
+  assertCacheValueSize(value, maximum)
+  try {
+    return JSON.parse(value) as unknown
+  } catch (error) {
+    throw new CacheSchemaMismatch('The cache contains malformed JSON.', { cause: error })
+  }
+}
+
+const validateCachedArtifactPath = (value: unknown) => {
+  if (typeof value !== 'string') {
+    throw new CacheSchemaMismatch('Cached artifact metadata must contain strings.')
+  }
+  const [, kind, id] = value.split('/')
+  if (kind === undefined || id === undefined) {
+    throw new CacheSchemaMismatch('Cached artifact metadata contains an invalid path.')
+  }
+  try {
+    return validateArtifactPath(value, kind, id)
+  } catch (error) {
+    throw new CacheSchemaMismatch('Cached artifact metadata contains an invalid path.', { cause: error })
+  }
+}
+
+const parseCachedRecord = (value: string): BrainRecord => {
+  const parsed = parseCacheJson(value, MAX_CACHE_RECORD_BYTES)
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new CacheSchemaMismatch('Cached record JSON must be an object.')
+  }
+  const { path, ...recordFile } = parsed as Record<string, unknown>
+  if (typeof path !== 'string') {
+    throw new CacheSchemaMismatch('Cached record JSON must include a runtime path.')
+  }
+  try {
+    const record = parseRecordFile(recordFile)
+    if (path === canonicalRecordPath(record)) {
+      return { ...record, path }
+    }
+  } catch {
+    // Normalise every cached-row validation failure into disposable cache corruption.
+  }
+  throw new CacheSchemaMismatch('Cached record JSON does not match the canonical record schema.')
+}
+
 const readMetadata = (database: DatabaseSync): Metadata | undefined => {
   const rows = database.prepare('SELECT key, value FROM metadata').all() as Array<{
-    key: string
-    value: string
+    key?: unknown
+    value?: unknown
   }>
-  const values = new Map(rows.map(row => [row.key, row.value]))
+  if (rows.length === 0) {
+    return
+  }
+  const values = new Map<string, string>()
+  for (const row of rows) {
+    if (
+      typeof row.key !== 'string' ||
+      typeof row.value !== 'string' ||
+      !(METADATA_KEYS as readonly string[]).includes(row.key)
+    ) {
+      throw new CacheSchemaMismatch('The cache metadata contains invalid keys or values.')
+    }
+    assertCacheValueSize(row.value, MAX_CACHE_METADATA_BYTES)
+    values.set(row.key, row.value)
+  }
+  if (values.size !== METADATA_KEYS.length || METADATA_KEYS.some(key => values.get(key) === undefined)) {
+    throw new CacheSchemaMismatch('The cache metadata key set is incomplete.')
+  }
   const artifactPathsValue = values.get('artifactPaths')
   const recordsIndexedValue = values.get('recordsIndexed')
+  if (artifactPathsValue === undefined || recordsIndexedValue === undefined) {
+    throw new CacheSchemaMismatch('The cache metadata key set is incomplete.')
+  }
+  const artifactPaths = parseCacheJson(artifactPathsValue, MAX_CACHE_METADATA_BYTES)
+  const recordsIndexed = Number(recordsIndexedValue)
   if (
-    values.get('schemaVersion') !== undefined &&
-    values.get('packageVersion') !== undefined &&
-    values.get('repositoryRealpath') !== undefined &&
-    values.get('manifest') !== undefined &&
-    artifactPathsValue !== undefined &&
-    recordsIndexedValue !== undefined
+    !Array.isArray(artifactPaths) ||
+    artifactPaths.length > MAX_CACHE_RECORDS ||
+    !Number.isSafeInteger(recordsIndexed) ||
+    recordsIndexed < 0 ||
+    recordsIndexed > MAX_CACHE_RECORDS
   ) {
-    try {
-      const artifactPaths = JSON.parse(artifactPathsValue) as unknown
-      const recordsIndexed = Number(recordsIndexedValue)
-      if (
-        Array.isArray(artifactPaths) &&
-        artifactPaths.every(path => typeof path === 'string') &&
-        Number.isInteger(recordsIndexed)
-      ) {
-        return {
-          artifactPaths,
-          manifest: values.get('manifest') ?? '',
-          packageVersion: values.get('packageVersion') ?? '',
-          recordsIndexed,
-          repositoryRealpath: values.get('repositoryRealpath') ?? '',
-          schemaVersion: values.get('schemaVersion') ?? '',
-        }
-      }
-    } catch {}
+    throw new CacheSchemaMismatch('The cache metadata contains invalid values.')
+  }
+  const validatedArtifactPaths = artifactPaths.map(validateCachedArtifactPath)
+  return {
+    artifactPaths: validatedArtifactPaths,
+    manifest: values.get('manifest') ?? '',
+    packageVersion: values.get('packageVersion') ?? '',
+    recordsIndexed,
+    repositoryRealpath: values.get('repositoryRealpath') ?? '',
+    schemaVersion: values.get('schemaVersion') ?? '',
   }
 }
 
@@ -321,14 +398,50 @@ const assertCacheScope = (root: string, metadata: Metadata | undefined) => {
   }
 }
 
-const metadataIsFresh = (root: string, metadata: Metadata | undefined): metadata is Metadata => {
+const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata) => {
+  const counts = database
+    .prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM records) AS records,
+        (SELECT COUNT(*) FROM record_search) AS searchRows,
+        (SELECT COUNT(DISTINCT id) FROM record_search) AS distinctSearchRows,
+        (SELECT COUNT(*) FROM records LEFT JOIN record_search ON records.id = record_search.id WHERE record_search.id IS NULL) AS missingSearchRows,
+        (SELECT COUNT(*) FROM record_search LEFT JOIN records ON records.id = record_search.id WHERE records.id IS NULL) AS orphanSearchRows
+      `,
+    )
+    .get() as {
+    distinctSearchRows?: unknown
+    missingSearchRows?: unknown
+    orphanSearchRows?: unknown
+    records?: unknown
+    searchRows?: unknown
+  }
+  if (
+    counts.records !== metadata.recordsIndexed ||
+    counts.searchRows !== metadata.recordsIndexed ||
+    counts.distinctSearchRows !== metadata.recordsIndexed ||
+    counts.missingSearchRows !== 0 ||
+    counts.orphanSearchRows !== 0
+  ) {
+    throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
+  }
+}
+
+const metadataIsFresh = (
+  root: string,
+  database: DatabaseSync,
+  metadata: Metadata | undefined,
+): metadata is Metadata => {
   assertCacheScope(root, metadata)
-  return (
+  const fresh =
     metadata !== undefined &&
     metadata.schemaVersion === SCHEMA_VERSION &&
     metadata.packageVersion === PACKAGE_VERSION &&
     metadata.manifest === repositoryManifest(root, metadata.artifactPaths)
-  )
+  if (fresh) {
+    assertCacheContentConsistent(database, metadata)
+  }
+  return fresh
 }
 
 const summaryForRecord = (record: BrainRecord) => {
@@ -406,7 +519,15 @@ const rebuildCache = (root: string): PrepareResult => {
       database = openDatabase(root)
     }
     try {
-      assertCacheScope(root, readMetadata(database))
+      let existingMetadata: Metadata | undefined
+      try {
+        existingMetadata = readMetadata(database)
+      } catch (error) {
+        if (!(error instanceof CacheSchemaMismatch)) {
+          throw error
+        }
+      }
+      assertCacheScope(root, existingMetadata)
       database.exec('BEGIN IMMEDIATE')
       try {
         database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
@@ -467,7 +588,7 @@ const prepareResolvedWithoutCorruptionRecovery = (root: string): PrepareResult =
         const recheck = openDatabase(root)
         try {
           const metadata = readMetadata(recheck)
-          if (metadataIsFresh(root, metadata)) {
+          if (metadataIsFresh(root, recheck, metadata)) {
             return {
               hydrated: false,
               recordsIndexed: metadata.recordsIndexed,
@@ -483,7 +604,7 @@ const prepareResolvedWithoutCorruptionRecovery = (root: string): PrepareResult =
   const database = openDatabase(root)
   try {
     const metadata = readMetadata(database)
-    if (metadataIsFresh(root, metadata)) {
+    if (metadataIsFresh(root, database, metadata)) {
       return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
     }
   } finally {
@@ -493,7 +614,7 @@ const prepareResolvedWithoutCorruptionRecovery = (root: string): PrepareResult =
     const recheck = openDatabase(root)
     try {
       const metadata = readMetadata(recheck)
-      if (metadataIsFresh(root, metadata)) {
+      if (metadataIsFresh(root, recheck, metadata)) {
         return {
           hydrated: false,
           recordsIndexed: metadata.recordsIndexed,
@@ -555,23 +676,37 @@ const positiveLimit = (value: unknown, fallback = 20) => {
 
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
   const root = resolveRepository(input)
-  try {
-    prepareResolved(root)
+  const readOpenDatabase = () => {
     const database = openDatabase(root)
     try {
       return read(database)
     } finally {
       database.close()
     }
+  }
+  try {
+    prepareResolved(root)
+    return readOpenDatabase()
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
+    }
+    if (isRecoverableCacheFailure(error)) {
+      withOperationLock(root, () => rebuildCache(root))
+      try {
+        return readOpenDatabase()
+      } catch (retryError) {
+        if (retryError instanceof EncephalonError) {
+          throw retryError
+        }
+        return wrapIo('Unable to read the Encephalon cache.', retryError)
+      }
     }
     return wrapIo('Unable to read the Encephalon cache.', error)
   }
 }
 
-const parseRecordRow = (row: RecordRow) => JSON.parse(row.record_json) as BrainRecord
+const parseRecordRow = (row: RecordRow) => parseCachedRecord(row.record_json)
 
 export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] =>
   withPreparedDatabase(input, database => {
@@ -652,16 +787,55 @@ export const searchRecords = (input: SearchRecordsInput): BrainRecord[] =>
 
 export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] =>
   withPreparedDatabase(input, database =>
-    searchRows(database, input).map(row => ({
-      id: row.id,
-      kind: row.kind,
-      path: row.path,
-      rank: row.rank,
-      snippet: row.snippet,
-      subject: row.subject,
-      summary: row.summary,
-    })),
+    searchRows(database, input).map(row => {
+      const record = parseRecordRow(row)
+      return {
+        id: record.id,
+        kind: record.kind,
+        path: record.path,
+        rank: row.rank,
+        snippet: row.snippet,
+        subject: record.subject,
+        summary: summaryForRecord(record),
+      }
+    }),
   )
+
+const readGatherFromDatabase = (root: string, input: GatherInput, hydrated: HydrateResult | null): GatherResult => {
+  const database = openDatabase(root)
+  try {
+    const searches = input.searches ?? []
+    const shows = input.shows ?? []
+    return {
+      hydrated,
+      records: shows.map(id => {
+        const activeClause = input.includeSuperseded === true ? '' : ' AND active = 1'
+        const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(id) as
+          | RecordRow
+          | undefined
+        return { id, record: row === undefined ? null : parseRecordRow(row) }
+      }),
+      searches: searches.map(query => ({
+        kind: input.kind ?? null,
+        query,
+        results: searchRows(database, { ...input, query }).map(row => {
+          const record = parseRecordRow(row)
+          return {
+            id: record.id,
+            kind: record.kind,
+            path: record.path,
+            rank: row.rank,
+            snippet: row.snippet,
+            subject: record.subject,
+            summary: summaryForRecord(record),
+          }
+        }),
+      })),
+    }
+  } finally {
+    database.close()
+  }
+}
 
 export const gatherRecords = (input: GatherInput): GatherResult => {
   const root = resolveRepository(input)
@@ -686,37 +860,25 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
         field: 'shows',
       })
     }
-    const database = openDatabase(root)
-    try {
-      return {
-        hydrated,
-        records: shows.map(id => {
-          const activeClause = input.includeSuperseded === true ? '' : ' AND active = 1'
-          const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(id) as
-            | RecordRow
-            | undefined
-          return { id, record: row === undefined ? null : parseRecordRow(row) }
-        }),
-        searches: searches.map(query => ({
-          kind: input.kind ?? null,
-          query,
-          results: searchRows(database, { ...input, query }).map(row => ({
-            id: row.id,
-            kind: row.kind,
-            path: row.path,
-            rank: row.rank,
-            snippet: row.snippet,
-            subject: row.subject,
-            summary: row.summary,
-          })),
-        })),
-      }
-    } finally {
-      database.close()
-    }
+    return readGatherFromDatabase(root, input, hydrated)
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
+    }
+    if (isRecoverableCacheFailure(error)) {
+      const recovered = withOperationLock(root, () => rebuildCache(root))
+      try {
+        return readGatherFromDatabase(
+          root,
+          input,
+          input.hydrate === true ? { recordsIndexed: recovered.recordsIndexed } : null,
+        )
+      } catch (retryError) {
+        if (retryError instanceof EncephalonError) {
+          throw retryError
+        }
+        return wrapIo('Unable to gather Encephalon records.', retryError)
+      }
     }
     return wrapIo('Unable to gather Encephalon records.', error)
   }
