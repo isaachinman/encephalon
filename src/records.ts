@@ -582,7 +582,11 @@ export const readRecordsAllowingGeneratedMultiHeads = (input: RootInput, allowed
   })
 }
 
-const addRecordFileResolved = (root: string, recordFile: BrainRecordFile, options: AddRecordOptions = {}): BrainRecord => {
+const addRecordFileResolved = (
+  root: string,
+  recordFile: BrainRecordFile,
+  options: AddRecordOptions = {},
+): BrainRecord => {
   const relativePath = `encephalon/${recordFile.kind}/${recordFile.id}.json`
   const path = resolve(root, ...relativePath.split('/'))
   if (existsSync(path)) {
