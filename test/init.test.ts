@@ -395,7 +395,43 @@ describe('initialisation', () => {
     assert.equal(readFileSync(join(root, backupName), 'utf8'), original)
   })
 
-  test('preserves old-descriptor mode changes after backup validation', {
+  test('reports old-descriptor mode changes after backup validation', {
+    skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    chmodSync(path, 0o600)
+    const descriptor = openSync(path, 'r+')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    try {
+      assert.throws(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'after-backup-validation') {
+                fchmodSync(descriptor, 0o744)
+              }
+            },
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+    } finally {
+      closeSync(descriptor)
+    }
+
+    const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
+    assert.ok(backupName)
+    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
+    assert.equal(statSync(join(root, backupName)).mode & 0o777, 0o744)
+  })
+
+  test('does not overwrite mode changes after final backup validation', {
     skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
   }, () => {
     const root = createRoot()
@@ -409,7 +445,7 @@ describe('initialisation', () => {
     try {
       applyInstructionChanges(root, [agentsPlan], {
         fault: point => {
-          if (point === 'after-backup-validation') {
+          if (point === 'after-final-backup-validation') {
             fchmodSync(descriptor, 0o744)
           }
         },
@@ -418,8 +454,11 @@ describe('initialisation', () => {
       closeSync(descriptor)
     }
 
+    const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
+    assert.ok(backupName)
     assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
-    assert.equal(statSync(path).mode & 0o777, 0o744)
+    assert.equal(statSync(path).mode & 0o777, 0o600)
+    assert.equal(statSync(join(root, backupName)).mode & 0o777, 0o744)
   })
 
   const faultPoints = [

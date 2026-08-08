@@ -264,6 +264,7 @@ const assertPlanIsCurrent = (root: string, plan: FilePlan) => {
 type AtomicWriteFault =
   | 'after-publication'
   | 'after-backup-validation'
+  | 'after-final-backup-validation'
   | 'before-temp-create'
   | 'during-backup-restore'
   | 'during-file-flush'
@@ -383,7 +384,10 @@ const publishTempFile = (path: string, tempPath: string, plan: FilePlan, hooks: 
     linkSync(tempPath, path)
     published = true
     const finalBackupMetadata = assertBackupUnchanged(backupPath, plan)
-    chmodSync(path, finalBackupMetadata.mode & MODE_BITS)
+    fault(hooks, 'after-final-backup-validation')
+    if ((finalBackupMetadata.mode & MODE_BITS) !== (backupMetadata.mode & MODE_BITS)) {
+      return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
       return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
