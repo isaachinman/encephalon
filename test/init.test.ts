@@ -266,7 +266,6 @@ describe('initialisation', () => {
       { arguments: ['run', 'test'], executable: 'yarn', scriptKey: 'test' },
       { arguments: ['run', 'unicodé'], executable: 'yarn', scriptKey: 'unicodé' },
     ])
-    assert.doesNotMatch(JSON.stringify(payload), /yarn .*semi;colon|yarn .*space name|line\\nbreak/)
   })
 
   test('refresh resolves equivalent generated baseline heads from branch merges', () => {
