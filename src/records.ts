@@ -17,6 +17,7 @@ import { basename, join, relative, resolve } from 'node:path'
 import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
+import { ordinalStringCompare } from './order.ts'
 import { resolveRepository } from './repository.ts'
 import { assertArtifactFile, createRecordFile, formatRecordFile, MAX_RECORD_BYTES, parseRecordFile } from './schema.ts'
 import type {
@@ -146,7 +147,7 @@ const scanCanonicalRecords = (root: string): RecordScan => {
     }
 
     const scanned = readdirSync(brainDirectory, { withFileTypes: true })
-      .sort((first, second) => first.name.localeCompare(second.name))
+      .sort((first, second) => ordinalStringCompare(first.name, second.name))
       .reduce<RecordScan>(
         (result, kindEntry) => {
           if (RESERVED_DIRECTORIES.has(kindEntry.name)) {
@@ -167,7 +168,7 @@ const scanCanonicalRecords = (root: string): RecordScan => {
           const kindPath = join(brainDirectory, kindEntry.name)
           if (!kindEntry.name.startsWith('_') && kindEntry.isDirectory() && !kindEntry.isSymbolicLink()) {
             return readdirSync(kindPath, { withFileTypes: true })
-              .sort((first, second) => first.name.localeCompare(second.name))
+              .sort((first, second) => ordinalStringCompare(first.name, second.name))
               .reduce<RecordScan>((kindResult, recordEntry) => {
                 const recordPath = join(kindPath, recordEntry.name)
                 const relativePath = posixRelative(root, recordPath)
@@ -229,7 +230,8 @@ const scanCanonicalRecords = (root: string): RecordScan => {
     return {
       errors: scanned.errors,
       records: scanned.records.sort(
-        (first, second) => first.createdAt.localeCompare(second.createdAt) || first.id.localeCompare(second.id),
+        (first, second) =>
+          ordinalStringCompare(first.createdAt, second.createdAt) || ordinalStringCompare(first.id, second.id),
       ),
     }
   }

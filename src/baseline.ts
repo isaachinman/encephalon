@@ -1,5 +1,6 @@
 import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs'
 import { extname, resolve } from 'node:path'
+import { ordinalStringCompare } from './order.ts'
 import type { AddRecordInput, JsonValue } from './types.ts'
 
 const MAX_SCANNED_FILES = 100_000
@@ -169,12 +170,10 @@ const readPackageFacts = (root: string): PackageFacts => {
           : {}),
         scriptKeys:
           value.scripts !== null && typeof value.scripts === 'object' && !Array.isArray(value.scripts)
-            ? Object.keys(value.scripts)
-                .filter(safeName)
-                .sort((first, second) => first.localeCompare(second))
+            ? Object.keys(value.scripts).filter(safeName).sort(ordinalStringCompare)
             : [],
         workspacePatterns: Array.isArray(workspaceValue)
-          ? workspaceValue.filter(safeWorkspacePattern).sort((first, second) => first.localeCompare(second))
+          ? workspaceValue.filter(safeWorkspacePattern).sort(ordinalStringCompare)
           : [],
       }
     } catch {
@@ -195,7 +194,7 @@ const scanLanguages = (root: string) => {
       return state
     }
     return readdirSync(directory, { withFileTypes: true })
-      .sort((first, second) => first.name.localeCompare(second.name))
+      .sort((first, second) => ordinalStringCompare(first.name, second.name))
       .reduce<ScanState>((current, entry) => {
         if (
           current.truncated ||
@@ -236,13 +235,13 @@ const workflowFiles = (root: string) => {
   return readdirSync(directory, { withFileTypes: true })
     .filter(entry => entry.isFile() && !entry.isSymbolicLink() && safeName(entry.name) && /\.ya?ml$/i.test(entry.name))
     .map(entry => `.github/workflows/${entry.name}`)
-    .sort((first, second) => first.localeCompare(second))
+    .sort(ordinalStringCompare)
 }
 
 const topLevelFacts = (root: string) =>
   readdirSync(root, { withFileTypes: true })
     .filter(entry => safeName(entry.name) && !entry.isSymbolicLink())
-    .sort((first, second) => first.name.localeCompare(second.name))
+    .sort((first, second) => ordinalStringCompare(first.name, second.name))
     .reduce<{ directories: string[]; recognisedFiles: string[] }>(
       (facts, entry) => {
         if (entry.isDirectory() && !EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())) {
@@ -268,12 +267,12 @@ export const scanBaseline = (root: string): AddRecordInput[] => {
   const packageManager = packageFacts.packageManager ?? packageManagerFromLock(layout.recognisedFiles)
   const scan = scanLanguages(root)
   const languages = [...scan.languageCounts.entries()]
-    .sort(([first], [second]) => first.localeCompare(second))
+    .sort(([first], [second]) => ordinalStringCompare(first, second))
     .map(([language, files]) => ({ files, language }))
   const workflows = workflowFiles(root)
   const safeSources = [
     ...new Set([...layout.recognisedFiles, ...(workflows.length === 0 ? [] : ['.github/workflows'])]),
-  ].sort((first, second) => first.localeCompare(second))
+  ].sort(ordinalStringCompare)
 
   return [
     {
@@ -326,7 +325,7 @@ const sortJson = (value: JsonValue): JsonValue => {
   if (value !== null && typeof value === 'object') {
     return Object.fromEntries(
       Object.keys(value)
-        .sort((first, second) => first.localeCompare(second))
+        .sort(ordinalStringCompare)
         .map(key => [key, sortJson(value[key] as JsonValue)]),
     )
   }

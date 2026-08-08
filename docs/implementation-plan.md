@@ -708,6 +708,7 @@ Missing `show` results are represented as `null` and are not errors. Gather pres
 - Gather search groups: exact caller-provided order, including repeated queries.
 - Gather show entries: exact caller-provided order, including repeated IDs.
 - Gather does not silently deduplicate requests.
+- Canonical JSON keys, generated baseline arrays, source manifests, validation output derived from scans, and supersession ID arrays use locale-independent UTF-16 code unit ordering. Sorting does not normalise or otherwise alter stored strings.
 
 ### 12.5 Compact search
 

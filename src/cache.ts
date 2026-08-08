@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
 import { cacheDirectory, withOperationLock } from './lock.ts'
+import { ordinalStringCompare } from './order.ts'
 import { readRecords } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import type {
@@ -242,7 +243,7 @@ const recordManifestEntries = (root: string) => {
   }
   const children = readdirSync(brainDirectory, { withFileTypes: true })
     .filter(entry => entry.name !== '_artifacts')
-    .sort((first, second) => first.name.localeCompare(second.name))
+    .sort((first, second) => ordinalStringCompare(first.name, second.name))
     .flatMap(entry => {
       const kindPath = resolve(brainDirectory, entry.name)
       const kindEntry = statEntry(root, kindPath)
@@ -250,7 +251,7 @@ const recordManifestEntries = (root: string) => {
         return [kindEntry]
       }
       const recordEntries = readdirSync(kindPath, { withFileTypes: true })
-        .sort((first, second) => first.name.localeCompare(second.name))
+        .sort((first, second) => ordinalStringCompare(first.name, second.name))
         .map(recordEntry => statEntry(root, resolve(kindPath, recordEntry.name)))
       return [kindEntry, ...recordEntries]
     })
@@ -261,7 +262,7 @@ const repositoryManifest = (root: string, artifactPaths: string[]) => {
   const entries = [
     ...recordManifestEntries(root),
     ...[...artifactPaths]
-      .sort((first, second) => first.localeCompare(second))
+      .sort(ordinalStringCompare)
       .map(path => statEntry(root, resolve(root, 'encephalon', ...path.split('/')))),
   ]
   return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
@@ -384,9 +385,7 @@ const rebuildCache = (root: string): PrepareResult => {
       }
       throw error
     }
-    const artifactPaths = [...new Set(records.flatMap(record => record.artifacts ?? []))].sort((first, second) =>
-      first.localeCompare(second),
-    )
+    const artifactPaths = [...new Set(records.flatMap(record => record.artifacts ?? []))].sort(ordinalStringCompare)
     const manifestBefore = repositoryManifest(root, artifactPaths)
     if (repositoryManifest(root, []) !== recordManifestBefore) {
       if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {

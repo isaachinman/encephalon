@@ -3,6 +3,7 @@ import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { applyInstructionChanges, planInstructionChanges } from './instructions.ts'
 import { withOperationLock } from './lock.ts'
+import { ordinalStringCompare } from './order.ts'
 import { addRecordResolved, readRecords } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import type { AddRecordInput, BrainRecord, InitEncephalonInput, InitEncephalonResult } from './types.ts'
@@ -34,7 +35,7 @@ const baselineActions = (records: BrainRecord[], baseline: AddRecordInput[], ref
           conflicts: [
             ...result.conflicts,
             {
-              activeRecordIds: matching.map(record => record.id).sort((first, second) => first.localeCompare(second)),
+              activeRecordIds: matching.map(record => record.id).sort(ordinalStringCompare),
               kind: candidate.kind,
               subject: candidate.subject,
             },
@@ -51,7 +52,7 @@ const baselineActions = (records: BrainRecord[], baseline: AddRecordInput[], ref
             ...result.additions,
             {
               ...candidate,
-              supersedes: matching.map(record => record.id).sort((first, second) => first.localeCompare(second)),
+              supersedes: matching.map(record => record.id).sort(ordinalStringCompare),
             },
           ],
         }

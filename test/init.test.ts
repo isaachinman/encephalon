@@ -17,6 +17,7 @@ import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
+import { ordinalStringCompare } from '../src/order.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -67,10 +68,11 @@ describe('initialisation', () => {
       root,
     })
     assert.equal(records.length, 3)
-    assert.deepEqual(
-      records.map(record => record.subject).sort((left, right) => left.localeCompare(right)),
-      ['encephalon:init/commands-ci', 'encephalon:init/repository-overview', 'encephalon:init/tooling-layout'],
-    )
+    assert.deepEqual(records.map(record => record.subject).sort(ordinalStringCompare), [
+      'encephalon:init/commands-ci',
+      'encephalon:init/repository-overview',
+      'encephalon:init/tooling-layout',
+    ])
     assert.equal(
       records.every(record => record.source === 'encephalon:init'),
       true,
