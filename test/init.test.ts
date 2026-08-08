@@ -376,7 +376,7 @@ describe('initialisation', () => {
         applyInstructionChanges(root, [agentsPlan], {
           fault: point => {
             if (point === 'after-backup-validation') {
-              throw new Error('Injected publication failure')
+              throw Object.assign(new Error('Injected publication failure'), { code: 'EIO' })
             }
             if (point === 'during-backup-restore') {
               writeFileSync(path, changed)
@@ -484,7 +484,7 @@ describe('initialisation', () => {
           applyInstructionChanges(root, [agentsPlan], {
             fault: point => {
               if (point === faultPoint) {
-                throw new Error(`Injected ${point}`)
+                throw Object.assign(new Error(`Injected ${point}`), { code: 'EIO' })
               }
             },
           }),

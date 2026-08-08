@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { fail } from './errors.ts'
+import { cliErrorResponse, fail } from './errors.ts'
 import {
   addRecord,
   EncephalonError,
@@ -340,14 +340,9 @@ export const runCli = (arguments_: string[] = process.argv.slice(2)) => {
     return result.exitCode ?? 0
   } catch (error) {
     if (error instanceof EncephalonError) {
-      writeJson(process.stderr, {
-        error: {
-          code: error.code,
-          details: error.details,
-          message: error.message,
-        },
-      })
-      return 2
+      const response = cliErrorResponse(error)
+      writeJson(process.stderr, response.body)
+      return response.exitCode
     }
     writeJson(process.stderr, {
       error: {
