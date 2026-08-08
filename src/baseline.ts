@@ -250,8 +250,16 @@ const topLevelFacts = (root: string) => {
   return facts
 }
 
-const commandForScript = (manager: string, script: string) =>
-  manager === 'yarn' ? `yarn ${script}` : `${manager} run ${script}`
+const invocationForScript = (manager: string, scriptKey: string) => {
+  if (scriptKey.startsWith('-')) {
+    return
+  }
+  return {
+    arguments: ['run', scriptKey],
+    executable: manager,
+    scriptKey,
+  }
+}
 
 export const scanBaseline = (root: string): AddRecordInput[] => {
   const layout = topLevelFacts(root)
@@ -298,10 +306,13 @@ export const scanBaseline = (root: string): AddRecordInput[] => {
     {
       kind: 'workflow',
       payload: {
-        commands: packageFacts.scriptKeys.map(script => commandForScript(packageManager, script)),
+        scriptInvocations: packageFacts.scriptKeys
+          .map(script => invocationForScript(packageManager, script))
+          .filter(invocation => invocation !== undefined),
         scriptKeys: packageFacts.scriptKeys,
         sources: [...(layout.recognisedFiles.includes('package.json') ? ['package.json'] : []), ...workflows],
-        summary: 'Derived package-script entry points and CI workflow filenames.',
+        summary:
+          'Derived package-script entry points and CI workflow filenames; use scriptInvocations as argv and treat scriptKeys as discovery-only.',
         workflowFiles: workflows,
       },
       source: 'encephalon:init',

@@ -85,6 +85,7 @@ describe('hot scan performance regressions', () => {
         },
       ],
       recordsChecked: 4,
+      truncated: false,
       valid: false,
     })
   })
