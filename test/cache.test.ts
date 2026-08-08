@@ -339,9 +339,14 @@ describe('SQLite cache and reads', () => {
       { budget: 'fullResultLimit', run: root => searchRecords({ limit: 51, query: 'x', root }) },
       { budget: 'compactResultLimit', run: root => searchCompactRecords({ limit: 101, query: 'x', root }) },
       { budget: 'queryBytes', run: root => searchRecords({ query: `${'x'.repeat(1024)}y`, root }) },
+      { budget: 'queryBytes', run: root => searchCompactRecords({ query: `${'x'.repeat(1024)}y`, root }) },
       {
         budget: 'queryTerms',
         run: root => searchRecords({ query: Array.from({ length: 33 }, () => 'x').join(' '), root }),
+      },
+      {
+        budget: 'queryTerms',
+        run: root => searchCompactRecords({ query: Array.from({ length: 33 }, () => 'x').join(' '), root }),
       },
       {
         budget: 'gatherSearches',

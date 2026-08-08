@@ -1027,6 +1027,7 @@ export const searchRecords = (input: SearchRecordsInput): BrainRecord[] => {
 
 export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] => {
   const parsed = parseSearchRecordsInput(input)
+  literalMatchQuery(parsed.query)
   compactResultLimit(parsed.limit)
   return withPreparedDatabase(parsed, database => createCompactSearchReader(database, parsed)(parsed.query))
 }
