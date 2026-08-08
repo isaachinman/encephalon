@@ -1,0 +1,32 @@
+{
+  "createdAt": "2026-08-08T02:04:28.950Z",
+  "id": "e49b75d4-bfea-470e-9f5b-ce645b483940",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Prevent repeat PR review issues found on MAR-2509, MAR-2510, and MAR-2512.",
+    "lessons": [
+      "For managed instruction-file publication, do not rely on a preflight-only snapshot before replacing a user-owned file; capture and revalidate the current target at publication time so concurrent edits return REPOSITORY_CHANGED instead of being overwritten.",
+      "Preserve mutable filesystem metadata from the file captured at publication time, not from the earlier plan, because owners can change permissions without changing bytes.",
+      "After renaming a user-owned file to a backup path, treat that backup inode as still mutable through existing open descriptors; revalidate it before cleanup and leave it recoverable if the bytes changed.",
+      "When restoring a moved-aside backup after a failed publication, use create-if-absent publication instead of check-then-rename so recovery cannot overwrite a target recreated by another writer.",
+      "Do not apply a final permission snapshot after publication if the source inode can still be changed through old descriptors; report pre-final mode drift and leave post-final drift recoverable on the backup instead.",
+      "When adding repository workflow guidance, keep Git commit subjects and PR titles prefixed with the Linear ticket in square brackets, for example [MAR-1234] Describe the change.",
+      "For append-only canonical record publication, treat successful hard-link creation as the commit point. Any post-publication cleanup or directory fsync failure must be best-effort and must not make the caller observe a failed mutation that will collide with RECORD_EXISTS on retry.",
+      "Cache hydration is derived state after canonical record publication. If hydration fails after the record commit point, return the committed record and let the next read rebuild cache state instead of reporting the mutation as failed.",
+      "For instruction-file deletion quarantine, the rename to a quarantine path is not the commit point. If any failure occurs before the quarantined file is unlinked while the public path is absent, restore the quarantine path or leave it visibly recoverable, and test failures after verification but before final unlink."
+    ],
+    "verification": [
+      "Search Encephalon before adding durable workflow lessons.",
+      "Add regression tests for each review comment when possible.",
+      "Use one commit per review-comment fix so replies can point to the exact change.",
+      "For publication paths, add tests for failures both before and after the commit point so successful commits are not misreported as failures.",
+      "For deletion quarantine paths, inject failures after quarantine and after verification to prove user-visible paths are restored until deletion has actually committed."
+    ]
+  },
+  "searchText": "PR review hardening lessons for Encephalon record and instruction publication",
+  "source": "agent",
+  "subject": "review.github-pr-feedback",
+  "supersedes": [
+    "a46c2d81-6579-4f27-a927-5dc07644cf38"
+  ]
+}
