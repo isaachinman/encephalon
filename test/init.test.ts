@@ -598,6 +598,39 @@ describe('initialisation', () => {
     )
   })
 
+  test('keeps old-descriptor writes recoverable after delete verification', {
+    skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const changed = '# Descriptor delete edit\n'
+    const descriptor = openSync(path, 'r+')
+
+    try {
+      assertErrorCode(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'after-delete-verification') {
+                ftruncateSync(descriptor, 0)
+                writeSync(descriptor, changed, 0, 'utf8')
+              }
+            },
+          }),
+        'REPOSITORY_CHANGED',
+      )
+    } finally {
+      closeSync(descriptor)
+    }
+
+    assert.equal(readFileSync(path, 'utf8'), changed)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
   test('keeps old-descriptor writes recoverable after backup validation', {
     skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
   }, () => {

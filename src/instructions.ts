@@ -463,6 +463,7 @@ const deletePlan = (path: string, plan: FilePlan, hooks: AtomicWriteHooks | unde
     fault(hooks, 'after-delete-quarantine')
     assertQuarantinedDeleteTarget(quarantinePath, plan)
     fault(hooks, 'after-delete-verification')
+    assertQuarantinedDeleteTarget(quarantinePath, plan)
     rmSync(quarantinePath, { force: true })
     fsyncDirectory(dirname(path))
   } catch (error) {
