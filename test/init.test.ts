@@ -240,7 +240,9 @@ describe('initialisation', () => {
     applyInstructionChanges(root, [agentsPlan])
 
     assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
-    assert.equal(statSync(path).mode & 0o777, 0o744)
+    if (process.platform !== 'win32') {
+      assert.equal(statSync(path).mode & 0o777, 0o744)
+    }
     assert.deepEqual(
       readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.tmp')),
       [],
