@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { parseArgs } from 'node:util'
-import { fail } from './errors.ts'
+import { cliErrorResponse, fail } from './errors.ts'
+import { PACKAGE_VERSION } from './generated/version.ts'
 import {
   addRecord,
   EncephalonError,
@@ -17,7 +18,6 @@ import {
 } from './index.ts'
 import type { JsonValue } from './types.ts'
 
-const VERSION = '0.1.0'
 const HELP = `Usage: encephalon [--root <path>] <command> [options]
 
 Commands:
@@ -35,8 +35,9 @@ Commands:
 
 Global options:
   --root <path>   Use this exact Git repository root.
-  --help          Show help.
-  --version       Show the package version.
+  --help, -h      Show help when this is the only remaining argv token (not per-command).
+  --version, -v   Show the package version when this is the only remaining argv token.
+  Values that start with '-' must use --name=value (for example --subject=-draft).
 `
 
 type ParsedOptions = {
@@ -195,14 +196,14 @@ const dispatch = (arguments_: string[]): CommandResult => {
     return { format: 'text', value: HELP }
   }
   if (arguments_.length === 1 && (arguments_[0] === '--version' || arguments_[0] === '-v')) {
-    return { format: 'text', value: `${VERSION}\n` }
+    return { format: 'text', value: `${PACKAGE_VERSION}\n` }
   }
   const extracted = extractRoot(arguments_)
   if (extracted.remaining.length === 1 && (extracted.remaining[0] === '--help' || extracted.remaining[0] === '-h')) {
     return { format: 'text', value: HELP }
   }
   if (extracted.remaining.length === 1 && (extracted.remaining[0] === '--version' || extracted.remaining[0] === '-v')) {
-    return { format: 'text', value: `${VERSION}\n` }
+    return { format: 'text', value: `${PACKAGE_VERSION}\n` }
   }
   const [command, ...commandArguments] = extracted.remaining
   if (command === undefined) {
@@ -375,14 +376,9 @@ export const runCli = (arguments_: string[] = process.argv.slice(2)) => {
     return result.exitCode ?? 0
   } catch (error) {
     if (error instanceof EncephalonError) {
-      writeJson(process.stderr, {
-        error: {
-          code: error.code,
-          details: error.details,
-          message: error.message,
-        },
-      })
-      return 2
+      const response = cliErrorResponse(error)
+      writeJson(process.stderr, response.body)
+      return response.exitCode
     }
     writeJson(process.stderr, {
       error: {

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, before, describe, test } from 'node:test'
+import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import { createTestRepository, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -83,6 +85,88 @@ describe('command-line interface', () => {
     })
   })
 
+  test('reports post-commit add failures with committed record details', () => {
+    const root = createRoot()
+    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'), { recursive: true })
+
+    const result = run(root, [
+      'add',
+      '--root',
+      root,
+      '--id',
+      'cli-post-commit',
+      '--kind',
+      'decision',
+      '--subject',
+      'post.commit',
+      '--source',
+      'agent',
+      '--data',
+      '{"summary":"Published"}',
+    ])
+
+    assert.equal(result.status, 2)
+    assert.equal(result.stdout, '')
+    assert.deepEqual(JSON.parse(result.stderr), {
+      error: {
+        code: 'IO_ERROR',
+        details: {
+          canonicalCommitted: true,
+          path: 'encephalon/decision/cli-post-commit.json',
+          postCommitPhase: 'cacheHydration',
+          recordId: 'cli-post-commit',
+          recoveryAction: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+        },
+        message:
+          'Record cli-post-commit was committed, but the cacheHydration post-commit phase failed. Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+      },
+    })
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'cli-post-commit.json')), true)
+
+    const retry = run(root, [
+      'add',
+      '--root',
+      root,
+      '--id',
+      'cli-post-commit',
+      '--kind',
+      'decision',
+      '--subject',
+      'post.commit',
+      '--source',
+      'agent',
+      '--data',
+      '{"summary":"Retry"}',
+    ])
+    assert.equal(retry.status, 2)
+    assert.equal(JSON.parse(retry.stderr).error.code, 'RECORD_EXISTS')
+  })
+
+  test('redacts CLI details that contain absolute repository paths', () => {
+    const root = createRoot()
+    const prepared = run(root, ['prepare', '--root', root])
+    assert.equal(prepared.status, 0)
+
+    const database = new DatabaseSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'))
+    database
+      .prepare("UPDATE metadata SET value = ? WHERE key = 'repositoryRealpath'")
+      .run(join(root, '..', 'other-repository'))
+    database.close()
+
+    const result = run(root, ['prepare', '--root', root])
+    assert.equal(result.status, 2)
+    assert.equal(result.stdout, '')
+    assert.equal(result.stderr.includes(root), false)
+    assert.equal(result.stderr.includes('Error:'), false)
+    assert.deepEqual(JSON.parse(result.stderr), {
+      error: {
+        code: 'CACHE_SCOPE_MISMATCH',
+        details: {},
+        message: 'The Encephalon cache belongs to a different repository.',
+      },
+    })
+  })
+
   test('prints invalid validation results once to stdout and exits 2', () => {
     const root = createRoot()
     const path = join(root, 'encephalon', 'decision')
@@ -100,9 +184,14 @@ describe('command-line interface', () => {
     const help = run(root, ['--help'])
     assert.equal(help.status, 0)
     assert.match(help.stdout, /^Usage: encephalon/m)
+    assert.match(help.stdout, /only remaining argv token/)
+    assert.match(help.stdout, /must use --name=value/)
     const version = run(root, ['--version'])
     assert.equal(version.status, 0)
-    assert.equal(version.stdout, '0.1.0\n')
+    assert.equal(version.stdout, `${PACKAGE_VERSION}\n`)
+    const commandHelp = run(root, ['list', '--help'])
+    assert.equal(commandHelp.status, 2)
+    assert.equal(errorJson(commandHelp).error.message, 'Unknown option --help.')
   })
 
   test('parses terminators, hyphen-leading queries, and repeated options predictably', () => {
@@ -208,6 +297,37 @@ describe('command-line interface', () => {
       ['help-query'],
     )
 
+    const dashSubject = run(root, [
+      'add',
+      '--root',
+      root,
+      '--id',
+      'dash-subject',
+      '--kind',
+      'decision',
+      '--subject=-draft',
+      '--source',
+      'agent',
+      '--data',
+      '{"summary":"Dash subject"}',
+    ])
+    assert.equal(dashSubject.status, 0)
+    assert.equal((outputJson(dashSubject) as { subject?: unknown }).subject, '-draft')
+
+    const dashListed = run(root, ['list', '--root', root, '--subject=-draft'])
+    assert.equal(dashListed.status, 0)
+    assert.deepEqual(
+      (outputJson(dashListed) as Array<{ id?: unknown }>).map(record => record.id),
+      ['dash-subject'],
+    )
+
+    const dashGathered = run(root, ['gather', '--root', root, '--search=-draft'])
+    assert.equal(dashGathered.status, 0)
+    assert.deepEqual(
+      (outputJson(dashGathered) as { searches: Array<{ query: string }> }).searches.map(search => search.query),
+      ['-draft'],
+    )
+
     const gathered = run(root, [
       'gather',
       '--root',
@@ -250,6 +370,14 @@ describe('command-line interface', () => {
       },
       { arguments_: ['show', '--root', root, '--id', '--missing'], message: '--id requires a value.' },
       { arguments_: ['list', '--root', root, '--limit=-1'], message: '--limit must be an integer between 1 and 1000.' },
+      {
+        arguments_: ['list', '--root', root, '--limit', '-1'],
+        message: '--limit requires a value.',
+      },
+      {
+        arguments_: ['add', '--root', root, '--kind', 'decision', '--subject', '-draft', '--source', 'agent', '--data', '{}'],
+        message: '--subject requires a value.',
+      },
     ]
 
     for (const entry of cases) {
