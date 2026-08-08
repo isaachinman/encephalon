@@ -1,0 +1,22 @@
+{
+  "createdAt": "2026-08-08T11:13:19.643Z",
+  "id": "b043f1e4-73a1-4ceb-b3e1-9b0ae96aa272",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Pullfrog PR #16 found corrupt SQLite operation-gate recovery must not unlink or rename a live replacement gate, and tests must prove multi-process exclusivity.",
+    "mistake": "Recovering a malformed operation-lock.sqlite by deleting the path can let one process hold a transaction on an unlinked inode while another process creates and locks a new inode at the same path.",
+    "guidance": [
+      "Serialise corrupt gate recovery with an atomic recovery marker before replacing gate files.",
+      "Make normal gate openers wait while recovery is active so no contender creates a new gate during quarantine.",
+      "Use rename-aside quarantine for corrupt gate files rather than direct unlinking of the live path.",
+      "Cover corrupt-gate recovery with at least two child-process contenders that assert exclusive critical-section entry.",
+      "Keep stale live-PID tests focused on stale owner metadata; do not mock Date.now unless the implementation still depends on clock polling."
+    ],
+    "verification": [
+      "Run node --test test/cache.test.ts after lock recovery changes.",
+      "Check Pullfrog review threads for both production race and test coverage comments before resolving them."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.lock-corrupt-gate-recovery"
+}
