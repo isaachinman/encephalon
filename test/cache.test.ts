@@ -252,6 +252,89 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('gather reads every search from one cache snapshot', () => {
+    const root = createRoot()
+    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
+    const firstId = 'search-snapshot-v1'
+    addRecord({
+      id: firstId,
+      kind: 'context',
+      payload: { summary: 'Search snapshot generation one' },
+      root,
+      searchText: 'snapshot searchable generation one',
+      source: 'agent',
+      subject: 'cache.search-snapshot',
+    })
+    const replacement = {
+      createdAt: '2026-08-08T00:00:01.000Z',
+      id: 'search-snapshot-v2',
+      kind: 'context',
+      path: 'encephalon/context/search-snapshot-v2.json',
+      payload: { summary: 'Search snapshot generation two' },
+      searchText: 'snapshot searchable generation two',
+      source: 'agent',
+      subject: 'cache.search-snapshot',
+      supersedes: [firstId],
+    }
+    let mutatedBetweenSearches = false
+
+    cacheReadTestHooks.afterCompactSearchRead = () => {
+      if (!mutatedBetweenSearches) {
+        mutatedBetweenSearches = true
+        const database = new DatabaseSync(cacheDatabasePath(root))
+        try {
+          database.exec('BEGIN IMMEDIATE')
+          database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
+          database
+            .prepare(`
+              INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `)
+            .run(
+              replacement.id,
+              replacement.kind,
+              replacement.subject,
+              replacement.source,
+              replacement.createdAt,
+              replacement.path,
+              1,
+              'Search snapshot generation two',
+              JSON.stringify(replacement),
+            )
+          database
+            .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
+            .run(replacement.id, replacement.searchText)
+          database.exec('COMMIT')
+        } catch (error) {
+          try {
+            database.exec('ROLLBACK')
+          } catch {}
+          throw error
+        } finally {
+          database.close()
+        }
+      }
+    }
+
+    try {
+      const gatherRecords =
+        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+      const gathered = gatherRecords({
+        root,
+        searches: ['snapshot searchable', 'snapshot searchable'],
+      }) as {
+        searches: Array<{ results: Array<{ id: string }> }>
+      }
+      assert.equal(mutatedBetweenSearches, true)
+      assert.deepEqual(
+        gathered.searches.map(entry => entry.results.map(result => result.id)),
+        [[firstId], [firstId]],
+      )
+    } finally {
+      cacheReadTestHooks.afterCompactSearchRead = undefined
+    }
+  })
+
   test('gather preserves duplicate order while reusing show and search statements', () => {
     const root = createRoot()
     const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')

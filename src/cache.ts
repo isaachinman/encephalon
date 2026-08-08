@@ -82,6 +82,7 @@ type CompactRow = {
 type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind' | 'limit'>
 
 type CacheReadTestHooks = {
+  afterCompactSearchRead?: ((query: string) => void) | undefined
   afterShowRead?: ((id: string) => void) | undefined
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
@@ -938,7 +939,9 @@ const createCompactSearchReader = (database: DatabaseSync, input: SearchStatemen
     if (match.length === 0) {
       return []
     }
-    return (statement.all(match, ...kindParameters, limit) as CompactRow[]).map(compactRecordFromRow)
+    const records = (statement.all(match, ...kindParameters, limit) as CompactRow[]).map(compactRecordFromRow)
+    cacheReadTestHooks.afterCompactSearchRead?.(query)
+    return records
   }
 }
 
