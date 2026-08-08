@@ -33,7 +33,7 @@ describe('package contract', () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as { version?: unknown }
 
     assert.equal(PACKAGE_VERSION, packageJson.version)
-    assert.match(generated, new RegExp(`PACKAGE_VERSION = '${PACKAGE_VERSION}'`))
+    assert.equal(generated.includes(`PACKAGE_VERSION = ${JSON.stringify(PACKAGE_VERSION)}`), true)
   })
 
   test('ships the generic repository-memory skill', () => {

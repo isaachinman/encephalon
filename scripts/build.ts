@@ -11,7 +11,7 @@ const generatedDirectory = resolve(root, 'src', 'generated')
 mkdirSync(generatedDirectory, { recursive: true })
 writeFileSync(
   resolve(generatedDirectory, 'version.ts'),
-  `// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = '${packageJson.version}'\n`,
+  `// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = ${JSON.stringify(packageJson.version)}\n`,
   'utf8',
 )
 

@@ -79,7 +79,7 @@ try {
     throw new Error('Package version must be a string.')
   }
   const generatedVersionSource = readFileSync(resolve(root, 'src', 'generated', 'version.ts'), 'utf8')
-  if (!generatedVersionSource.includes(`PACKAGE_VERSION = '${packageJson.version}'`)) {
+  if (!generatedVersionSource.includes(`PACKAGE_VERSION = ${JSON.stringify(packageJson.version)}`)) {
     throw new Error('Generated runtime package version is stale.')
   }
   if (
