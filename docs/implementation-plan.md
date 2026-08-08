@@ -1043,6 +1043,7 @@ Before changing either file:
 
 - Read raw bytes when it exists.
 - Reject NUL-containing or invalid UTF-8 text.
+- Reject instruction files larger than 1 MiB before rewriting them.
 - Detect the file's existing line ending without normalising content.
 - Detect zero, one, or multiple marker pairs.
 - Reject duplicate, nested, reversed, or unmatched markers.
