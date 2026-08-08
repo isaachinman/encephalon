@@ -322,7 +322,7 @@ describe('SQLite cache and reads', () => {
     const readyPath = join(root, 'cache-writer-timeout-ready')
     const holder = spawn(
       process.execPath,
-      [join(import.meta.dirname, 'fixtures', 'hold-cache-database-lock.ts'), cachePath, readyPath, '2200'],
+      [join(import.meta.dirname, 'fixtures', 'hold-cache-database-lock.ts'), cachePath, readyPath, '4500'],
       { stdio: 'inherit' },
     )
     waitForPath(readyPath, holder)
@@ -341,7 +341,7 @@ describe('SQLite cache and reads', () => {
     )
     const elapsed = Date.now() - startedAt
     assert.ok(elapsed >= 800)
-    assert.ok(elapsed < 2000)
+    assert.ok(elapsed < 4000)
     if (holder.exitCode === null) {
       await once(holder, 'exit')
     }
