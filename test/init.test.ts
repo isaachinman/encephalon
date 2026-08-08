@@ -29,9 +29,12 @@ const createRoot = () => {
 
 const MAX_INSTRUCTION_FILE_BYTES = 1024 * 1024
 
-const assertErrorCode = (operation: () => unknown, code: string) => {
+const assertErrorCode = (operation: () => unknown, code: string, message?: RegExp) => {
   assert.throws(operation, (error: unknown) => {
     assert.equal((error as { code?: unknown }).code, code)
+    if (message) {
+      assert.match((error as Error).message, message)
+    }
     return true
   })
 }
@@ -254,7 +257,11 @@ describe('initialisation', () => {
     writeFileSync(agentsPath, originalAgents)
     writeFileSync(claudePath, originalClaude)
 
-    assertErrorCode(() => api.initEncephalon({ root }), 'VALIDATION_FAILED')
+    assertErrorCode(
+      () => api.initEncephalon({ root }),
+      'VALIDATION_FAILED',
+      /cannot fit the Encephalon managed block within the 1 MiB instruction-file limit/,
+    )
 
     assert.deepEqual(readFileSync(agentsPath), originalAgents)
     assert.deepEqual(readFileSync(claudePath), originalClaude)

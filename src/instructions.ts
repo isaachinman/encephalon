@@ -118,7 +118,10 @@ const boundedInstructionBytes = (filename: (typeof FILENAMES)[number], bytes: Bu
   if (bytes.length <= MAX_INSTRUCTION_FILE_BYTES) {
     return bytes
   }
-  return fail('VALIDATION_FAILED', `${filename} exceeds the 1 MiB instruction-file limit.`)
+  return fail(
+    'VALIDATION_FAILED',
+    `${filename} cannot fit the Encephalon managed block within the 1 MiB instruction-file limit.`,
+  )
 }
 
 const blockFor = (metadata: BlockMetadata) => {
