@@ -32,6 +32,31 @@ const assertErrorCode = (operation: () => unknown, code: string) => {
   })
 }
 
+const assertPostCommitError = (
+  operation: () => unknown,
+  expected: {
+    phase: string
+    path: string
+    recordId: string
+  },
+) => {
+  assert.throws(operation, (error: unknown) => {
+    const actual = error as {
+      code?: unknown
+      details?: Record<string, unknown>
+    }
+    assert.equal(actual.code, 'IO_ERROR')
+    assert.deepEqual(actual.details, {
+      canonicalCommitted: true,
+      path: expected.path,
+      postCommitPhase: expected.phase,
+      recordId: expected.recordId,
+      recoveryAction: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+    })
+    return true
+  })
+}
+
 afterEach(() => {
   roots.splice(0).forEach(removeTestRepository)
 })
@@ -210,90 +235,77 @@ describe('canonical records', () => {
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'after-orphan.json')), true)
   })
 
-  test('does not misreport cleanup failure after canonical publication', () => {
+  test('reports staging cleanup failure after canonical publication as committed', () => {
     const root = createRoot()
-    const record = addRecordResolved(
-      root,
-      {
-        id: 'cleanup-failure',
-        kind: 'decision',
-        payload: { summary: 'Published' },
-        source: 'agent',
-        subject: 'cleanup.failure',
-      },
-      {
-        hooks: {
-          fault: point => {
-            if (point === 'during-cleanup') {
-              throw new Error('Injected cleanup failure')
-            }
+    assertPostCommitError(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'cleanup-failure',
+            kind: 'decision',
+            payload: { summary: 'Published' },
+            source: 'agent',
+            subject: 'cleanup.failure',
           },
-        },
-        hydrate: false,
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'during-cleanup') {
+                  throw Object.assign(new Error('Injected cleanup failure'), { code: 'EIO' })
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      {
+        path: 'encephalon/decision/cleanup-failure.json',
+        phase: 'stagingCleanup',
+        recordId: 'cleanup-failure',
       },
     )
 
-    assert.equal(record.id, 'cleanup-failure')
-    assert.equal(existsSync(join(root, record.path)), true)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'cleanup-failure.json')), true)
     assert.equal(readdirSync(join(root, 'encephalon', '_staging')).length, 1)
   })
 
-  test('does not misreport directory flush failure after canonical publication', () => {
+  test('reports cache hydration failure after canonical publication as committed', () => {
     const root = createRoot()
-    const record = addRecordResolved(
-      root,
-      {
-        id: 'flush-failure',
-        kind: 'decision',
-        payload: { summary: 'Published' },
-        source: 'agent',
-        subject: 'flush.failure',
-      },
-      {
-        hooks: {
-          fault: point => {
-            if (point === 'during-publication-flush') {
-              throw new Error('Injected directory flush failure')
-            }
+    assertPostCommitError(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'hydration-failure',
+            kind: 'decision',
+            payload: { summary: 'Published' },
+            source: 'agent',
+            subject: 'hydration.failure',
           },
-        },
-        hydrate: false,
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'during-hydration') {
+                  throw Object.assign(new Error('Injected hydration failure'), { code: 'EIO' })
+                }
+              },
+            },
+          },
+        ),
+      {
+        path: 'encephalon/decision/hydration-failure.json',
+        phase: 'cacheHydration',
+        recordId: 'hydration-failure',
       },
     )
 
-    assert.equal(record.id, 'flush-failure')
-    assert.equal(existsSync(join(root, record.path)), true)
-    assert.deepEqual(readdirSync(join(root, 'encephalon', '_staging')), [])
-  })
-
-  test('does not misreport cache hydration failure after canonical publication', () => {
-    const root = createRoot()
-    const record = addRecordResolved(
-      root,
-      {
-        id: 'hydration-failure',
-        kind: 'decision',
-        payload: { summary: 'Published' },
-        source: 'agent',
-        subject: 'hydration.failure',
-      },
-      {
-        hooks: {
-          fault: point => {
-            if (point === 'during-hydration') {
-              throw new Error('Injected hydration failure')
-            }
-          },
-        },
-      },
-    )
-
-    assert.equal(record.id, 'hydration-failure')
-    assert.equal(existsSync(join(root, record.path)), true)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'hydration-failure.json')), true)
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
     assertErrorCode(
       () =>
         api.addRecord({
-          id: record.id,
+          id: 'hydration-failure',
           kind: 'decision',
           payload: { summary: 'Retry' },
           root,
@@ -302,6 +314,40 @@ describe('canonical records', () => {
         }),
       'RECORD_EXISTS',
     )
+  })
+
+  test('does not let cleanup failure replace publication flush failure after commit', () => {
+    const root = createRoot()
+    assertPostCommitError(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'flush-and-cleanup-failure',
+            kind: 'decision',
+            payload: { summary: 'Published' },
+            source: 'agent',
+            subject: 'flush.cleanup',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'during-publication-flush' || point === 'during-cleanup') {
+                  throw Object.assign(new Error(`Injected ${point}`), { code: 'EIO' })
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      {
+        path: 'encephalon/decision/flush-and-cleanup-failure.json',
+        phase: 'publicationFlush',
+        recordId: 'flush-and-cleanup-failure',
+      },
+    )
+
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'flush-and-cleanup-failure.json')), true)
   })
 
   test('validates supersession graphs and permits a multi-head resolver', () => {

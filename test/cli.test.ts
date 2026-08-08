@@ -71,6 +71,44 @@ describe('command-line interface', () => {
     })
   })
 
+  test('reports post-commit add failures with committed record details', () => {
+    const root = createRoot()
+    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'), { recursive: true })
+
+    const result = run(root, [
+      'add',
+      '--root',
+      root,
+      '--id',
+      'cli-post-commit',
+      '--kind',
+      'decision',
+      '--subject',
+      'post.commit',
+      '--source',
+      'agent',
+      '--data',
+      '{"summary":"Published"}',
+    ])
+
+    assert.equal(result.status, 2)
+    assert.equal(result.stdout, '')
+    assert.deepEqual(JSON.parse(result.stderr), {
+      error: {
+        code: 'IO_ERROR',
+        details: {
+          canonicalCommitted: true,
+          path: 'encephalon/decision/cli-post-commit.json',
+          postCommitPhase: 'cacheHydration',
+          recordId: 'cli-post-commit',
+          recoveryAction: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+        },
+        message:
+          'Record cli-post-commit was committed, but the cacheHydration post-commit phase failed. Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+      },
+    })
+  })
+
   test('prints invalid validation results once to stdout and exits 2', () => {
     const root = createRoot()
     const path = join(root, 'encephalon', 'decision')

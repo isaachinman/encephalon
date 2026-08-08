@@ -50,6 +50,34 @@ type AddRecordOptions = {
   hydrate?: boolean
 }
 
+type PostCommitPhase = 'cacheHydration' | 'publicationFlush' | 'stagingCleanup'
+
+const POST_COMMIT_RECOVERY_ACTION =
+  'Run prepare to rebuild disposable cache state, then validate before retrying this add.'
+
+const postCommitPriority: Record<PostCommitPhase, number> = {
+  cacheHydration: 2,
+  publicationFlush: 3,
+  stagingCleanup: 1,
+}
+
+const postCommitMessage = (recordId: string, phase: PostCommitPhase) =>
+  `Record ${recordId} was committed, but the ${phase} post-commit phase failed. ${POST_COMMIT_RECOVERY_ACTION}`
+
+const postCommitError = (record: BrainRecord, phase: PostCommitPhase, cause: unknown) =>
+  new EncephalonError(
+    'IO_ERROR',
+    postCommitMessage(record.id, phase),
+    {
+      canonicalCommitted: true,
+      path: record.path,
+      postCommitPhase: phase,
+      recordId: record.id,
+      recoveryAction: POST_COMMIT_RECOVERY_ACTION,
+    },
+    { cause },
+  )
+
 const STAGING_DIRECTORY = '_staging'
 const RESERVED_DIRECTORIES = new Set(['_artifacts', STAGING_DIRECTORY])
 const directoryFlag = constants.O_DIRECTORY ?? 0
@@ -433,6 +461,14 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
   let published = false
   let operationFailed = false
   let cleanupError: unknown
+  let committedError: EncephalonError | undefined
+  let committedErrorPhase: PostCommitPhase | undefined
+  const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
+    if (committedErrorPhase === undefined || postCommitPriority[phase] > postCommitPriority[committedErrorPhase]) {
+      committedError = postCommitError(candidate, phase, error)
+      committedErrorPhase = phase
+    }
+  }
   try {
     assertRealDirectory(root, stagingDirectory)
     const descriptor = openSync(
@@ -463,8 +499,8 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
       fault(options.hooks, 'after-publication')
       fault(options.hooks, 'during-publication-flush')
       fsyncDirectory(kindDirectory)
-    } catch {
-      // The canonical hard link is already visible; do not report a committed mutation as failed.
+    } catch (error) {
+      capturePostCommitError('publicationFlush', error)
     }
   } catch (error) {
     operationFailed = true
@@ -475,7 +511,9 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
       rmSync(stagingPath, { force: true })
       fsyncDirectory(stagingDirectory)
     } catch (error) {
-      if (!(operationFailed || published)) {
+      if (published) {
+        capturePostCommitError('stagingCleanup', error)
+      } else if (!operationFailed) {
         cleanupError = error
       }
     }
@@ -483,13 +521,16 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
   if (cleanupError !== undefined) {
     throw cleanupError
   }
-  if (options.hydrate !== false) {
+  if (committedErrorPhase !== 'publicationFlush' && options.hydrate !== false) {
     try {
       fault(options.hooks, 'during-hydration')
       hydrateResolvedRepository(root, false)
-    } catch {
-      // Cache rebuild is derived state after the record commit point; the next read can rebuild it.
+    } catch (error) {
+      capturePostCommitError('cacheHydration', error)
     }
+  }
+  if (committedError !== undefined) {
+    throw committedError
   }
   return candidate
 }
