@@ -228,7 +228,7 @@ const readBoundedDirectoryEntries = (directory: string) =>
   })
 
 const scanLanguages = (root: string) => {
-  const initial: ScanState = {
+  const state: ScanState = {
     directoriesSeen: 0,
     filesSeen: 0,
     languageCounts: new Map(),
@@ -236,36 +236,36 @@ const scanLanguages = (root: string) => {
   }
   const queue = [{ depth: 0, directory: root }]
   scanDirectories: for (const { depth, directory } of queue) {
-    if (initial.directoriesSeen >= MAX_SCANNED_DIRECTORIES) {
-      initial.truncationReasons.add('directory-limit')
+    if (state.directoriesSeen >= MAX_SCANNED_DIRECTORIES) {
+      state.truncationReasons.add('directory-limit')
       break
     }
     try {
       const metadata = lstatSync(directory)
       if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
-        initial.directoriesSeen += 1
+        state.directoriesSeen += 1
         try {
           const { entries, truncated } = readBoundedDirectoryEntries(directory)
           if (truncated) {
-            initial.truncationReasons.add('directory-entry-limit')
+            state.truncationReasons.add('directory-entry-limit')
           }
           for (const entry of entries) {
             const path = resolve(directory, entry.name)
             if (entry.isDirectory()) {
               if (depth >= MAX_SCAN_DEPTH) {
-                initial.truncationReasons.add('max-depth')
+                state.truncationReasons.add('max-depth')
               } else {
                 queue.push({ depth: depth + 1, directory: path })
               }
             } else if (entry.isFile()) {
-              if (initial.filesSeen >= MAX_SCANNED_FILES) {
-                initial.truncationReasons.add('regular-file-limit')
+              if (state.filesSeen >= MAX_SCANNED_FILES) {
+                state.truncationReasons.add('regular-file-limit')
                 break scanDirectories
               }
-              initial.filesSeen += 1
+              state.filesSeen += 1
               const language = LANGUAGE_BY_EXTENSION.get(extname(entry.name).toLowerCase())
               if (language !== undefined) {
-                initial.languageCounts.set(language, (initial.languageCounts.get(language) ?? 0) + 1)
+                state.languageCounts.set(language, (state.languageCounts.get(language) ?? 0) + 1)
               }
             }
           }
@@ -273,7 +273,7 @@ const scanLanguages = (root: string) => {
       }
     } catch {}
   }
-  return initial
+  return state
 }
 
 const openRealDirectory = (path: string) => {
@@ -309,25 +309,22 @@ const workflowFiles = (root: string) => {
   return []
 }
 
-const topLevelFacts = (root: string) =>
-  readdirSync(root, { withFileTypes: true })
-    .filter(entry => safeName(entry.name) && !entry.isSymbolicLink())
-    .sort((first, second) => first.name.localeCompare(second.name))
-    .reduce<{ directories: string[]; recognisedFiles: string[] }>(
-      (facts, entry) => {
-        if (entry.isDirectory() && !EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())) {
-          return { ...facts, directories: [...facts.directories, entry.name] }
-        }
-        if (entry.isFile() && RECOGNISED_FILES.has(entry.name.toLowerCase())) {
-          return {
-            ...facts,
-            recognisedFiles: [...facts.recognisedFiles, entry.name],
-          }
-        }
-        return facts
-      },
-      { directories: [], recognisedFiles: [] },
-    )
+const topLevelFacts = (root: string) => {
+  const facts: { directories: string[]; recognisedFiles: string[] } = {
+    directories: [],
+    recognisedFiles: [],
+  }
+  for (const entry of readdirSync(root, { withFileTypes: true })
+    .filter(candidate => safeName(candidate.name) && !candidate.isSymbolicLink())
+    .sort((first, second) => first.name.localeCompare(second.name))) {
+    if (entry.isDirectory() && !EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())) {
+      facts.directories.push(entry.name)
+    } else if (entry.isFile() && RECOGNISED_FILES.has(entry.name.toLowerCase())) {
+      facts.recognisedFiles.push(entry.name)
+    }
+  }
+  return facts
+}
 
 const invocationForScript = (manager: string, scriptKey: string) => {
   if (scriptKey.startsWith('-')) {
