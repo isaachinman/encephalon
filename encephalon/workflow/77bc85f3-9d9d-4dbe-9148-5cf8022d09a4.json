@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T09:51:38.753Z",
+  "id": "77bc85f3-9d9d-4dbe-9148-5cf8022d09a4",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Pullfrog PR #12 reinforced that package script keys are discovery data and script invocations are the only executable argv source.",
+    "lessons": [
+      "Do not persist package-script commands as shell strings or encourage agents to shell-join executable and arguments.",
+      "Keep scriptInvocations as structured argv data with executable, arguments, and scriptKey; consumers must execute from this field with shell disabled.",
+      "Treat scriptKeys as discovery-only data. Keys that begin with a hyphen may remain visible there but must not produce runnable invocations.",
+      "Keep documentation aligned with the persisted payload shape, including scriptKey and any non-runnable omission rule."
+    ],
+    "verification": [
+      "Review generated baseline payloads and docs whenever script invocation semantics change.",
+      "Test unsafe script names with spaces, shell metacharacters, leading hyphens, slashes, colons, and Unicode without asserting via narrow shell-string regexes."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.package-script-invocations"
+}

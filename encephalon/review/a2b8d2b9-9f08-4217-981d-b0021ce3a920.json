@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-08T12:24:40.909Z",
+  "id": "a2b8d2b9-9f08-4217-981d-b0021ce3a920",
+  "kind": "review",
+  "payload": {
+    "summary": "Validation issue caps need one coherent shape across scan stopping, returned entries, and sentinel text.",
+    "lessons": [
+      "If validation returns a sentinel within a fixed issue-entry budget, the maximum concrete issue count is one less than the returned entry limit.",
+      "Scan-time stopping should collect only enough concrete issues to justify the sentinel instead of doing one extra discarded read.",
+      "Tests should assert the sentinel code and message, not only the final array length."
+    ],
+    "verification": [
+      "For validation-budget changes, run a malformed-corpus truncation test that checks both the retained issue count and sentinel wording."
+    ]
+  },
+  "searchText": "validation issue truncation sentinel scan cap returned entries Pullfrog",
+  "source": "agent",
+  "subject": "review.validation-truncation-shape"
+}

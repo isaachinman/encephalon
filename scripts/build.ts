@@ -3,6 +3,17 @@ import { resolve } from 'node:path'
 
 const root = resolve(import.meta.dir, '..')
 const outputDirectory = resolve(root, 'dist')
+const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as { version?: unknown }
+if (typeof packageJson.version !== 'string') {
+  throw new Error('package.json must declare a string version.')
+}
+const generatedDirectory = resolve(root, 'src', 'generated')
+mkdirSync(generatedDirectory, { recursive: true })
+writeFileSync(
+  resolve(generatedDirectory, 'version.ts'),
+  `// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = ${JSON.stringify(packageJson.version)}\n`,
+  'utf8',
+)
 
 rmSync(outputDirectory, { force: true, recursive: true })
 mkdirSync(outputDirectory, { recursive: true })

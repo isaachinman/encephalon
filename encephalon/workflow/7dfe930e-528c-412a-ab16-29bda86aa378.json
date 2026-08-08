@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T09:04:43.199Z",
+  "id": "7dfe930e-528c-412a-ab16-29bda86aa378",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Use Pullfrog reviews patiently and avoid duplicate or model-flag triggers unless a run reaches a terminal failure.",
+    "lessons": [
+      "Trigger Pullfrog reviews with a plain @pullfrog comment unless the user gives a different exact trigger.",
+      "After Pullfrog starts, allow significant time for the OSS tool to run; do not cancel, retry, or trigger duplicates merely because the agent step is quiet for several minutes.",
+      "Treat provider/model availability messages as external review-tool state, not code feedback. Only change repository code for actionable review comments or project workflow learnings.",
+      "Before confirming readiness or pushing/merging PR work, use Encephalon directly in this repository to retrieve relevant workflow learnings."
+    ],
+    "verification": [
+      "Check PR comments, review threads, and status checks for terminal Pullfrog results before deciding whether another @pullfrog trigger is necessary."
+    ]
+  },
+  "searchText": "Pullfrog review trigger and wait policy",
+  "source": "agent",
+  "subject": "workflow.pullfrog-review-gate"
+}
