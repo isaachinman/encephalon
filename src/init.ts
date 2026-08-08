@@ -4,7 +4,7 @@ import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { applyInstructionChanges, planInstructionChanges } from './instructions.ts'
 import { withOperationLock } from './lock.ts'
-import { addRecordResolved, readRecords } from './records.ts'
+import { addRecordResolved, readRecords, readRecordsAllowingGeneratedMultiHeads } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import type { AddRecordInput, BrainRecord, InitEncephalonInput, InitEncephalonResult } from './types.ts'
 
@@ -44,7 +44,8 @@ const baselineActions = (records: BrainRecord[], baseline: AddRecordInput[], ref
       }
       if (
         refresh &&
-        matching.some(record => canonicalPayload(record.payload) !== canonicalPayload(candidate.payload))
+        (matching.length > 1 ||
+          matching.some(record => canonicalPayload(record.payload) !== canonicalPayload(candidate.payload)))
       ) {
         return {
           ...result,
@@ -62,6 +63,18 @@ const baselineActions = (records: BrainRecord[], baseline: AddRecordInput[], ref
     { additions: [], conflicts: [] },
   )
 
+const readBaselineRecords = (root: string, baseline: AddRecordInput[], refresh: boolean) =>
+  refresh
+    ? readRecordsAllowingGeneratedMultiHeads(
+        { root },
+        baseline.map(candidate => ({
+          kind: candidate.kind,
+          source: 'encephalon:init',
+          subject: candidate.subject,
+        })),
+      )
+    : readRecords({ root })
+
 const initResolved = (input: InitEncephalonInput): InitEncephalonResult => {
   if (input.remove === true && input.refreshBaseline === true) {
     return fail('INVALID_ARGUMENT', 'init cannot refresh and remove managed instructions in the same operation.')
@@ -78,10 +91,15 @@ const initResolved = (input: InitEncephalonInput): InitEncephalonResult => {
     }))
   }
 
-  readRecords({ root })
+  readBaselineRecords(root, scanBaseline(root), input.refreshBaseline === true)
   return withOperationLock(root, () => {
     const instructionPlans = planInstructionChanges(root, false)
-    const actions = baselineActions(readRecords({ root }), scanBaseline(root), input.refreshBaseline === true)
+    const baseline = scanBaseline(root)
+    const actions = baselineActions(
+      readBaselineRecords(root, baseline, input.refreshBaseline === true),
+      baseline,
+      input.refreshBaseline === true,
+    )
     const recordsCreated = actions.additions.map(addition =>
       addRecordResolved(root, { ...addition, root }, { hydrate: false }),
     )
