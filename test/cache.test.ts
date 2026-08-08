@@ -849,6 +849,30 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('reclaims an abandoned operation gate recovery marker', () => {
+    const root = createRoot()
+    const recoveryPath = join(root, 'node_modules', '.cache', 'encephalon', 'operation-lock.recovery')
+    const deadProcess = spawnSync(process.execPath, ['-e', ''])
+    const deadPid = deadProcess.pid
+    assert.equal(deadProcess.status, 0)
+    assert.ok(deadPid !== undefined)
+    mkdirSync(recoveryPath, { recursive: true })
+    writeFileSync(
+      join(recoveryPath, 'owner.json'),
+      `${JSON.stringify({
+        acquiredAt: new Date().toISOString(),
+        pid: deadPid,
+        token: 'dead-recovery-owner',
+      })}\n`,
+    )
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
+    assert.equal(existsSync(recoveryPath), false)
+  })
+
   test('serialises two contenders recovering the same malformed operation gate', async () => {
     const root = createRoot()
     const cachePath = join(root, 'node_modules', '.cache', 'encephalon')
