@@ -180,8 +180,10 @@ export const parseInitInput = (value: unknown = {}): InitEncephalonInput => {
 
 export const parseAddRecordInput = (value: unknown): ParsedAddRecordInput => {
   const input = objectInput(value, 'addRecord') as AddRecordInput
+  const root = rootProperties(input)
   return {
     ...input,
+    ...root,
     recordFile: createRecordFile(input),
   }
 }

@@ -136,6 +136,18 @@ describe('SQLite cache and reads', () => {
         },
       ],
       [
+        'add root',
+        () => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')({
+            kind: 'context',
+            payload: null,
+            root: 123,
+            source: 'agent',
+            subject: 'cache.validation',
+          })
+        },
+      ],
+      [
         'init booleans',
         root => {
           functionFromApi<(input: Record<string, unknown>) => unknown>('initEncephalon')({
