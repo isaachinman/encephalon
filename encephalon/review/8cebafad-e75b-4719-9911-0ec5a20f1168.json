@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-08T12:33:29.159Z",
+  "id": "8cebafad-e75b-4719-9911-0ec5a20f1168",
+  "kind": "review",
+  "payload": {
+    "summary": "Package-version generation should quote manifest values safely and root-install mismatches should explain version drift clearly.",
+    "lessons": [
+      "When generating TypeScript constants from package.json values, emit literals with JSON.stringify instead of hand-wrapping strings.",
+      "Keep package contract checks aligned with the generated source shape so stale metadata failures remain meaningful.",
+      "If root-install verification fails because the installed package version differs from the executing bundle, keep the stable error code but use a message that points to rebuild or reinstall."
+    ],
+    "verification": [
+      "Run build, package contract tests, and check:package after changing generated package version metadata."
+    ]
+  },
+  "searchText": "package version generation JSON.stringify root install version mismatch Pullfrog",
+  "source": "agent",
+  "subject": "review.package-version-generation"
+}
