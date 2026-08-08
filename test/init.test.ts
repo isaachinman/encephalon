@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
   closeSync,
@@ -76,6 +77,12 @@ const createRoot = () => {
   roots.push(root)
   return root
 }
+
+const runCli = (root: string, arguments_: string[]) =>
+  spawnSync(process.execPath, [join(import.meta.dirname, '..', 'src', 'cli.ts'), ...arguments_], {
+    cwd: root,
+    encoding: 'utf8',
+  })
 
 const MAX_INSTRUCTION_FILE_BYTES = 1024 * 1024
 
@@ -221,6 +228,29 @@ describe('initialisation', () => {
       records.every(record => existsSync(join(root, record.path))),
       true,
     )
+  })
+
+  test('does not persist or print unrelated instruction-file content', () => {
+    const root = createRoot()
+    const sentinel = 'PRIVATE_INSTRUCTION_SENTINEL_do_not_store'
+    writeFileSync(join(root, 'AGENTS.md'), `# Agent notes\n${sentinel}\n`)
+    writeFileSync(join(root, 'CLAUDE.md'), `# Claude notes\n${sentinel}\n`)
+
+    const initialized = runCli(root, ['--root', root, 'init'])
+    assert.equal(initialized.status, 0)
+    assert.equal(initialized.stderr, '')
+    assert.doesNotMatch(initialized.stdout, new RegExp(sentinel))
+
+    const records = api.listRecords({ includeSuperseded: true, limit: 20, root })
+    assert.doesNotMatch(JSON.stringify(records), new RegExp(sentinel))
+    assert.deepEqual(api.searchRecords({ query: sentinel, root }), [])
+
+    writeFileSync(join(root, 'AGENTS.md'), `${sentinel}\n<!-- encephalon:managed-instructions:start invalid -->\n`)
+    const failed = runCli(root, ['--root', root, 'init'])
+    assert.equal(failed.status, 2)
+    assert.equal(failed.stdout, '')
+    assert.doesNotMatch(failed.stderr, new RegExp(sentinel))
+    assert.equal(JSON.parse(failed.stderr).error.code, 'VALIDATION_FAILED')
   })
 
   test('is idempotent and refreshes only changed generated facts by superseding the active head', () => {

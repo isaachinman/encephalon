@@ -38,6 +38,7 @@
   "files": [
     "dist",
     "skills",
+    "assets/encephalon.png",
     "README.md",
     "LICENSE"
   ],

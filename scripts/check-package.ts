@@ -36,6 +36,24 @@ const collectFiles = (directory: string): string[] =>
     return entry.isDirectory() ? collectFiles(path) : [path]
   })
 
+const readmeReferences = (content: string) => {
+  const pattern = /(?:!?\[[^\]]*]\(([^)]+)\)|<img\b[^>]*\bsrc=["']([^"']+)["'])/gi
+  return [...content.matchAll(pattern)]
+    .map(match => match[1] ?? match[2] ?? '')
+    .map(reference => reference.trim())
+    .filter(
+      reference =>
+        reference.length > 0 &&
+        !reference.startsWith('#') &&
+        !reference.startsWith('/') &&
+        !/^[a-z][a-z0-9+.-]*:/i.test(reference),
+    )
+    .map(reference => {
+      const [path = ''] = reference.split(/[?#]/u, 1)
+      return path.startsWith('./') ? path.slice(2) : path
+    })
+}
+
 const packedMode = (tarball: string, expectedPath: string) => {
   const archive = gunzipSync(readFileSync(tarball))
   const field = (fieldOffset: number, fieldLength: number) =>
@@ -92,7 +110,8 @@ try {
       JSON.stringify({
         '.': { import: './dist/index.mjs', types: './dist/index.d.ts' },
       }) ||
-    JSON.stringify(packageJson.files) !== JSON.stringify(['dist', 'skills', 'README.md', 'LICENSE']) ||
+    JSON.stringify(packageJson.files) !==
+      JSON.stringify(['dist', 'skills', 'assets/encephalon.png', 'README.md', 'LICENSE']) ||
     packageJson.dependencies !== undefined
   ) {
     throw new Error('Package identity, exports, engine, files, or zero-runtime-dependency contract is invalid.')
@@ -107,6 +126,7 @@ try {
     'dist/index.mjs',
     'dist/index.d.ts',
     'skills/encephalon/SKILL.md',
+    'assets/encephalon.png',
     'README.md',
     'LICENSE',
   ]
@@ -156,12 +176,19 @@ try {
   if (pack === undefined) {
     throw new Error('npm pack did not return package metadata.')
   }
-  const allowedRootFiles = new Set(['LICENSE', 'README.md', 'package.json'])
+  const allowedFiles = new Set(['LICENSE', 'README.md', 'assets/encephalon.png', 'package.json'])
   const unexpected = pack.files
     .map(file => file.path)
-    .filter(path => !(allowedRootFiles.has(path) || path.startsWith('dist/') || path.startsWith('skills/')))
+    .filter(path => !(allowedFiles.has(path) || path.startsWith('dist/') || path.startsWith('skills/')))
   if (unexpected.length > 0) {
     throw new Error(`The tarball contains unexpected files: ${unexpected.join(', ')}`)
+  }
+  const packedPaths = new Set(pack.files.map(file => file.path))
+  const missingReadmeReferences = readmeReferences(readFileSync(resolve(root, 'README.md'), 'utf8')).filter(
+    path => !packedPaths.has(path),
+  )
+  if (missingReadmeReferences.length > 0) {
+    throw new Error(`The packed README references missing files: ${missingReadmeReferences.join(', ')}`)
   }
   const tarball = resolve(temporaryDirectory, pack.filename)
   const packedCli = pack.files.find(file => file.path === 'dist/cli.mjs')
