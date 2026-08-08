@@ -320,7 +320,8 @@ export const scanBaseline = (root: string): AddRecordInput[] => {
           .filter(invocation => invocation !== undefined),
         scriptKeys: packageFacts.scriptKeys,
         sources: [...(layout.recognisedFiles.includes('package.json') ? ['package.json'] : []), ...workflows],
-        summary: 'Derived package-script entry points and CI workflow filenames.',
+        summary:
+          'Derived package-script entry points and CI workflow filenames; use scriptInvocations as argv and treat scriptKeys as discovery-only.',
         workflowFiles: workflows,
       },
       source: 'encephalon:init',

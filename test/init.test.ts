@@ -144,7 +144,8 @@ describe('initialisation', () => {
       ],
       scriptKeys: ['build', 'test'],
       sources: ['package.json', '.github/workflows/checks.yml'],
-      summary: 'Derived package-script entry points and CI workflow filenames.',
+      summary:
+        'Derived package-script entry points and CI workflow filenames; use scriptInvocations as argv and treat scriptKeys as discovery-only.',
       workflowFiles: ['.github/workflows/checks.yml'],
     })
     const serialized = JSON.stringify(records)
