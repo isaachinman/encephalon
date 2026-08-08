@@ -17,6 +17,7 @@ import {
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
+import { selectBoundedDirectoryEntries } from '../src/baseline.ts'
 import * as api from '../src/index.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
@@ -459,6 +460,24 @@ describe('initialisation', () => {
     assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, [
       'directory-entry-limit',
     ])
+  })
+
+  test('selects directory entry caps from sorted names regardless of input order', () => {
+    const reverseGroupOrder = [
+      ...Array.from({ length: 300 }, (_, index) => ({ name: `z-${String(index).padStart(3, '0')}.py` })),
+      ...Array.from({ length: 300 }, (_, index) => ({ name: `a-${String(index).padStart(3, '0')}.ts` })),
+    ]
+    const { entries, truncated } = selectBoundedDirectoryEntries(reverseGroupOrder, () => true)
+
+    assert.equal(truncated, true)
+    assert.equal(entries.length, 512)
+    assert.deepEqual(
+      entries.map(entry => entry.name),
+      [
+        ...Array.from({ length: 300 }, (_, index) => `a-${String(index).padStart(3, '0')}.ts`),
+        ...Array.from({ length: 212 }, (_, index) => `z-${String(index).padStart(3, '0')}.py`),
+      ],
+    )
   })
 
   test('bounds baseline scanner depth without following deep chains forever', () => {
