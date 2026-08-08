@@ -62,7 +62,7 @@ const isRecognizedSQLiteError = (error: unknown) => {
   }
   return (
     (typeof error.code === 'string' && SQLITE_IO_STRING_CODES.has(error.code)) ||
-    (typeof error.errcode === 'number' && SQLITE_IO_ERROR_CODES.has(error.errcode)) ||
+    (typeof error.errcode === 'number' && SQLITE_IO_ERROR_CODES.has(error.errcode & 0xff)) ||
     (typeof error.message === 'string' &&
       /database disk image is malformed|database is locked|file is not a database|SQLITE_(?:BUSY|CANTOPEN|CORRUPT|FULL|IOERR|LOCKED|NOMEM|NOTADB|PERM|READONLY)/i.test(
         error.message,

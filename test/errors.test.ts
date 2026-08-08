@@ -31,8 +31,16 @@ describe('error classification', () => {
       'IO_ERROR',
     )
     assertWrappedCode(
+      Object.assign(new Error('disk I/O error'), { code: 'ERR_SQLITE_ERROR', errcode: 266 }),
+      'IO_ERROR',
+    )
+    assertWrappedCode(
       Object.assign(new Error('file is not a database'), { code: 'ERR_SQLITE_ERROR', errcode: 26 }),
       'IO_ERROR',
+    )
+    assertWrappedCode(
+      Object.assign(new Error('UNIQUE constraint failed'), { code: 'ERR_SQLITE_ERROR', errcode: 1555 }),
+      'INTERNAL_ERROR',
     )
   })
 
