@@ -28,7 +28,5 @@
   "searchText": "PR review hardening lessons for Encephalon record and instruction publication managed file final size limit validation wording",
   "source": "agent",
   "subject": "review.github-pr-feedback",
-  "supersedes": [
-    "7e9c78c8-df84-4ed6-8eb1-04bbd9a09a08"
-  ]
+  "supersedes": ["7e9c78c8-df84-4ed6-8eb1-04bbd9a09a08"]
 }

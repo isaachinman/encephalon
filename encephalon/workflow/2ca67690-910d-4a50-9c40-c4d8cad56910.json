@@ -23,7 +23,5 @@
   "searchText": "PR review hardening lessons for Encephalon record and instruction publication",
   "source": "agent",
   "subject": "review.github-pr-feedback",
-  "supersedes": [
-    "77f71585-914f-4acf-8116-884c688abed5"
-  ]
+  "supersedes": ["77f71585-914f-4acf-8116-884c688abed5"]
 }
