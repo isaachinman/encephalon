@@ -367,7 +367,7 @@ const writeAll = (descriptor: number, bytes: Buffer, plan: FilePlan, hooks: Atom
   while (offset < bytes.length) {
     const written = writeSync(descriptor, bytes, offset, bytes.length - offset, offset)
     if (written <= 0) {
-      throw new Error(`Unable to write ${plan.filename}.`)
+      throw Object.assign(new Error(`Unable to write ${plan.filename}.`), { code: 'EIO' })
     }
     offset += written
   }

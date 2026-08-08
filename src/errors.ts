@@ -2,7 +2,9 @@ import type { EncephalonErrorCode, JsonValue } from './types.ts'
 
 const FILESYSTEM_ERROR_CODES = new Set([
   'EACCES',
+  'EAGAIN',
   'EBUSY',
+  'EDQUOT',
   'EEXIST',
   'EIO',
   'EISDIR',
@@ -16,9 +18,22 @@ const FILESYSTEM_ERROR_CODES = new Set([
   'ENOTEMPTY',
   'EPERM',
   'EROFS',
+  'ESTALE',
   'EXDEV',
 ])
-const SQLITE_ERROR_CODE_PREFIX = 'SQLITE_'
+const SQLITE_IO_ERROR_CODES = new Set([3, 5, 6, 7, 8, 10, 11, 13, 14, 26])
+const SQLITE_IO_STRING_CODES = new Set([
+  'SQLITE_BUSY',
+  'SQLITE_CANTOPEN',
+  'SQLITE_CORRUPT',
+  'SQLITE_FULL',
+  'SQLITE_IOERR',
+  'SQLITE_LOCKED',
+  'SQLITE_NOMEM',
+  'SQLITE_NOTADB',
+  'SQLITE_PERM',
+  'SQLITE_READONLY',
+])
 const MAX_CLI_STRING_LENGTH = 256
 const MAX_CLI_ARRAY_LENGTH = 25
 const MAX_CLI_OBJECT_KEYS = 25
@@ -41,10 +56,10 @@ const isRecognizedSQLiteError = (error: unknown) => {
     return false
   }
   return (
-    (typeof error.code === 'string' && error.code.startsWith(SQLITE_ERROR_CODE_PREFIX)) ||
-    typeof error.errcode === 'number' ||
+    (typeof error.code === 'string' && SQLITE_IO_STRING_CODES.has(error.code)) ||
+    (typeof error.errcode === 'number' && SQLITE_IO_ERROR_CODES.has(error.errcode)) ||
     (typeof error.message === 'string' &&
-      /database disk image is malformed|database is locked|file is not a database|SQLITE_(?:BUSY|LOCKED)/i.test(
+      /database disk image is malformed|database is locked|file is not a database|SQLITE_(?:BUSY|CANTOPEN|CORRUPT|FULL|IOERR|LOCKED|NOMEM|NOTADB|PERM|READONLY)/i.test(
         error.message,
       ))
   )
