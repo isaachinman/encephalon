@@ -145,87 +145,68 @@ const scanCanonicalRecords = (root: string): RecordScan => {
       }
     }
 
-    const scanned = readdirSync(brainDirectory, { withFileTypes: true })
-      .sort((first, second) => first.name.localeCompare(second.name))
-      .reduce<RecordScan>(
-        (result, kindEntry) => {
-          if (RESERVED_DIRECTORIES.has(kindEntry.name)) {
-            return kindEntry.isDirectory() && !kindEntry.isSymbolicLink()
-              ? result
-              : {
-                  errors: [
-                    ...result.errors,
+    const scanned: RecordScan = { errors: [], records: [] }
+    for (const kindEntry of readdirSync(brainDirectory, { withFileTypes: true }).sort((first, second) =>
+      first.name.localeCompare(second.name),
+    )) {
+      if (RESERVED_DIRECTORIES.has(kindEntry.name)) {
+        if (!(kindEntry.isDirectory() && !kindEntry.isSymbolicLink())) {
+          scanned.errors.push(
+            issue(
+              'INVALID_RECORD_LAYOUT',
+              `${kindEntry.name} must be a real directory.`,
+              `encephalon/${kindEntry.name}`,
+            ),
+          )
+        }
+      } else {
+        const kindPath = join(brainDirectory, kindEntry.name)
+        if (!kindEntry.name.startsWith('_') && kindEntry.isDirectory() && !kindEntry.isSymbolicLink()) {
+          for (const recordEntry of readdirSync(kindPath, { withFileTypes: true }).sort((first, second) =>
+            first.name.localeCompare(second.name),
+          )) {
+            const recordPath = join(kindPath, recordEntry.name)
+            const relativePath = posixRelative(root, recordPath)
+            if (recordEntry.isFile() && !recordEntry.isSymbolicLink() && recordEntry.name.endsWith('.json')) {
+              try {
+                const record = readRecord(root, recordPath)
+                const expectedName = `${record.id}.json`
+                if (recordEntry.name !== expectedName || record.kind !== kindEntry.name) {
+                  scanned.errors.push(
                     issue(
-                      'INVALID_RECORD_LAYOUT',
-                      `${kindEntry.name} must be a real directory.`,
-                      `encephalon/${kindEntry.name}`,
-                    ),
-                  ],
-                  records: result.records,
-                }
-          }
-          const kindPath = join(brainDirectory, kindEntry.name)
-          if (!kindEntry.name.startsWith('_') && kindEntry.isDirectory() && !kindEntry.isSymbolicLink()) {
-            return readdirSync(kindPath, { withFileTypes: true })
-              .sort((first, second) => first.name.localeCompare(second.name))
-              .reduce<RecordScan>((kindResult, recordEntry) => {
-                const recordPath = join(kindPath, recordEntry.name)
-                const relativePath = posixRelative(root, recordPath)
-                if (recordEntry.isFile() && !recordEntry.isSymbolicLink() && recordEntry.name.endsWith('.json')) {
-                  try {
-                    const record = readRecord(root, recordPath)
-                    const expectedName = `${record.id}.json`
-                    const pathErrors = [
-                      ...(recordEntry.name === expectedName && record.kind === kindEntry.name
-                        ? []
-                        : [
-                            issue(
-                              'RECORD_PATH_MISMATCH',
-                              'Record filename and parent kind must match its envelope.',
-                              relativePath,
-                              record.id,
-                            ),
-                          ]),
-                    ]
-                    return {
-                      errors: [...kindResult.errors, ...pathErrors],
-                      records: [...kindResult.records, record],
-                    }
-                  } catch (error) {
-                    const message = error instanceof Error ? error.message : 'Record could not be parsed.'
-                    return {
-                      errors: [...kindResult.errors, issue('INVALID_RECORD', message, relativePath)],
-                      records: kindResult.records,
-                    }
-                  }
-                }
-                return {
-                  errors: [
-                    ...kindResult.errors,
-                    issue(
-                      'INVALID_RECORD_LAYOUT',
-                      'Kind directories may contain only direct regular JSON files.',
+                      'RECORD_PATH_MISMATCH',
+                      'Record filename and parent kind must match its envelope.',
                       relativePath,
+                      record.id,
                     ),
-                  ],
-                  records: kindResult.records,
+                  )
                 }
-              }, result)
+                scanned.records.push(record)
+              } catch (error) {
+                const message = error instanceof Error ? error.message : 'Record could not be parsed.'
+                scanned.errors.push(issue('INVALID_RECORD', message, relativePath))
+              }
+            } else {
+              scanned.errors.push(
+                issue(
+                  'INVALID_RECORD_LAYOUT',
+                  'Kind directories may contain only direct regular JSON files.',
+                  relativePath,
+                ),
+              )
+            }
           }
-          return {
-            errors: [
-              ...result.errors,
-              issue(
-                'INVALID_RECORD_LAYOUT',
-                'The brain root may contain only kind directories and reserved internal directories.',
-                posixRelative(root, kindPath),
-              ),
-            ],
-            records: result.records,
-          }
-        },
-        { errors: [], records: [] },
-      )
+        } else {
+          scanned.errors.push(
+            issue(
+              'INVALID_RECORD_LAYOUT',
+              'The brain root may contain only kind directories and reserved internal directories.',
+              posixRelative(root, kindPath),
+            ),
+          )
+        }
+      }
+    }
     return {
       errors: scanned.errors,
       records: scanned.records.sort(
@@ -239,47 +220,48 @@ const scanCanonicalRecords = (root: string): RecordScan => {
 const duplicateAndCaseIssues = (records: BrainRecord[]) => {
   const ids = new Map<string, BrainRecord>()
   const paths = new Map<string, BrainRecord>()
-  return records.reduce<ValidationIssue[]>((errors, record) => {
+  const errors: ValidationIssue[] = []
+  for (const record of records) {
     const idCollision = ids.get(record.id)
     const pathCollision = paths.get(record.path.normalize('NFC').toLowerCase())
     ids.set(record.id, record)
     paths.set(record.path.normalize('NFC').toLowerCase(), record)
-    return [
-      ...errors,
-      ...(idCollision === undefined
-        ? []
-        : [issue('DUPLICATE_RECORD_ID', `Duplicate record id ${record.id}.`, record.path, record.id)]),
-      ...(pathCollision === undefined || pathCollision.path === record.path
-        ? []
-        : [issue('CASE_COLLISION', 'Record paths collide on case-insensitive filesystems.', record.path, record.id)]),
-    ]
-  }, [])
+    if (idCollision !== undefined) {
+      errors.push(issue('DUPLICATE_RECORD_ID', `Duplicate record id ${record.id}.`, record.path, record.id))
+    }
+    if (pathCollision !== undefined && pathCollision.path !== record.path) {
+      errors.push(
+        issue('CASE_COLLISION', 'Record paths collide on case-insensitive filesystems.', record.path, record.id),
+      )
+    }
+  }
+  return errors
 }
 
 const supersessionIssues = (records: BrainRecord[]) => {
   const byId = new Map(records.map(record => [record.id, record]))
-  const edgeIssues = records.flatMap(record =>
-    (record.supersedes ?? []).flatMap(targetId => {
+  const edgeIssues: ValidationIssue[] = []
+  for (const record of records) {
+    for (const targetId of record.supersedes ?? []) {
       const target = byId.get(targetId)
       if (target === undefined) {
-        return [issue('MISSING_SUPERSEDES', `Record supersedes missing record ${targetId}.`, record.path, record.id)]
-      }
-      if (targetId === record.id) {
-        return [issue('SELF_SUPERSEDES', 'A record may not supersede itself.', record.path, record.id)]
-      }
-      if (target.kind !== record.kind || target.subject !== record.subject) {
-        return [
+        edgeIssues.push(
+          issue('MISSING_SUPERSEDES', `Record supersedes missing record ${targetId}.`, record.path, record.id),
+        )
+      } else if (targetId === record.id) {
+        edgeIssues.push(issue('SELF_SUPERSEDES', 'A record may not supersede itself.', record.path, record.id))
+      } else if (target.kind !== record.kind || target.subject !== record.subject) {
+        edgeIssues.push(
           issue(
             'CROSS_SUBJECT_SUPERSEDES',
             'Superseded records must have the same kind and subject.',
             record.path,
             record.id,
           ),
-        ]
+        )
       }
-      return []
-    }),
-  )
+    }
+  }
 
   const cycleIssues: ValidationIssue[] = []
   const visiting = new Set<string>()
@@ -306,49 +288,59 @@ const supersessionIssues = (records: BrainRecord[]) => {
   }
 
   const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-  const activeGroups = records
-    .filter(record => !superseded.has(record.id))
-    .reduce<Map<string, BrainRecord[]>>((groups, record) => {
+  const activeGroups = new Map<string, BrainRecord[]>()
+  for (const record of records) {
+    if (!superseded.has(record.id)) {
       const key = `${record.kind}\0${record.subject}`
-      groups.set(key, [...(groups.get(key) ?? []), record])
-      return groups
-    }, new Map())
-  const activeIssues = [...activeGroups.values()].flatMap(group =>
-    group.length <= 1
-      ? []
-      : group.map(record =>
+      const group = activeGroups.get(key)
+      if (group === undefined) {
+        activeGroups.set(key, [record])
+      } else {
+        group.push(record)
+      }
+    }
+  }
+  const activeIssues: ValidationIssue[] = []
+  for (const group of activeGroups.values()) {
+    if (group.length > 1) {
+      for (const record of group) {
+        activeIssues.push(
           issue(
             'MULTIPLE_ACTIVE_HEADS',
             `Multiple active records exist for ${record.kind}/${record.subject}.`,
             record.path,
             record.id,
           ),
-        ),
-  )
+        )
+      }
+    }
+  }
   return [...edgeIssues, ...cycleIssues, ...activeIssues]
 }
 
 const artifactIssues = (root: string, records: BrainRecord[]) => {
   const brainDirectory = resolve(root, 'encephalon')
   const paths = new Map<string, string>()
-  return records.flatMap(record =>
-    (record.artifacts ?? []).flatMap(artifact => {
+  const errors: ValidationIssue[] = []
+  for (const record of records) {
+    for (const artifact of record.artifacts ?? []) {
       const collisionKey = artifact.normalize('NFC').toLowerCase()
       const collision = paths.get(collisionKey)
       paths.set(collisionKey, artifact)
-      const collisionIssues =
-        collision === undefined || collision === artifact
-          ? []
-          : [issue('CASE_COLLISION', 'Artifact paths collide on case-insensitive filesystems.', record.path, record.id)]
+      if (collision !== undefined && collision !== artifact) {
+        errors.push(
+          issue('CASE_COLLISION', 'Artifact paths collide on case-insensitive filesystems.', record.path, record.id),
+        )
+      }
       try {
         assertArtifactFile(brainDirectory, artifact)
-        return collisionIssues
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Artifact is invalid.'
-        return [...collisionIssues, issue('INVALID_ARTIFACT', message, record.path, record.id)]
+        errors.push(issue('INVALID_ARTIFACT', message, record.path, record.id))
       }
-    }),
-  )
+    }
+  }
+  return errors
 }
 
 const validateScanned = (root: string, scan: RecordScan): ValidateResult => {

@@ -185,47 +185,41 @@ const readPackageFacts = (root: string): PackageFacts => {
 }
 
 const scanLanguages = (root: string) => {
-  const initial: ScanState = {
+  const state: ScanState = {
     filesSeen: 0,
     languageCounts: new Map(),
     truncated: false,
   }
-  const visit = (directory: string, state: ScanState): ScanState => {
+  const visit = (directory: string) => {
     if (state.truncated) {
-      return state
+      return
     }
-    return readdirSync(directory, { withFileTypes: true })
-      .sort((first, second) => first.name.localeCompare(second.name))
-      .reduce<ScanState>((current, entry) => {
-        if (
-          current.truncated ||
-          !safeName(entry.name) ||
-          entry.isSymbolicLink() ||
-          EXCLUDED_FILES.has(entry.name.toLowerCase())
-        ) {
-          return current
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((first, second) =>
+      first.name.localeCompare(second.name),
+    )) {
+      if (
+        state.truncated ||
+        !safeName(entry.name) ||
+        entry.isSymbolicLink() ||
+        EXCLUDED_FILES.has(entry.name.toLowerCase())
+      ) {
+        continue
+      }
+      const path = resolve(directory, entry.name)
+      if (entry.isDirectory() && !EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())) {
+        visit(path)
+      } else if (entry.isFile()) {
+        state.filesSeen += 1
+        const language = LANGUAGE_BY_EXTENSION.get(extname(entry.name).toLowerCase())
+        if (language !== undefined) {
+          state.languageCounts.set(language, (state.languageCounts.get(language) ?? 0) + 1)
         }
-        const path = resolve(directory, entry.name)
-        if (entry.isDirectory()) {
-          return EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase()) ? current : visit(path, current)
-        }
-        if (entry.isFile()) {
-          const filesSeen = current.filesSeen + 1
-          const language = LANGUAGE_BY_EXTENSION.get(extname(entry.name).toLowerCase())
-          const languageCounts = new Map(current.languageCounts)
-          if (language !== undefined) {
-            languageCounts.set(language, (languageCounts.get(language) ?? 0) + 1)
-          }
-          return {
-            filesSeen,
-            languageCounts,
-            truncated: filesSeen >= MAX_SCANNED_FILES,
-          }
-        }
-        return current
-      }, state)
+        state.truncated = state.filesSeen >= MAX_SCANNED_FILES
+      }
+    }
   }
-  return visit(root, initial)
+  visit(root)
+  return state
 }
 
 const workflowFiles = (root: string) => {
@@ -239,25 +233,22 @@ const workflowFiles = (root: string) => {
     .sort((first, second) => first.localeCompare(second))
 }
 
-const topLevelFacts = (root: string) =>
-  readdirSync(root, { withFileTypes: true })
-    .filter(entry => safeName(entry.name) && !entry.isSymbolicLink())
-    .sort((first, second) => first.name.localeCompare(second.name))
-    .reduce<{ directories: string[]; recognisedFiles: string[] }>(
-      (facts, entry) => {
-        if (entry.isDirectory() && !EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())) {
-          return { ...facts, directories: [...facts.directories, entry.name] }
-        }
-        if (entry.isFile() && RECOGNISED_FILES.has(entry.name.toLowerCase())) {
-          return {
-            ...facts,
-            recognisedFiles: [...facts.recognisedFiles, entry.name],
-          }
-        }
-        return facts
-      },
-      { directories: [], recognisedFiles: [] },
-    )
+const topLevelFacts = (root: string) => {
+  const facts: { directories: string[]; recognisedFiles: string[] } = {
+    directories: [],
+    recognisedFiles: [],
+  }
+  for (const entry of readdirSync(root, { withFileTypes: true })
+    .filter(candidate => safeName(candidate.name) && !candidate.isSymbolicLink())
+    .sort((first, second) => first.name.localeCompare(second.name))) {
+    if (entry.isDirectory() && !EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())) {
+      facts.directories.push(entry.name)
+    } else if (entry.isFile() && RECOGNISED_FILES.has(entry.name.toLowerCase())) {
+      facts.recognisedFiles.push(entry.name)
+    }
+  }
+  return facts
+}
 
 const commandForScript = (manager: string, script: string) =>
   manager === 'yarn' ? `yarn ${script}` : `${manager} run ${script}`
