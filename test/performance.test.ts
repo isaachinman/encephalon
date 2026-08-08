@@ -140,7 +140,8 @@ describe('hot scan performance regressions', () => {
     const recordsSource = readFileSync(join(import.meta.dirname, '..', 'src', 'records.ts'), 'utf8')
     const baselineSource = readFileSync(join(import.meta.dirname, '..', 'src', 'baseline.ts'), 'utf8')
 
-    assert.doesNotMatch(recordsSource, /\.\.\.(?:result|kindResult)\.(?:errors|records)/)
+    assert.doesNotMatch(recordsSource, /return \[\.\.\.errors,/)
+    assert.doesNotMatch(recordsSource, /new Set<[^>]+>\(\[\.\.\.ids,\s*\.\.\./)
     assert.doesNotMatch(recordsSource, /groups\.set\(key,\s*\[\.\.\./)
     assert.doesNotMatch(baselineSource, /new Map\(current\.languageCounts\)/)
     assert.doesNotMatch(baselineSource, /\.\.\.facts\.(?:directories|recognisedFiles)/)
