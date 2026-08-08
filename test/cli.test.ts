@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import { createTestRepository, removeTestRepository } from '../test/helpers.ts'
@@ -68,6 +69,31 @@ describe('command-line interface', () => {
         code: 'INVALID_ARGUMENT',
         details: {},
         message: 'add requires --kind, --subject, --source, and --data.',
+      },
+    })
+  })
+
+  test('redacts CLI details that contain absolute repository paths', () => {
+    const root = createRoot()
+    const prepared = run(root, ['prepare', '--root', root])
+    assert.equal(prepared.status, 0)
+
+    const database = new DatabaseSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'))
+    database
+      .prepare("UPDATE metadata SET value = ? WHERE key = 'repositoryRealpath'")
+      .run(join(root, '..', 'other-repository'))
+    database.close()
+
+    const result = run(root, ['prepare', '--root', root])
+    assert.equal(result.status, 2)
+    assert.equal(result.stdout, '')
+    assert.equal(result.stderr.includes(root), false)
+    assert.equal(result.stderr.includes('Error:'), false)
+    assert.deepEqual(JSON.parse(result.stderr), {
+      error: {
+        code: 'CACHE_SCOPE_MISMATCH',
+        details: {},
+        message: 'The Encephalon cache belongs to a different repository.',
       },
     })
   })
