@@ -13,20 +13,13 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs'
-import { basename, join, relative, resolve } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
 import { resolveRepository } from './repository.ts'
 import { assertArtifactFile, createRecordFile, formatRecordFile, MAX_RECORD_BYTES, parseRecordFile } from './schema.ts'
-import type {
-  AddRecordInput,
-  BrainRecord,
-  BrainRecordFile,
-  RootInput,
-  ValidateResult,
-  ValidationIssue,
-} from './types.ts'
+import type { AddRecordInput, BrainRecord, RootInput, ValidateResult, ValidationIssue } from './types.ts'
 
 type RecordScan = {
   records: BrainRecord[]
@@ -505,6 +498,3 @@ export const addRecord = (input: AddRecordInput): BrainRecord => {
     return wrapIo('Unable to add the Encephalon record.', error)
   }
 }
-
-export const canonicalRecordPath = (record: BrainRecordFile) =>
-  join('encephalon', record.kind, `${basename(record.id)}.json`).replaceAll('\\', '/')
