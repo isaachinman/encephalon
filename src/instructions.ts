@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import type { Stats } from 'node:fs'
 import {
   chmodSync,
   closeSync,
@@ -38,6 +39,12 @@ type FilePlan = {
   originalBytes: Buffer
   originalContent: string
   originalFileExisted: boolean
+  originalIdentity?: FileIdentity
+}
+
+type FileIdentity = {
+  dev: number
+  ino: number
 }
 
 const ALLOWED_SEPARATORS = new Set(['', '\n', '\n\n', '\r\n', '\r\n\r\n'])
@@ -46,6 +53,14 @@ const MAX_INSTRUCTION_FILE_BYTES = 1024 * 1024
 const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
 const directoryFlag = typeof constants.O_DIRECTORY === 'number' ? constants.O_DIRECTORY : 0
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+
+const identityFor = (metadata: Stats): FileIdentity => ({
+  dev: metadata.dev,
+  ino: metadata.ino,
+})
+
+const sameIdentity = (left: FileIdentity | undefined, right: FileIdentity) =>
+  left !== undefined && left.dev === right.dev && left.ino === right.ino
 
 const lstatIfExists = (path: string) => {
   try {
@@ -215,6 +230,7 @@ const additionPlan = (root: string, filename: (typeof FILENAMES)[number]): FileP
       originalBytes,
       originalContent: content,
       originalFileExisted: existed,
+      ...(existingMetadata === undefined ? {} : { originalIdentity: identityFor(existingMetadata) }),
     }
   }
   const lineEnding = lineEndingFor(content)
@@ -236,6 +252,7 @@ const additionPlan = (root: string, filename: (typeof FILENAMES)[number]): FileP
     contentBytes: nextBytes,
     filename,
     originalBytes,
+    ...(existingMetadata === undefined ? {} : { originalIdentity: identityFor(existingMetadata) }),
     originalContent: content,
     originalFileExisted: existed,
   }
@@ -266,6 +283,7 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
       originalBytes,
       originalContent: content,
       originalFileExisted: true,
+      originalIdentity: identityFor(fileMetadata),
     }
   }
   const contentWithoutBlock = `${content.slice(0, installed.start - installed.separator.length)}${content.slice(installed.end)}`
@@ -276,6 +294,7 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
       originalBytes,
       originalContent: content,
       originalFileExisted: true,
+      originalIdentity: identityFor(fileMetadata),
     }
   }
   const nextBytes = Buffer.from(contentWithoutBlock, 'utf8')
@@ -287,6 +306,7 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
     originalBytes,
     originalContent: content,
     originalFileExisted: true,
+    originalIdentity: identityFor(fileMetadata),
   }
 }
 
@@ -308,7 +328,13 @@ const assertPlanIsCurrent = (root: string, plan: FilePlan) => {
 type AtomicWriteFault =
   | 'after-publication'
   | 'after-backup-validation'
+  | 'after-delete-quarantine'
+  | 'after-delete-verification'
   | 'after-final-backup-validation'
+  | 'after-plan-validation'
+  | 'before-deletion'
+  | 'during-delete-flush'
+  | 'during-quarantine-restore'
   | 'before-temp-create'
   | 'during-backup-restore'
   | 'during-file-flush'
@@ -400,6 +426,61 @@ const assertBackupUnchanged = (backupPath: string, plan: FilePlan) => {
     return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
   }
   return metadata
+}
+
+const restoreQuarantinedFile = (path: string, quarantinePath: string, hooks: AtomicWriteHooks | undefined) => {
+  try {
+    if (lstatIfExists(path) === undefined && lstatIfExists(quarantinePath) !== undefined) {
+      fault(hooks, 'during-quarantine-restore')
+      linkSync(quarantinePath, path)
+      rmSync(quarantinePath, { force: true })
+    }
+  } catch {
+    // Keep the quarantined file in place so the inspected bytes remain recoverable.
+  }
+}
+
+const assertQuarantinedDeleteTarget = (quarantinePath: string, plan: FilePlan) => {
+  const metadata = lstatIfExists(quarantinePath)
+  if (metadata === undefined || metadata.isSymbolicLink() || !metadata.isFile()) {
+    return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+  }
+  if (!sameIdentity(plan.originalIdentity, identityFor(metadata))) {
+    return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+  }
+  if (!readRegularFileBytes(quarantinePath, plan.filename).equals(plan.originalBytes)) {
+    return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+  }
+}
+
+const deletePlan = (path: string, plan: FilePlan, hooks: AtomicWriteHooks | undefined) => {
+  const quarantinePath = tempPathFor(path, 'delete')
+  let quarantined = false
+  try {
+    fault(hooks, 'before-deletion')
+    assertQuarantinedDeleteTarget(path, plan)
+    renameSync(path, quarantinePath)
+    quarantined = true
+    fault(hooks, 'after-delete-quarantine')
+    assertQuarantinedDeleteTarget(quarantinePath, plan)
+    fault(hooks, 'after-delete-verification')
+    assertQuarantinedDeleteTarget(quarantinePath, plan)
+    rmSync(quarantinePath, { force: true })
+    try {
+      fault(hooks, 'during-delete-flush')
+      fsyncDirectory(dirname(path))
+    } catch {
+      // The quarantine unlink is the deletion commit point; do not report a committed deletion as failed.
+    }
+  } catch (error) {
+    if (quarantined) {
+      restoreQuarantinedFile(path, quarantinePath, hooks)
+    }
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+    }
+    throw error
+  }
 }
 
 const publishTempFile = (path: string, tempPath: string, plan: FilePlan, hooks: AtomicWriteHooks | undefined) => {
@@ -502,10 +583,11 @@ export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?:
         assertPlanIsCurrent(root, plan)
       }
     }
+    fault(hooks, 'after-plan-validation')
     for (const plan of plans) {
       const path = resolve(root, plan.filename)
       if (plan.action === 'delete') {
-        rmSync(path)
+        deletePlan(path, plan, hooks)
       }
       if (plan.action === 'write') {
         writePlan(root, path, plan, hooks)

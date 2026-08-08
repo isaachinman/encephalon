@@ -5,15 +5,17 @@ import {
   existsSync,
   fchmodSync,
   ftruncateSync,
+  mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
   writeSync,
 } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
@@ -37,6 +39,13 @@ const assertErrorCode = (operation: () => unknown, code: string, message?: RegEx
     }
     return true
   })
+}
+
+const createDeletePlan = (root: string) => {
+  api.initEncephalon({ root })
+  const [agentsPlan] = planInstructionChanges(root, true)
+  assert.equal(agentsPlan?.action, 'delete')
+  return agentsPlan
 }
 
 afterEach(() => {
@@ -447,6 +456,201 @@ describe('initialisation', () => {
     assert.equal(readFileSync(path, 'utf8'), changed)
   })
 
+  test('does not delete an instruction file replaced after global plan validation', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const replacement = '# Replacement guidance\n'
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-plan-validation') {
+              writeFileSync(path, replacement)
+            }
+          },
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+  })
+
+  const preDeletionReplacementCases = [
+    {
+      assertReplacement: (path: string, replacement: string) => assert.equal(readFileSync(path, 'utf8'), replacement),
+      name: 'regular file',
+      replace: (path: string, replacement: string) => writeFileSync(path, replacement),
+      skip: false,
+    },
+    {
+      assertReplacement: (path: string, replacement: string) => assert.equal(readFileSync(path, 'utf8'), replacement),
+      name: 'different file containing identical bytes',
+      replace: (path: string, replacement: string) => {
+        rmSync(path)
+        writeFileSync(path, replacement)
+      },
+      skip: false,
+    },
+    {
+      assertReplacement: (path: string, replacement: string) => assert.equal(readFileSync(path, 'utf8'), replacement),
+      name: 'symlink',
+      replace: (path: string, replacement: string) => {
+        const target = join(dirname(path), 'replacement-target.md')
+        rmSync(path)
+        writeFileSync(target, replacement)
+        symlinkSync(target, path)
+      },
+      skip: process.platform === 'win32',
+    },
+    {
+      assertReplacement: (path: string) => assert.equal(statSync(path).isDirectory(), true),
+      name: 'directory',
+      replace: (path: string) => {
+        rmSync(path)
+        mkdirSync(path)
+      },
+      skip: false,
+    },
+  ] as const
+
+  for (const replacementCase of preDeletionReplacementCases) {
+    test(`does not delete a ${replacementCase.name} replacement immediately before deletion`, {
+      skip: replacementCase.skip ? 'Windows runners may not permit file symlink creation.' : false,
+    }, () => {
+      const root = createRoot()
+      const path = join(root, 'AGENTS.md')
+      const agentsPlan = createDeletePlan(root)
+      const replacement =
+        replacementCase.name === 'regular file' ? '# Replacement guidance\n' : readFileSync(path, 'utf8')
+
+      assertErrorCode(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'before-deletion') {
+                replacementCase.replace(path, replacement)
+              }
+            },
+          }),
+        'REPOSITORY_CHANGED',
+      )
+      replacementCase.assertReplacement(path, replacement)
+    })
+  }
+
+  test('does not delete a replacement created after deletion quarantine', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const replacement = '# Replacement after quarantine\n'
+
+    applyInstructionChanges(root, [agentsPlan], {
+      fault: point => {
+        if (point === 'after-delete-quarantine') {
+          writeFileSync(path, replacement)
+        }
+      },
+    })
+
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+  })
+
+  test('does not delete a replacement created after deletion verification', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const replacement = '# Replacement after verification\n'
+
+    applyInstructionChanges(root, [agentsPlan], {
+      fault: point => {
+        if (point === 'after-delete-verification') {
+          writeFileSync(path, replacement)
+        }
+      },
+    })
+
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+  })
+
+  test('restores the quarantined instruction file when final unlink fails', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const original = readFileSync(path, 'utf8')
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-delete-verification') {
+              throw new Error('Injected final unlink failure')
+            }
+          },
+        }),
+      'IO_ERROR',
+    )
+
+    assert.equal(readFileSync(path, 'utf8'), original)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
+  test('keeps old-descriptor writes recoverable after delete verification', {
+    skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const changed = '# Descriptor delete edit\n'
+    const descriptor = openSync(path, 'r+')
+
+    try {
+      assertErrorCode(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'after-delete-verification') {
+                ftruncateSync(descriptor, 0)
+                writeSync(descriptor, changed, 0, 'utf8')
+              }
+            },
+          }),
+        'REPOSITORY_CHANGED',
+      )
+    } finally {
+      closeSync(descriptor)
+    }
+
+    assert.equal(readFileSync(path, 'utf8'), changed)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
+  test('does not misreport directory flush failure after committed delete', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+
+    applyInstructionChanges(root, [agentsPlan], {
+      fault: point => {
+        if (point === 'during-delete-flush') {
+          throw new Error('Injected delete flush failure')
+        }
+      },
+    })
+
+    assert.equal(existsSync(path), false)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
   test('keeps old-descriptor writes recoverable after backup validation', {
     skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
   }, () => {
@@ -515,6 +719,36 @@ describe('initialisation', () => {
     assert.ok(backupName)
     assert.equal(readFileSync(path, 'utf8'), changed)
     assert.equal(readFileSync(join(root, backupName), 'utf8'), original)
+  })
+
+  test('does not overwrite files created while restoring a quarantined delete', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const original = readFileSync(path, 'utf8')
+    const replacement = '# Concurrent delete restore guidance\n'
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-delete-verification') {
+              throw new Error('Injected deletion failure')
+            }
+            if (point === 'during-quarantine-restore') {
+              writeFileSync(path, replacement)
+            }
+          },
+        }),
+      'IO_ERROR',
+    )
+
+    const [quarantineName] = readdirSync(root).filter(
+      name => name.startsWith('.AGENTS.md.') && name.endsWith('.delete'),
+    )
+    assert.ok(quarantineName)
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+    assert.equal(readFileSync(join(root, quarantineName), 'utf8'), original)
   })
 
   test('reports old-descriptor mode changes after backup validation', {
