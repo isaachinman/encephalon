@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T12:07:03.860Z",
+  "id": "76e4ea10-a8cc-4e6d-aa3b-9fb5ece06c6d",
+  "kind": "review",
+  "payload": {
+    "summary": "Cache budget work must keep compact projections JSON-free and stream full-record rows through byte checks.",
+    "lessons": [
+      "Do not reuse full-record SELECT helpers for compact search or gather search paths; compact paths should select only cached metadata plus FTS rank/snippet.",
+      "A full-response byte cap applied after StatementSync.all() still allows large transient allocation. Use StatementSync.iterate() or an equivalent cursor-like path so parsing stops when the running byte budget is exceeded.",
+      "When merging older cache-budget branches over newer cache hardening, preserve the split full/compact readers and apply budgets to the current parser/read architecture."
+    ],
+    "verification": [
+      "Inspect compact search SQL for absence of records.record_json before pushing cache budget changes.",
+      "Run cache tests covering request budget pre-I/O rejection and full-response byte caps after resolving cache conflicts."
+    ]
+  },
+  "searchText": "cache budget compact projection full record streaming Pullfrog",
+  "source": "agent",
+  "subject": "review.cache-budget-streaming"
+}

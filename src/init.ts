@@ -1,3 +1,4 @@
+import { parseInitInput } from './api-input.ts'
 import { canonicalPayload, scanBaseline } from './baseline.ts'
 import { hydrateResolvedRepository, prepareResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
@@ -56,7 +57,8 @@ const baselineActions = (records: BrainRecord[], baseline: AddRecordInput[], ref
       }
       if (
         refresh &&
-        matching.some(record => canonicalPayload(record.payload) !== canonicalPayload(candidate.payload))
+        (matching.length > 1 ||
+          matching.some(record => canonicalPayload(record.payload) !== canonicalPayload(candidate.payload)))
       ) {
         return {
           ...result,
@@ -92,9 +94,21 @@ const initResolved = (input: InitEncephalonInput, hooks: InitHooks = {}): InitEn
 
   return withOperationLock(root, () => {
     const instructionPlans = planInstructionChanges(root, false)
-    const records = readRecordsResolved(root, hooks)
     hooks.baselineScan?.()
-    const actions = baselineActions(records, scanBaseline(root), input.refreshBaseline === true)
+    const baseline = scanBaseline(root)
+    const refresh = input.refreshBaseline === true
+    const records = readRecordsResolved(
+      root,
+      hooks,
+      refresh
+        ? baseline.map(candidate => ({
+            kind: candidate.kind,
+            source: 'encephalon:init',
+            subject: candidate.subject,
+          }))
+        : undefined,
+    )
+    const actions = baselineActions(records, baseline, refresh)
     const plans = actions.additions.map(addition => planRecordAddition(root, { ...addition, root }))
     if (plans.length > 0) {
       assertRecordGraph(
@@ -121,7 +135,7 @@ const initResolved = (input: InitEncephalonInput, hooks: InitHooks = {}): InitEn
 
 export const initEncephalon = (input: InitEncephalonInput = {}): InitEncephalonResult => {
   try {
-    return initResolved(input)
+    return initResolved(parseInitInput(input))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -135,7 +149,7 @@ export const initEncephalonWithHooks = (
   hooks: InitHooks = {},
 ): InitEncephalonResult => {
   try {
-    return initResolved(input, hooks)
+    return initResolved(parseInitInput(input), hooks)
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
