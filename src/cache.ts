@@ -24,9 +24,16 @@ const PACKAGE_VERSION = '0.1.0'
 const SCHEMA_VERSION = '1'
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
 const DATABASE_FILENAME = 'brain.sqlite'
+const SQLITE_BUSY_TIMEOUT_MILLISECONDS = 1000
 
 type SQLiteModule = {
-  DatabaseSync: new (path: string) => DatabaseSync
+  DatabaseSync: new (
+    path: string,
+    options?: {
+      readOnly?: boolean
+      timeout?: number
+    },
+  ) => DatabaseSync
 }
 
 type Metadata = {
@@ -93,6 +100,8 @@ const isRecoverableCacheFailure = (error: unknown) => {
   const sqlite = error as { errcode?: unknown; message?: unknown }
   return (
     error instanceof CacheSchemaMismatch ||
+    sqlite.errcode === 8 ||
+    sqlite.errcode === 14 ||
     sqlite.errcode === 11 ||
     sqlite.errcode === 26 ||
     (typeof sqlite.message === 'string' &&
@@ -112,7 +121,7 @@ const assertTableColumns = (database: DatabaseSync, table: string, expected: str
 
 const removeCorruptCache = (root: string) => {
   const path = databasePath(root)
-  for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+  for (const candidate of [path, `${path}-wal`, `${path}-shm`, `${path}-journal`]) {
     rmSync(candidate, { force: true })
   }
 }
@@ -142,56 +151,82 @@ const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync'])
   }
 }
 
-const openDatabase = (root: string) => {
+const assertCacheSchema = (database: DatabaseSync) => {
+  assertTableColumns(database, 'metadata', ['key', 'value'])
+  assertTableColumns(database, 'records', [
+    'id',
+    'kind',
+    'subject',
+    'source',
+    'created_at',
+    'path',
+    'active',
+    'summary',
+    'record_json',
+  ])
+  assertTableColumns(database, 'record_search', ['id', 'text'])
+  const searchSchema = database
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'record_search'")
+    .get() as { sql?: unknown } | undefined
+  if (typeof searchSchema?.sql !== 'string' || !/\bUSING\s+fts5\b/i.test(searchSchema.sql)) {
+    throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
+  }
+}
+
+const createCacheSchema = (database: DatabaseSync) => {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS metadata (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS records (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      source TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      path TEXT NOT NULL,
+      active INTEGER NOT NULL CHECK (active IN (0, 1)),
+      summary TEXT,
+      record_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS records_active_order
+      ON records(active, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS records_kind_subject
+      ON records(kind, subject);
+    CREATE VIRTUAL TABLE IF NOT EXISTS record_search USING fts5(
+      id UNINDEXED,
+      text
+    );
+  `)
+}
+
+const openWriterDatabase = (root: string) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  const database = new DatabaseConstructor(databasePath(root))
+  const database = new DatabaseConstructor(databasePath(root), {
+    timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
+  })
   try {
     database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS metadata (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS records (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        subject TEXT NOT NULL,
-        source TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        path TEXT NOT NULL,
-        active INTEGER NOT NULL CHECK (active IN (0, 1)),
-        summary TEXT,
-        record_json TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS records_active_order
-        ON records(active, created_at DESC, id DESC);
-      CREATE INDEX IF NOT EXISTS records_kind_subject
-        ON records(kind, subject);
-      CREATE VIRTUAL TABLE IF NOT EXISTS record_search USING fts5(
-        id UNINDEXED,
-        text
-      );
-    `)
-    assertTableColumns(database, 'metadata', ['key', 'value'])
-    assertTableColumns(database, 'records', [
-      'id',
-      'kind',
-      'subject',
-      'source',
-      'created_at',
-      'path',
-      'active',
-      'summary',
-      'record_json',
-    ])
-    assertTableColumns(database, 'record_search', ['id', 'text'])
-    const searchSchema = database
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'record_search'")
-      .get() as { sql?: unknown } | undefined
-    if (typeof searchSchema?.sql !== 'string' || !/\bUSING\s+fts5\b/i.test(searchSchema.sql)) {
-      throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
-    }
+    createCacheSchema(database)
+    assertCacheSchema(database)
+    return database
+  } catch (error) {
+    database.close()
+    throw error
+  }
+}
+
+const openReaderDatabase = (root: string) => {
+  const { DatabaseSync: DatabaseConstructor } = loadSQLite()
+  verifySQLiteFeatures(DatabaseConstructor)
+  const database = new DatabaseConstructor(databasePath(root), {
+    readOnly: true,
+    timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
+  })
+  try {
+    assertCacheSchema(database)
     return database
   } catch (error) {
     database.close()
@@ -368,6 +403,16 @@ const writeMetadata = (database: DatabaseSync, metadata: Metadata) => {
   }
 }
 
+const readFreshMetadata = (root: string): Metadata | undefined => {
+  const database = openReaderDatabase(root)
+  try {
+    const metadata = readMetadata(database)
+    return metadataIsFresh(root, metadata) ? metadata : undefined
+  } finally {
+    database.close()
+  }
+}
+
 const rebuildCache = (root: string): PrepareResult => {
   const attempts = Array.from({ length: MAX_REPOSITORY_CHANGE_RETRIES }, (_, index) => index)
   for (const attempt of attempts) {
@@ -397,13 +442,13 @@ const rebuildCache = (root: string): PrepareResult => {
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
     let database: DatabaseSync
     try {
-      database = openDatabase(root)
+      database = openWriterDatabase(root)
     } catch (error) {
       if (!isRecoverableCacheFailure(error)) {
         throw error
       }
       removeCorruptCache(root)
-      database = openDatabase(root)
+      database = openWriterDatabase(root)
     }
     try {
       assertCacheScope(root, readMetadata(database))
@@ -464,43 +509,34 @@ const prepareResolvedWithoutCorruptionRecovery = (root: string): PrepareResult =
   if (!existsSync(databasePath(root))) {
     return withOperationLock(root, () => {
       if (existsSync(databasePath(root))) {
-        const recheck = openDatabase(root)
         try {
-          const metadata = readMetadata(recheck)
-          if (metadataIsFresh(root, metadata)) {
-            return {
-              hydrated: false,
-              recordsIndexed: metadata.recordsIndexed,
-            }
+          const metadata = readFreshMetadata(root)
+          if (metadata !== undefined) {
+            return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
           }
-        } finally {
-          recheck.close()
+        } catch (error) {
+          if (!isRecoverableCacheFailure(error)) {
+            throw error
+          }
         }
       }
       return rebuildCache(root)
     })
   }
-  const database = openDatabase(root)
-  try {
-    const metadata = readMetadata(database)
-    if (metadataIsFresh(root, metadata)) {
-      return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
-    }
-  } finally {
-    database.close()
+  const cachedMetadata = readFreshMetadata(root)
+  if (cachedMetadata !== undefined) {
+    return { hydrated: false, recordsIndexed: cachedMetadata.recordsIndexed }
   }
   return withOperationLock(root, () => {
-    const recheck = openDatabase(root)
     try {
-      const metadata = readMetadata(recheck)
-      if (metadataIsFresh(root, metadata)) {
-        return {
-          hydrated: false,
-          recordsIndexed: metadata.recordsIndexed,
-        }
+      const metadata = readFreshMetadata(root)
+      if (metadata !== undefined) {
+        return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
       }
-    } finally {
-      recheck.close()
+    } catch (error) {
+      if (!isRecoverableCacheFailure(error)) {
+        throw error
+      }
     }
     return rebuildCache(root)
   })
@@ -553,16 +589,55 @@ const positiveLimit = (value: unknown, fallback = 20) => {
   return fail('INVALID_ARGUMENT', 'limit must be an integer between 1 and 1000.', { field: 'limit' })
 }
 
-const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
-  const root = resolveRepository(input)
+const openFreshReaderDatabase = (root: string) => {
+  const database = openReaderDatabase(root)
   try {
-    prepareResolved(root)
-    const database = openDatabase(root)
+    const metadata = readMetadata(database)
+    if (metadataIsFresh(root, metadata)) {
+      return database
+    }
+    throw new CacheSchemaMismatch('The Encephalon cache metadata is stale.')
+  } catch (error) {
+    database.close()
+    throw error
+  }
+}
+
+const readPreparedDatabase = <Result>(root: string, read: (database: DatabaseSync) => Result) => {
+  const readOnce = () => {
+    const database = openFreshReaderDatabase(root)
     try {
       return read(database)
     } finally {
       database.close()
     }
+  }
+
+  try {
+    return readOnce()
+  } catch (error) {
+    if (!isRecoverableCacheFailure(error)) {
+      throw error
+    }
+    return withOperationLock(root, () => {
+      try {
+        return readOnce()
+      } catch (recheckError) {
+        if (!isRecoverableCacheFailure(recheckError)) {
+          throw recheckError
+        }
+        rebuildCache(root)
+        return readOnce()
+      }
+    })
+  }
+}
+
+const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
+  const root = resolveRepository(input)
+  try {
+    prepareResolved(root)
+    return readPreparedDatabase(root, read)
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -686,34 +761,29 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
         field: 'shows',
       })
     }
-    const database = openDatabase(root)
-    try {
-      return {
-        hydrated,
-        records: shows.map(id => {
-          const activeClause = input.includeSuperseded === true ? '' : ' AND active = 1'
-          const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(id) as
-            | RecordRow
-            | undefined
-          return { id, record: row === undefined ? null : parseRecordRow(row) }
-        }),
-        searches: searches.map(query => ({
-          kind: input.kind ?? null,
-          query,
-          results: searchRows(database, { ...input, query }).map(row => ({
-            id: row.id,
-            kind: row.kind,
-            path: row.path,
-            rank: row.rank,
-            snippet: row.snippet,
-            subject: row.subject,
-            summary: row.summary,
-          })),
+    return readPreparedDatabase(root, database => ({
+      hydrated,
+      records: shows.map(id => {
+        const activeClause = input.includeSuperseded === true ? '' : ' AND active = 1'
+        const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(id) as
+          | RecordRow
+          | undefined
+        return { id, record: row === undefined ? null : parseRecordRow(row) }
+      }),
+      searches: searches.map(query => ({
+        kind: input.kind ?? null,
+        query,
+        results: searchRows(database, { ...input, query }).map(row => ({
+          id: row.id,
+          kind: row.kind,
+          path: row.path,
+          rank: row.rank,
+          snippet: row.snippet,
+          subject: row.subject,
+          summary: row.summary,
         })),
-      }
-    } finally {
-      database.close()
-    }
+      })),
+    }))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
