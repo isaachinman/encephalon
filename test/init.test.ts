@@ -20,11 +20,57 @@ import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { selectBoundedDirectoryEntries } from '../src/baseline.ts'
 import * as api from '../src/index.ts'
+import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
+
+type InitCounts = {
+  baselineScans: number
+  canonicalScans: number
+  graphValidations: number
+  hydrations: number
+}
+
+type InitFaultPoint =
+  | 'after-publication'
+  | 'before-publication'
+  | 'during-cleanup'
+  | 'during-hydration'
+  | 'during-publication-flush'
+  | 'during-staging-write'
+
+const initWithCounts = (
+  input: Parameters<typeof initEncephalonWithHooks>[0],
+  fault?: (point: InitFaultPoint) => void,
+) => {
+  const counts: InitCounts = {
+    baselineScans: 0,
+    canonicalScans: 0,
+    graphValidations: 0,
+    hydrations: 0,
+  }
+  const result = initEncephalonWithHooks(input, {
+    baselineScan: () => {
+      counts.baselineScans += 1
+    },
+    canonicalScan: () => {
+      counts.canonicalScans += 1
+    },
+    graphValidation: () => {
+      counts.graphValidations += 1
+    },
+    hydration: cacheResult => {
+      if (cacheResult.hydrated) {
+        counts.hydrations += 1
+      }
+    },
+    ...(fault === undefined ? {} : { recordWriteHooks: { fault } }),
+  })
+  return { counts, result }
+}
 
 const createRoot = () => {
   const root = createTestRepository()
@@ -246,6 +292,120 @@ describe('initialisation', () => {
     ])
     assert.doesNotMatch(JSON.stringify(workflow[0]?.payload), /lint-private-body/)
     assert.equal(api.listRecords({ limit: 20, root }).length, 3)
+  })
+
+  test('plans first and idempotent baseline additions against one canonical snapshot', () => {
+    const root = createRoot()
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+
+    const first = initWithCounts({ root })
+    assert.equal(first.result.recordsCreated.length, 3)
+    assert.deepEqual(first.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 2,
+      hydrations: 1,
+    })
+
+    const second = initWithCounts({ root })
+    assert.deepEqual(second.result.recordsCreated, [])
+    assert.deepEqual(second.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 1,
+      hydrations: 0,
+    })
+  })
+
+  test('refreshes one or three changed generated subjects with one planning scan', () => {
+    const root = createRoot()
+    const packagePath = join(root, 'package.json')
+    writeFileSync(
+      packagePath,
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+    initWithCounts({ root })
+
+    writeFileSync(
+      packagePath,
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { lint: 'lint-private-body', test: 'node --test' },
+      }),
+    )
+    const oneChanged = initWithCounts({ refreshBaseline: true, root })
+    assert.equal(oneChanged.result.recordsCreated.length, 1)
+    assert.deepEqual(oneChanged.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 2,
+      hydrations: 1,
+    })
+
+    writeFileSync(
+      packagePath,
+      JSON.stringify({
+        name: 'renamed-project',
+        scripts: { build: 'private-build-command', lint: 'lint-private-body', test: 'node --test' },
+      }),
+    )
+    ensureParent(join(root, 'src', 'index.ts'))
+    writeFileSync(join(root, 'src', 'index.ts'), 'export const value = 1')
+    const threeChanged = initWithCounts({ refreshBaseline: true, root })
+    assert.equal(threeChanged.result.recordsCreated.length, 3)
+    assert.deepEqual(threeChanged.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 2,
+      hydrations: 1,
+    })
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('reruns safely after a mid-batch baseline publication failure', () => {
+    const root = createRoot()
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+    let publicationAttempts = 0
+    assert.throws(
+      () =>
+        initWithCounts({ root }, point => {
+          if (point === 'before-publication') {
+            publicationAttempts += 1
+            if (publicationAttempts === 2) {
+              throw new Error('Injected mid-batch failure')
+            }
+          }
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        return true
+      },
+    )
+
+    assert.equal(api.validateRecords({ root }).valid, true)
+    assert.equal(api.listRecords({ includeSuperseded: true, limit: 20, root }).length, 1)
+
+    const rerun = initWithCounts({ root })
+    assert.equal(rerun.result.recordsCreated.length, 2)
+    assert.equal(api.validateRecords({ root }).valid, true)
+    const records = api.listRecords({ includeSuperseded: true, limit: 20, root })
+    assert.equal(records.length, 3)
+    assert.deepEqual(new Set(records.map(record => record.subject)).size, 3)
   })
 
   test('records package scripts as structured argv data instead of shell strings', () => {

@@ -14,7 +14,14 @@ import {
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
-import { addRecordResolved, MAX_CANONICAL_RECORDS, validateRecordsResolved } from '../src/records.ts'
+import {
+  addRecordResolved,
+  assertRecordGraph,
+  MAX_CANONICAL_RECORD_BYTES,
+  MAX_CANONICAL_RECORDS,
+  planRecordAddition,
+  validateRecordsResolved,
+} from '../src/records.ts'
 import { discoverRepository } from '../src/repository.ts'
 import type { ValidateResult } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
@@ -215,6 +222,42 @@ describe('canonical records', () => {
     assert.deepEqual(record.artifacts, [artifact])
     assert.deepEqual(readdirSync(join(root, 'encephalon', '_artifacts', 'architecture', id)), ['diagram.svg'])
     assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('validates planned graph bytes without counting runtime paths', () => {
+    const root = createRoot()
+    const plans = Array.from({ length: 8 }, (_, index) =>
+      planRecordAddition(root, {
+        id: `planned-byte-accounting-${index}`,
+        kind: 'decision',
+        payload: { summary: 'x'.repeat(1_048_350) },
+        source: 'agent',
+        subject: `planning.bytes.${index}`,
+      }),
+    )
+    const canonicalBytes = plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted, 'utf8'), 0)
+    const runtimeBytes = plans.reduce(
+      (total, plan) => total + Buffer.byteLength(`${JSON.stringify(plan.record, null, 2)}\n`, 'utf8'),
+      0,
+    )
+
+    assert.equal(canonicalBytes <= MAX_CANONICAL_RECORD_BYTES, true)
+    assert.equal(runtimeBytes > MAX_CANONICAL_RECORD_BYTES, true)
+    assert.doesNotThrow(() =>
+      assertRecordGraph(
+        root,
+        plans.map(plan => plan.record),
+      ),
+    )
+    assert.doesNotThrow(() =>
+      assertRecordGraph(
+        root,
+        plans.map(plan => plan.record),
+        'Canonical records are invalid.',
+        {},
+        canonicalBytes,
+      ),
+    )
   })
 
   test('rejects a symlinked internal staging directory before writing records', {
