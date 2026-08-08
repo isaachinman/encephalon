@@ -326,6 +326,60 @@ describe('SQLite cache and reads', () => {
     assert.equal(searchCompactRecords({ query: 'searchable marker', root })[0]?.summary, null)
   })
 
+  test('keeps compact search and repeated gather ordering aligned with full search for large records', () => {
+    const root = createRoot()
+    const largePayload = 'payload filler '.repeat(10_000)
+    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
+    const records = [
+      addRecord({
+        id: 'large-search-alpha',
+        kind: 'context',
+        payload: { body: largePayload, summary: 'Alpha compact summary' },
+        root,
+        searchText: 'shared performance needle',
+        source: 'agent',
+        subject: 'search.large.alpha',
+      }),
+      addRecord({
+        id: 'large-search-beta',
+        kind: 'context',
+        payload: { body: largePayload, summary: 'Beta compact summary' },
+        root,
+        searchText: 'shared performance needle',
+        source: 'agent',
+        subject: 'search.large.beta',
+      }),
+    ]
+    const expectedIds = records.map(record => record.id).reverse()
+
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    const searchCompactRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
+    const fullIds = searchRecords({ query: 'shared performance needle', root }).map(record => record.id)
+    const compactResults = searchCompactRecords({ query: 'shared performance needle', root })
+
+    assert.deepEqual(fullIds, expectedIds)
+    assert.deepEqual(
+      compactResults.map(record => record.id),
+      fullIds,
+    )
+    assert.deepEqual(
+      compactResults.map(record => Object.keys(record).sort()),
+      compactResults.map(() => ['id', 'kind', 'path', 'rank', 'snippet', 'subject', 'summary']),
+    )
+
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+    const gathered = gatherRecords({
+      root,
+      searches: ['shared performance needle', 'shared performance needle'],
+    }) as { searches: Array<{ results: Array<{ id: string }> }> }
+    assert.deepEqual(
+      gathered.searches.map(entry => entry.results.map(record => record.id)),
+      [fullIds, fullIds],
+    )
+  })
+
   test('accepts request budget boundaries and rejects one unit over before cache I/O', () => {
     const validRoot = createRoot()
     const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
