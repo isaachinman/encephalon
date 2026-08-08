@@ -460,9 +460,10 @@ const rebuildCache = (root: string): PrepareResult => {
   return fail('INTERNAL_ERROR', 'The Encephalon cache rebuild ended unexpectedly.')
 }
 
-const prepareResolvedWithoutCorruptionRecovery = (root: string): PrepareResult => {
+const prepareResolvedWithoutCorruptionRecovery = (root: string, lock = true): PrepareResult => {
+  const serialize = <Result>(operation: () => Result) => (lock ? withOperationLock(root, operation) : operation())
   if (!existsSync(databasePath(root))) {
-    return withOperationLock(root, () => {
+    return serialize(() => {
       if (existsSync(databasePath(root))) {
         const recheck = openDatabase(root)
         try {
@@ -489,7 +490,7 @@ const prepareResolvedWithoutCorruptionRecovery = (root: string): PrepareResult =
   } finally {
     database.close()
   }
-  return withOperationLock(root, () => {
+  return serialize(() => {
     const recheck = openDatabase(root)
     try {
       const metadata = readMetadata(recheck)
@@ -506,16 +507,18 @@ const prepareResolvedWithoutCorruptionRecovery = (root: string): PrepareResult =
   })
 }
 
-const prepareResolved = (root: string): PrepareResult => {
+const prepareResolved = (root: string, lock = true): PrepareResult => {
   try {
-    return prepareResolvedWithoutCorruptionRecovery(root)
+    return prepareResolvedWithoutCorruptionRecovery(root, lock)
   } catch (error) {
     if (!isRecoverableCacheFailure(error)) {
       throw error
     }
-    return withOperationLock(root, () => rebuildCache(root))
+    return lock ? withOperationLock(root, () => rebuildCache(root)) : rebuildCache(root)
   }
 }
+
+export const prepareResolvedRepository = (root: string, lock = true): PrepareResult => prepareResolved(root, lock)
 
 export const hydrateResolvedRepository = (root: string, lock = true): PrepareResult =>
   lock ? withOperationLock(root, () => rebuildCache(root)) : rebuildCache(root)

@@ -33,7 +33,7 @@ type RecordScan = {
   errors: ValidationIssue[]
 }
 
-type RecordWriteFault =
+export type RecordWriteFault =
   | 'after-publication'
   | 'before-publication'
   | 'during-cleanup'
@@ -41,13 +41,26 @@ type RecordWriteFault =
   | 'during-publication-flush'
   | 'during-staging-write'
 
-type RecordWriteHooks = {
+export type RecordWriteHooks = {
   fault?: (point: RecordWriteFault) => void
+}
+
+export type RecordReadHooks = {
+  canonicalScan?: () => void
+  graphValidation?: () => void
 }
 
 type AddRecordOptions = {
   hooks?: RecordWriteHooks
   hydrate?: boolean
+}
+
+type PlannedRecord = {
+  formatted: string
+  path: string
+  record: BrainRecord
+  recordFile: BrainRecordFile
+  relativePath: string
 }
 
 const STAGING_DIRECTORY = '_staging'
@@ -351,7 +364,8 @@ const artifactIssues = (root: string, records: BrainRecord[]) => {
   )
 }
 
-const validateScanned = (root: string, scan: RecordScan): ValidateResult => {
+const validateScanned = (root: string, scan: RecordScan, hooks: RecordReadHooks = {}): ValidateResult => {
+  hooks.graphValidation?.()
   const errors = [
     ...scan.errors,
     ...duplicateAndCaseIssues(scan.records),
@@ -377,10 +391,10 @@ export const validateRecords = (input: RootInput = {}): ValidateResult => {
   }
 }
 
-export const readRecords = (input: RootInput = {}) => {
-  const root = resolveRepository(input)
+export const readRecordsResolved = (root: string, hooks: RecordReadHooks = {}) => {
+  hooks.canonicalScan?.()
   const scan = scanCanonicalRecords(root)
-  const result = validateScanned(root, scan)
+  const result = validateScanned(root, scan, hooks)
   if (result.valid) {
     return scan.records
   }
@@ -392,7 +406,9 @@ export const readRecords = (input: RootInput = {}) => {
   })
 }
 
-export const addRecordResolved = (root: string, input: AddRecordInput, options: AddRecordOptions = {}): BrainRecord => {
+export const readRecords = (input: RootInput = {}) => readRecordsResolved(resolveRepository(input))
+
+export const planRecordAddition = (root: string, input: AddRecordInput): PlannedRecord => {
   const recordFile = createRecordFile(input)
   const relativePath = `encephalon/${recordFile.kind}/${recordFile.id}.json`
   const path = resolve(root, ...relativePath.split('/'))
@@ -401,32 +417,48 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
       path: relativePath,
     })
   }
-
-  cleanupStagingDirectory(root, options.hooks)
-  const scan = scanCanonicalRecords(root)
-  if (scan.errors.length > 0) {
-    return fail('VALIDATION_FAILED', 'Existing canonical records are invalid.', {
-      errors: scan.errors.map(error => ({
-        code: error.code,
-        message: error.message,
-      })),
-    })
+  const record: BrainRecord = { ...recordFile, path: relativePath }
+  return {
+    formatted: formatRecordFile(recordFile),
+    path,
+    record,
+    recordFile,
+    relativePath,
   }
-  const candidate: BrainRecord = { ...recordFile, path: relativePath }
-  const candidateResult = validateScanned(root, {
-    errors: [],
-    records: [...scan.records, candidate],
+}
+
+export const assertRecordGraph = (
+  root: string,
+  records: BrainRecord[],
+  message = 'Canonical records are invalid.',
+  hooks: RecordReadHooks = {},
+) => {
+  const result = validateScanned(
+    root,
+    {
+      errors: [],
+      records,
+    },
+    hooks,
+  )
+  if (result.valid) {
+    return
+  }
+  return fail('VALIDATION_FAILED', message, {
+    errors: result.errors.map(error => ({
+      code: error.code,
+      message: error.message,
+    })),
   })
-  if (!candidateResult.valid) {
-    return fail('VALIDATION_FAILED', 'The new record would make canonical records invalid.', {
-      errors: candidateResult.errors.map(error => ({
-        code: error.code,
-        message: error.message,
-      })),
-    })
-  }
+}
 
-  const formatted = formatRecordFile(recordFile)
+export const publishPlannedRecord = (
+  root: string,
+  plan: PlannedRecord,
+  options: { hooks?: RecordWriteHooks } = {},
+): BrainRecord => {
+  cleanupStagingDirectory(root, options.hooks)
+  const { formatted, path, record, recordFile, relativePath } = plan
   const kindDirectory = ensureDirectoryChain(root, ['encephalon', recordFile.kind])
   const stagingDirectory = ensureDirectoryChain(root, ['encephalon', STAGING_DIRECTORY])
   const stagingPath = resolve(stagingDirectory, `record-${process.pid}-${randomUUID()}.tmp`)
@@ -483,6 +515,35 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
   if (cleanupError !== undefined) {
     throw cleanupError
   }
+  return record
+}
+
+export const addRecordResolved = (root: string, input: AddRecordInput, options: AddRecordOptions = {}): BrainRecord => {
+  const plan = planRecordAddition(root, input)
+  const scan = scanCanonicalRecords(root)
+  if (scan.errors.length > 0) {
+    return fail('VALIDATION_FAILED', 'Existing canonical records are invalid.', {
+      errors: scan.errors.map(error => ({
+        code: error.code,
+        message: error.message,
+      })),
+    })
+  }
+  const candidateResult = validateScanned(root, {
+    errors: [],
+    records: [...scan.records, plan.record],
+  })
+  if (!candidateResult.valid) {
+    return fail('VALIDATION_FAILED', 'The new record would make canonical records invalid.', {
+      errors: candidateResult.errors.map(error => ({
+        code: error.code,
+        message: error.message,
+      })),
+    })
+  }
+
+  const publishOptions = options.hooks === undefined ? {} : { hooks: options.hooks }
+  const candidate = publishPlannedRecord(root, plan, publishOptions)
   if (options.hydrate !== false) {
     try {
       fault(options.hooks, 'during-hydration')

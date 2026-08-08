@@ -1,14 +1,27 @@
 import { canonicalPayload, scanBaseline } from './baseline.ts'
-import { hydrateResolvedRepository } from './cache.ts'
+import { hydrateResolvedRepository, prepareResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { applyInstructionChanges, planInstructionChanges } from './instructions.ts'
 import { withOperationLock } from './lock.ts'
-import { addRecordResolved, readRecords } from './records.ts'
+import {
+  assertRecordGraph,
+  planRecordAddition,
+  publishPlannedRecord,
+  type RecordReadHooks,
+  type RecordWriteHooks,
+  readRecordsResolved,
+} from './records.ts'
 import { resolveRepository } from './repository.ts'
-import type { AddRecordInput, BrainRecord, InitEncephalonInput, InitEncephalonResult } from './types.ts'
+import type { AddRecordInput, BrainRecord, InitEncephalonInput, InitEncephalonResult, PrepareResult } from './types.ts'
 
 const NEXT_ACTION =
   'Read ./node_modules/encephalon/skills/encephalon/SKILL.md and perform optional semantic enrichment for durable repository knowledge.'
+
+type InitHooks = RecordReadHooks & {
+  baselineScan?: () => void
+  hydration?: (result: PrepareResult) => void
+  recordWriteHooks?: RecordWriteHooks
+}
 
 const activeRecords = (records: BrainRecord[]) => {
   const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
@@ -61,7 +74,7 @@ const baselineActions = (records: BrainRecord[], baseline: AddRecordInput[], ref
     { additions: [], conflicts: [] },
   )
 
-const initResolved = (input: InitEncephalonInput): InitEncephalonResult => {
+const initResolved = (input: InitEncephalonInput, hooks: InitHooks = {}): InitEncephalonResult => {
   if (input.remove === true && input.refreshBaseline === true) {
     return fail('INVALID_ARGUMENT', 'init cannot refresh and remove managed instructions in the same operation.')
   }
@@ -77,14 +90,25 @@ const initResolved = (input: InitEncephalonInput): InitEncephalonResult => {
     }))
   }
 
-  readRecords({ root })
   return withOperationLock(root, () => {
     const instructionPlans = planInstructionChanges(root, false)
-    const actions = baselineActions(readRecords({ root }), scanBaseline(root), input.refreshBaseline === true)
-    const recordsCreated = actions.additions.map(addition =>
-      addRecordResolved(root, { ...addition, root }, { hydrate: false }),
-    )
-    hydrateResolvedRepository(root, false)
+    const records = readRecordsResolved(root, hooks)
+    hooks.baselineScan?.()
+    const actions = baselineActions(records, scanBaseline(root), input.refreshBaseline === true)
+    const plans = actions.additions.map(addition => planRecordAddition(root, { ...addition, root }))
+    if (plans.length > 0) {
+      assertRecordGraph(
+        root,
+        [...records, ...plans.map(plan => plan.record)],
+        'The generated baseline would make canonical records invalid.',
+        hooks,
+      )
+    }
+    const recordWriteOptions = hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }
+    const recordsCreated = plans.map(plan => publishPlannedRecord(root, plan, recordWriteOptions))
+    const cacheResult =
+      recordsCreated.length === 0 ? prepareResolvedRepository(root, false) : hydrateResolvedRepository(root, false)
+    hooks.hydration?.(cacheResult)
     const instructionFiles = applyInstructionChanges(root, instructionPlans)
     return {
       instructionFiles,
@@ -98,6 +122,20 @@ const initResolved = (input: InitEncephalonInput): InitEncephalonResult => {
 export const initEncephalon = (input: InitEncephalonInput = {}): InitEncephalonResult => {
   try {
     return initResolved(input)
+  } catch (error) {
+    if (error instanceof EncephalonError) {
+      throw error
+    }
+    return wrapIo('Unable to initialise Encephalon.', error)
+  }
+}
+
+export const initEncephalonWithHooks = (
+  input: InitEncephalonInput = {},
+  hooks: InitHooks = {},
+): InitEncephalonResult => {
+  try {
+    return initResolved(input, hooks)
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
