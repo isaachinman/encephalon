@@ -861,6 +861,47 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('serialises two contenders recovering the same malformed operation gate', async () => {
+    const root = createRoot()
+    const cachePath = join(root, 'node_modules', '.cache', 'encephalon')
+    const gatePath = join(cachePath, 'operation-lock.sqlite')
+    const releasePath = join(root, 'release-corrupt-gate-contenders')
+    const activePath = join(root, 'active-corrupt-gate-contender')
+    const firstReady = join(root, 'first-corrupt-gate-ready')
+    const secondReady = join(root, 'second-corrupt-gate-ready')
+    const firstEntered = join(root, 'first-corrupt-gate-entered')
+    const secondEntered = join(root, 'second-corrupt-gate-entered')
+    mkdirSync(cachePath, { recursive: true })
+    writeFileSync(gatePath, 'not a sqlite database')
+
+    const fixture = join(import.meta.dirname, 'fixtures', 'contend-for-corrupt-gate.ts')
+    const first = spawn(process.execPath, [fixture, root, firstReady, releasePath, activePath, firstEntered, '300'], {
+      stdio: 'inherit',
+    })
+    const second = spawn(
+      process.execPath,
+      [fixture, root, secondReady, releasePath, activePath, secondEntered, '300'],
+      {
+        stdio: 'inherit',
+      },
+    )
+
+    waitForPath(firstReady, first)
+    waitForPath(secondReady, second)
+    writeFileSync(releasePath, 'release')
+
+    if (first.exitCode === null) {
+      await once(first, 'exit')
+    }
+    if (second.exitCode === null) {
+      await once(second, 'exit')
+    }
+    assert.equal(first.exitCode, 0)
+    assert.equal(second.exitCode, 0)
+    assert.equal(existsSync(firstEntered), true)
+    assert.equal(existsSync(secondEntered), true)
+  })
+
   test('serialises two contenders that both observed the same stale lock', async () => {
     const root = createRoot()
     const cachePath = join(root, 'node_modules', '.cache', 'encephalon')
