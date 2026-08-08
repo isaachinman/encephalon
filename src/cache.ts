@@ -51,6 +51,7 @@ type RecordRow = {
 }
 
 type CompactRow = {
+  created_at: string
   id: string
   kind: string
   subject: string
@@ -616,10 +617,10 @@ const literalMatchQuery = (query: unknown) => {
   return terms.map(term => `"${term.replaceAll('"', '""')}"`).join(' AND ')
 }
 
-const searchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
+const searchParts = (input: SearchRecordsInput) => {
   const match = literalMatchQuery(input.query)
   if (match.length === 0) {
-    return []
+    return null
   }
   const conditions = [
     'record_search MATCH ?',
@@ -627,15 +628,43 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
     input.kind === undefined ? undefined : 'records.kind = ?',
   ].filter((value): value is string => value !== undefined)
   const parameters = [match, ...(input.kind === undefined ? [] : [input.kind]), positiveLimit(input.limit)]
+  return { conditions, parameters }
+}
+
+const fullSearchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
+  const parts = searchParts(input)
+  if (parts === null) {
+    return []
+  }
+  const { conditions, parameters } = parts
   return database
     .prepare(`
     SELECT
-      records.record_json,
+      records.record_json
+    FROM record_search
+    JOIN records ON records.id = record_search.id
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY bm25(record_search) ASC, records.created_at DESC, records.id DESC
+    LIMIT ?
+  `)
+    .all(...parameters) as RecordRow[]
+}
+
+const compactSearchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
+  const parts = searchParts(input)
+  if (parts === null) {
+    return []
+  }
+  const { conditions, parameters } = parts
+  return database
+    .prepare(`
+    SELECT
       records.id,
       records.kind,
       records.subject,
       records.path,
       records.summary,
+      records.created_at,
       bm25(record_search) AS rank,
       snippet(record_search, 1, '[', ']', '...', 16) AS snippet
     FROM record_search
@@ -644,15 +673,15 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
     ORDER BY rank ASC, records.created_at DESC, records.id DESC
     LIMIT ?
   `)
-    .all(...parameters) as Array<RecordRow & CompactRow>
+    .all(...parameters) as CompactRow[]
 }
 
 export const searchRecords = (input: SearchRecordsInput): BrainRecord[] =>
-  withPreparedDatabase(input, database => searchRows(database, input).map(parseRecordRow))
+  withPreparedDatabase(input, database => fullSearchRows(database, input).map(parseRecordRow))
 
 export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] =>
   withPreparedDatabase(input, database =>
-    searchRows(database, input).map(row => ({
+    compactSearchRows(database, input).map(row => ({
       id: row.id,
       kind: row.kind,
       path: row.path,
@@ -700,7 +729,7 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
         searches: searches.map(query => ({
           kind: input.kind ?? null,
           query,
-          results: searchRows(database, { ...input, query }).map(row => ({
+          results: compactSearchRows(database, { ...input, query }).map(row => ({
             id: row.id,
             kind: row.kind,
             path: row.path,
