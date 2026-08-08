@@ -1,8 +1,19 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
+import { addRecordResolved } from '../src/records.ts'
 import { discoverRepository } from '../src/repository.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
@@ -40,6 +51,7 @@ describe('canonical records', () => {
     })
 
     assert.equal(record.path, 'encephalon/decision/550e8400-e29b-41d4-a716-446655440000.json')
+    assert.equal(existsSync(join(root, 'encephalon', '_artifacts', 'decision', record.id)), false)
     const filePath = join(root, record.path)
     assert.equal(existsSync(filePath), true)
     assert.equal(
@@ -111,7 +123,119 @@ describe('canonical records', () => {
     })
 
     assert.deepEqual(record.artifacts, [artifact])
+    assert.deepEqual(readdirSync(join(root, 'encephalon', '_artifacts', 'architecture', id)), ['diagram.svg'])
     assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('rejects a symlinked internal staging directory before writing records', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit directory symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    const outside = join(root, 'outside-staging')
+    mkdirSync(outside)
+    mkdirSync(join(root, 'encephalon'))
+    symlinkSync(outside, join(root, 'encephalon', '_staging'), 'dir')
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'staging-symlink',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'staging.symlink',
+        }),
+      'VALIDATION_FAILED',
+    )
+    assert.deepEqual(readdirSync(outside), [])
+  })
+
+  test('rejects a replaced kind directory immediately before publication', () => {
+    const root = createRoot()
+
+    assertErrorCode(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'kind-replaced',
+            kind: 'decision',
+            payload: {},
+            source: 'agent',
+            subject: 'kind.replaced',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'before-publication') {
+                  rmSync(join(root, 'encephalon', 'decision'), { force: true, recursive: true })
+                  writeFileSync(join(root, 'encephalon', 'decision'), 'not a directory')
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      'VALIDATION_FAILED',
+    )
+    assert.equal(readFileSync(join(root, 'encephalon', 'decision'), 'utf8'), 'not a directory')
+  })
+
+  test('cleans orphaned internal staging aliases on the next mutation', () => {
+    const root = createRoot()
+    const first = api.addRecord({
+      id: 'orphan-source',
+      kind: 'decision',
+      payload: { summary: 'Committed' },
+      root,
+      source: 'agent',
+      subject: 'staging.orphan',
+    })
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    mkdirSync(stagingDirectory, { recursive: true })
+    linkSync(join(root, first.path), join(stagingDirectory, 'orphan.tmp'))
+
+    api.addRecord({
+      id: 'after-orphan',
+      kind: 'decision',
+      payload: { summary: 'Next' },
+      root,
+      source: 'agent',
+      subject: 'staging.next',
+    })
+
+    assert.deepEqual(readdirSync(stagingDirectory), [])
+    assert.equal(existsSync(join(root, first.path)), true)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'after-orphan.json')), true)
+  })
+
+  test('does not misreport cleanup failure after canonical publication', () => {
+    const root = createRoot()
+    const record = addRecordResolved(
+      root,
+      {
+        id: 'cleanup-failure',
+        kind: 'decision',
+        payload: { summary: 'Published' },
+        source: 'agent',
+        subject: 'cleanup.failure',
+      },
+      {
+        hooks: {
+          fault: point => {
+            if (point === 'during-cleanup') {
+              throw new Error('Injected cleanup failure')
+            }
+          },
+        },
+        hydrate: false,
+      },
+    )
+
+    assert.equal(record.id, 'cleanup-failure')
+    assert.equal(existsSync(join(root, record.path)), true)
+    assert.equal(readdirSync(join(root, 'encephalon', '_staging')).length, 1)
   })
 
   test('validates supersession graphs and permits a multi-head resolver', () => {
