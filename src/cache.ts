@@ -81,10 +81,18 @@ type CompactRow = {
 
 type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind' | 'limit'>
 
+type CacheReadTestHooks = {
+  afterShowRead?: ((id: string) => void) | undefined
+  onCompactSearchPrepare?: ((source: string) => void) | undefined
+  onShowPrepare?: ((source: string) => void) | undefined
+}
+
 class CacheSchemaMismatch extends Error {}
 
 let sqliteModule: SQLiteModule | undefined
 let sqliteFeaturesVerified = false
+
+export const cacheReadTestHooks: CacheReadTestHooks = {}
 
 const loadSQLite = () => {
   if (sqliteModule === undefined) {
@@ -908,7 +916,7 @@ const createCompactSearchReader = (database: DatabaseSync, input: SearchStatemen
   ].filter((value): value is string => value !== undefined)
   const kindParameters = input.kind === undefined ? [] : [input.kind]
   const limit = positiveLimit(input.limit)
-  const statement = database.prepare(`
+  const source = `
     SELECT
       records.id,
       records.kind,
@@ -922,7 +930,9 @@ const createCompactSearchReader = (database: DatabaseSync, input: SearchStatemen
     WHERE ${conditions.join(' AND ')}
     ORDER BY rank ASC, records.created_at DESC, records.id DESC
     LIMIT ?
-  `)
+  `
+  cacheReadTestHooks.onCompactSearchPrepare?.(source)
+  const statement = database.prepare(source)
   return (query: string) => {
     const match = literalMatchQuery(query)
     if (match.length === 0) {
@@ -940,9 +950,12 @@ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRec
 
 const createShowReader = (database: DatabaseSync, includeSuperseded: boolean | undefined) => {
   const activeClause = includeSuperseded === true ? '' : ' AND active = 1'
-  const statement = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`)
+  const source = `SELECT record_json FROM records WHERE id = ?${activeClause}`
+  cacheReadTestHooks.onShowPrepare?.(source)
+  const statement = database.prepare(source)
   return (id: string) => {
     const row = statement.get(id) as RecordRow | undefined
+    cacheReadTestHooks.afterShowRead?.(id)
     return row === undefined ? null : parseRecordRow(row)
   }
 }

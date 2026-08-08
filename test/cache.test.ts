@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symli
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
+import { cacheReadTestHooks } from '../src/cache.ts'
 import * as api from '../src/index.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
@@ -50,10 +51,6 @@ const mutateCache = (root: string, mutation: (database: DatabaseSync) => void) =
   } finally {
     database.close()
   }
-}
-
-type SQLitePrototype = {
-  prepare: (source: string) => unknown
 }
 
 describe('SQLite cache and reads', () => {
@@ -196,62 +193,44 @@ describe('SQLite cache and reads', () => {
       subject: 'cache.snapshot',
       supersedes: [firstId],
     }
-    const prototype = DatabaseSync.prototype as unknown as SQLitePrototype
-    const originalPrepare = prototype.prepare
     let mutatedBetweenItems = false
 
-    prototype.prepare = function patchedPrepare(this: unknown, source: string) {
-      const statement = originalPrepare.call(this, source) as Record<PropertyKey, unknown>
-      if (source.includes('SELECT record_json FROM records WHERE id = ?')) {
-        return new Proxy(statement, {
-          get(target, property, receiver) {
-            const value = Reflect.get(target, property, receiver)
-            if (property !== 'get' || typeof value !== 'function') {
-              return value
-            }
-            return (...parameters: unknown[]) => {
-              const result = value.apply(target, parameters)
-              if (!mutatedBetweenItems) {
-                mutatedBetweenItems = true
-                const database = new DatabaseSync(cacheDatabasePath(root))
-                try {
-                  database.exec('BEGIN IMMEDIATE')
-                  database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
-                  database
-                    .prepare(`
-                      INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    `)
-                    .run(
-                      replacement.id,
-                      replacement.kind,
-                      replacement.subject,
-                      replacement.source,
-                      replacement.createdAt,
-                      replacement.path,
-                      1,
-                      'Snapshot generation two',
-                      JSON.stringify(replacement),
-                    )
-                  database
-                    .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
-                    .run(replacement.id, 'Snapshot generation two')
-                  database.exec('COMMIT')
-                } catch (error) {
-                  try {
-                    database.exec('ROLLBACK')
-                  } catch {}
-                  throw error
-                } finally {
-                  database.close()
-                }
-              }
-              return result
-            }
-          },
-        })
+    cacheReadTestHooks.afterShowRead = () => {
+      if (!mutatedBetweenItems) {
+        mutatedBetweenItems = true
+        const database = new DatabaseSync(cacheDatabasePath(root))
+        try {
+          database.exec('BEGIN IMMEDIATE')
+          database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
+          database
+            .prepare(`
+              INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `)
+            .run(
+              replacement.id,
+              replacement.kind,
+              replacement.subject,
+              replacement.source,
+              replacement.createdAt,
+              replacement.path,
+              1,
+              'Snapshot generation two',
+              JSON.stringify(replacement),
+            )
+          database
+            .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
+            .run(replacement.id, 'Snapshot generation two')
+          database.exec('COMMIT')
+        } catch (error) {
+          try {
+            database.exec('ROLLBACK')
+          } catch {}
+          throw error
+        } finally {
+          database.close()
+        }
       }
-      return statement
     }
 
     try {
@@ -269,7 +248,7 @@ describe('SQLite cache and reads', () => {
         ],
       )
     } finally {
-      prototype.prepare = originalPrepare
+      cacheReadTestHooks.afterShowRead = undefined
     }
   })
 
@@ -294,21 +273,16 @@ describe('SQLite cache and reads', () => {
       subject: 'cache.reuse',
       supersedes: [first.id],
     })
-    const prototype = DatabaseSync.prototype as unknown as SQLitePrototype
-    const originalPrepare = prototype.prepare
     let showPrepareCount = 0
     let searchPrepareCount = 0
     let compactSearchSelectedRecordJson = false
 
-    prototype.prepare = function patchedPrepare(this: unknown, source: string) {
-      if (source.includes('SELECT record_json FROM records WHERE id = ?')) {
-        showPrepareCount += 1
-      }
-      if (source.includes('bm25(record_search)')) {
-        searchPrepareCount += 1
-        compactSearchSelectedRecordJson ||= source.includes('records.record_json')
-      }
-      return originalPrepare.call(this, source)
+    cacheReadTestHooks.onShowPrepare = () => {
+      showPrepareCount += 1
+    }
+    cacheReadTestHooks.onCompactSearchPrepare = source => {
+      searchPrepareCount += 1
+      compactSearchSelectedRecordJson ||= source.includes('records.record_json')
     }
 
     try {
@@ -339,7 +313,8 @@ describe('SQLite cache and reads', () => {
         ],
       )
     } finally {
-      prototype.prepare = originalPrepare
+      cacheReadTestHooks.onShowPrepare = undefined
+      cacheReadTestHooks.onCompactSearchPrepare = undefined
     }
 
     assert.equal(showPrepareCount, 1)
