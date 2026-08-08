@@ -1,0 +1,237 @@
+{
+  "cases": [
+    {
+      "artifacts": 0,
+      "canonicalJsonBytes": 0,
+      "largePayloads": 0,
+      "records": 0,
+      "supersessionDepth": 0,
+      "cache": {
+        "amplification": null,
+        "databaseBytes": 49152,
+        "shmBytes": 0,
+        "totalBytes": 49152,
+        "walBytes": 0
+      },
+      "operations": {
+        "coldHydrate": {
+          "durationMs": 6.746,
+          "peakRssBytes": 97058816,
+          "rssDeltaBytes": 6127616
+        },
+        "compactSearch": {
+          "durationMs": 1.159,
+          "peakRssBytes": 98844672,
+          "rssDeltaBytes": 360448
+        },
+        "fullSearch": {
+          "durationMs": 0.984,
+          "peakRssBytes": 99057664,
+          "rssDeltaBytes": 212992
+        },
+        "gather": {
+          "durationMs": 1.05,
+          "peakRssBytes": 99188736,
+          "rssDeltaBytes": 131072
+        },
+        "list": {
+          "durationMs": 0.945,
+          "peakRssBytes": 98402304,
+          "rssDeltaBytes": 475136
+        },
+        "show": {
+          "durationMs": 1.173,
+          "peakRssBytes": 98484224,
+          "rssDeltaBytes": 81920
+        },
+        "stalePrepare": {
+          "durationMs": 0.516,
+          "peakRssBytes": 97910784,
+          "rssDeltaBytes": 425984
+        },
+        "unchangedPrepare": {
+          "durationMs": 0.631,
+          "peakRssBytes": 97468416,
+          "rssDeltaBytes": 376832
+        }
+      }
+    },
+    {
+      "artifacts": 10,
+      "canonicalJsonBytes": 356589,
+      "largePayloads": 10,
+      "records": 100,
+      "supersessionDepth": 10,
+      "cache": {
+        "amplification": 2.745,
+        "databaseBytes": 978944,
+        "shmBytes": 0,
+        "totalBytes": 978944,
+        "walBytes": 0
+      },
+      "operations": {
+        "coldHydrate": {
+          "durationMs": 16.296,
+          "peakRssBytes": 105889792,
+          "rssDeltaBytes": 4390912
+        },
+        "compactSearch": {
+          "durationMs": 2.316,
+          "peakRssBytes": 108265472,
+          "rssDeltaBytes": 737280
+        },
+        "fullSearch": {
+          "durationMs": 2.407,
+          "peakRssBytes": 108822528,
+          "rssDeltaBytes": 557056
+        },
+        "gather": {
+          "durationMs": 337.46,
+          "peakRssBytes": 108920832,
+          "rssDeltaBytes": 98304
+        },
+        "list": {
+          "durationMs": 1.471,
+          "peakRssBytes": 107003904,
+          "rssDeltaBytes": 311296
+        },
+        "show": {
+          "durationMs": 1.347,
+          "peakRssBytes": 107511808,
+          "rssDeltaBytes": 507904
+        },
+        "stalePrepare": {
+          "durationMs": 11.71,
+          "peakRssBytes": 106708992,
+          "rssDeltaBytes": 770048
+        },
+        "unchangedPrepare": {
+          "durationMs": 1.098,
+          "peakRssBytes": 105922560,
+          "rssDeltaBytes": 49152
+        }
+      }
+    },
+    {
+      "artifacts": 100,
+      "canonicalJsonBytes": 3580039,
+      "largePayloads": 100,
+      "records": 1000,
+      "supersessionDepth": 100,
+      "cache": {
+        "amplification": 2.595,
+        "databaseBytes": 9289728,
+        "shmBytes": 0,
+        "totalBytes": 9289728,
+        "walBytes": 0
+      },
+      "operations": {
+        "coldHydrate": {
+          "durationMs": 89.77,
+          "peakRssBytes": 126812160,
+          "rssDeltaBytes": 15826944
+        },
+        "compactSearch": {
+          "durationMs": 13.939,
+          "peakRssBytes": 147849216,
+          "rssDeltaBytes": 344064
+        },
+        "fullSearch": {
+          "durationMs": 14.526,
+          "peakRssBytes": 148078592,
+          "rssDeltaBytes": 229376
+        },
+        "gather": {
+          "durationMs": 3310.987,
+          "peakRssBytes": 148815872,
+          "rssDeltaBytes": 737280
+        },
+        "list": {
+          "durationMs": 5.983,
+          "peakRssBytes": 147685376,
+          "rssDeltaBytes": 180224
+        },
+        "show": {
+          "durationMs": 5.255,
+          "peakRssBytes": 147685376,
+          "rssDeltaBytes": -180224
+        },
+        "stalePrepare": {
+          "durationMs": 103.908,
+          "peakRssBytes": 147587072,
+          "rssDeltaBytes": 20709376
+        },
+        "unchangedPrepare": {
+          "durationMs": 5.919,
+          "peakRssBytes": 126812160,
+          "rssDeltaBytes": 0
+        }
+      }
+    },
+    {
+      "artifacts": 1000,
+      "canonicalJsonBytes": 35949539,
+      "largePayloads": 1000,
+      "records": 10000,
+      "supersessionDepth": 1000,
+      "cache": {
+        "amplification": 2.336,
+        "databaseBytes": 83980288,
+        "shmBytes": 0,
+        "totalBytes": 83980288,
+        "walBytes": 0
+      },
+      "operations": {
+        "coldHydrate": {
+          "durationMs": 874.09,
+          "peakRssBytes": 283852800,
+          "rssDeltaBytes": 117653504
+        },
+        "compactSearch": {
+          "durationMs": 124.238,
+          "peakRssBytes": 310575104,
+          "rssDeltaBytes": -1753088
+        },
+        "fullSearch": {
+          "durationMs": 126.087,
+          "peakRssBytes": 310575104,
+          "rssDeltaBytes": 0
+        },
+        "gather": {
+          "durationMs": 33237.116,
+          "peakRssBytes": 310771712,
+          "rssDeltaBytes": 1949696
+        },
+        "list": {
+          "durationMs": 44.403,
+          "peakRssBytes": 310231040,
+          "rssDeltaBytes": 0
+        },
+        "show": {
+          "durationMs": 41.296,
+          "peakRssBytes": 310575104,
+          "rssDeltaBytes": 1769472
+        },
+        "stalePrepare": {
+          "durationMs": 972.22,
+          "peakRssBytes": 310231040,
+          "rssDeltaBytes": 42876928
+        },
+        "unchangedPrepare": {
+          "durationMs": 44.197,
+          "peakRssBytes": 283852800,
+          "rssDeltaBytes": 16384
+        }
+      }
+    }
+  ],
+  "environment": {
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "node": "v24.15.0",
+    "platform": "darwin"
+  },
+  "generatedAt": "2026-08-08T05:04:56.356Z",
+  "profile": "baseline",
+  "schemaVersion": 1
+}

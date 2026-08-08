@@ -178,6 +178,15 @@ bun run check:package
 bun run check:publish
 ```
 
+Performance benchmarks are separate from correctness tests:
+
+```bash
+bun run benchmark -- --output docs/performance-baseline.json
+bun run benchmark:check
+```
+
+See [docs/performance.md](./docs/performance.md) for benchmark profiles, budgets, baseline results, and scale guidance.
+
 `check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything.
 
 ## Licence

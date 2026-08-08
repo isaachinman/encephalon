@@ -45,6 +45,8 @@
     "access": "public"
   },
   "scripts": {
+    "benchmark": "node scripts/benchmark.ts",
+    "benchmark:check": "node scripts/benchmark.ts --profile ci --budget docs/performance-budgets.json",
     "build": "bun run scripts/build.ts",
     "check:package": "bun run scripts/check-package.ts",
     "check:publish": "npm publish --dry-run --access public --json",
