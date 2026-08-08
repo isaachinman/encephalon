@@ -461,6 +461,29 @@ describe('initialisation', () => {
     ])
   })
 
+  test('applies directory entry caps after sorting so truncation is deterministic', () => {
+    const root = createRoot()
+    for (let index = 0; index < 300; index += 1) {
+      writeFileSync(join(root, `z-${String(index).padStart(3, '0')}.py`), 'pass\n')
+      writeFileSync(join(root, `a-${String(index).padStart(3, '0')}.ts`), 'export {}\n')
+    }
+
+    api.initEncephalon({ root })
+    const overview = generatedRecord(root, 'encephalon:init/repository-overview')
+    const payload = overview.payload as {
+      languageCounts?: Array<{ files: number; language: string }>
+      scannedRegularFiles?: unknown
+      scanTruncationReasons?: unknown
+    }
+
+    assert.equal(payload.scannedRegularFiles, 512)
+    assert.deepEqual(payload.scanTruncationReasons, ['directory-entry-limit'])
+    assert.deepEqual(payload.languageCounts, [
+      { files: 212, language: 'Python' },
+      { files: 300, language: 'TypeScript' },
+    ])
+  })
+
   test('bounds baseline scanner depth without following deep chains forever', () => {
     const root = createRoot()
     let current = root

@@ -1,14 +1,4 @@
-import {
-  closeSync,
-  constants,
-  type Dirent,
-  fstatSync,
-  lstatSync,
-  opendirSync,
-  openSync,
-  readdirSync,
-  readFileSync,
-} from 'node:fs'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readFileSync } from 'node:fs'
 import { extname, resolve } from 'node:path'
 import type { AddRecordInput, JsonValue } from './types.ts'
 
@@ -206,32 +196,20 @@ const readPackageFacts = (root: string): PackageFacts => {
 }
 
 const readBoundedDirectoryEntries = (directory: string) => {
-  const retained: Dirent[] = []
-  let truncated = false
-  const handle = opendirSync(directory)
-  try {
-    for (let entry = handle.readSync(); entry !== null; entry = handle.readSync()) {
+  const accepted = readdirSync(directory, { withFileTypes: true })
+    .filter(entry => {
       const excludedDirectory = entry.isDirectory() && EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())
-      const acceptable =
+      return (
         safeName(entry.name) &&
         !entry.isSymbolicLink() &&
         !EXCLUDED_FILES.has(entry.name.toLowerCase()) &&
         !excludedDirectory
-      if (acceptable) {
-        if (retained.length < MAX_DIRECTORY_ENTRIES) {
-          retained.push(entry)
-        } else {
-          truncated = true
-          break
-        }
-      }
-    }
-  } finally {
-    handle.closeSync()
-  }
+      )
+    })
+    .sort((first, second) => first.name.localeCompare(second.name))
   return {
-    entries: retained.sort((first, second) => first.name.localeCompare(second.name)),
-    truncated,
+    entries: accepted.slice(0, MAX_DIRECTORY_ENTRIES),
+    truncated: accepted.length > MAX_DIRECTORY_ENTRIES,
   }
 }
 
