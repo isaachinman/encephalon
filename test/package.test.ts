@@ -44,7 +44,6 @@ describe('package contract', () => {
     assert.equal(skill.includes('Do not stage, commit, push'), true)
   })
 
-<<<<<<< HEAD
   test('marks the old implementation plan historical and maintains a concise contract', () => {
     const implementationPlan = readFileSync(resolve(root, 'docs', 'implementation-plan.md'), 'utf8')
     const contract = readFileSync(resolve(root, 'docs', 'contract.md'), 'utf8')
@@ -68,7 +67,8 @@ describe('package contract', () => {
     assert.match(skill, /npx --no-install encephalon validate/)
     assert.match(contract, /npx --no-install encephalon/)
     assert.doesNotMatch(skill, /node \.\/node_modules\/encephalon\/dist\/cli\.mjs/)
-=======
+  })
+
   test('runs package and publish-contract checks in CI without publishing', () => {
     const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
     const publishCheck = readFileSync(resolve(root, 'scripts', 'check-publish.ts'), 'utf8')
@@ -85,6 +85,5 @@ describe('package contract', () => {
     assert.equal(publishCheck.includes("'--dry-run'"), true)
     assert.equal(publishCheck.includes("'--ignore-scripts'"), true)
     assert.equal(publishCheck.includes('You cannot publish over the previously published versions'), true)
->>>>>>> origin/main
   })
 })

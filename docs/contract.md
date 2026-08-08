@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-08 for audited snapshot `946228d7151301bf64b54603ebb09f04687fc354`.
+Last reviewed: 2026-08-08 for audited snapshot `514f444fdaf428c2e41124020b40b7568af66b6b`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -18,7 +18,7 @@ This document is the concise contract maintainers should update when public beha
 - Canonical knowledge is append-only JSON under `encephalon/<kind>/<id>.json`.
 - Artifact files are immutable supporting files under `encephalon/_artifacts/<kind>/<id>/...` and must stay beneath the matching record artifact directory.
 - The runtime-only `path` field is never written to canonical record files.
-- Supersession records must use the same kind and subject as their targets. Active records are records not superseded by another valid record.
+- Supersession records must use the same kind and subject as their targets. Active records are records not listed in any other record’s `supersedes`.
 - Existing records are not rewritten or deleted by normal mutations; changed knowledge is represented by a new record that supersedes the active head.
 
 ## Initialisation and Privacy
