@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-08T11:20:18.683Z",
+  "id": "1f3d2e98-59b3-4ff3-ab64-15bcc785a5fa",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Pullfrog PR #16 found non-SQLite recovery markers must be reclaimable because process death does not clean filesystem marker directories.",
+    "mistake": "A mkdir-based operation-lock.recovery marker can permanently block all later callers if the recoverer dies before its finally cleanup, even though SQLite locks themselves are released by the OS.",
+    "guidance": [
+      "When adding filesystem marker locks around SQLite recovery, write owner metadata with pid, token, and acquiredAt.",
+      "Peers must reclaim dead-owner or stale recovery markers before timing out with CACHE_BUSY.",
+      "Prefer rename-aside reclamation over direct deletion of marker paths to keep races benign."
+    ],
+    "verification": [
+      "Add a regression test with a dead recovery-marker owner before considering marker-lock recovery complete."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.lock-recovery-marker-reclaim"
+}
