@@ -34,4 +34,22 @@ describe('package contract', () => {
     assert.equal(skill.includes('npx --no-install encephalon validate'), true)
     assert.equal(skill.includes('Do not stage, commit, push'), true)
   })
+
+  test('runs package and publish-contract checks in CI without publishing', () => {
+    const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
+    const publishCheck = readFileSync(resolve(root, 'scripts', 'check-publish.ts'), 'utf8')
+    const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
+      scripts?: Record<string, unknown>
+    }
+    const publishScript = String(packageJson.scripts?.['check:publish'])
+
+    assert.equal(workflow.includes('bun run check:package'), true)
+    assert.equal(workflow.includes('bun run check:publish'), true)
+    assert.equal(workflow.includes("matrix.os == 'ubuntu-latest'"), true)
+    assert.equal(workflow.includes('actions/upload-artifact'), true)
+    assert.equal(publishScript, 'bun run scripts/check-publish.ts')
+    assert.equal(publishCheck.includes("'--dry-run'"), true)
+    assert.equal(publishCheck.includes("'--ignore-scripts'"), true)
+    assert.equal(publishCheck.includes('You cannot publish over the previously published versions'), true)
+  })
 })

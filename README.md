@@ -178,7 +178,7 @@ bun run check:package
 bun run check:publish
 ```
 
-`check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything.
+`check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything. The Ubuntu CI job is the release-equivalent package gate: it runs both checks and uploads the generated `npm pack` tarball for inspection.
 
 ## Licence
 
