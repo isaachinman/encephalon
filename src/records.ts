@@ -118,6 +118,11 @@ const postCommitError = (record: BrainRecord, phase: PostCommitPhase, cause: unk
     { cause },
   )
 
+const canonicalRecordBytes = (record: BrainRecord) => {
+  const { path: _path, ...recordFile } = record
+  return Buffer.byteLength(formatRecordFile(recordFile), 'utf8')
+}
+
 const STAGING_DIRECTORY = '_staging'
 const RESERVED_DIRECTORIES = new Set(['_artifacts', STAGING_DIRECTORY])
 const directoryFlag = constants.O_DIRECTORY ?? 0
@@ -759,7 +764,7 @@ export const assertRecordGraph = (
   const result = validateScanned(
     root,
     {
-      bytes: bytes ?? records.reduce((total, record) => total + Buffer.byteLength(formatRecordFile(record), 'utf8'), 0),
+      bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
       errors: [],
       records,
     },
