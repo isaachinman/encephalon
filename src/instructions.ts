@@ -265,6 +265,7 @@ type AtomicWriteFault =
   | 'after-publication'
   | 'after-backup-validation'
   | 'before-temp-create'
+  | 'during-backup-restore'
   | 'during-file-flush'
   | 'during-publication'
   | 'during-temp-cleanup'
@@ -335,11 +336,11 @@ const fsyncFile = (path: string) => {
   }
 }
 
-const restoreBackupFile = (path: string, backupPath: string) => {
+const restoreBackupFile = (path: string, backupPath: string, hooks: AtomicWriteHooks | undefined) => {
   try {
-    if (lstatIfExists(path) === undefined) {
-      renameSync(backupPath, path)
-    }
+    fault(hooks, 'during-backup-restore')
+    linkSync(backupPath, path)
+    rmSync(backupPath, { force: true })
   } catch {
     // Keep the backup file in place so the pre-publication bytes remain recoverable.
   }
@@ -372,7 +373,6 @@ const publishTempFile = (path: string, tempPath: string, plan: FilePlan, hooks: 
   const backupPath = tempPathFor(path, 'backup')
   let backupCreated = false
   let published = false
-  let removeBackup = false
   try {
     renameSync(path, backupPath)
     backupCreated = true
@@ -384,20 +384,14 @@ const publishTempFile = (path: string, tempPath: string, plan: FilePlan, hooks: 
     published = true
     const finalBackupMetadata = assertBackupUnchanged(backupPath, plan)
     chmodSync(path, finalBackupMetadata.mode & MODE_BITS)
-    removeBackup = true
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
       return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
     }
     throw error
   } finally {
-    if (backupCreated) {
-      if (!published) {
-        restoreBackupFile(path, backupPath)
-      }
-      if (removeBackup || lstatIfExists(backupPath) === undefined) {
-        rmSync(backupPath, { force: true })
-      }
+    if (backupCreated && !published) {
+      restoreBackupFile(path, backupPath, hooks)
     }
   }
 }

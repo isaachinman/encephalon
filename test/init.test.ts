@@ -362,6 +362,39 @@ describe('initialisation', () => {
     assert.equal(readFileSync(join(root, backupName), 'utf8'), changed)
   })
 
+  test('does not overwrite files created while restoring a backup', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = '# Existing guidance\n'
+    const changed = '# Concurrent restore guidance\n'
+    writeFileSync(path, original)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-backup-validation') {
+              throw new Error('Injected publication failure')
+            }
+            if (point === 'during-backup-restore') {
+              writeFileSync(path, changed)
+            }
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        return true
+      },
+    )
+
+    const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
+    assert.ok(backupName)
+    assert.equal(readFileSync(path, 'utf8'), changed)
+    assert.equal(readFileSync(join(root, backupName), 'utf8'), original)
+  })
+
   test('preserves old-descriptor mode changes after backup validation', {
     skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
   }, () => {
