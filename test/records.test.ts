@@ -175,7 +175,7 @@ describe('canonical records', () => {
         : []),
       ...unicodeNames.map(name => ['INVALID_KIND_DIRECTORY', `encephalon/${name}`]),
       ...(unicodeNames.length === 2 ? [['KIND_DIRECTORY_COLLISION', 'encephalon/café']] : []),
-    ]
+    ].sort((first, second) => String(first[1]).localeCompare(String(second[1])))
 
     const result = api.validateRecords({ root })
     assert.equal(result.valid, expected.length === 0)
