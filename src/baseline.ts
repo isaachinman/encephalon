@@ -195,23 +195,37 @@ const readPackageFacts = (root: string): PackageFacts => {
   return { scriptKeys: [], workspacePatterns: [] }
 }
 
-const readBoundedDirectoryEntries = (directory: string) => {
-  const accepted = readdirSync(directory, { withFileTypes: true })
-    .filter(entry => {
-      const excludedDirectory = entry.isDirectory() && EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())
-      return (
-        safeName(entry.name) &&
-        !entry.isSymbolicLink() &&
-        !EXCLUDED_FILES.has(entry.name.toLowerCase()) &&
-        !excludedDirectory
-      )
-    })
-    .sort((first, second) => first.name.localeCompare(second.name))
+const compareEntryNames = (first: string, second: string) => {
+  if (first < second) {
+    return -1
+  }
+  if (first > second) {
+    return 1
+  }
+  return 0
+}
+
+export const selectBoundedDirectoryEntries = <T extends { name: string }>(
+  entries: readonly T[],
+  isAccepted: (entry: T) => boolean,
+) => {
+  const accepted = entries.filter(isAccepted).sort((first, second) => compareEntryNames(first.name, second.name))
   return {
     entries: accepted.slice(0, MAX_DIRECTORY_ENTRIES),
     truncated: accepted.length > MAX_DIRECTORY_ENTRIES,
   }
 }
+
+const readBoundedDirectoryEntries = (directory: string) =>
+  selectBoundedDirectoryEntries(readdirSync(directory, { withFileTypes: true }), entry => {
+    const excludedDirectory = entry.isDirectory() && EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())
+    return (
+      safeName(entry.name) &&
+      !entry.isSymbolicLink() &&
+      !EXCLUDED_FILES.has(entry.name.toLowerCase()) &&
+      !excludedDirectory
+    )
+  })
 
 const scanLanguages = (root: string) => {
   const initial: ScanState = {

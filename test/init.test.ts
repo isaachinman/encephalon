@@ -17,6 +17,7 @@ import {
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
+import { selectBoundedDirectoryEntries } from '../src/baseline.ts'
 import * as api from '../src/index.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
@@ -461,27 +462,22 @@ describe('initialisation', () => {
     ])
   })
 
-  test('applies directory entry caps after sorting so truncation is deterministic', () => {
-    const root = createRoot()
-    for (let index = 0; index < 300; index += 1) {
-      writeFileSync(join(root, `z-${String(index).padStart(3, '0')}.py`), 'pass\n')
-      writeFileSync(join(root, `a-${String(index).padStart(3, '0')}.ts`), 'export {}\n')
-    }
+  test('selects directory entry caps from sorted names regardless of input order', () => {
+    const reverseGroupOrder = [
+      ...Array.from({ length: 300 }, (_, index) => ({ name: `z-${String(index).padStart(3, '0')}.py` })),
+      ...Array.from({ length: 300 }, (_, index) => ({ name: `a-${String(index).padStart(3, '0')}.ts` })),
+    ]
+    const { entries, truncated } = selectBoundedDirectoryEntries(reverseGroupOrder, () => true)
 
-    api.initEncephalon({ root })
-    const overview = generatedRecord(root, 'encephalon:init/repository-overview')
-    const payload = overview.payload as {
-      languageCounts?: Array<{ files: number; language: string }>
-      scannedRegularFiles?: unknown
-      scanTruncationReasons?: unknown
-    }
-
-    assert.equal(payload.scannedRegularFiles, 512)
-    assert.deepEqual(payload.scanTruncationReasons, ['directory-entry-limit'])
-    assert.deepEqual(payload.languageCounts, [
-      { files: 212, language: 'Python' },
-      { files: 300, language: 'TypeScript' },
-    ])
+    assert.equal(truncated, true)
+    assert.equal(entries.length, 512)
+    assert.deepEqual(
+      entries.map(entry => entry.name),
+      [
+        ...Array.from({ length: 300 }, (_, index) => `a-${String(index).padStart(3, '0')}.ts`),
+        ...Array.from({ length: 212 }, (_, index) => `z-${String(index).padStart(3, '0')}.py`),
+      ],
+    )
   })
 
   test('bounds baseline scanner depth without following deep chains forever', () => {
