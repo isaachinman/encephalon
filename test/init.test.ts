@@ -18,6 +18,7 @@ import {
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
+import { selectBoundedDirectoryEntries } from '../src/baseline.ts'
 import * as api from '../src/index.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
@@ -61,6 +62,14 @@ const recordsForSubject = (root: string, subject: string) =>
 
 const activeRecordsForSubject = (root: string, subject: string) =>
   api.listRecords({ limit: 50, root }).filter(record => record.subject === subject)
+
+const generatedRecord = (root: string, subject: string) => {
+  const record = api
+    .listRecords({ includeSuperseded: true, limit: 20, root })
+    .find(candidate => candidate.subject === subject)
+  assert.ok(record)
+  return record
+}
 
 const readRecordFile = (root: string, record: BrainRecord): BrainRecordFile =>
   JSON.parse(readFileSync(join(root, record.path), 'utf8')) as BrainRecordFile
@@ -466,6 +475,69 @@ describe('initialisation', () => {
         .filter(record => record.subject === 'encephalon:init/repository-overview').length,
       1,
     )
+  })
+
+  test('bounds baseline scanning and records deterministic truncation reasons', () => {
+    const root = createRoot()
+    for (let index = 0; index < 600; index += 1) {
+      writeFileSync(join(root, `file-${String(index).padStart(3, '0')}.ts`), 'export {}\n')
+    }
+
+    api.initEncephalon({ root })
+    const overview = generatedRecord(root, 'encephalon:init/repository-overview')
+
+    assert.equal((overview.payload as { scannedRegularFiles?: unknown }).scannedRegularFiles, 512)
+    assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, [
+      'directory-entry-limit',
+    ])
+  })
+
+  test('selects directory entry caps from sorted names regardless of input order', () => {
+    const reverseGroupOrder = [
+      ...Array.from({ length: 300 }, (_, index) => ({ name: `z-${String(index).padStart(3, '0')}.py` })),
+      ...Array.from({ length: 300 }, (_, index) => ({ name: `a-${String(index).padStart(3, '0')}.ts` })),
+    ]
+    const { entries, truncated } = selectBoundedDirectoryEntries(reverseGroupOrder, () => true)
+
+    assert.equal(truncated, true)
+    assert.equal(entries.length, 512)
+    assert.deepEqual(
+      entries.map(entry => entry.name),
+      [
+        ...Array.from({ length: 300 }, (_, index) => `a-${String(index).padStart(3, '0')}.ts`),
+        ...Array.from({ length: 212 }, (_, index) => `z-${String(index).padStart(3, '0')}.py`),
+      ],
+    )
+  })
+
+  test('bounds baseline scanner depth without following deep chains forever', () => {
+    const root = createRoot()
+    let current = root
+    for (let index = 0; index < 30; index += 1) {
+      current = join(current, `level-${String(index).padStart(2, '0')}`)
+      ensureParent(join(current, 'placeholder'))
+    }
+    writeFileSync(join(current, 'deep.ts'), 'export {}\n')
+
+    api.initEncephalon({ root })
+    const overview = generatedRecord(root, 'encephalon:init/repository-overview')
+
+    assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, ['max-depth'])
+  })
+
+  test('does not enumerate workflows through a symlinked .github ancestor', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit directory symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    const outside = createRoot()
+    ensureParent(join(outside, '.github', 'workflows', 'leaked.yml'))
+    writeFileSync(join(outside, '.github', 'workflows', 'leaked.yml'), 'name: leaked\n')
+    symlinkSync(join(outside, '.github'), join(root, '.github'))
+
+    api.initEncephalon({ root })
+    const workflow = generatedRecord(root, 'encephalon:init/commands-ci')
+
+    assert.deepEqual((workflow.payload as { workflowFiles?: unknown }).workflowFiles, [])
   })
 
   test('preflights both instruction files before writing anything', () => {
