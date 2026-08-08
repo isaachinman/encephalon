@@ -375,7 +375,19 @@ describe('command-line interface', () => {
         message: '--limit requires a value.',
       },
       {
-        arguments_: ['add', '--root', root, '--kind', 'decision', '--subject', '-draft', '--source', 'agent', '--data', '{}'],
+        arguments_: [
+          'add',
+          '--root',
+          root,
+          '--kind',
+          'decision',
+          '--subject',
+          '-draft',
+          '--source',
+          'agent',
+          '--data',
+          '{}',
+        ],
         message: '--subject requires a value.',
       },
     ]
