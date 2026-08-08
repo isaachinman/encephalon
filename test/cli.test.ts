@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
+import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import { createTestRepository, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -90,6 +91,6 @@ describe('command-line interface', () => {
     assert.match(help.stdout, /^Usage: encephalon/m)
     const version = run(root, ['--version'])
     assert.equal(version.status, 0)
-    assert.equal(version.stdout, '0.1.0\n')
+    assert.equal(version.stdout, `${PACKAGE_VERSION}\n`)
   })
 })

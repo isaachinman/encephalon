@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { fail } from './errors.ts'
+import { PACKAGE_VERSION } from './generated/version.ts'
 import {
   addRecord,
   EncephalonError,
@@ -16,7 +17,6 @@ import {
 } from './index.ts'
 import type { JsonValue } from './types.ts'
 
-const VERSION = '0.1.0'
 const HELP = `Usage: encephalon [--root <path>] <command> [options]
 
 Commands:
@@ -160,7 +160,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
     return { value: HELP }
   }
   if (arguments_.includes('--version') || arguments_.includes('-v')) {
-    return { value: `${VERSION}\n` }
+    return { value: `${PACKAGE_VERSION}\n` }
   }
   const extracted = extractRoot(arguments_)
   const [command, ...commandArguments] = extracted.remaining

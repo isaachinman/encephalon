@@ -2,6 +2,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { fail, wrapIo } from './errors.ts'
+import { PACKAGE_VERSION } from './generated/version.ts'
 
 export type DiscoverRepositoryInput = {
   root?: string
@@ -106,7 +107,7 @@ export const assertRootInstallation = (root: string) => {
           name?: unknown
           version?: unknown
         }
-        if (packageJson.name === 'encephalon' && typeof packageJson.version === 'string') {
+        if (packageJson.name === 'encephalon' && packageJson.version === PACKAGE_VERSION) {
           return installedRoot
         }
       }

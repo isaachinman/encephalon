@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
+import { PACKAGE_VERSION } from './generated/version.ts'
 import { cacheDirectory, withOperationLock } from './lock.ts'
 import { readRecords } from './records.ts'
 import { resolveRepository } from './repository.ts'
@@ -20,7 +21,6 @@ import type {
   ShowRecordInput,
 } from './types.ts'
 
-const PACKAGE_VERSION = '0.1.0'
 const SCHEMA_VERSION = '1'
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
 const DATABASE_FILENAME = 'brain.sqlite'
@@ -326,7 +326,6 @@ const metadataIsFresh = (root: string, metadata: Metadata | undefined): metadata
   return (
     metadata !== undefined &&
     metadata.schemaVersion === SCHEMA_VERSION &&
-    metadata.packageVersion === PACKAGE_VERSION &&
     metadata.manifest === repositoryManifest(root, metadata.artifactPaths)
   )
 }
