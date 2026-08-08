@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
+import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import { createTestRepository, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -71,6 +73,88 @@ describe('command-line interface', () => {
     })
   })
 
+  test('reports post-commit add failures with committed record details', () => {
+    const root = createRoot()
+    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'), { recursive: true })
+
+    const result = run(root, [
+      'add',
+      '--root',
+      root,
+      '--id',
+      'cli-post-commit',
+      '--kind',
+      'decision',
+      '--subject',
+      'post.commit',
+      '--source',
+      'agent',
+      '--data',
+      '{"summary":"Published"}',
+    ])
+
+    assert.equal(result.status, 2)
+    assert.equal(result.stdout, '')
+    assert.deepEqual(JSON.parse(result.stderr), {
+      error: {
+        code: 'IO_ERROR',
+        details: {
+          canonicalCommitted: true,
+          path: 'encephalon/decision/cli-post-commit.json',
+          postCommitPhase: 'cacheHydration',
+          recordId: 'cli-post-commit',
+          recoveryAction: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+        },
+        message:
+          'Record cli-post-commit was committed, but the cacheHydration post-commit phase failed. Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+      },
+    })
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'cli-post-commit.json')), true)
+
+    const retry = run(root, [
+      'add',
+      '--root',
+      root,
+      '--id',
+      'cli-post-commit',
+      '--kind',
+      'decision',
+      '--subject',
+      'post.commit',
+      '--source',
+      'agent',
+      '--data',
+      '{"summary":"Retry"}',
+    ])
+    assert.equal(retry.status, 2)
+    assert.equal(JSON.parse(retry.stderr).error.code, 'RECORD_EXISTS')
+  })
+
+  test('redacts CLI details that contain absolute repository paths', () => {
+    const root = createRoot()
+    const prepared = run(root, ['prepare', '--root', root])
+    assert.equal(prepared.status, 0)
+
+    const database = new DatabaseSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'))
+    database
+      .prepare("UPDATE metadata SET value = ? WHERE key = 'repositoryRealpath'")
+      .run(join(root, '..', 'other-repository'))
+    database.close()
+
+    const result = run(root, ['prepare', '--root', root])
+    assert.equal(result.status, 2)
+    assert.equal(result.stdout, '')
+    assert.equal(result.stderr.includes(root), false)
+    assert.equal(result.stderr.includes('Error:'), false)
+    assert.deepEqual(JSON.parse(result.stderr), {
+      error: {
+        code: 'CACHE_SCOPE_MISMATCH',
+        details: {},
+        message: 'The Encephalon cache belongs to a different repository.',
+      },
+    })
+  })
+
   test('prints invalid validation results once to stdout and exits 2', () => {
     const root = createRoot()
     const path = join(root, 'encephalon', 'decision')
@@ -90,6 +174,6 @@ describe('command-line interface', () => {
     assert.match(help.stdout, /^Usage: encephalon/m)
     const version = run(root, ['--version'])
     assert.equal(version.status, 0)
-    assert.equal(version.stdout, '0.1.0\n')
+    assert.equal(version.stdout, `${PACKAGE_VERSION}\n`)
   })
 })

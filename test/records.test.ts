@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import {
   existsSync,
   linkSync,
@@ -13,8 +14,9 @@ import {
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
-import { addRecordResolved } from '../src/records.ts'
+import { addRecordResolved, MAX_CANONICAL_RECORDS, validateRecordsResolved } from '../src/records.ts'
 import { discoverRepository } from '../src/repository.ts'
+import type { ValidateResult } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -25,11 +27,99 @@ const createRoot = () => {
   return root
 }
 
+const timestampAt = (index: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, 0, index)).toISOString()
+
+const writeCanonicalRecord = (
+  root: string,
+  record: {
+    id: string
+    kind?: string
+    subject?: string
+    payload?: Record<string, unknown>
+    supersedes?: string[]
+    artifacts?: string[]
+    createdAt?: string
+  },
+) => {
+  const kind = record.kind ?? 'decision'
+  const path = join(root, 'encephalon', kind, `${record.id}.json`)
+  ensureParent(path)
+  writeFileSync(
+    path,
+    `${JSON.stringify(
+      {
+        createdAt: record.createdAt ?? timestampAt(0),
+        id: record.id,
+        kind,
+        payload: record.payload ?? {},
+        source: 'test',
+        subject: record.subject ?? 'validation.corpus',
+        ...(record.artifacts === undefined ? {} : { artifacts: record.artifacts }),
+        ...(record.supersedes === undefined ? {} : { supersedes: record.supersedes }),
+      },
+      null,
+      2,
+    )}\n`,
+  )
+}
+
 const assertErrorCode = (operation: () => unknown, code: string) => {
   assert.throws(operation, (error: unknown) => {
     assert.equal((error as { code?: unknown }).code, code)
     return true
   })
+}
+
+const postCommitRecoveryAction = {
+  cacheHydration: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+  publicationFlush:
+    'Confirm the canonical record file is present; prepare does not re-fsync the kind directory, so treat durability as unverified until that sync succeeds.',
+  stagingCleanup: 'Retry this add; leftovers under encephalon/_staging are cleared by the next add.',
+} as const
+
+const assertPostCommitError = (
+  operation: () => unknown,
+  expected: {
+    phase: keyof typeof postCommitRecoveryAction
+    path: string
+    recordId: string
+  },
+) => {
+  assert.throws(operation, (error: unknown) => {
+    const actual = error as {
+      code?: unknown
+      details?: Record<string, unknown>
+    }
+    assert.equal(actual.code, 'IO_ERROR')
+    assert.deepEqual(actual.details, {
+      canonicalCommitted: true,
+      path: expected.path,
+      postCommitPhase: expected.phase,
+      recordId: expected.recordId,
+      recoveryAction: postCommitRecoveryAction[expected.phase],
+    })
+    return true
+  })
+}
+
+const assertValidationFailureCode = (operation: () => unknown, code: string) => {
+  assert.throws(operation, (error: unknown) => {
+    const typed = error as { code?: unknown; details?: { errors?: Array<{ code?: unknown }> } }
+    assert.equal(typed.code, 'VALIDATION_FAILED')
+    assert.equal(
+      typed.details?.errors?.some(validationIssue => validationIssue.code === code),
+      true,
+    )
+    return true
+  })
+}
+
+const assertInvalidRecord = (result: ValidateResult, path?: string) => {
+  assert.equal(result.valid, false)
+  assert.equal(
+    result.errors.some(error => error.code === 'INVALID_RECORD' && (path === undefined || error.path === path)),
+    true,
+  )
 }
 
 afterEach(() => {
@@ -210,90 +300,77 @@ describe('canonical records', () => {
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'after-orphan.json')), true)
   })
 
-  test('does not misreport cleanup failure after canonical publication', () => {
+  test('reports staging cleanup failure after canonical publication as committed', () => {
     const root = createRoot()
-    const record = addRecordResolved(
-      root,
-      {
-        id: 'cleanup-failure',
-        kind: 'decision',
-        payload: { summary: 'Published' },
-        source: 'agent',
-        subject: 'cleanup.failure',
-      },
-      {
-        hooks: {
-          fault: point => {
-            if (point === 'during-cleanup') {
-              throw new Error('Injected cleanup failure')
-            }
+    assertPostCommitError(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'cleanup-failure',
+            kind: 'decision',
+            payload: { summary: 'Published' },
+            source: 'agent',
+            subject: 'cleanup.failure',
           },
-        },
-        hydrate: false,
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'during-cleanup') {
+                  throw Object.assign(new Error('Injected cleanup failure'), { code: 'EIO' })
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      {
+        path: 'encephalon/decision/cleanup-failure.json',
+        phase: 'stagingCleanup',
+        recordId: 'cleanup-failure',
       },
     )
 
-    assert.equal(record.id, 'cleanup-failure')
-    assert.equal(existsSync(join(root, record.path)), true)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'cleanup-failure.json')), true)
     assert.equal(readdirSync(join(root, 'encephalon', '_staging')).length, 1)
   })
 
-  test('does not misreport directory flush failure after canonical publication', () => {
+  test('reports cache hydration failure after canonical publication as committed', () => {
     const root = createRoot()
-    const record = addRecordResolved(
-      root,
-      {
-        id: 'flush-failure',
-        kind: 'decision',
-        payload: { summary: 'Published' },
-        source: 'agent',
-        subject: 'flush.failure',
-      },
-      {
-        hooks: {
-          fault: point => {
-            if (point === 'during-publication-flush') {
-              throw new Error('Injected directory flush failure')
-            }
+    assertPostCommitError(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'hydration-failure',
+            kind: 'decision',
+            payload: { summary: 'Published' },
+            source: 'agent',
+            subject: 'hydration.failure',
           },
-        },
-        hydrate: false,
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'during-hydration') {
+                  throw Object.assign(new Error('Injected hydration failure'), { code: 'EIO' })
+                }
+              },
+            },
+          },
+        ),
+      {
+        path: 'encephalon/decision/hydration-failure.json',
+        phase: 'cacheHydration',
+        recordId: 'hydration-failure',
       },
     )
 
-    assert.equal(record.id, 'flush-failure')
-    assert.equal(existsSync(join(root, record.path)), true)
-    assert.deepEqual(readdirSync(join(root, 'encephalon', '_staging')), [])
-  })
-
-  test('does not misreport cache hydration failure after canonical publication', () => {
-    const root = createRoot()
-    const record = addRecordResolved(
-      root,
-      {
-        id: 'hydration-failure',
-        kind: 'decision',
-        payload: { summary: 'Published' },
-        source: 'agent',
-        subject: 'hydration.failure',
-      },
-      {
-        hooks: {
-          fault: point => {
-            if (point === 'during-hydration') {
-              throw new Error('Injected hydration failure')
-            }
-          },
-        },
-      },
-    )
-
-    assert.equal(record.id, 'hydration-failure')
-    assert.equal(existsSync(join(root, record.path)), true)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'hydration-failure.json')), true)
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
     assertErrorCode(
       () =>
         api.addRecord({
-          id: record.id,
+          id: 'hydration-failure',
           kind: 'decision',
           payload: { summary: 'Retry' },
           root,
@@ -302,6 +379,75 @@ describe('canonical records', () => {
         }),
       'RECORD_EXISTS',
     )
+  })
+
+  test('reports publication flush failure after canonical publication as committed', () => {
+    const root = createRoot()
+    assertPostCommitError(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'flush-failure',
+            kind: 'decision',
+            payload: { summary: 'Published' },
+            source: 'agent',
+            subject: 'flush.failure',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'during-publication-flush') {
+                  throw Object.assign(new Error('Injected directory flush failure'), { code: 'EIO' })
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      {
+        path: 'encephalon/decision/flush-failure.json',
+        phase: 'publicationFlush',
+        recordId: 'flush-failure',
+      },
+    )
+
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'flush-failure.json')), true)
+    assert.deepEqual(readdirSync(join(root, 'encephalon', '_staging')), [])
+  })
+
+  test('does not let cleanup failure replace publication flush failure after commit', () => {
+    const root = createRoot()
+    assertPostCommitError(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'flush-and-cleanup-failure',
+            kind: 'decision',
+            payload: { summary: 'Published' },
+            source: 'agent',
+            subject: 'flush.cleanup',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'during-publication-flush' || point === 'during-cleanup') {
+                  throw Object.assign(new Error(`Injected ${point}`), { code: 'EIO' })
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      {
+        path: 'encephalon/decision/flush-and-cleanup-failure.json',
+        phase: 'publicationFlush',
+        recordId: 'flush-and-cleanup-failure',
+      },
+    )
+
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'flush-and-cleanup-failure.json')), true)
   })
 
   test('validates supersession graphs and permits a multi-head resolver', () => {
@@ -358,6 +504,162 @@ describe('canonical records', () => {
       supersedes: [second.id, 'record-c'],
     })
     assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('validates a corpus at the record limit with an iterative supersession chain', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 1000 }, (_, value) => value)) {
+      writeCanonicalRecord(root, {
+        createdAt: timestampAt(index),
+        id: `chain-${index}`,
+        ...(index === 0 ? {} : { supersedes: [`chain-${index - 1}`] }),
+      })
+    }
+
+    const result = api.validateRecords({ root }) as { truncated?: boolean } & ReturnType<typeof api.validateRecords>
+    assert.equal(result.valid, true)
+    assert.equal(result.recordsChecked, 1000)
+    assert.equal(result.errors.length, 0)
+    assert.equal(result.truncated, false)
+  })
+
+  test('reports corpus budget overflows deterministically', () => {
+    const recordCountRoot = createRoot()
+    for (const index of Array.from({ length: 1001 }, (_, value) => value)) {
+      writeCanonicalRecord(recordCountRoot, {
+        createdAt: timestampAt(index),
+        id: `count-${index}`,
+        subject: `validation.count.${index}`,
+      })
+    }
+    const recordCountResult = api.validateRecords({ root: recordCountRoot })
+    assert.equal(recordCountResult.valid, false)
+    assert.equal(recordCountResult.errors[0]?.code, 'CORPUS_RECORD_LIMIT')
+    assert.equal(recordCountResult.recordsChecked, 1000)
+
+    const byteRoot = createRoot()
+    for (const index of Array.from({ length: 10 }, (_, value) => value)) {
+      writeCanonicalRecord(byteRoot, {
+        createdAt: timestampAt(index),
+        id: `bytes-${index}`,
+        payload: { text: 'x'.repeat(900 * 1024) },
+        subject: `validation.bytes.${index}`,
+      })
+    }
+    const byteResult = api.validateRecords({ root: byteRoot })
+    assert.equal(byteResult.valid, false)
+    assert.equal(byteResult.errors[0]?.code, 'CORPUS_BYTE_LIMIT')
+
+    const edgeRoot = createRoot()
+    writeCanonicalRecord(edgeRoot, {
+      id: 'too-many-edges',
+      supersedes: Array.from({ length: 1001 }, (_, index) => `missing-${index}`),
+    })
+    const edgeResult = api.validateRecords({ root: edgeRoot })
+    assert.equal(edgeResult.valid, false)
+    assert.equal(edgeResult.errors[0]?.code, 'CORPUS_SUPERSEDES_LIMIT')
+
+    const artifactRoot = createRoot()
+    for (const recordIndex of Array.from({ length: 201 }, (_, value) => value)) {
+      const id = `artifact-${recordIndex}`
+      writeCanonicalRecord(artifactRoot, {
+        artifacts: Array.from(
+          { length: 5 },
+          (_, artifactIndex) => `_artifacts/decision/${id}/file-${artifactIndex}.txt`,
+        ),
+        id,
+        subject: `validation.artifacts.${recordIndex}`,
+      })
+    }
+    const artifactResult = api.validateRecords({ root: artifactRoot })
+    assert.equal(artifactResult.valid, false)
+    assert.equal(artifactResult.errors[0]?.code, 'CORPUS_ARTIFACT_LIMIT')
+  })
+
+  test('rejects addRecord when the candidate would exceed corpus count or byte budgets', () => {
+    const countRoot = createRoot()
+    for (const index of Array.from({ length: MAX_CANONICAL_RECORDS }, (_, value) => value)) {
+      writeCanonicalRecord(countRoot, {
+        createdAt: timestampAt(index),
+        id: `count-existing-${index}`,
+        subject: `validation.count-existing.${index}`,
+      })
+    }
+
+    assertValidationFailureCode(
+      () =>
+        api.addRecord({
+          id: 'count-overflow',
+          kind: 'decision',
+          payload: {},
+          root: countRoot,
+          source: 'test',
+          subject: 'validation.count-overflow',
+        }),
+      'CORPUS_RECORD_LIMIT',
+    )
+    assert.equal(existsSync(join(countRoot, 'encephalon', 'decision', 'count-overflow.json')), false)
+
+    const byteRoot = createRoot()
+    for (const index of Array.from({ length: 8 }, (_, value) => value)) {
+      writeCanonicalRecord(byteRoot, {
+        createdAt: timestampAt(index),
+        id: `byte-existing-${index}`,
+        payload: { text: 'x'.repeat(1000 * 1024) },
+        subject: `validation.byte-existing.${index}`,
+      })
+    }
+    assert.equal(api.validateRecords({ root: byteRoot }).valid, true)
+
+    assertValidationFailureCode(
+      () =>
+        api.addRecord({
+          id: 'byte-overflow',
+          kind: 'decision',
+          payload: { text: 'x'.repeat(300 * 1024) },
+          root: byteRoot,
+          source: 'test',
+          subject: 'validation.byte-overflow',
+        }),
+      'CORPUS_BYTE_LIMIT',
+    )
+    assert.equal(existsSync(join(byteRoot, 'encephalon', 'decision', 'byte-overflow.json')), false)
+  })
+
+  test('detects a long supersession cycle without recursive stack growth', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 1000 }, (_, value) => value)) {
+      writeCanonicalRecord(root, {
+        createdAt: timestampAt(index),
+        id: `cycle-${index}`,
+        supersedes: index === 0 ? ['cycle-999'] : [`cycle-${index - 1}`],
+      })
+    }
+
+    assert.doesNotThrow(() => api.validateRecords({ root }))
+    const result = api.validateRecords({ root })
+    assert.equal(result.valid, false)
+    assert.equal(
+      result.errors.some(error => error.code === 'SUPERSEDES_CYCLE'),
+      true,
+    )
+  })
+
+  test('truncates validation issues with a deterministic sentinel', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 105 }, (_, value) => value)) {
+      const path = join(root, 'encephalon', 'decision', `invalid-${String(index).padStart(3, '0')}.json`)
+      ensureParent(path)
+      writeFileSync(path, '{invalid')
+    }
+
+    const result = api.validateRecords({ root }) as { truncated?: boolean } & ReturnType<typeof api.validateRecords>
+    assert.equal(result.valid, false)
+    assert.equal(result.truncated, true)
+    assert.equal(result.errors.length, 100)
+    assert.equal(result.errors[0]?.path, 'encephalon/decision/invalid-000.json')
+    assert.equal(result.errors.at(-1)?.code, 'VALIDATION_ISSUES_TRUNCATED')
+    assert.equal(result.errors.at(-1)?.message, 'Validation stopped reporting after 99 concrete issues.')
   })
 
   test('rejects non-JSON payloads and unsafe portable paths', () => {
@@ -469,6 +771,19 @@ describe('canonical records', () => {
         }),
       'INVALID_ARGUMENT',
     )
+    const cyclic: Record<string, unknown> = {}
+    cyclic.self = cyclic
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: cyclic as never,
+          root,
+          source: 'agent',
+          subject: 'x',
+        }),
+      'INVALID_ARGUMENT',
+    )
     assertErrorCode(
       () =>
         api.addRecord({
@@ -559,6 +874,145 @@ describe('canonical records', () => {
     )
   })
 
+  test('rejects payload accessors without invoking them', () => {
+    const root = createRoot()
+    let getterCalls = 0
+    const payloadWithGetter: Record<string, unknown> = {}
+    Object.defineProperty(payloadWithGetter, 'secret', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1
+        return 'side effect'
+      },
+    })
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: payloadWithGetter as never,
+          root,
+          source: 'agent',
+          subject: 'payload.accessor',
+        }),
+      'INVALID_ARGUMENT',
+    )
+    assert.equal(getterCalls, 0)
+
+    const payloadWithSetter = {}
+    Object.defineProperty(payloadWithSetter, 'secret', {
+      enumerable: true,
+      set: () => {
+        throw new Error('setter must not run')
+      },
+    })
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: payloadWithSetter,
+          root,
+          source: 'agent',
+          subject: 'payload.setter',
+        }),
+      'INVALID_ARGUMENT',
+    )
+  })
+
+  test('returns stable invalid argument errors for hostile payload descriptors', () => {
+    const root = createRoot()
+    const throwingDescriptorProxy = new Proxy(
+      { summary: 'Hidden' },
+      {
+        getOwnPropertyDescriptor: () => {
+          throw new Error('descriptor trap must not escape')
+        },
+      },
+    )
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: throwingDescriptorProxy,
+          root,
+          source: 'agent',
+          subject: 'payload.proxy',
+        }),
+      'INVALID_ARGUMENT',
+    )
+  })
+
+  test('bounds payload depth and total node count', () => {
+    const root = createRoot()
+    const buildNestedPayload = (depth: number) =>
+      Array.from({ length: depth }).reduce<unknown>(payload => ({ child: payload }), null)
+    const buildWidePayload = (properties: number) =>
+      Object.fromEntries(Array.from({ length: properties }, (_, index) => [`k${index}`, null]))
+
+    const deepestValid = api.addRecord({
+      id: 'payload-depth-limit',
+      kind: 'decision',
+      payload: buildNestedPayload(64) as never,
+      root,
+      source: 'agent',
+      subject: 'payload.depth.valid',
+    })
+    assert.equal(existsSync(join(root, deepestValid.path)), true)
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: buildNestedPayload(65) as never,
+          root,
+          source: 'agent',
+          subject: 'payload.depth.invalid',
+        }),
+      'INVALID_ARGUMENT',
+    )
+
+    const widestValid = api.addRecord({
+      id: 'payload-node-limit',
+      kind: 'decision',
+      payload: buildWidePayload(9999),
+      root,
+      source: 'agent',
+      subject: 'payload.nodes.valid',
+    })
+    assert.equal(existsSync(join(root, widestValid.path)), true)
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: buildWidePayload(10_000),
+          root,
+          source: 'agent',
+          subject: 'payload.nodes.invalid',
+        }),
+      'INVALID_ARGUMENT',
+    )
+  })
+
+  test('normalizes negative zero payload numbers before formatting', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'payload-negative-zero',
+      kind: 'decision',
+      payload: { value: -0 },
+      root,
+      source: 'agent',
+      subject: 'payload.negative-zero',
+    })
+
+    assert.equal(Object.is((record.payload as { value: number }).value, 0), true)
+    const persisted = JSON.parse(readFileSync(join(root, record.path), 'utf8')) as { payload: { value: number } }
+    assert.equal(Object.is(persisted.payload.value, 0), true)
+    assert.deepEqual(record.payload, persisted.payload)
+  })
+
   test('enforces portable artifact path component lengths', () => {
     const root = createRoot()
     const validComponent = 'a'.repeat(255)
@@ -616,6 +1070,207 @@ describe('canonical records', () => {
       true,
     )
     assert.equal(readFileSync(path, 'utf8'), original)
+  })
+
+  test('rejects a record replaced by a symlink between enumeration and open', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'record-symlink-race',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'record.symlink-race',
+    })
+    const path = join(root, record.path)
+    const target = join(root, 'outside-record.json')
+    writeFileSync(target, '{}')
+    let replaced = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: point => {
+          if (point === 'after-record-lstat' && !replaced) {
+            replaced = true
+            rmSync(path)
+            symlinkSync(target, path)
+          }
+        },
+      },
+    })
+
+    assertInvalidRecord(result, record.path)
+  })
+
+  test('rejects a record when its parent kind directory is replaced during read', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'parent-replaced',
+      kind: 'decision',
+      payload: { summary: 'Original' },
+      root,
+      source: 'agent',
+      subject: 'record.parent-race',
+    })
+    const kindPath = join(root, 'encephalon', 'decision')
+    const recordPath = join(root, record.path)
+    let replaced = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: point => {
+          if (point === 'after-record-lstat' && !replaced) {
+            replaced = true
+            rmSync(kindPath, { recursive: true })
+            mkdirSync(kindPath)
+            writeFileSync(
+              recordPath,
+              JSON.stringify({
+                createdAt: record.createdAt,
+                id: record.id,
+                kind: record.kind,
+                payload: { summary: 'Replacement' },
+                source: record.source,
+                subject: record.subject,
+              }),
+            )
+          }
+        },
+      },
+    })
+
+    assertInvalidRecord(result, record.path)
+  })
+
+  test('rejects a symlink record whose target exceeds the byte limit', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'oversized-symlink-target',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'record.oversized-symlink',
+    })
+    const path = join(root, record.path)
+    const target = join(root, 'oversized-target.json')
+    writeFileSync(target, 'x'.repeat(1024 * 1024 + 1))
+    let replaced = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: point => {
+          if (point === 'after-record-lstat' && !replaced) {
+            replaced = true
+            rmSync(path)
+            symlinkSync(target, path)
+          }
+        },
+      },
+    })
+
+    assertInvalidRecord(result, record.path)
+  })
+
+  test('rejects non-regular canonical record entries where supported', {
+    skip: process.platform === 'win32' ? 'Windows runners do not provide mkfifo.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'encephalon', 'decision', 'fifo-record.json')
+    ensureParent(path)
+    execFileSync('mkfifo', [path])
+
+    const result = api.validateRecords({ root })
+
+    assert.equal(result.valid, false)
+    assert.equal(
+      result.errors.some(
+        error => error.code === 'INVALID_RECORD_LAYOUT' && error.path === 'encephalon/decision/fifo-record.json',
+      ),
+      true,
+    )
+  })
+
+  test('rejects invalid UTF-8 record bytes', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'invalid-utf8',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'record.invalid-utf8',
+    })
+    writeFileSync(join(root, record.path), Buffer.from([0xff, 0xfe, 0xfd]))
+
+    const result = api.validateRecords({ root })
+
+    assertInvalidRecord(result, record.path)
+    assert.equal(
+      result.errors.some(error => error.message === 'Record file is not valid UTF-8.'),
+      true,
+    )
+  })
+
+  test('rejects a record changed after descriptor verification but before read', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'changed-after-open',
+      kind: 'decision',
+      payload: { summary: 'Original' },
+      root,
+      source: 'agent',
+      subject: 'record.changed-after-open',
+    })
+    const path = join(root, record.path)
+    let changed = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: point => {
+          if (point === 'after-record-fstat' && !changed) {
+            changed = true
+            writeFileSync(path, '{"changed":true}')
+          }
+        },
+      },
+    })
+
+    assertInvalidRecord(result, record.path)
+    assert.equal(
+      result.errors.some(error => error.message === 'Record file changed while it was being read.'),
+      true,
+    )
+  })
+
+  test('reports malformed JSON without echoing source content', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'malformed-json',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'record.malformed-json',
+    })
+    const secret = 'SECRET_TOKEN_SHOULD_NOT_APPEAR'
+    writeFileSync(join(root, record.path), `{"payload":"${secret}",`)
+
+    const result = api.validateRecords({ root })
+
+    assertInvalidRecord(result, record.path)
+    assert.equal(
+      result.errors.some(error => error.message === 'Record file contains invalid JSON.'),
+      true,
+    )
+    assert.equal(
+      result.errors.some(error => error.message.includes(secret)),
+      false,
+    )
   })
 
   test('discovers a worktree-style git root and rejects an invalid explicit root', () => {
