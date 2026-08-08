@@ -325,7 +325,8 @@ const tempPathFor = (path: string, suffix = 'tmp') =>
   join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.${suffix}`)
 
 const fsyncFile = (path: string) => {
-  const descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
+  const access = process.platform === 'win32' ? constants.O_RDWR : constants.O_RDONLY
+  const descriptor = openSync(path, access | noFollowFlag)
   try {
     fsyncSync(descriptor)
   } finally {
