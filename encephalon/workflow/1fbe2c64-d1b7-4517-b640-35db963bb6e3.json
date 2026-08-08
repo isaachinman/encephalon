@@ -1,9 +1,9 @@
 {
-  "createdAt": "2026-08-08T01:37:15.886Z",
-  "id": "a46c2d81-6579-4f27-a927-5dc07644cf38",
+  "createdAt": "2026-08-08T07:45:17.000Z",
+  "id": "1fbe2c64-d1b7-4517-b640-35db963bb6e3",
   "kind": "workflow",
   "payload": {
-    "summary": "Prevent repeat PR review issues found on MAR-2509 and MAR-2510.",
+    "summary": "Prevent repeat PR review issues found in Encephalon review fixes.",
     "lessons": [
       "For managed instruction-file publication, do not rely on a preflight-only snapshot before replacing a user-owned file; capture and revalidate the current target at publication time so concurrent edits return REPOSITORY_CHANGED instead of being overwritten.",
       "Preserve mutable filesystem metadata from the file captured at publication time, not from the earlier plan, because owners can change permissions without changing bytes.",
@@ -12,17 +12,23 @@
       "Do not apply a final permission snapshot after publication if the source inode can still be changed through old descriptors; report pre-final mode drift and leave post-final drift recoverable on the backup instead.",
       "When adding repository workflow guidance, keep Git commit subjects and PR titles prefixed with the Linear ticket in square brackets, for example [MAR-1234] Describe the change.",
       "For append-only canonical record publication, treat successful hard-link creation as the commit point. Any post-publication cleanup or directory fsync failure must be best-effort and must not make the caller observe a failed mutation that will collide with RECORD_EXISTS on retry.",
-      "Cache hydration is derived state after canonical record publication. If hydration fails after the record commit point, return the committed record and let the next read rebuild cache state instead of reporting the mutation as failed."
+      "Cache hydration is derived state after canonical record publication. If hydration fails after the record commit point, return the committed record and let the next read rebuild cache state instead of reporting the mutation as failed.",
+      "When adding a managed block to a user-owned file with a byte-size limit, validate the final bytes that Encephalon will publish, not only the original preflight bytes, so the tool cannot create a file it later refuses to read or remove.",
+      "When reporting size-limit validation failures, describe the bytes actually being rejected: distinguish an original file that exceeds the cap from a final managed output that cannot fit the appended block within the cap.",
+      "Treat actionable Pullfrog review-body nitpicks as comments to resolve, even when GitHub does not expose them as inline review threads."
     ],
     "verification": [
       "Search Encephalon before adding durable workflow lessons.",
       "Add regression tests for each review comment when possible.",
       "Use one commit per review-comment fix so replies can point to the exact change.",
-      "For publication paths, add tests for failures both before and after the commit point so successful commits are not misreported as failures."
+      "For publication paths, add tests for failures both before and after the commit point so successful commits are not misreported as failures.",
+      "For managed file-size limits, test boundary inputs after Encephalon's own appended or removed bytes are included.",
+      "Assert user-facing validation wording when the distinction between source bytes and generated output bytes matters.",
+      "Before merging, scan both unresolved inline threads and latest review bodies for outstanding actionable feedback."
     ]
   },
-  "searchText": "PR review hardening lessons for Encephalon record and instruction publication",
+  "searchText": "PR review hardening lessons Pullfrog review body nitpicks managed file accept boundary exact size limit",
   "source": "agent",
   "subject": "review.github-pr-feedback",
-  "supersedes": ["2ca67690-910d-4a50-9c40-c4d8cad56910"]
+  "supersedes": ["9c13e80e-1a09-4d9f-94a6-fd248c5b1479"]
 }

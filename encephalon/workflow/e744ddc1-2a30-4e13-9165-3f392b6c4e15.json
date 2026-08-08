@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-08T07:37:20.000Z",
+  "id": "e744ddc1-2a30-4e13-9165-3f392b6c4e15",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Keep Encephalon dogfooding state visible to Git.",
+    "lessons": [
+      "Do not ignore the repository's root encephalon directory wholesale in projects that dogfood Encephalon; records and referenced artifacts are durable project memory and should be ordinary reviewable Git changes.",
+      "If local scratch state needs ignoring, ignore only the transient internal path, such as encephalon/_staging, so future memory records do not require git add -f."
+    ],
+    "verification": [
+      "After changing Encephalon state, run git status without force-add assumptions and confirm new records appear as ordinary untracked or staged files."
+    ]
+  },
+  "searchText": "Encephalon dogfooding gitignore state records visible git staging",
+  "source": "agent",
+  "subject": "workflow.gitignore-dogfooding",
+  "supersedes": []
+}

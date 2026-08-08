@@ -2,6 +2,6 @@ node_modules/
 dist/
 *.tgz
 coverage/
-/encephalon/
+/encephalon/_staging/
 .DS_Store
 AGENTS.md
