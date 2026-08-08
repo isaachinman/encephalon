@@ -62,4 +62,4 @@ When an implementation change intentionally alters this contract:
 | The packaged skill uses `npx --no-install encephalon ...` examples instead of direct `node ./node_modules/encephalon/dist/cli.mjs` examples. | Accepted current contract. Root-install verification prevents ephemeral package execution, and package tests assert the skill guidance. |
 | CI and release gates evolved after the original plan. | Owned by MAR-2527 for CI package gates. The maintained release contract remains the checked package scripts plus manual publishing. |
 | Initialisation result and managed-file mutation details changed during implementation. | Implemented and tested in the init, instruction-file, package, and CLI suites; the README and this contract describe the maintained behaviour. |
-| `canonicalRecordPath` was exported from `src/records.ts` without a production consumer. | Removed as dead internal surface; it was not part of the public `src/index.ts` API. |
+| `canonicalRecordPath` was exported from `src/records.ts` without a public API surface. | Retained as an internal helper used by cache path validation; not exported from `src/index.ts`. |
