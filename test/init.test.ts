@@ -139,8 +139,8 @@ describe('initialisation', () => {
     assert.ok(workflow)
     assert.deepEqual(workflow.payload, {
       scriptInvocations: [
-        { arguments: ['run-script', 'build'], executable: 'npm', scriptKey: 'build' },
-        { arguments: ['run-script', 'test'], executable: 'npm', scriptKey: 'test' },
+        { arguments: ['run', 'build'], executable: 'npm', scriptKey: 'build' },
+        { arguments: ['run', 'test'], executable: 'npm', scriptKey: 'test' },
       ],
       scriptKeys: ['build', 'test'],
       sources: ['package.json', '.github/workflows/checks.yml'],
@@ -201,8 +201,8 @@ describe('initialisation', () => {
     assert.ok(refreshedWorkflow)
     assert.deepEqual((refreshedWorkflow.payload as { scriptKeys?: unknown }).scriptKeys, ['lint', 'test'])
     assert.deepEqual((refreshedWorkflow.payload as { scriptInvocations?: unknown }).scriptInvocations, [
-      { arguments: ['run-script', 'lint'], executable: 'npm', scriptKey: 'lint' },
-      { arguments: ['run-script', 'test'], executable: 'npm', scriptKey: 'test' },
+      { arguments: ['run', 'lint'], executable: 'npm', scriptKey: 'lint' },
+      { arguments: ['run', 'test'], executable: 'npm', scriptKey: 'test' },
     ])
     assert.doesNotMatch(JSON.stringify(workflow[0]?.payload), /lint-private-body/)
     assert.equal(api.listRecords({ limit: 20, root }).length, 3)

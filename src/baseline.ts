@@ -264,7 +264,7 @@ const invocationForScript = (manager: string, scriptKey: string) => {
     return
   }
   return {
-    arguments: [manager === 'npm' ? 'run-script' : 'run', scriptKey],
+    arguments: ['run', scriptKey],
     executable: manager,
     scriptKey,
   }
