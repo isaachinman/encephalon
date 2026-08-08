@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-08T08:38:03.178Z",
+  "id": "2bf81475-1e33-4350-8229-e614d09fd073",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Use Encephalon itself as a required workflow gate before confirming or pushing PR work in this repository.",
+    "lessons": [
+      "Before confirming a PR is ready, pushing PR updates, or merging PR work in this repository, query Encephalon state directly for relevant workflow and review learnings.",
+      "If a relevant workflow rule is missing from Encephalon state, add it through Encephalon itself before proceeding so future agents can retrieve it without relying on conversation context.",
+      "Use the repository-local Encephalon CLI or API, not CreateState, for durable project learnings in this repo."
+    ],
+    "verification": [
+      "Run an Encephalon search or gather command before PR push/confirmation steps and cite the retrieved state in the working notes."
+    ]
+  },
+  "searchText": "Use Encephalon before PR confirmation and push",
+  "source": "agent",
+  "subject": "workflow.encephalon-pr-gate"
+}

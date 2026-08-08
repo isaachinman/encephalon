@@ -460,6 +460,7 @@ export type BrainRecord = BrainRecordFile & {
 - Is required and may be any valid `JsonValue`.
 - Runtime validation rejects `undefined`, `bigint`, functions, symbols, non-finite numbers, cyclic values, sparse arrays, non-plain objects, accessors, Maps, Sets, Dates, and typed arrays.
 - Objects must have `Object.prototype` or a null prototype and enumerable string keys whose values are valid JSON.
+- Payload validation accepts at most 64 nested levels and 10,000 JSON nodes, counting the root value, arrays, objects, and primitive values.
 - The final formatted record file must not exceed 1 MiB.
 
 `searchText`:
@@ -952,8 +953,8 @@ Persistable facts:
 
 - Safe top-level file and directory names, excluding secret-prone hidden paths.
 - Recognised root manifest, lockfile, and configuration filenames.
-- Root `package.json` package name, `packageManager`, workspace presence, and script keys.
-- Derived package script invocations such as `npm run test`; never the script body.
+- Root `package.json` package name, `packageManager`, workspace presence, and discovery-only script keys.
+- Derived package script invocations as structured `{ executable, arguments, scriptKey }` argv data; never shell command strings or the script body. Script keys beginning with `-` remain discoverable in `scriptKeys` but do not produce runnable invocations.
 - CI workflow filenames under `.github/workflows`; never YAML content, triggers, jobs, steps, secrets, or environment values.
 - Recognised language/file counts derived from extensions.
 - Repository identity derived from a safe root package name, or the root directory basename when no manifest provides a name.
@@ -984,7 +985,7 @@ Generate no more than these subjects:
    - Recognised languages and counts.
    - Manifest, lockfile, workspace, and configuration presence.
 3. Kind `workflow`, subject `encephalon:init/commands-ci`.
-   - Package script keys and safe derived invocations.
+   - Package script keys as discovery-only data and safe derived structured invocations as the only execution source of truth.
    - CI workflow filenames.
 
 All use `source: "encephalon:init"`. Payload keys and arrays are emitted in a stable order so canonical deep comparison is deterministic.
@@ -1052,6 +1053,7 @@ Before changing either file:
 
 - Read raw bytes when it exists.
 - Reject NUL-containing or invalid UTF-8 text.
+- Reject instruction files larger than 1 MiB before rewriting them.
 - Detect the file's existing line ending without normalising content.
 - Detect zero, one, or multiple marker pairs.
 - Reject duplicate, nested, reversed, or unmatched markers.

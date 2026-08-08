@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import {
   existsSync,
   linkSync,
@@ -13,8 +14,9 @@ import {
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
-import { addRecordResolved } from '../src/records.ts'
+import { addRecordResolved, validateRecordsResolved } from '../src/records.ts'
 import { discoverRepository } from '../src/repository.ts'
+import type { ValidateResult } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -30,6 +32,14 @@ const assertErrorCode = (operation: () => unknown, code: string) => {
     assert.equal((error as { code?: unknown }).code, code)
     return true
   })
+}
+
+const assertInvalidRecord = (result: ValidateResult, path?: string) => {
+  assert.equal(result.valid, false)
+  assert.equal(
+    result.errors.some(error => error.code === 'INVALID_RECORD' && (path === undefined || error.path === path)),
+    true,
+  )
 }
 
 afterEach(() => {
@@ -436,6 +446,19 @@ describe('canonical records', () => {
         }),
       'INVALID_ARGUMENT',
     )
+    const cyclic: Record<string, unknown> = {}
+    cyclic.self = cyclic
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: cyclic as never,
+          root,
+          source: 'agent',
+          subject: 'x',
+        }),
+      'INVALID_ARGUMENT',
+    )
     assertErrorCode(
       () =>
         api.addRecord({
@@ -526,6 +549,145 @@ describe('canonical records', () => {
     )
   })
 
+  test('rejects payload accessors without invoking them', () => {
+    const root = createRoot()
+    let getterCalls = 0
+    const payloadWithGetter: Record<string, unknown> = {}
+    Object.defineProperty(payloadWithGetter, 'secret', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1
+        return 'side effect'
+      },
+    })
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: payloadWithGetter as never,
+          root,
+          source: 'agent',
+          subject: 'payload.accessor',
+        }),
+      'INVALID_ARGUMENT',
+    )
+    assert.equal(getterCalls, 0)
+
+    const payloadWithSetter = {}
+    Object.defineProperty(payloadWithSetter, 'secret', {
+      enumerable: true,
+      set: () => {
+        throw new Error('setter must not run')
+      },
+    })
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: payloadWithSetter,
+          root,
+          source: 'agent',
+          subject: 'payload.setter',
+        }),
+      'INVALID_ARGUMENT',
+    )
+  })
+
+  test('returns stable invalid argument errors for hostile payload descriptors', () => {
+    const root = createRoot()
+    const throwingDescriptorProxy = new Proxy(
+      { summary: 'Hidden' },
+      {
+        getOwnPropertyDescriptor: () => {
+          throw new Error('descriptor trap must not escape')
+        },
+      },
+    )
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: throwingDescriptorProxy,
+          root,
+          source: 'agent',
+          subject: 'payload.proxy',
+        }),
+      'INVALID_ARGUMENT',
+    )
+  })
+
+  test('bounds payload depth and total node count', () => {
+    const root = createRoot()
+    const buildNestedPayload = (depth: number) =>
+      Array.from({ length: depth }).reduce<unknown>(payload => ({ child: payload }), null)
+    const buildWidePayload = (properties: number) =>
+      Object.fromEntries(Array.from({ length: properties }, (_, index) => [`k${index}`, null]))
+
+    const deepestValid = api.addRecord({
+      id: 'payload-depth-limit',
+      kind: 'decision',
+      payload: buildNestedPayload(64) as never,
+      root,
+      source: 'agent',
+      subject: 'payload.depth.valid',
+    })
+    assert.equal(existsSync(join(root, deepestValid.path)), true)
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: buildNestedPayload(65) as never,
+          root,
+          source: 'agent',
+          subject: 'payload.depth.invalid',
+        }),
+      'INVALID_ARGUMENT',
+    )
+
+    const widestValid = api.addRecord({
+      id: 'payload-node-limit',
+      kind: 'decision',
+      payload: buildWidePayload(9999),
+      root,
+      source: 'agent',
+      subject: 'payload.nodes.valid',
+    })
+    assert.equal(existsSync(join(root, widestValid.path)), true)
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          kind: 'decision',
+          payload: buildWidePayload(10_000),
+          root,
+          source: 'agent',
+          subject: 'payload.nodes.invalid',
+        }),
+      'INVALID_ARGUMENT',
+    )
+  })
+
+  test('normalizes negative zero payload numbers before formatting', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'payload-negative-zero',
+      kind: 'decision',
+      payload: { value: -0 },
+      root,
+      source: 'agent',
+      subject: 'payload.negative-zero',
+    })
+
+    assert.equal(Object.is((record.payload as { value: number }).value, 0), true)
+    const persisted = JSON.parse(readFileSync(join(root, record.path), 'utf8')) as { payload: { value: number } }
+    assert.equal(Object.is(persisted.payload.value, 0), true)
+    assert.deepEqual(record.payload, persisted.payload)
+  })
+
   test('reports malformed files without rewriting them', () => {
     const root = createRoot()
     const path = join(root, 'encephalon', 'decision', 'wrong-name.json')
@@ -547,6 +709,207 @@ describe('canonical records', () => {
       true,
     )
     assert.equal(readFileSync(path, 'utf8'), original)
+  })
+
+  test('rejects a record replaced by a symlink between enumeration and open', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'record-symlink-race',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'record.symlink-race',
+    })
+    const path = join(root, record.path)
+    const target = join(root, 'outside-record.json')
+    writeFileSync(target, '{}')
+    let replaced = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: point => {
+          if (point === 'after-record-lstat' && !replaced) {
+            replaced = true
+            rmSync(path)
+            symlinkSync(target, path)
+          }
+        },
+      },
+    })
+
+    assertInvalidRecord(result, record.path)
+  })
+
+  test('rejects a record when its parent kind directory is replaced during read', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'parent-replaced',
+      kind: 'decision',
+      payload: { summary: 'Original' },
+      root,
+      source: 'agent',
+      subject: 'record.parent-race',
+    })
+    const kindPath = join(root, 'encephalon', 'decision')
+    const recordPath = join(root, record.path)
+    let replaced = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: point => {
+          if (point === 'after-record-lstat' && !replaced) {
+            replaced = true
+            rmSync(kindPath, { recursive: true })
+            mkdirSync(kindPath)
+            writeFileSync(
+              recordPath,
+              JSON.stringify({
+                createdAt: record.createdAt,
+                id: record.id,
+                kind: record.kind,
+                payload: { summary: 'Replacement' },
+                source: record.source,
+                subject: record.subject,
+              }),
+            )
+          }
+        },
+      },
+    })
+
+    assertInvalidRecord(result, record.path)
+  })
+
+  test('rejects a symlink record whose target exceeds the byte limit', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'oversized-symlink-target',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'record.oversized-symlink',
+    })
+    const path = join(root, record.path)
+    const target = join(root, 'oversized-target.json')
+    writeFileSync(target, 'x'.repeat(1024 * 1024 + 1))
+    let replaced = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: point => {
+          if (point === 'after-record-lstat' && !replaced) {
+            replaced = true
+            rmSync(path)
+            symlinkSync(target, path)
+          }
+        },
+      },
+    })
+
+    assertInvalidRecord(result, record.path)
+  })
+
+  test('rejects non-regular canonical record entries where supported', {
+    skip: process.platform === 'win32' ? 'Windows runners do not provide mkfifo.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'encephalon', 'decision', 'fifo-record.json')
+    ensureParent(path)
+    execFileSync('mkfifo', [path])
+
+    const result = api.validateRecords({ root })
+
+    assert.equal(result.valid, false)
+    assert.equal(
+      result.errors.some(
+        error => error.code === 'INVALID_RECORD_LAYOUT' && error.path === 'encephalon/decision/fifo-record.json',
+      ),
+      true,
+    )
+  })
+
+  test('rejects invalid UTF-8 record bytes', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'invalid-utf8',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'record.invalid-utf8',
+    })
+    writeFileSync(join(root, record.path), Buffer.from([0xff, 0xfe, 0xfd]))
+
+    const result = api.validateRecords({ root })
+
+    assertInvalidRecord(result, record.path)
+    assert.equal(
+      result.errors.some(error => error.message === 'Record file is not valid UTF-8.'),
+      true,
+    )
+  })
+
+  test('rejects a record changed after descriptor verification but before read', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'changed-after-open',
+      kind: 'decision',
+      payload: { summary: 'Original' },
+      root,
+      source: 'agent',
+      subject: 'record.changed-after-open',
+    })
+    const path = join(root, record.path)
+    let changed = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: point => {
+          if (point === 'after-record-fstat' && !changed) {
+            changed = true
+            writeFileSync(path, '{"changed":true}')
+          }
+        },
+      },
+    })
+
+    assertInvalidRecord(result, record.path)
+    assert.equal(
+      result.errors.some(error => error.message === 'Record file changed while it was being read.'),
+      true,
+    )
+  })
+
+  test('reports malformed JSON without echoing source content', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'malformed-json',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'record.malformed-json',
+    })
+    const secret = 'SECRET_TOKEN_SHOULD_NOT_APPEAR'
+    writeFileSync(join(root, record.path), `{"payload":"${secret}",`)
+
+    const result = api.validateRecords({ root })
+
+    assertInvalidRecord(result, record.path)
+    assert.equal(
+      result.errors.some(error => error.message === 'Record file contains invalid JSON.'),
+      true,
+    )
+    assert.equal(
+      result.errors.some(error => error.message.includes(secret)),
+      false,
+    )
   })
 
   test('discovers a worktree-style git root and rejects an invalid explicit root', () => {

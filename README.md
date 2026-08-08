@@ -26,7 +26,9 @@ npm install --save-dev encephalon
 npx --no-install encephalon init
 ```
 
-`init` safely scans derived repository metadata, creates up to three baseline records, builds the local cache, and adds a reversible managed block to root `AGENTS.md` and `CLAUDE.md`. It never reads source bodies, instruction-file text, README content, environment files, registry configuration, Git history, Git remotes, or CI workflow contents.
+`init` safely scans derived repository metadata, creates up to three baseline records, builds the local cache, and adds a reversible managed block to root `AGENTS.md` and `CLAUDE.md`. It does not record source bodies, instruction-file text, README content, environment files, registry configuration, Git history, Git remotes, or CI workflow contents.
+
+Existing instruction files must be valid UTF-8, NUL-free, regular non-symlink files no larger than 1 MiB. Invalid files are rejected before either instruction file is changed.
 
 The result includes a `nextAction` asking an agent to read the installed skill and optionally enrich the baseline semantically.
 
@@ -120,6 +122,8 @@ type BrainRecordFile = {
 
 type BrainRecord = BrainRecordFile & { path: string };
 ```
+
+Payload values are validated without invoking accessors. They may contain at most 64 nested levels and 10,000 JSON nodes, counting the root value, arrays, objects, and primitive values.
 
 The disposable cache lives at `node_modules/.cache/encephalon/brain.sqlite` and should not be committed. It uses SQLite WAL mode, FTS5, a repository-scoped operation lock, manifest-based freshness, and transactional table rebuilds. Canonical records remain the source of truth.
 
