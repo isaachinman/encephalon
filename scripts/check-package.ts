@@ -229,7 +229,7 @@ try {
   const cli = (arguments_: string[]) => run(['node', installedCli, ...arguments_], consumer)
   const cliJson = (arguments_: string[]) => JSON.parse(cli(arguments_)) as unknown
 
-  if (!/^Usage: encephalon/m.test(cli(['--help'])) || cli(['--version']) !== '0.1.0\n') {
+  if (!/^Usage: encephalon/m.test(cli(['--help'])) || cli(['--version']) !== `${packageJson.version}\n`) {
     throw new Error('The packed Node-only CLI help/version contract failed.')
   }
 
