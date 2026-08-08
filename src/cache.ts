@@ -711,23 +711,24 @@ const positiveLimit = (value: unknown, fallback = 20) => {
   return fail('INVALID_ARGUMENT', 'limit must be an integer between 1 and 1000.', { field: 'limit' })
 }
 
+const readFreshDatabase = <Result>(root: string, read: (database: DatabaseSync) => Result) => {
+  const database = openDatabase(root)
+  try {
+    const metadata = readMetadata(database)
+    if (!metadataIsFresh(root, database, metadata)) {
+      throw new CacheSchemaMismatch('The cache is stale before read.')
+    }
+    return read(database)
+  } finally {
+    database.close()
+  }
+}
+
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
   const root = resolveRepository(input)
-  const readOpenDatabase = () => {
-    const database = openDatabase(root)
-    try {
-      const metadata = readMetadata(database)
-      if (!metadataIsFresh(root, database, metadata)) {
-        throw new CacheSchemaMismatch('The cache is stale before read.')
-      }
-      return read(database)
-    } finally {
-      database.close()
-    }
-  }
   try {
     prepareResolved(root)
-    return readOpenDatabase()
+    return readFreshDatabase(root, read)
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -735,7 +736,7 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
     if (isRecoverableCacheFailure(error)) {
       withOperationLock(root, () => rebuildCache(root))
       try {
-        return readOpenDatabase()
+        return readFreshDatabase(root, read)
       } catch (retryError) {
         if (retryError instanceof EncephalonError) {
           throw retryError
@@ -856,39 +857,38 @@ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRec
     }),
   )
 
-const readGatherFromDatabase = (root: string, input: GatherInput, hydrated: HydrateResult | null): GatherResult => {
-  const database = openDatabase(root)
-  try {
-    const searches = input.searches ?? []
-    const shows = input.shows ?? []
-    return {
-      hydrated,
-      records: shows.map(id => {
-        const activeClause = input.includeSuperseded === true ? '' : ' AND active = 1'
-        const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(id) as
-          | RecordRow
-          | undefined
-        return { id, record: row === undefined ? null : parseRecordRow(row) }
+const readGatherFromDatabase = (
+  database: DatabaseSync,
+  input: GatherInput,
+  hydrated: HydrateResult | null,
+): GatherResult => {
+  const searches = input.searches ?? []
+  const shows = input.shows ?? []
+  return {
+    hydrated,
+    records: shows.map(id => {
+      const activeClause = input.includeSuperseded === true ? '' : ' AND active = 1'
+      const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(id) as
+        | RecordRow
+        | undefined
+      return { id, record: row === undefined ? null : parseRecordRow(row) }
+    }),
+    searches: searches.map(query => ({
+      kind: input.kind ?? null,
+      query,
+      results: searchRows(database, { ...input, query }).map(row => {
+        const record = parseRecordRow(row)
+        return {
+          id: record.id,
+          kind: record.kind,
+          path: record.path,
+          rank: compactRank(row.rank),
+          snippet: compactSnippet(row.snippet),
+          subject: record.subject,
+          summary: summaryForRecord(record),
+        }
       }),
-      searches: searches.map(query => ({
-        kind: input.kind ?? null,
-        query,
-        results: searchRows(database, { ...input, query }).map(row => {
-          const record = parseRecordRow(row)
-          return {
-            id: record.id,
-            kind: record.kind,
-            path: record.path,
-            rank: compactRank(row.rank),
-            snippet: compactSnippet(row.snippet),
-            subject: record.subject,
-            summary: summaryForRecord(record),
-          }
-        }),
-      })),
-    }
-  } finally {
-    database.close()
+    })),
   }
 }
 
@@ -915,7 +915,7 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
         field: 'shows',
       })
     }
-    return readGatherFromDatabase(root, input, hydrated)
+    return readFreshDatabase(root, database => readGatherFromDatabase(database, input, hydrated))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -923,10 +923,12 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
     if (isRecoverableCacheFailure(error)) {
       const recovered = withOperationLock(root, () => rebuildCache(root))
       try {
-        return readGatherFromDatabase(
-          root,
-          input,
-          input.hydrate === true ? { recordsIndexed: recovered.recordsIndexed } : null,
+        return readFreshDatabase(root, database =>
+          readGatherFromDatabase(
+            database,
+            input,
+            input.hydrate === true ? { recordsIndexed: recovered.recordsIndexed } : null,
+          ),
         )
       } catch (retryError) {
         if (retryError instanceof EncephalonError) {
