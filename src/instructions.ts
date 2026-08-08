@@ -1,16 +1,19 @@
+import { randomUUID } from 'node:crypto'
 import {
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
-  ftruncateSync,
+  fsyncSync,
+  linkSync,
   lstatSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
-  writeFileSync,
   writeSync,
 } from 'node:fs'
-import { resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 
 const FILENAMES = ['AGENTS.md', 'CLAUDE.md'] as const
@@ -32,9 +35,11 @@ type FilePlan = {
   content?: string
   originalContent: string
   originalFileExisted: boolean
+  originalMode?: number
 }
 
 const ALLOWED_SEPARATORS = new Set(['', '\n', '\n\n', '\r\n', '\r\n\r\n'])
+const MODE_BITS = 0o7777
 
 const lstatIfExists = (path: string) => {
   try {
@@ -179,6 +184,7 @@ const additionPlan = (root: string, filename: (typeof FILENAMES)[number]): FileP
     filename,
     originalContent: content,
     originalFileExisted: existed,
+    ...(existingMetadata === undefined ? {} : { originalMode: existingMetadata.mode }),
   }
 }
 
@@ -207,6 +213,7 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
       filename,
       originalContent: content,
       originalFileExisted: true,
+      originalMode: fileMetadata.mode,
     }
   }
   const contentWithoutBlock = `${content.slice(0, installed.start - installed.separator.length)}${content.slice(installed.end)}`
@@ -224,10 +231,12 @@ const removalPlan = (root: string, filename: (typeof FILENAMES)[number]): FilePl
     filename,
     originalContent: content,
     originalFileExisted: true,
+    originalMode: fileMetadata.mode,
   }
 }
 
 const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
+const directoryFlag = typeof constants.O_DIRECTORY === 'number' ? constants.O_DIRECTORY : 0
 
 const readRegularFile = (path: string) => {
   const descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
@@ -256,36 +265,124 @@ const assertPlanIsCurrent = (root: string, plan: FilePlan) => {
   }
 }
 
-const writePlan = (path: string, plan: FilePlan) => {
-  const content = plan.content ?? ''
-  if (!plan.originalFileExisted) {
-    try {
-      writeFileSync(path, content, { encoding: 'utf8', flag: 'wx' })
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-        return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
-      }
-      throw error
+type AtomicWriteFault =
+  | 'after-publication'
+  | 'before-temp-create'
+  | 'during-file-flush'
+  | 'during-publication'
+  | 'during-temp-cleanup'
+  | 'during-temp-write'
+
+type AtomicWriteHooks = {
+  fault?: (point: AtomicWriteFault) => void
+}
+
+const fault = (hooks: AtomicWriteHooks | undefined, point: AtomicWriteFault) => {
+  hooks?.fault?.(point)
+}
+
+const closeAfterOperation = (descriptor: number, operationFailed: boolean) => {
+  try {
+    closeSync(descriptor)
+  } catch (error) {
+    if (operationFailed) {
+      return
     }
+    throw error
+  }
+}
+
+const writeAll = (descriptor: number, bytes: Buffer, plan: FilePlan, hooks: AtomicWriteHooks | undefined) => {
+  fault(hooks, 'during-temp-write')
+  let offset = 0
+  while (offset < bytes.length) {
+    const written = writeSync(descriptor, bytes, offset, bytes.length - offset, offset)
+    if (written <= 0) {
+      throw new Error(`Unable to write ${plan.filename}.`)
+    }
+    offset += written
+  }
+}
+
+const fsyncDirectory = (path: string) => {
+  if (process.platform !== 'win32') {
+    let descriptor: number | undefined
+    let operationFailed = false
+    try {
+      descriptor = openSync(path, constants.O_RDONLY | directoryFlag)
+      fsyncSync(descriptor)
+    } catch (error) {
+      operationFailed = true
+      const { code } = error as NodeJS.ErrnoException
+      if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'EPERM') {
+        throw error
+      }
+    } finally {
+      if (descriptor !== undefined) {
+        closeAfterOperation(descriptor, operationFailed)
+      }
+    }
+  }
+}
+
+const tempPathFor = (path: string) => join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`)
+
+const publishTempFile = (path: string, tempPath: string, plan: FilePlan) => {
+  if (plan.originalFileExisted) {
+    renameSync(tempPath, path)
     return
   }
-  const descriptor = openSync(path, constants.O_RDWR | noFollowFlag)
   try {
-    if (!fstatSync(descriptor).isFile() || readFileSync(descriptor, 'utf8') !== plan.originalContent) {
+    linkSync(tempPath, path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
       return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
     }
-    const bytes = Buffer.from(content, 'utf8')
-    ftruncateSync(descriptor, 0)
-    let offset = 0
-    while (offset < bytes.length) {
-      const written = writeSync(descriptor, bytes, offset, bytes.length - offset, offset)
-      if (written <= 0) {
-        throw new Error(`Unable to write ${plan.filename}.`)
-      }
-      offset += written
+    throw error
+  }
+}
+
+const cleanupTempFile = (tempPath: string, hooks: AtomicWriteHooks | undefined, operationFailed: boolean) => {
+  try {
+    fault(hooks, 'during-temp-cleanup')
+    rmSync(tempPath, { force: true })
+  } catch (error) {
+    if (!operationFailed) {
+      throw error
     }
-  } finally {
+  }
+}
+
+const writePlan = (root: string, path: string, plan: FilePlan, hooks?: AtomicWriteHooks) => {
+  const content = plan.content ?? ''
+  const bytes = Buffer.from(content, 'utf8')
+  const tempPath = tempPathFor(path)
+  let descriptor: number | undefined
+  let operationFailed = false
+  try {
+    fault(hooks, 'before-temp-create')
+    descriptor = openSync(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o666)
+    if (plan.originalFileExisted && plan.originalMode !== undefined) {
+      fchmodSync(descriptor, plan.originalMode & MODE_BITS)
+    }
+    writeAll(descriptor, bytes, plan, hooks)
+    fault(hooks, 'during-file-flush')
+    fsyncSync(descriptor)
     closeSync(descriptor)
+    descriptor = undefined
+    assertPlanIsCurrent(root, plan)
+    fault(hooks, 'during-publication')
+    publishTempFile(path, tempPath, plan)
+    fault(hooks, 'after-publication')
+    fsyncDirectory(dirname(path))
+  } catch (error) {
+    operationFailed = true
+    throw error
+  } finally {
+    if (descriptor !== undefined) {
+      closeAfterOperation(descriptor, operationFailed)
+    }
+    cleanupTempFile(tempPath, hooks, operationFailed)
   }
 }
 
@@ -300,7 +397,7 @@ export const planInstructionChanges = (root: string, remove: boolean) => {
   }
 }
 
-export const applyInstructionChanges = (root: string, plans: FilePlan[]) => {
+export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?: AtomicWriteHooks) => {
   try {
     for (const plan of plans) {
       if (plan.action !== 'none') {
@@ -313,7 +410,7 @@ export const applyInstructionChanges = (root: string, plans: FilePlan[]) => {
         rmSync(path)
       }
       if (plan.action === 'write') {
-        writePlan(path, plan)
+        writePlan(root, path, plan, hooks)
       }
     }
     return plans

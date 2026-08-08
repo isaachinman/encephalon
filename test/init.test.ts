@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
+import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -227,4 +228,82 @@ describe('initialisation', () => {
     api.initEncephalon({ remove: true, root })
     assert.equal(readFileSync(path, 'utf8'), `${original}User addition.\r\n`)
   })
+
+  test('atomically publishes instruction replacements and preserves the existing file mode', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    chmodSync(path, 0o744)
+
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+    applyInstructionChanges(root, [agentsPlan])
+
+    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
+    assert.equal(statSync(path).mode & 0o777, 0o744)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.tmp')),
+      [],
+    )
+  })
+
+  test('detects instruction-file changes observed before atomic publication', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = '# Existing guidance\n'
+    const changed = '# Concurrent guidance\n'
+    writeFileSync(path, original)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+    writeFileSync(path, changed)
+
+    assert.throws(
+      () => applyInstructionChanges(root, [agentsPlan]),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(readFileSync(path, 'utf8'), changed)
+  })
+
+  const faultPoints = [
+    ['before-temp-create', 'old'],
+    ['during-temp-write', 'old'],
+    ['during-file-flush', 'old'],
+    ['during-publication', 'old'],
+    ['after-publication', 'new'],
+    ['during-temp-cleanup', 'new'],
+  ] as const
+
+  for (const [faultPoint, expectedContent] of faultPoints) {
+    test(`keeps instruction writes whole when fault injection fails ${faultPoint}`, () => {
+      const root = createRoot()
+      const path = join(root, 'AGENTS.md')
+      const original = '# Existing guidance\n'
+      writeFileSync(path, original)
+      const [agentsPlan] = planInstructionChanges(root, false)
+      assert.ok(agentsPlan?.content)
+
+      assert.throws(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === faultPoint) {
+                throw new Error(`Injected ${point}`)
+              }
+            },
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+          return true
+        },
+      )
+
+      const content = readFileSync(path, 'utf8')
+      assert.equal(content, expectedContent === 'old' ? original : agentsPlan.content)
+      assert.notEqual(content, '')
+      assert.notEqual(content, original.slice(0, 4))
+    })
+  }
 })
