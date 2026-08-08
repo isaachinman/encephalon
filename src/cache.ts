@@ -24,6 +24,13 @@ const PACKAGE_VERSION = '0.1.0'
 const SCHEMA_VERSION = '1'
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
 const DATABASE_FILENAME = 'brain.sqlite'
+export const MAX_QUERY_BYTES = 1024
+export const MAX_QUERY_TERMS = 32
+export const MAX_GATHER_SEARCHES = 16
+export const MAX_GATHER_SHOWS = 64
+export const MAX_FULL_RESULT_LIMIT = 50
+export const MAX_COMPACT_RESULT_LIMIT = 100
+export const MAX_FULL_RESPONSE_BYTES = 4 * 1024 * 1024
 
 type SQLiteModule = {
   DatabaseSync: new (path: string) => DatabaseSync
@@ -48,6 +55,7 @@ type ManifestEntry = {
 
 type RecordRow = {
   record_json: string
+  record_bytes?: number
 }
 
 type CompactRow = {
@@ -545,13 +553,26 @@ export const hydrate = (input: RootInput = {}): HydrateResult => {
   }
 }
 
-const positiveLimit = (value: unknown, fallback = 20) => {
+const byteLength = (value: string) => Buffer.byteLength(value, 'utf8')
+
+const budgetFailure = (field: string, budget: string, maximum: number, message: string) =>
+  fail('INVALID_ARGUMENT', message, {
+    budget,
+    field,
+    maximum,
+  })
+
+const positiveLimit = (value: unknown, maximum: number, budget: string, fallback = 20) => {
   const limit = value === undefined ? fallback : value
-  if (typeof limit === 'number' && Number.isInteger(limit) && limit > 0 && limit <= 1000) {
+  if (typeof limit === 'number' && Number.isInteger(limit) && limit > 0 && limit <= maximum) {
     return limit
   }
-  return fail('INVALID_ARGUMENT', 'limit must be an integer between 1 and 1000.', { field: 'limit' })
+  return budgetFailure('limit', budget, maximum, `limit must be an integer between 1 and ${maximum}.`)
 }
+
+const fullResultLimit = (value: unknown) => positiveLimit(value, MAX_FULL_RESULT_LIMIT, 'fullResultLimit')
+
+const compactResultLimit = (value: unknown) => positiveLimit(value, MAX_COMPACT_RESULT_LIMIT, 'compactResultLimit')
 
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
   const root = resolveRepository(input)
@@ -573,8 +594,38 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
 
 const parseRecordRow = (row: RecordRow) => JSON.parse(row.record_json) as BrainRecord
 
-export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] =>
-  withPreparedDatabase(input, database => {
+type FullResponseBudget = {
+  bytes: number
+}
+
+const recordRowBytes = (row: RecordRow) => {
+  if (typeof row.record_bytes === 'number' && Number.isFinite(row.record_bytes) && row.record_bytes >= 0) {
+    return row.record_bytes
+  }
+  return byteLength(row.record_json)
+}
+
+const parseRecordRowWithinBudget = (row: RecordRow, budget: FullResponseBudget) => {
+  budget.bytes += recordRowBytes(row)
+  if (budget.bytes > MAX_FULL_RESPONSE_BYTES) {
+    return budgetFailure(
+      'response',
+      'fullResponseBytes',
+      MAX_FULL_RESPONSE_BYTES,
+      `full-record responses may contain at most ${MAX_FULL_RESPONSE_BYTES} UTF-8 bytes.`,
+    )
+  }
+  return parseRecordRow(row)
+}
+
+const parseRecordRowsWithinBudget = (rows: RecordRow[]) => {
+  const budget = { bytes: 0 }
+  return rows.map(row => parseRecordRowWithinBudget(row, budget))
+}
+
+export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] => {
+  const limit = fullResultLimit(input.limit)
+  return withPreparedDatabase(input, database => {
     const conditions = [
       input.includeSuperseded === true ? undefined : 'active = 1',
       input.kind === undefined ? undefined : 'kind = ?',
@@ -583,14 +634,17 @@ export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] =>
     const parameters = [
       ...(input.kind === undefined ? [] : [input.kind]),
       ...(input.subject === undefined ? [] : [input.subject]),
-      positiveLimit(input.limit),
+      limit,
     ]
     const where = conditions.length === 0 ? '' : `WHERE ${conditions.join(' AND ')}`
     const rows = database
-      .prepare(`SELECT record_json FROM records ${where} ORDER BY created_at DESC, id DESC LIMIT ?`)
+      .prepare(
+        `SELECT record_json, length(cast(record_json AS BLOB)) AS record_bytes FROM records ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
+      )
       .all(...parameters) as RecordRow[]
-    return rows.map(parseRecordRow)
+    return parseRecordRowsWithinBudget(rows)
   })
+}
 
 export const showRecord = (input: ShowRecordInput): BrainRecord | null =>
   withPreparedDatabase(input, database => {
@@ -600,10 +654,12 @@ export const showRecord = (input: ShowRecordInput): BrainRecord | null =>
       })
     }
     const activeClause = input.activeOnly === true ? ' AND active = 1' : ''
-    const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(input.id) as
-      | RecordRow
-      | undefined
-    return row === undefined ? null : parseRecordRow(row)
+    const row = database
+      .prepare(
+        `SELECT record_json, length(cast(record_json AS BLOB)) AS record_bytes FROM records WHERE id = ?${activeClause}`,
+      )
+      .get(input.id) as RecordRow | undefined
+    return row === undefined ? null : parseRecordRowWithinBudget(row, { bytes: 0 })
   })
 
 const literalMatchQuery = (query: unknown) => {
@@ -612,12 +668,27 @@ const literalMatchQuery = (query: unknown) => {
       field: 'query',
     })
   }
+  if (byteLength(query) > MAX_QUERY_BYTES) {
+    return budgetFailure(
+      'query',
+      'queryBytes',
+      MAX_QUERY_BYTES,
+      `query must contain at most ${MAX_QUERY_BYTES} UTF-8 bytes.`,
+    )
+  }
   const terms = query.split(/[^A-Za-z0-9_]+/u).filter(term => term.length > 0)
+  if (terms.length > MAX_QUERY_TERMS) {
+    return budgetFailure(
+      'query',
+      'queryTerms',
+      MAX_QUERY_TERMS,
+      `query may contain at most ${MAX_QUERY_TERMS} literal terms.`,
+    )
+  }
   return terms.map(term => `"${term.replaceAll('"', '""')}"`).join(' AND ')
 }
 
-const searchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
-  const match = literalMatchQuery(input.query)
+const searchRows = (database: DatabaseSync, input: SearchRecordsInput, match: string, limit: number) => {
   if (match.length === 0) {
     return []
   }
@@ -626,11 +697,12 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
     input.includeSuperseded === true ? undefined : 'records.active = 1',
     input.kind === undefined ? undefined : 'records.kind = ?',
   ].filter((value): value is string => value !== undefined)
-  const parameters = [match, ...(input.kind === undefined ? [] : [input.kind]), positiveLimit(input.limit)]
+  const parameters = [match, ...(input.kind === undefined ? [] : [input.kind]), limit]
   return database
     .prepare(`
     SELECT
       records.record_json,
+      length(cast(records.record_json AS BLOB)) AS record_bytes,
       records.id,
       records.kind,
       records.subject,
@@ -647,12 +719,17 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput) => {
     .all(...parameters) as Array<RecordRow & CompactRow>
 }
 
-export const searchRecords = (input: SearchRecordsInput): BrainRecord[] =>
-  withPreparedDatabase(input, database => searchRows(database, input).map(parseRecordRow))
+export const searchRecords = (input: SearchRecordsInput): BrainRecord[] => {
+  const match = literalMatchQuery(input.query)
+  const limit = fullResultLimit(input.limit)
+  return withPreparedDatabase(input, database => parseRecordRowsWithinBudget(searchRows(database, input, match, limit)))
+}
 
-export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] =>
-  withPreparedDatabase(input, database =>
-    searchRows(database, input).map(row => ({
+export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] => {
+  const match = literalMatchQuery(input.query)
+  const limit = compactResultLimit(input.limit)
+  return withPreparedDatabase(input, database =>
+    searchRows(database, input, match, limit).map(row => ({
       id: row.id,
       kind: row.kind,
       path: row.path,
@@ -662,8 +739,51 @@ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRec
       summary: row.summary,
     })),
   )
+}
+
+const gatherSearches = (value: unknown) => {
+  const searches = value ?? []
+  if (!(Array.isArray(searches) && searches.every(query => typeof query === 'string'))) {
+    return fail('INVALID_ARGUMENT', 'searches must be an array of strings.', {
+      field: 'searches',
+    })
+  }
+  if (searches.length > MAX_GATHER_SEARCHES) {
+    return budgetFailure(
+      'searches',
+      'gatherSearches',
+      MAX_GATHER_SEARCHES,
+      `gather may contain at most ${MAX_GATHER_SEARCHES} searches.`,
+    )
+  }
+  return searches.map(query => ({
+    match: literalMatchQuery(query),
+    query,
+  }))
+}
+
+const gatherShows = (value: unknown) => {
+  const shows = value ?? []
+  if (!(Array.isArray(shows) && shows.every(id => typeof id === 'string'))) {
+    return fail('INVALID_ARGUMENT', 'shows must be an array of strings.', {
+      field: 'shows',
+    })
+  }
+  if (shows.length > MAX_GATHER_SHOWS) {
+    return budgetFailure(
+      'shows',
+      'gatherShows',
+      MAX_GATHER_SHOWS,
+      `gather may contain at most ${MAX_GATHER_SHOWS} shows.`,
+    )
+  }
+  return shows
+}
 
 export const gatherRecords = (input: GatherInput): GatherResult => {
+  const searches = gatherSearches(input.searches)
+  const shows = gatherShows(input.shows)
+  const limit = compactResultLimit(input.limit)
   const root = resolveRepository(input)
   try {
     let hydrated: HydrateResult | null = null
@@ -674,33 +794,24 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
     } else {
       prepareResolved(root)
     }
-    const searches = input.searches ?? []
-    const shows = input.shows ?? []
-    if (!(Array.isArray(searches) && searches.every(query => typeof query === 'string'))) {
-      return fail('INVALID_ARGUMENT', 'searches must be an array of strings.', {
-        field: 'searches',
-      })
-    }
-    if (!(Array.isArray(shows) && shows.every(id => typeof id === 'string'))) {
-      return fail('INVALID_ARGUMENT', 'shows must be an array of strings.', {
-        field: 'shows',
-      })
-    }
     const database = openDatabase(root)
     try {
+      const showBudget = { bytes: 0 }
       return {
         hydrated,
         records: shows.map(id => {
           const activeClause = input.includeSuperseded === true ? '' : ' AND active = 1'
-          const row = database.prepare(`SELECT record_json FROM records WHERE id = ?${activeClause}`).get(id) as
-            | RecordRow
-            | undefined
-          return { id, record: row === undefined ? null : parseRecordRow(row) }
+          const row = database
+            .prepare(
+              `SELECT record_json, length(cast(record_json AS BLOB)) AS record_bytes FROM records WHERE id = ?${activeClause}`,
+            )
+            .get(id) as RecordRow | undefined
+          return { id, record: row === undefined ? null : parseRecordRowWithinBudget(row, showBudget) }
         }),
-        searches: searches.map(query => ({
+        searches: searches.map(({ match, query }) => ({
           kind: input.kind ?? null,
           query,
-          results: searchRows(database, { ...input, query }).map(row => ({
+          results: searchRows(database, { ...input, query }, match, limit).map(row => ({
             id: row.id,
             kind: row.kind,
             path: row.path,
