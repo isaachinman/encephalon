@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 
 const LOCK_WAIT_MILLISECONDS = 60_000
+const RECOVERY_POLL_MILLISECONDS = 50
 
 type LockOwner = {
   token: string
@@ -67,6 +68,7 @@ export const withOperationLock = <Result>(
   const directory = cacheDirectory(root)
   const lockPath = resolve(directory, 'operation.lock')
   const gatePath = resolve(directory, 'operation-lock.sqlite')
+  const gateRecoveryPath = resolve(directory, 'operation-lock.recovery')
   const token = randomUUID()
   const candidatePath = resolve(directory, `operation.lock.${token}`)
   const startedAt = Date.now()
@@ -75,13 +77,45 @@ export const withOperationLock = <Result>(
 
   const remainingMilliseconds = () => Math.max(0, LOCK_WAIT_MILLISECONDS - (Date.now() - startedAt))
 
-  const removeGate = () => {
-    for (const candidate of [gatePath, `${gatePath}-wal`, `${gatePath}-shm`, `${gatePath}-journal`]) {
-      rmSync(candidate, { force: true })
+  const wait = (milliseconds: number) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds)
+  }
+
+  const missingPath = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
+
+  const quarantineGateCandidate = (path: string) => {
+    const quarantinePath = `${path}.corrupt-${token}`
+    try {
+      renameSync(path, quarantinePath)
+      rmSync(quarantinePath, { force: true })
+    } catch (error) {
+      if (!missingPath(error)) {
+        throw error
+      }
     }
   }
 
-  const beginGateTransaction = () => {
+  const waitForGateRecovery = () => {
+    while (existsSync(gateRecoveryPath)) {
+      if (remainingMilliseconds() === 0) {
+        return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
+          timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
+        })
+      }
+      wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))
+    }
+  }
+
+  const quarantineCorruptGate = () => {
+    for (const candidate of [`${gatePath}-wal`, `${gatePath}-shm`, `${gatePath}-journal`, gatePath]) {
+      quarantineGateCandidate(candidate)
+    }
+  }
+
+  const beginGateTransaction = (recoveryLockHeld = false) => {
+    if (!recoveryLockHeld) {
+      waitForGateRecovery()
+    }
     gate = new DatabaseSync(gatePath, { timeout: remainingMilliseconds() })
     try {
       gate.exec('BEGIN IMMEDIATE')
@@ -90,6 +124,45 @@ export const withOperationLock = <Result>(
       gate.close()
       gate = undefined
       throw error
+    }
+  }
+
+  const recoverCorruptGate = () => {
+    let recoveryLockHeld = false
+    while (!recoveryLockHeld) {
+      try {
+        mkdirSync(gateRecoveryPath)
+        recoveryLockHeld = true
+      } catch (error) {
+        const existingRecovery = (error as NodeJS.ErrnoException).code === 'EEXIST'
+        if (!existingRecovery) {
+          throw error
+        }
+        if (remainingMilliseconds() === 0) {
+          return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
+            timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
+          })
+        }
+        wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))
+      }
+    }
+    try {
+      try {
+        beginGateTransaction(true)
+      } catch (error) {
+        if (sqliteBusy(error)) {
+          return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
+            timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
+          })
+        }
+        if (!sqliteCorrupt(error)) {
+          throw error
+        }
+        quarantineCorruptGate()
+        beginGateTransaction(true)
+      }
+    } finally {
+      rmSync(gateRecoveryPath, { force: true, recursive: true })
     }
   }
 
@@ -118,17 +191,7 @@ export const withOperationLock = <Result>(
       if (!sqliteCorrupt(error)) {
         throw error
       }
-      removeGate()
-      try {
-        beginGateTransaction()
-      } catch (retryError) {
-        if (sqliteBusy(retryError)) {
-          return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
-            timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
-          })
-        }
-        throw retryError
-      }
+      recoverCorruptGate()
     }
 
     // The SQLite transaction is the authoritative operation lock. A valid owner
