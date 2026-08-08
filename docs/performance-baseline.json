@@ -9,50 +9,50 @@
       "cache": {
         "amplification": null,
         "databaseBytes": 49152,
-        "shmBytes": 0,
-        "totalBytes": 49152,
+        "shmBytes": 32768,
+        "totalBytes": 81920,
         "walBytes": 0
       },
       "operations": {
         "coldHydrate": {
-          "durationMs": 6.746,
-          "peakRssBytes": 97058816,
-          "rssDeltaBytes": 6127616
+          "durationMs": 4.736,
+          "peakRssBytes": 95797248,
+          "rssDeltaBytes": 5357568
         },
         "compactSearch": {
-          "durationMs": 1.159,
-          "peakRssBytes": 98844672,
-          "rssDeltaBytes": 360448
+          "durationMs": 1.058,
+          "peakRssBytes": 97468416,
+          "rssDeltaBytes": 180224
         },
         "fullSearch": {
-          "durationMs": 0.984,
-          "peakRssBytes": 99057664,
-          "rssDeltaBytes": 212992
+          "durationMs": 0.915,
+          "peakRssBytes": 97583104,
+          "rssDeltaBytes": 114688
         },
         "gather": {
-          "durationMs": 1.05,
-          "peakRssBytes": 99188736,
-          "rssDeltaBytes": 131072
+          "durationMs": 1.01,
+          "peakRssBytes": 97681408,
+          "rssDeltaBytes": 98304
         },
         "list": {
-          "durationMs": 0.945,
-          "peakRssBytes": 98402304,
-          "rssDeltaBytes": 475136
+          "durationMs": 1.04,
+          "peakRssBytes": 96616448,
+          "rssDeltaBytes": 311296
         },
         "show": {
-          "durationMs": 1.173,
-          "peakRssBytes": 98484224,
-          "rssDeltaBytes": 81920
+          "durationMs": 0.965,
+          "peakRssBytes": 97288192,
+          "rssDeltaBytes": 655360
         },
         "stalePrepare": {
-          "durationMs": 0.516,
-          "peakRssBytes": 97910784,
-          "rssDeltaBytes": 425984
+          "durationMs": 0.605,
+          "peakRssBytes": 96288768,
+          "rssDeltaBytes": 49152
         },
         "unchangedPrepare": {
-          "durationMs": 0.631,
-          "peakRssBytes": 97468416,
-          "rssDeltaBytes": 376832
+          "durationMs": 0.625,
+          "peakRssBytes": 96223232,
+          "rssDeltaBytes": 409600
         }
       }
     },
@@ -63,52 +63,52 @@
       "records": 100,
       "supersessionDepth": 10,
       "cache": {
-        "amplification": 2.745,
+        "amplification": 2.837,
         "databaseBytes": 978944,
-        "shmBytes": 0,
-        "totalBytes": 978944,
+        "shmBytes": 32768,
+        "totalBytes": 1011712,
         "walBytes": 0
       },
       "operations": {
         "coldHydrate": {
-          "durationMs": 16.296,
-          "peakRssBytes": 105889792,
-          "rssDeltaBytes": 4390912
+          "durationMs": 18.357,
+          "peakRssBytes": 104890368,
+          "rssDeltaBytes": 3932160
         },
         "compactSearch": {
-          "durationMs": 2.316,
-          "peakRssBytes": 108265472,
-          "rssDeltaBytes": 737280
+          "durationMs": 11.088,
+          "peakRssBytes": 109985792,
+          "rssDeltaBytes": 65536
         },
         "fullSearch": {
-          "durationMs": 2.407,
-          "peakRssBytes": 108822528,
-          "rssDeltaBytes": 557056
+          "durationMs": 10.329,
+          "peakRssBytes": 110133248,
+          "rssDeltaBytes": 131072
         },
         "gather": {
-          "durationMs": 337.46,
-          "peakRssBytes": 108920832,
-          "rssDeltaBytes": 98304
+          "durationMs": 307.139,
+          "peakRssBytes": 110166016,
+          "rssDeltaBytes": 32768
         },
         "list": {
-          "durationMs": 1.471,
-          "peakRssBytes": 107003904,
-          "rssDeltaBytes": 311296
+          "durationMs": 10.111,
+          "peakRssBytes": 109887488,
+          "rssDeltaBytes": 212992
         },
         "show": {
-          "durationMs": 1.347,
-          "peakRssBytes": 107511808,
-          "rssDeltaBytes": 507904
+          "durationMs": 10.128,
+          "peakRssBytes": 109936640,
+          "rssDeltaBytes": 49152
         },
         "stalePrepare": {
-          "durationMs": 11.71,
-          "peakRssBytes": 106708992,
-          "rssDeltaBytes": 770048
+          "durationMs": 13.847,
+          "peakRssBytes": 109674496,
+          "rssDeltaBytes": 4669440
         },
         "unchangedPrepare": {
-          "durationMs": 1.098,
-          "peakRssBytes": 105922560,
-          "rssDeltaBytes": 49152
+          "durationMs": 5.646,
+          "peakRssBytes": 105005056,
+          "rssDeltaBytes": 131072
         }
       }
     },
@@ -119,108 +119,52 @@
       "records": 1000,
       "supersessionDepth": 100,
       "cache": {
-        "amplification": 2.595,
+        "amplification": 2.604,
         "databaseBytes": 9289728,
-        "shmBytes": 0,
-        "totalBytes": 9289728,
+        "shmBytes": 32768,
+        "totalBytes": 9322496,
         "walBytes": 0
       },
       "operations": {
         "coldHydrate": {
-          "durationMs": 89.77,
-          "peakRssBytes": 126812160,
-          "rssDeltaBytes": 15826944
+          "durationMs": 90.499,
+          "peakRssBytes": 125927424,
+          "rssDeltaBytes": 15679488
         },
         "compactSearch": {
-          "durationMs": 13.939,
-          "peakRssBytes": 147849216,
-          "rssDeltaBytes": 344064
-        },
-        "fullSearch": {
-          "durationMs": 14.526,
-          "peakRssBytes": 148078592,
-          "rssDeltaBytes": 229376
-        },
-        "gather": {
-          "durationMs": 3310.987,
-          "peakRssBytes": 148815872,
-          "rssDeltaBytes": 737280
-        },
-        "list": {
-          "durationMs": 5.983,
-          "peakRssBytes": 147685376,
+          "durationMs": 687.611,
+          "peakRssBytes": 186466304,
           "rssDeltaBytes": 180224
         },
-        "show": {
-          "durationMs": 5.255,
-          "peakRssBytes": 147685376,
-          "rssDeltaBytes": -180224
-        },
-        "stalePrepare": {
-          "durationMs": 103.908,
-          "peakRssBytes": 147587072,
-          "rssDeltaBytes": 20709376
-        },
-        "unchangedPrepare": {
-          "durationMs": 5.919,
-          "peakRssBytes": 126812160,
-          "rssDeltaBytes": 0
-        }
-      }
-    },
-    {
-      "artifacts": 1000,
-      "canonicalJsonBytes": 35949539,
-      "largePayloads": 1000,
-      "records": 10000,
-      "supersessionDepth": 1000,
-      "cache": {
-        "amplification": 2.336,
-        "databaseBytes": 83980288,
-        "shmBytes": 0,
-        "totalBytes": 83980288,
-        "walBytes": 0
-      },
-      "operations": {
-        "coldHydrate": {
-          "durationMs": 874.09,
-          "peakRssBytes": 283852800,
-          "rssDeltaBytes": 117653504
-        },
-        "compactSearch": {
-          "durationMs": 124.238,
-          "peakRssBytes": 310575104,
-          "rssDeltaBytes": -1753088
-        },
         "fullSearch": {
-          "durationMs": 126.087,
-          "peakRssBytes": 310575104,
-          "rssDeltaBytes": 0
+          "durationMs": 658.739,
+          "peakRssBytes": 186826752,
+          "rssDeltaBytes": 360448
         },
         "gather": {
-          "durationMs": 33237.116,
-          "peakRssBytes": 310771712,
-          "rssDeltaBytes": 1949696
+          "durationMs": 3695.658,
+          "peakRssBytes": 186990592,
+          "rssDeltaBytes": 163840
         },
         "list": {
-          "durationMs": 44.403,
-          "peakRssBytes": 310231040,
-          "rssDeltaBytes": 0
+          "durationMs": 646.251,
+          "peakRssBytes": 169033728,
+          "rssDeltaBytes": 17465344
         },
         "show": {
-          "durationMs": 41.296,
-          "peakRssBytes": 310575104,
-          "rssDeltaBytes": 1769472
+          "durationMs": 669.75,
+          "peakRssBytes": 186286080,
+          "rssDeltaBytes": 17252352
         },
         "stalePrepare": {
-          "durationMs": 972.22,
-          "peakRssBytes": 310231040,
-          "rssDeltaBytes": 42876928
+          "durationMs": 102.346,
+          "peakRssBytes": 151584768,
+          "rssDeltaBytes": 13238272
         },
         "unchangedPrepare": {
-          "durationMs": 44.197,
-          "peakRssBytes": 283852800,
-          "rssDeltaBytes": 16384
+          "durationMs": 326.315,
+          "peakRssBytes": 138330112,
+          "rssDeltaBytes": 12419072
         }
       }
     }
@@ -228,10 +172,10 @@
   "environment": {
     "arch": "arm64",
     "cpu": "Apple M5 Pro",
-    "node": "v24.15.0",
+    "node": "v26.5.0",
     "platform": "darwin"
   },
-  "generatedAt": "2026-08-08T05:04:56.356Z",
+  "generatedAt": "2026-08-08T17:46:54.645Z",
   "profile": "baseline",
   "schemaVersion": 1
 }

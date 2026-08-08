@@ -12,6 +12,7 @@ import {
   searchRecords,
   showRecord,
 } from '../src/index.ts'
+import { MAX_CANONICAL_RECORDS } from '../src/records.ts'
 import { formatRecordFile } from '../src/schema.ts'
 import type { BrainRecordFile } from '../src/types.ts'
 
@@ -75,10 +76,12 @@ type BudgetFile = {
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const deterministicStart = Date.UTC(2026, 0, 1)
 
+const productLimitProfile = [0, 100, MAX_CANONICAL_RECORDS] as const
+
 const profiles = {
-  baseline: [0, 100, 1000, 10_000],
+  baseline: [...productLimitProfile],
   ci: [0, 100],
-  full: [0, 100, 1000, 10_000],
+  full: [...productLimitProfile],
 } satisfies Record<ProfileName, number[]>
 
 const round = (value: number, digits = 3) => Number(value.toFixed(digits))
@@ -362,11 +365,23 @@ const { values } = parseArgs({
     budget: { type: 'string' },
     output: { short: 'o', type: 'string' },
     profile: { default: 'baseline', type: 'string' },
+    records: { multiple: true, type: 'string' },
   },
 })
 
 const profile = parseProfile(values.profile)
-const results = profiles[profile].map(runCase)
+const explicitRecordCounts =
+  values.records === undefined
+    ? undefined
+    : values.records.map(value => {
+        const records = Number(value)
+        if (!Number.isInteger(records) || records < 0) {
+          throw new Error(`Invalid --records value: ${value}.`)
+        }
+        return records
+      })
+const recordCounts = explicitRecordCounts ?? profiles[profile]
+const results = recordCounts.map(runCase)
 assertBudget(results, loadBudget(values.budget))
 
 const report = {
