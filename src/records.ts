@@ -285,7 +285,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
     let stopScanning = false
     const addScanError = (validationIssue: ValidationIssue) => {
       scanned.errors.push(validationIssue)
-      if (scanned.errors.length > MAX_VALIDATION_ISSUES) {
+      if (scanned.errors.length >= MAX_VALIDATION_ISSUES) {
         stopScanning = true
       }
     }
@@ -553,7 +553,7 @@ const artifactIssues = (root: string, records: BrainRecord[]) => {
 }
 
 const truncateValidationIssues = (errors: ValidationIssue[]) => {
-  if (errors.length <= MAX_VALIDATION_ISSUES) {
+  if (errors.length < MAX_VALIDATION_ISSUES) {
     return { errors, truncated: false }
   }
   return {
