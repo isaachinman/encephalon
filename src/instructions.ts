@@ -114,6 +114,13 @@ const readRegularFileBytes = (path: string, filename: (typeof FILENAMES)[number]
   }
 }
 
+const boundedInstructionBytes = (filename: (typeof FILENAMES)[number], bytes: Buffer) => {
+  if (bytes.length <= MAX_INSTRUCTION_FILE_BYTES) {
+    return bytes
+  }
+  return fail('VALIDATION_FAILED', `${filename} exceeds the 1 MiB instruction-file limit.`)
+}
+
 const blockFor = (metadata: BlockMetadata) => {
   const lineEnding = metadata.lineEnding === 'CRLF' ? '\r\n' : '\n'
   return [
@@ -219,10 +226,11 @@ const additionPlan = (root: string, filename: (typeof FILENAMES)[number]): FileP
     separatorBase64: Buffer.from(separator, 'utf8').toString('base64'),
   }
   const nextContent = `${content}${separator}${blockFor(metadata)}`
+  const nextBytes = boundedInstructionBytes(filename, Buffer.from(nextContent, 'utf8'))
   return {
     action: 'write',
     content: nextContent,
-    contentBytes: Buffer.from(nextContent, 'utf8'),
+    contentBytes: nextBytes,
     filename,
     originalBytes,
     originalContent: content,

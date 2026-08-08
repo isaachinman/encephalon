@@ -245,15 +245,20 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'encephalon')), false)
   })
 
-  test('accepts an instruction file exactly at the preflight size limit', () => {
+  test('rejects an instruction file that cannot fit the managed block without mutation', () => {
     const root = createRoot()
-    const path = join(root, 'AGENTS.md')
-    writeFileSync(path, Buffer.alloc(MAX_INSTRUCTION_FILE_BYTES, 0x61))
+    const agentsPath = join(root, 'AGENTS.md')
+    const claudePath = join(root, 'CLAUDE.md')
+    const originalAgents = Buffer.alloc(MAX_INSTRUCTION_FILE_BYTES, 0x61)
+    const originalClaude = Buffer.from('untouched')
+    writeFileSync(agentsPath, originalAgents)
+    writeFileSync(claudePath, originalClaude)
 
-    const [agentsPlan] = planInstructionChanges(root, false)
+    assertErrorCode(() => api.initEncephalon({ root }), 'VALIDATION_FAILED')
 
-    assert.equal(agentsPlan?.action, 'write')
-    assert.deepEqual(readFileSync(path), Buffer.alloc(MAX_INSTRUCTION_FILE_BYTES, 0x61))
+    assert.deepEqual(readFileSync(agentsPath), originalAgents)
+    assert.deepEqual(readFileSync(claudePath), originalClaude)
+    assert.equal(existsSync(join(root, 'encephalon')), false)
   })
 
   test('rejects an instruction file over the preflight size limit without mutation', () => {
