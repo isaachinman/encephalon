@@ -268,6 +268,27 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'encephalon')), false)
   })
 
+  test('round-trips an instruction file whose managed bytes exactly reach the size limit', () => {
+    const root = createRoot()
+    const agentsPath = join(root, 'AGENTS.md')
+    writeFileSync(agentsPath, Buffer.from('a'))
+    const [samplePlan] = planInstructionChanges(root, false)
+    if (samplePlan?.action !== 'write' || samplePlan.contentBytes === undefined) {
+      assert.fail('Expected a write plan for a non-empty instruction file.')
+    }
+    const managedOverheadBytes = samplePlan.contentBytes.length - 1
+    const originalAgents = Buffer.alloc(MAX_INSTRUCTION_FILE_BYTES - managedOverheadBytes, 0x61)
+    writeFileSync(agentsPath, originalAgents)
+
+    api.initEncephalon({ root })
+
+    assert.equal(readFileSync(agentsPath).length, MAX_INSTRUCTION_FILE_BYTES)
+
+    api.initEncephalon({ remove: true, root })
+
+    assert.deepEqual(readFileSync(agentsPath), originalAgents)
+  })
+
   test('rejects an instruction file over the preflight size limit without mutation', () => {
     const root = createRoot()
     const agentsPath = join(root, 'AGENTS.md')
