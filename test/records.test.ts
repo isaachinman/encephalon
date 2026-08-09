@@ -14,7 +14,14 @@ import {
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
-import { addRecordResolved, MAX_CANONICAL_RECORDS, validateRecordsResolved } from '../src/records.ts'
+import {
+  addRecordResolved,
+  assertRecordGraph,
+  MAX_CANONICAL_RECORD_BYTES,
+  MAX_CANONICAL_RECORDS,
+  planRecordAddition,
+  validateRecordsResolved,
+} from '../src/records.ts'
 import { discoverRepository } from '../src/repository.ts'
 import { validateKind } from '../src/schema.ts'
 import type { ValidateResult } from '../src/types.ts'
@@ -227,6 +234,42 @@ describe('canonical records', () => {
     assert.equal(api.validateRecords({ root }).valid, true)
   })
 
+  test('validates planned graph bytes without counting runtime paths', () => {
+    const root = createRoot()
+    const plans = Array.from({ length: 8 }, (_, index) =>
+      planRecordAddition(root, {
+        id: `planned-byte-accounting-${index}`,
+        kind: 'decision',
+        payload: { summary: 'x'.repeat(1_048_350) },
+        source: 'agent',
+        subject: `planning.bytes.${index}`,
+      }),
+    )
+    const canonicalBytes = plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted, 'utf8'), 0)
+    const runtimeBytes = plans.reduce(
+      (total, plan) => total + Buffer.byteLength(`${JSON.stringify(plan.record, null, 2)}\n`, 'utf8'),
+      0,
+    )
+
+    assert.equal(canonicalBytes <= MAX_CANONICAL_RECORD_BYTES, true)
+    assert.equal(runtimeBytes > MAX_CANONICAL_RECORD_BYTES, true)
+    assert.doesNotThrow(() =>
+      assertRecordGraph(
+        root,
+        plans.map(plan => plan.record),
+      ),
+    )
+    assert.doesNotThrow(() =>
+      assertRecordGraph(
+        root,
+        plans.map(plan => plan.record),
+        'Canonical records are invalid.',
+        {},
+        canonicalBytes,
+      ),
+    )
+  })
+
   test('uses the record kind portable path predicate for kind directories', () => {
     for (const invalid of ['Decision', 'bad kind', 'CON', 'kind.', 'kind ']) {
       assertErrorCode(() => validateKind(invalid), 'INVALID_ARGUMENT')
@@ -256,6 +299,21 @@ describe('canonical records', () => {
     mkdirSync(join(root, 'encephalon', 'context'), { recursive: true })
     const caseVariantCreated = canCreateDirectory(root, 'Context')
     const unicodeNames = ['cafe\u0301', 'café'].filter(name => canCreateDirectory(root, name))
+    const unicodeCollisionPaths = readdirSync(join(root, 'encephalon'))
+      .filter(name => unicodeNames.includes(name))
+      .sort((first, second) => first.localeCompare(second))
+      .reduce<{ paths: string[]; seen: Set<string> }>(
+        (accumulator, name) => {
+          const collisionKey = name.normalize('NFC').toLowerCase()
+          return {
+            paths: accumulator.seen.has(collisionKey)
+              ? [...accumulator.paths, `encephalon/${name}`]
+              : accumulator.paths,
+            seen: new Set([...accumulator.seen, collisionKey]),
+          }
+        },
+        { paths: [], seen: new Set<string>() },
+      ).paths
     const expected = [
       ...(caseVariantCreated
         ? [
@@ -264,7 +322,7 @@ describe('canonical records', () => {
           ]
         : []),
       ...unicodeNames.map(name => ['INVALID_KIND_DIRECTORY', `encephalon/${name}`]),
-      ...(unicodeNames.length === 2 ? [['KIND_DIRECTORY_COLLISION', 'encephalon/café']] : []),
+      ...unicodeCollisionPaths.map(path => ['KIND_DIRECTORY_COLLISION', path]),
     ].sort((first, second) => String(first[1]).localeCompare(String(second[1])))
 
     const result = api.validateRecords({ root })
@@ -301,7 +359,6 @@ describe('canonical records', () => {
     assert.equal(result.errors[0]?.path, 'encephalon/Bad')
     assert.equal(existsSync(join(directory, 'record-a.json')), true)
   })
-
   test('rejects a symlinked internal staging directory before writing records', {
     skip: process.platform === 'win32' ? 'Windows runners may not permit directory symlink creation.' : false,
   }, () => {
