@@ -39,6 +39,9 @@
     "dist",
     "skills",
     "assets/encephalon.png",
+    "docs/performance.md",
+    "docs/performance-baseline.json",
+    "docs/performance-budgets.json",
     "README.md",
     "LICENSE"
   ],
@@ -46,6 +49,8 @@
     "access": "public"
   },
   "scripts": {
+    "benchmark": "node scripts/benchmark.ts",
+    "benchmark:check": "node scripts/benchmark.ts --profile ci --budget docs/performance-budgets.json",
     "build": "bun run scripts/build.ts",
     "check:package": "bun run scripts/check-package.ts",
     "check:publish": "bun run scripts/check-publish.ts",

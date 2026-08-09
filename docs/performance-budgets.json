@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "records": 0,
+      "max": {
+        "coldHydrateMs": 2500,
+        "unchangedPrepareMs": 1500,
+        "stalePrepareMs": 1500,
+        "listMs": 1500,
+        "showMs": 1500,
+        "compactSearchMs": 1500,
+        "fullSearchMs": 1500,
+        "gatherMs": 1500,
+        "totalCacheBytes": 1048576
+      }
+    },
+    {
+      "records": 100,
+      "max": {
+        "coldHydrateMs": 15000,
+        "unchangedPrepareMs": 5000,
+        "stalePrepareMs": 15000,
+        "listMs": 5000,
+        "showMs": 5000,
+        "compactSearchMs": 5000,
+        "fullSearchMs": 5000,
+        "gatherMs": 5000,
+        "totalCacheBytes": 20971520,
+        "amplification": 100
+      }
+    }
+  ]
+}

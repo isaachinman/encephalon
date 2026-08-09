@@ -1,0 +1,181 @@
+{
+  "cases": [
+    {
+      "artifacts": 0,
+      "canonicalJsonBytes": 0,
+      "largePayloads": 0,
+      "records": 0,
+      "supersessionDepth": 0,
+      "cache": {
+        "amplification": null,
+        "databaseBytes": 49152,
+        "shmBytes": 32768,
+        "totalBytes": 81920,
+        "walBytes": 0
+      },
+      "operations": {
+        "coldHydrate": {
+          "durationMs": 6.399,
+          "peakRssBytes": 96649216,
+          "rssDeltaBytes": 5357568
+        },
+        "compactSearch": {
+          "durationMs": 1.087,
+          "peakRssBytes": 97959936,
+          "rssDeltaBytes": 98304
+        },
+        "fullSearch": {
+          "durationMs": 0.998,
+          "peakRssBytes": 98041856,
+          "rssDeltaBytes": 81920
+        },
+        "gather": {
+          "durationMs": 1.091,
+          "peakRssBytes": 98156544,
+          "rssDeltaBytes": 114688
+        },
+        "list": {
+          "durationMs": 1.141,
+          "peakRssBytes": 97566720,
+          "rssDeltaBytes": 737280
+        },
+        "show": {
+          "durationMs": 1.308,
+          "peakRssBytes": 97861632,
+          "rssDeltaBytes": 294912
+        },
+        "stalePrepare": {
+          "durationMs": 0.55,
+          "peakRssBytes": 96813056,
+          "rssDeltaBytes": 49152
+        },
+        "unchangedPrepare": {
+          "durationMs": 0.793,
+          "peakRssBytes": 96763904,
+          "rssDeltaBytes": 98304
+        }
+      }
+    },
+    {
+      "artifacts": 10,
+      "canonicalJsonBytes": 356589,
+      "largePayloads": 10,
+      "records": 100,
+      "supersessionDepth": 10,
+      "cache": {
+        "amplification": 2.837,
+        "databaseBytes": 978944,
+        "shmBytes": 32768,
+        "totalBytes": 1011712,
+        "walBytes": 0
+      },
+      "operations": {
+        "coldHydrate": {
+          "durationMs": 20.169,
+          "peakRssBytes": 105463808,
+          "rssDeltaBytes": 4079616
+        },
+        "compactSearch": {
+          "durationMs": 12.185,
+          "peakRssBytes": 110641152,
+          "rssDeltaBytes": 98304
+        },
+        "fullSearch": {
+          "durationMs": 11.159,
+          "peakRssBytes": 110723072,
+          "rssDeltaBytes": 81920
+        },
+        "gather": {
+          "durationMs": 311.133,
+          "peakRssBytes": 110739456,
+          "rssDeltaBytes": 16384
+        },
+        "list": {
+          "durationMs": 11.29,
+          "peakRssBytes": 110526464,
+          "rssDeltaBytes": 294912
+        },
+        "show": {
+          "durationMs": 10.98,
+          "peakRssBytes": 110542848,
+          "rssDeltaBytes": 16384
+        },
+        "stalePrepare": {
+          "durationMs": 14.928,
+          "peakRssBytes": 110247936,
+          "rssDeltaBytes": 4685824
+        },
+        "unchangedPrepare": {
+          "durationMs": 6.249,
+          "peakRssBytes": 105545728,
+          "rssDeltaBytes": 98304
+        }
+      }
+    },
+    {
+      "artifacts": 100,
+      "canonicalJsonBytes": 3580039,
+      "largePayloads": 100,
+      "records": 1000,
+      "supersessionDepth": 100,
+      "cache": {
+        "amplification": 2.604,
+        "databaseBytes": 9289728,
+        "shmBytes": 32768,
+        "totalBytes": 9322496,
+        "walBytes": 0
+      },
+      "operations": {
+        "coldHydrate": {
+          "durationMs": 95.271,
+          "peakRssBytes": 126337024,
+          "rssDeltaBytes": 15548416
+        },
+        "compactSearch": {
+          "durationMs": 685.883,
+          "peakRssBytes": 185860096,
+          "rssDeltaBytes": 147456
+        },
+        "fullSearch": {
+          "durationMs": 687.851,
+          "peakRssBytes": 186220544,
+          "rssDeltaBytes": 360448
+        },
+        "gather": {
+          "durationMs": 3625.749,
+          "peakRssBytes": 186368000,
+          "rssDeltaBytes": 147456
+        },
+        "list": {
+          "durationMs": 671.872,
+          "peakRssBytes": 168378368,
+          "rssDeltaBytes": 17367040
+        },
+        "show": {
+          "durationMs": 686.857,
+          "peakRssBytes": 185712640,
+          "rssDeltaBytes": 17334272
+        },
+        "stalePrepare": {
+          "durationMs": 119.369,
+          "peakRssBytes": 151027712,
+          "rssDeltaBytes": 13090816
+        },
+        "unchangedPrepare": {
+          "durationMs": 338.358,
+          "peakRssBytes": 137920512,
+          "rssDeltaBytes": 11583488
+        }
+      }
+    }
+  ],
+  "environment": {
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "node": "v26.5.0",
+    "platform": "darwin"
+  },
+  "generatedAt": "2026-08-08T17:47:50.724Z",
+  "profile": "baseline",
+  "schemaVersion": 1
+}

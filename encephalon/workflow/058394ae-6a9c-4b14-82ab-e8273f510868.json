@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T23:08:12.688Z",
+  "id": "058394ae-6a9c-4b14-82ab-e8273f510868",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Keep packaged README relative references aligned with the npm files whitelist and package checks.",
+    "lessons": [
+      "When a PR adds a repository-relative README link or image that npm consumers can see, update package.json files and scripts/check-package.ts so the packed tarball contains the target.",
+      "If the linked document contains its own repository-relative references, either include those targets as well or avoid making the package README point at the document.",
+      "Run bun run check:package after merging documentation or package-whitelist PRs into branches that add README links; earlier green package checks may become stale after branch stacking."
+    ],
+    "verification": [
+      "Inspect npm pack metadata for every repository-relative README reference.",
+      "Keep scripts/check-package.ts expected packageJson.files, requiredFiles, and allowedFiles in sync with package.json files."
+    ]
+  },
+  "searchText": "packaged README links npm files whitelist check-package docs performance",
+  "source": "agent",
+  "subject": "review.package-readme-links"
+}

@@ -112,7 +112,16 @@ try {
         '.': { import: './dist/index.mjs', types: './dist/index.d.ts' },
       }) ||
     JSON.stringify(packageJson.files) !==
-      JSON.stringify(['dist', 'skills', 'assets/encephalon.png', 'README.md', 'LICENSE']) ||
+      JSON.stringify([
+        'dist',
+        'skills',
+        'assets/encephalon.png',
+        'docs/performance.md',
+        'docs/performance-baseline.json',
+        'docs/performance-budgets.json',
+        'README.md',
+        'LICENSE',
+      ]) ||
     packageJson.dependencies !== undefined
   ) {
     throw new Error('Package identity, exports, engine, files, or zero-runtime-dependency contract is invalid.')
@@ -128,6 +137,9 @@ try {
     'dist/index.d.ts',
     'skills/encephalon/SKILL.md',
     'assets/encephalon.png',
+    'docs/performance.md',
+    'docs/performance-baseline.json',
+    'docs/performance-budgets.json',
     'README.md',
     'LICENSE',
   ]
@@ -177,7 +189,15 @@ try {
   if (pack === undefined) {
     throw new Error('npm pack did not return package metadata.')
   }
-  const allowedFiles = new Set(['LICENSE', 'README.md', 'assets/encephalon.png', 'package.json'])
+  const allowedFiles = new Set([
+    'LICENSE',
+    'README.md',
+    'assets/encephalon.png',
+    'docs/performance.md',
+    'docs/performance-baseline.json',
+    'docs/performance-budgets.json',
+    'package.json',
+  ])
   const unexpected = pack.files
     .map(file => file.path)
     .filter(path => !(allowedFiles.has(path) || path.startsWith('dist/') || path.startsWith('skills/')))
