@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-09T01:06:04.611Z",
+  "id": "36103fcb-af7d-4fd0-a79b-f620be91aedc",
+  "kind": "review",
+  "payload": {
+    "summary": "Derive filesystem collision test expectations from actual directory entries.",
+    "lessons": [
+      "Case and Unicode-normalisation collision tests must not hard-code which path becomes the collision representative; case-sensitive and case-insensitive filesystems can keep different real directory names.",
+      "When validator behaviour depends on sorted readdir entries, build test expectations from the actual readdirSync names using the same ordinal comparator and collision-key reduce.",
+      "A test that passes on macOS and Windows can still fail on Ubuntu when it assumes case-variant creation or collision order from another filesystem."
+    ],
+    "verification": [
+      "For tests that create case or Unicode variants, run the focused test and inspect the expected array against the validator scan order before committing.",
+      "If a local Linux container is unavailable, explicitly note that GitHub Ubuntu remains the authoritative verification for case-sensitive filesystem behaviour."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.filesystem-collision-test-expectations"
+}

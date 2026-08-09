@@ -37,6 +37,24 @@ const collectFiles = (directory: string): string[] =>
     return entry.isDirectory() ? collectFiles(path) : [path]
   })
 
+const readmeReferences = (content: string) => {
+  const pattern = /(?:!?\[[^\]]*]\(([^)]+)\)|<img\b[^>]*\bsrc=["']([^"']+)["'])/gi
+  return [...content.matchAll(pattern)]
+    .map(match => match[1] ?? match[2] ?? '')
+    .map(reference => reference.trim())
+    .filter(
+      reference =>
+        reference.length > 0 &&
+        !reference.startsWith('#') &&
+        !reference.startsWith('/') &&
+        !/^[a-z][a-z0-9+.-]*:/i.test(reference),
+    )
+    .map(reference => {
+      const [path = ''] = reference.split(/[?#]/u, 1)
+      return path.startsWith('./') ? path.slice(2) : path
+    })
+}
+
 const packedMode = (tarball: string, expectedPath: string) => {
   const archive = gunzipSync(readFileSync(tarball))
   const field = (fieldOffset: number, fieldLength: number) =>
@@ -93,7 +111,8 @@ try {
       JSON.stringify({
         '.': { import: './dist/index.mjs', types: './dist/index.d.ts' },
       }) ||
-    JSON.stringify(packageJson.files) !== JSON.stringify(['dist', 'skills', 'README.md', 'LICENSE']) ||
+    JSON.stringify(packageJson.files) !==
+      JSON.stringify(['dist', 'skills', 'assets/encephalon.png', 'README.md', 'LICENSE']) ||
     packageJson.dependencies !== undefined
   ) {
     throw new Error('Package identity, exports, engine, files, or zero-runtime-dependency contract is invalid.')
@@ -108,6 +127,7 @@ try {
     'dist/index.mjs',
     'dist/index.d.ts',
     'skills/encephalon/SKILL.md',
+    'assets/encephalon.png',
     'README.md',
     'LICENSE',
   ]
@@ -157,12 +177,19 @@ try {
   if (pack === undefined) {
     throw new Error('npm pack did not return package metadata.')
   }
-  const allowedRootFiles = new Set(['LICENSE', 'README.md', 'package.json'])
+  const allowedFiles = new Set(['LICENSE', 'README.md', 'assets/encephalon.png', 'package.json'])
   const unexpected = pack.files
     .map(file => file.path)
-    .filter(path => !(allowedRootFiles.has(path) || path.startsWith('dist/') || path.startsWith('skills/')))
+    .filter(path => !(allowedFiles.has(path) || path.startsWith('dist/') || path.startsWith('skills/')))
   if (unexpected.length > 0) {
     throw new Error(`The tarball contains unexpected files: ${unexpected.join(', ')}`)
+  }
+  const packedPaths = new Set(pack.files.map(file => file.path))
+  const missingReadmeReferences = readmeReferences(readFileSync(resolve(root, 'README.md'), 'utf8')).filter(
+    path => !packedPaths.has(path),
+  )
+  if (missingReadmeReferences.length > 0) {
+    throw new Error(`The packed README references missing files: ${missingReadmeReferences.join(', ')}`)
   }
   const tarball = resolve(temporaryDirectory, pack.filename)
   const packedCli = pack.files.find(file => file.path === 'dist/cli.mjs')
@@ -226,14 +253,73 @@ try {
     ],
     consumer,
   )
-  const prepared = JSON.parse(
-    run(
-      ['node', resolve(consumer, 'node_modules', 'encephalon', 'dist', 'cli.mjs'), '--root', consumer, 'prepare'],
-      consumer,
-    ),
-  ) as { hydrated?: unknown; recordsIndexed?: unknown }
+  const installedCli = resolve(consumer, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
+  const cli = (arguments_: string[]) => run(['node', installedCli, ...arguments_], consumer)
+  const cliJson = (arguments_: string[]) => JSON.parse(cli(arguments_)) as unknown
+
+  if (!/^Usage: encephalon/m.test(cli(['--help'])) || cli(['--version']) !== `${packageJson.version}\n`) {
+    throw new Error('The packed Node-only CLI help/version contract failed.')
+  }
+
+  const prepared = cliJson(['--root', consumer, 'prepare']) as { hydrated?: unknown; recordsIndexed?: unknown }
   if (prepared.hydrated !== true || prepared.recordsIndexed !== 0) {
-    throw new Error('The packed Node-only CLI smoke test returned an unexpected result.')
+    throw new Error('The packed Node-only CLI prepare command returned an unexpected result.')
+  }
+  const initialised = cliJson(['init', '--root', consumer]) as { recordsCreated?: unknown }
+  if (!Array.isArray(initialised.recordsCreated) || initialised.recordsCreated.length !== 3) {
+    throw new Error('The packed Node-only CLI init command returned an unexpected result.')
+  }
+  const added = cliJson([
+    'add',
+    '--root',
+    consumer,
+    '--id',
+    'packed-cli-record',
+    '--kind',
+    'decision',
+    '--subject',
+    'packed.cli',
+    '--source',
+    'package-contract',
+    '--data',
+    '{"summary":"Packed CLI record"}',
+    '--text',
+    'packed-contract-marker',
+  ]) as { id?: unknown }
+  if (added.id !== 'packed-cli-record') {
+    throw new Error('The packed Node-only CLI add command returned an unexpected result.')
+  }
+  const hydrated = cliJson(['hydrate', '--root', consumer]) as { recordsIndexed?: unknown }
+  if (hydrated.recordsIndexed !== 4) {
+    throw new Error('The packed Node-only CLI hydrate command returned an unexpected result.')
+  }
+  const validated = cliJson(['validate', '--root', consumer]) as { valid?: unknown }
+  if (validated.valid !== true) {
+    throw new Error('The packed Node-only CLI validate command returned an unexpected result.')
+  }
+  const listed = cliJson(['list', '--root', consumer, '--include-superseded', '--limit=10']) as unknown[]
+  if (!listed.some(record => (record as { id?: unknown }).id === 'packed-cli-record')) {
+    throw new Error('The packed Node-only CLI list command returned an unexpected result.')
+  }
+  const shown = cliJson(['show', '--root', consumer, '--id', 'packed-cli-record']) as { id?: unknown }
+  if (shown.id !== 'packed-cli-record') {
+    throw new Error('The packed Node-only CLI show command returned an unexpected result.')
+  }
+  const searched = cliJson(['search', '--root', consumer, '--compact', '--', 'packed-contract-marker']) as unknown[]
+  if (!searched.some(record => (record as { id?: unknown }).id === 'packed-cli-record')) {
+    throw new Error('The packed Node-only CLI search command returned an unexpected result.')
+  }
+  const gathered = cliJson([
+    'gather',
+    '--root',
+    consumer,
+    '--search',
+    'packed-contract-marker',
+    '--show',
+    'packed-cli-record',
+  ]) as { records?: unknown; searches?: unknown }
+  if (!(Array.isArray(gathered.records) && Array.isArray(gathered.searches))) {
+    throw new Error('The packed Node-only CLI gather command returned an unexpected result.')
   }
 } finally {
   rmSync(temporaryDirectory, { force: true, recursive: true })

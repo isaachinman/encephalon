@@ -1,0 +1,21 @@
+{
+  "createdAt": "2026-08-09T00:19:56.450Z",
+  "id": "9f1cd11c-1505-4803-a6e1-1bc3891914aa",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Regression tests that simulate filesystem identity collisions should preserve runtime identity shape and make metadata differences deterministic.",
+    "lessons": [
+      "When a review notes that a test passes on the old implementation for the wrong reason, adjust the test so it preserves the old runtime shape as well as the new one.",
+      "When preserving old and new identity runtime shapes in one test, explicitly model both shapes and mutate only the fields that simulate the collision.",
+      "Set file timestamps before planning and after replacement when timestamp metadata is part of the expected rejection path, so the test does not depend on filesystem timing or write granularity.",
+      "Use byte assertions for byte-identical replacement tests to avoid accidental text transcoding in the test itself."
+    ],
+    "verification": [
+      "Before replying to review feedback about a regression test, rerun the focused test and ensure the code explains why the simulated shape matches the intended failure mode.",
+      "Run the focused regression test after deterministic timestamp setup and before committing the review response."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.runtime-shape-regressions",
+  "supersedes": ["12e39f12-151a-4fa9-b6c5-afb5b285b591"]
+}

@@ -1,0 +1,18 @@
+{
+  "createdAt": "2026-08-08T23:32:19.829Z",
+  "id": "837fb5f7-4a9b-4874-8bff-0ab2f4d557d8",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Source-regex regression guards must match the exact removed code shape, not a stricter variant.",
+    "lessons": [
+      "When Pullfrog asks for a source guard against a removed pattern, test the regex mentally or with the removed snippet before committing it.",
+      "Avoid adding incidental requirements such as TypeScript generic parameters unless the target source shape actually includes them.",
+      "Prefer the smallest regex that catches the forbidden construction while staying specific to the intended hotspot."
+    ],
+    "verification": [
+      "For a guard against new Set([...ids, ...]), use a pattern that matches new Set( directly and does not require new Set<...>( unless the production code used a generic."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.regex-guard-specificity"
+}
