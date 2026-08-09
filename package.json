@@ -1,6 +1,6 @@
 {
   "name": "encephalon",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Repository-local, durable knowledge for coding agents",
   "keywords": [
     "agents",
