@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
   closeSync,
@@ -12,13 +13,16 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
   writeSync,
 } from 'node:fs'
 
 import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
+import { selectBoundedDirectoryEntries } from '../src/baseline.ts'
 import * as api from '../src/index.ts'
+import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
@@ -26,11 +30,62 @@ import { createTestRepository, ensureParent, removeTestRepository } from '../tes
 
 const roots: string[] = []
 
+type InitCounts = {
+  baselineScans: number
+  canonicalScans: number
+  graphValidations: number
+  hydrations: number
+}
+
+type InitFaultPoint =
+  | 'after-publication'
+  | 'before-publication'
+  | 'during-cleanup'
+  | 'during-hydration'
+  | 'during-publication-flush'
+  | 'during-staging-write'
+
+const initWithCounts = (
+  input: Parameters<typeof initEncephalonWithHooks>[0],
+  fault?: (point: InitFaultPoint) => void,
+) => {
+  const counts: InitCounts = {
+    baselineScans: 0,
+    canonicalScans: 0,
+    graphValidations: 0,
+    hydrations: 0,
+  }
+  const result = initEncephalonWithHooks(input, {
+    baselineScan: () => {
+      counts.baselineScans += 1
+    },
+    canonicalScan: () => {
+      counts.canonicalScans += 1
+    },
+    graphValidation: () => {
+      counts.graphValidations += 1
+    },
+    hydration: cacheResult => {
+      if (cacheResult.hydrated) {
+        counts.hydrations += 1
+      }
+    },
+    ...(fault === undefined ? {} : { recordWriteHooks: { fault } }),
+  })
+  return { counts, result }
+}
+
 const createRoot = () => {
   const root = createTestRepository()
   roots.push(root)
   return root
 }
+
+const runCli = (root: string, arguments_: string[]) =>
+  spawnSync(process.execPath, [join(import.meta.dirname, '..', 'src', 'cli.ts'), ...arguments_], {
+    cwd: root,
+    encoding: 'utf8',
+  })
 
 const MAX_INSTRUCTION_FILE_BYTES = 1024 * 1024
 
@@ -56,6 +111,14 @@ const recordsForSubject = (root: string, subject: string) =>
 
 const activeRecordsForSubject = (root: string, subject: string) =>
   api.listRecords({ limit: 50, root }).filter(record => record.subject === subject)
+
+const generatedRecord = (root: string, subject: string) => {
+  const record = api
+    .listRecords({ includeSuperseded: true, limit: 20, root })
+    .find(candidate => candidate.subject === subject)
+  assert.ok(record)
+  return record
+}
 
 const readRecordFile = (root: string, record: BrainRecord): BrainRecordFile =>
   JSON.parse(readFileSync(join(root, record.path), 'utf8')) as BrainRecordFile
@@ -171,6 +234,29 @@ describe('initialisation', () => {
     )
   })
 
+  test('does not persist or print unrelated instruction-file content', () => {
+    const root = createRoot()
+    const sentinel = 'PRIVATE_INSTRUCTION_SENTINEL_do_not_store'
+    writeFileSync(join(root, 'AGENTS.md'), `# Agent notes\n${sentinel}\n`)
+    writeFileSync(join(root, 'CLAUDE.md'), `# Claude notes\n${sentinel}\n`)
+
+    const initialized = runCli(root, ['--root', root, 'init'])
+    assert.equal(initialized.status, 0)
+    assert.equal(initialized.stderr, '')
+    assert.doesNotMatch(initialized.stdout, new RegExp(sentinel))
+
+    const records = api.listRecords({ includeSuperseded: true, limit: 20, root })
+    assert.doesNotMatch(JSON.stringify(records), new RegExp(sentinel))
+    assert.deepEqual(api.searchRecords({ query: sentinel, root }), [])
+
+    writeFileSync(join(root, 'AGENTS.md'), `${sentinel}\n<!-- encephalon:managed-instructions:start invalid -->\n`)
+    const failed = runCli(root, ['--root', root, 'init'])
+    assert.equal(failed.status, 2)
+    assert.equal(failed.stdout, '')
+    assert.doesNotMatch(failed.stderr, new RegExp(sentinel))
+    assert.equal(JSON.parse(failed.stderr).error.code, 'VALIDATION_FAILED')
+  })
+
   test('is idempotent and refreshes only changed generated facts by superseding the active head', () => {
     const root = createRoot()
     const packagePath = join(root, 'package.json')
@@ -210,6 +296,120 @@ describe('initialisation', () => {
     ])
     assert.doesNotMatch(JSON.stringify(workflow[0]?.payload), /lint-private-body/)
     assert.equal(api.listRecords({ limit: 20, root }).length, 3)
+  })
+
+  test('plans first and idempotent baseline additions against one canonical snapshot', () => {
+    const root = createRoot()
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+
+    const first = initWithCounts({ root })
+    assert.equal(first.result.recordsCreated.length, 3)
+    assert.deepEqual(first.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 2,
+      hydrations: 1,
+    })
+
+    const second = initWithCounts({ root })
+    assert.deepEqual(second.result.recordsCreated, [])
+    assert.deepEqual(second.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 1,
+      hydrations: 0,
+    })
+  })
+
+  test('refreshes one or three changed generated subjects with one planning scan', () => {
+    const root = createRoot()
+    const packagePath = join(root, 'package.json')
+    writeFileSync(
+      packagePath,
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+    initWithCounts({ root })
+
+    writeFileSync(
+      packagePath,
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { lint: 'lint-private-body', test: 'node --test' },
+      }),
+    )
+    const oneChanged = initWithCounts({ refreshBaseline: true, root })
+    assert.equal(oneChanged.result.recordsCreated.length, 1)
+    assert.deepEqual(oneChanged.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 2,
+      hydrations: 1,
+    })
+
+    writeFileSync(
+      packagePath,
+      JSON.stringify({
+        name: 'renamed-project',
+        scripts: { build: 'private-build-command', lint: 'lint-private-body', test: 'node --test' },
+      }),
+    )
+    ensureParent(join(root, 'src', 'index.ts'))
+    writeFileSync(join(root, 'src', 'index.ts'), 'export const value = 1')
+    const threeChanged = initWithCounts({ refreshBaseline: true, root })
+    assert.equal(threeChanged.result.recordsCreated.length, 3)
+    assert.deepEqual(threeChanged.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 2,
+      hydrations: 1,
+    })
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('reruns safely after a mid-batch baseline publication failure', () => {
+    const root = createRoot()
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+    let publicationAttempts = 0
+    assert.throws(
+      () =>
+        initWithCounts({ root }, point => {
+          if (point === 'before-publication') {
+            publicationAttempts += 1
+            if (publicationAttempts === 2) {
+              throw new Error('Injected mid-batch failure')
+            }
+          }
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        return true
+      },
+    )
+
+    assert.equal(api.validateRecords({ root }).valid, true)
+    assert.equal(api.listRecords({ includeSuperseded: true, limit: 20, root }).length, 1)
+
+    const rerun = initWithCounts({ root })
+    assert.equal(rerun.result.recordsCreated.length, 2)
+    assert.equal(api.validateRecords({ root }).valid, true)
+    const records = api.listRecords({ includeSuperseded: true, limit: 20, root })
+    assert.equal(records.length, 3)
+    assert.deepEqual(new Set(records.map(record => record.subject)).size, 3)
   })
 
   test('records package scripts as structured argv data instead of shell strings', () => {
@@ -433,6 +633,69 @@ describe('initialisation', () => {
         .filter(record => record.subject === 'encephalon:init/repository-overview').length,
       1,
     )
+  })
+
+  test('bounds baseline scanning and records deterministic truncation reasons', () => {
+    const root = createRoot()
+    for (let index = 0; index < 600; index += 1) {
+      writeFileSync(join(root, `file-${String(index).padStart(3, '0')}.ts`), 'export {}\n')
+    }
+
+    api.initEncephalon({ root })
+    const overview = generatedRecord(root, 'encephalon:init/repository-overview')
+
+    assert.equal((overview.payload as { scannedRegularFiles?: unknown }).scannedRegularFiles, 512)
+    assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, [
+      'directory-entry-limit',
+    ])
+  })
+
+  test('selects directory entry caps from sorted names regardless of input order', () => {
+    const reverseGroupOrder = [
+      ...Array.from({ length: 300 }, (_, index) => ({ name: `z-${String(index).padStart(3, '0')}.py` })),
+      ...Array.from({ length: 300 }, (_, index) => ({ name: `a-${String(index).padStart(3, '0')}.ts` })),
+    ]
+    const { entries, truncated } = selectBoundedDirectoryEntries(reverseGroupOrder, () => true)
+
+    assert.equal(truncated, true)
+    assert.equal(entries.length, 512)
+    assert.deepEqual(
+      entries.map(entry => entry.name),
+      [
+        ...Array.from({ length: 300 }, (_, index) => `a-${String(index).padStart(3, '0')}.ts`),
+        ...Array.from({ length: 212 }, (_, index) => `z-${String(index).padStart(3, '0')}.py`),
+      ],
+    )
+  })
+
+  test('bounds baseline scanner depth without following deep chains forever', () => {
+    const root = createRoot()
+    let current = root
+    for (let index = 0; index < 30; index += 1) {
+      current = join(current, `level-${String(index).padStart(2, '0')}`)
+      ensureParent(join(current, 'placeholder'))
+    }
+    writeFileSync(join(current, 'deep.ts'), 'export {}\n')
+
+    api.initEncephalon({ root })
+    const overview = generatedRecord(root, 'encephalon:init/repository-overview')
+
+    assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, ['max-depth'])
+  })
+
+  test('does not enumerate workflows through a symlinked .github ancestor', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit directory symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    const outside = createRoot()
+    ensureParent(join(outside, '.github', 'workflows', 'leaked.yml'))
+    writeFileSync(join(outside, '.github', 'workflows', 'leaked.yml'), 'name: leaked\n')
+    symlinkSync(join(outside, '.github'), join(root, '.github'))
+
+    api.initEncephalon({ root })
+    const workflow = generatedRecord(root, 'encephalon:init/commands-ci')
+
+    assert.deepEqual((workflow.payload as { workflowFiles?: unknown }).workflowFiles, [])
   })
 
   test('preflights both instruction files before writing anything', () => {
@@ -795,6 +1058,56 @@ describe('initialisation', () => {
       replacementCase.assertReplacement(path, replacement)
     })
   }
+
+  test('detects byte-identical instruction replacement when inode identity is reused', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const originalTime = new Date('2000-01-01T00:00:00.000Z')
+    const replacementTime = new Date('2001-01-01T00:00:00.000Z')
+    api.initEncephalon({ root })
+    utimesSync(path, originalTime, originalTime)
+    const [agentsPlan] = planInstructionChanges(root, true)
+    assert.equal(agentsPlan?.action, 'delete')
+    type LegacyInstructionIdentity = { dev: number; ino: number }
+    type StrengthenedInstructionIdentity = {
+      birthtimeNs: string
+      ctimeNs: string
+      dev: string
+      ino: string
+      mtimeNs: string
+      size: string
+    }
+    type TestInstructionIdentity = LegacyInstructionIdentity | StrengthenedInstructionIdentity
+    const isStrengthenedIdentity = (identity: TestInstructionIdentity): identity is StrengthenedInstructionIdentity =>
+      typeof identity.dev === 'string'
+    const mutablePlan = agentsPlan as { originalIdentity?: TestInstructionIdentity }
+    const plannedIdentity = mutablePlan.originalIdentity
+    assert.ok(plannedIdentity)
+    const replacement = readFileSync(path)
+    rmSync(path)
+    writeFileSync(path, replacement)
+    utimesSync(path, replacementTime, replacementTime)
+    if (isStrengthenedIdentity(plannedIdentity)) {
+      const replacementMetadata = statSync(path, { bigint: true })
+      mutablePlan.originalIdentity = {
+        birthtimeNs: plannedIdentity.birthtimeNs,
+        ctimeNs: plannedIdentity.ctimeNs,
+        dev: replacementMetadata.dev.toString(),
+        ino: replacementMetadata.ino.toString(),
+        mtimeNs: plannedIdentity.mtimeNs,
+        size: plannedIdentity.size,
+      }
+    } else {
+      const replacementMetadata = statSync(path)
+      mutablePlan.originalIdentity = {
+        dev: replacementMetadata.dev,
+        ino: replacementMetadata.ino,
+      }
+    }
+
+    assertErrorCode(() => applyInstructionChanges(root, [agentsPlan]), 'REPOSITORY_CHANGED')
+    assert.deepEqual(readFileSync(path), replacement)
+  })
 
   test('does not delete a replacement created after deletion quarantine', () => {
     const root = createRoot()
