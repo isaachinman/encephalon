@@ -1,0 +1,18 @@
+{
+  "createdAt": "2026-08-09T00:33:16.048Z",
+  "id": "c479ae77-18a8-414e-9bbd-965de647e02a",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Tests for canonically equivalent filesystem names must account for locale comparator ties and actual directory order.",
+    "lessons": [
+      "When validation reports whichever canonically equivalent directory appears second, do not hardcode one Unicode spelling as the collision path.",
+      "If production sorts directory entries with localeCompare, compute expected collision paths from the actual sorted directory names because localeCompare can return 0 for canonically equivalent strings.",
+      "Avoid deriving expected paths from validation errors; derive them from filesystem setup and the same documented ordering rule instead."
+    ],
+    "verification": [
+      "Run focused records validation tests on the branch after resolving review feedback about Unicode or case-collision path ordering."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.locale-collision-tests"
+}
