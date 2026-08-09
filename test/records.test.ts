@@ -299,21 +299,19 @@ describe('canonical records', () => {
     mkdirSync(join(root, 'encephalon', 'context'), { recursive: true })
     const caseVariantCreated = canCreateDirectory(root, 'Context')
     const unicodeNames = ['cafe\u0301', 'café'].filter(name => canCreateDirectory(root, name))
-    const unicodeCollisionPaths = readdirSync(join(root, 'encephalon'))
+    const unicodeOrderedNames = readdirSync(join(root, 'encephalon'))
       .filter(name => unicodeNames.includes(name))
       .sort((first, second) => first.localeCompare(second))
-      .reduce<{ paths: string[]; seen: Set<string> }>(
-        (accumulator, name) => {
-          const collisionKey = name.normalize('NFC').toLowerCase()
-          return {
-            paths: accumulator.seen.has(collisionKey)
-              ? [...accumulator.paths, `encephalon/${name}`]
-              : accumulator.paths,
-            seen: new Set([...accumulator.seen, collisionKey]),
-          }
-        },
-        { paths: [], seen: new Set<string>() },
-      ).paths
+    const unicodeCollisionPaths = unicodeOrderedNames.reduce<{ paths: string[]; seen: Set<string> }>(
+      (accumulator, name) => {
+        const collisionKey = name.normalize('NFC').toLowerCase()
+        return {
+          paths: accumulator.seen.has(collisionKey) ? [...accumulator.paths, `encephalon/${name}`] : accumulator.paths,
+          seen: new Set([...accumulator.seen, collisionKey]),
+        }
+      },
+      { paths: [], seen: new Set<string>() },
+    ).paths
     const expected = [
       ...(caseVariantCreated
         ? [
@@ -321,7 +319,7 @@ describe('canonical records', () => {
             ['KIND_DIRECTORY_COLLISION', 'encephalon/Context'],
           ]
         : []),
-      ...unicodeNames.map(name => ['INVALID_KIND_DIRECTORY', `encephalon/${name}`]),
+      ...unicodeOrderedNames.map(name => ['INVALID_KIND_DIRECTORY', `encephalon/${name}`]),
       ...unicodeCollisionPaths.map(path => ['KIND_DIRECTORY_COLLISION', path]),
     ].sort((first, second) => String(first[1]).localeCompare(String(second[1])))
 
