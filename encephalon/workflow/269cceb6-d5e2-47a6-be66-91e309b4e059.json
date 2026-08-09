@@ -10,10 +10,10 @@
       "Run release-equivalent checks without publishing, and leave the release pull request open for maintainer inspection."
     ],
     "verification": [
-      "Run typecheck, tests, lint, build, check:package, and check:publish before confirming or pushing the release PR."
+      "Run typecheck, tests, lint, benchmark:check, build, check:package, check:publish, and encephalon validate before confirming or pushing the release PR."
     ]
   },
-  "searchText": "release preparation changelog manual publication version metadata package checks",
+  "searchText": "release preparation changelog manual publication version metadata package checks benchmark validate",
   "source": "agent",
   "subject": "workflow.release-prepare"
 }
