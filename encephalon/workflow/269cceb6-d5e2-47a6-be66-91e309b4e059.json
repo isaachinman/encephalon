@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-09T01:40:26.397Z",
+  "id": "269cceb6-d5e2-47a6-be66-91e309b4e059",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Prepare releases as reviewable metadata-only pull requests before manual publication.",
+    "lessons": [
+      "Update package.json and regenerate src/generated/version.ts together so the bundled CLI and package checks agree on the release version.",
+      "Populate a top-level CHANGELOG.md from the merged history since the previous release.",
+      "Run release-equivalent checks without publishing, and leave the release pull request open for maintainer inspection."
+    ],
+    "verification": [
+      "Run typecheck, tests, lint, build, check:package, and check:publish before confirming or pushing the release PR."
+    ]
+  },
+  "searchText": "release preparation changelog manual publication version metadata package checks",
+  "source": "agent",
+  "subject": "workflow.release-prepare"
+}
