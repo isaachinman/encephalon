@@ -92,14 +92,54 @@ const LANGUAGE_BY_EXTENSION = new Map([
   ['.tsx', 'TypeScript'],
   ['.vue', 'Vue'],
 ])
-const PACKAGE_MANAGERS = new Set(['bun', 'npm', 'pnpm', 'yarn'])
+const PACKAGE_MANAGER_NAMES = ['bun', 'npm', 'pnpm', 'yarn']
+const PACKAGE_MANAGERS = new Set(PACKAGE_MANAGER_NAMES)
+const LOCKFILE_MANAGERS = [
+  { file: 'bun.lock', manager: 'bun' },
+  { file: 'bun.lockb', manager: 'bun' },
+  { file: 'package-lock.json', manager: 'npm' },
+  { file: 'pnpm-lock.yaml', manager: 'pnpm' },
+  { file: 'yarn.lock', manager: 'yarn' },
+] as const
 
 type PackageFacts = {
   name?: string
-  packageManager?: string | undefined
+  packageManager?: string
   workspacePatterns: string[]
   scriptKeys: string[]
 }
+
+type PackageManagerLockfile = {
+  file: string
+  manager: string
+}
+
+type PackageManagerEvidence =
+  | {
+      status: 'conflicted'
+      candidates: string[]
+      declared?: string
+      lockfiles: PackageManagerLockfile[]
+    }
+  | {
+      status: 'declared'
+      declared: string
+      manager: string
+    }
+  | {
+      status: 'declared-and-lockfile'
+      declared: string
+      lockfiles: PackageManagerLockfile[]
+      manager: string
+    }
+  | {
+      status: 'lockfile-derived'
+      lockfiles: PackageManagerLockfile[]
+      manager: string
+    }
+  | {
+      status: 'unknown'
+    }
 
 type ScanState = {
   directoriesSeen: number
@@ -120,20 +160,45 @@ const safeName = (value: string) =>
   !hasControlCharacters(value) &&
   !/(?:^|[._-])(secret|credential|password|token|private)(?:$|[._-])/i.test(value)
 
-const packageManagerFromLock = (files: string[]) => {
-  if (files.includes('bun.lock') || files.includes('bun.lockb')) {
-    return 'bun'
+const declaredPackageManager = (value: unknown) => {
+  if (typeof value === 'string') {
+    const manager = value.split('@')[0]?.toLowerCase()
+    if (manager !== undefined && PACKAGE_MANAGERS.has(manager)) {
+      return manager
+    }
   }
-  if (files.includes('pnpm-lock.yaml')) {
-    return 'pnpm'
+}
+
+const lockfileEvidence = (files: string[]): PackageManagerLockfile[] =>
+  LOCKFILE_MANAGERS.filter(lockfile => files.includes(lockfile.file))
+
+const packageManagerEvidence = (
+  declared: string | undefined,
+  lockfiles: PackageManagerLockfile[],
+): PackageManagerEvidence => {
+  const lockfileManagers = [...new Set(lockfiles.map(lockfile => lockfile.manager))]
+  if (declared === undefined && lockfileManagers.length === 0) {
+    return { status: 'unknown' }
   }
-  if (files.includes('yarn.lock')) {
-    return 'yarn'
+  if (declared !== undefined && lockfileManagers.length === 0) {
+    return { declared, manager: declared, status: 'declared' }
   }
-  if (files.includes('package-lock.json')) {
-    return 'npm'
+  if (declared === undefined && lockfileManagers.length === 1) {
+    const [manager] = lockfileManagers
+    if (manager !== undefined) {
+      return { lockfiles, manager, status: 'lockfile-derived' }
+    }
   }
-  return 'npm'
+  if (declared !== undefined && lockfileManagers.length === 1 && lockfileManagers[0] === declared) {
+    return { declared, lockfiles, manager: declared, status: 'declared-and-lockfile' }
+  }
+  const evidencedManagers = new Set([...(declared === undefined ? [] : [declared]), ...lockfileManagers])
+  return {
+    ...(declared === undefined ? {} : { declared }),
+    candidates: PACKAGE_MANAGER_NAMES.filter(manager => evidencedManagers.has(manager)),
+    lockfiles,
+    status: 'conflicted',
+  }
 }
 
 const safeWorkspacePattern = (value: unknown): value is string =>
@@ -168,14 +233,10 @@ const readPackageFacts = (root: string): PackageFacts => {
         ) {
           workspaceValue = (value.workspaces as { packages?: unknown }).packages
         }
+        const packageManager = declaredPackageManager(value.packageManager)
         return {
           ...(typeof value.name === 'string' && safeName(value.name) ? { name: value.name } : {}),
-          ...(typeof value.packageManager === 'string' &&
-          PACKAGE_MANAGERS.has(value.packageManager.split('@')[0]?.toLowerCase() ?? '')
-            ? {
-                packageManager: value.packageManager.split('@')[0]?.toLowerCase(),
-              }
-            : {}),
+          ...(packageManager === undefined ? {} : { packageManager }),
           scriptKeys:
             value.scripts !== null && typeof value.scripts === 'object' && !Array.isArray(value.scripts)
               ? Object.keys(value.scripts).filter(safeName).sort(ordinalStringCompare)
@@ -329,7 +390,11 @@ const invocationForScript = (manager: string, scriptKey: string) => {
 export const scanBaseline = (root: string): AddRecordInput[] => {
   const layout = topLevelFacts(root)
   const packageFacts = readPackageFacts(root)
-  const packageManager = packageFacts.packageManager ?? packageManagerFromLock(layout.recognisedFiles)
+  const packageEvidence = packageManagerEvidence(packageFacts.packageManager, lockfileEvidence(layout.recognisedFiles))
+  const packageManager =
+    packageEvidence.status === 'unknown' || packageEvidence.status === 'conflicted'
+      ? undefined
+      : packageEvidence.manager
   const scan = scanLanguages(root)
   const languages = [...scan.languageCounts.entries()]
     .sort(([first], [second]) => ordinalStringCompare(first, second))
@@ -360,7 +425,8 @@ export const scanBaseline = (root: string): AddRecordInput[] => {
       payload: {
         summary: 'Derived package and tooling layout captured during Encephalon initialisation.',
         ...(packageFacts.name === undefined ? {} : { packageName: packageFacts.name }),
-        packageManager,
+        ...(packageManager === undefined ? {} : { packageManager }),
+        packageManagerEvidence: packageEvidence,
         recognisedFiles: layout.recognisedFiles,
         sources: layout.recognisedFiles,
         workspaceConfigured: packageFacts.workspacePatterns.length > 0,
@@ -372,9 +438,12 @@ export const scanBaseline = (root: string): AddRecordInput[] => {
     {
       kind: 'workflow',
       payload: {
-        scriptInvocations: packageFacts.scriptKeys
-          .map(script => invocationForScript(packageManager, script))
-          .filter(invocation => invocation !== undefined),
+        scriptInvocations:
+          packageManager === undefined
+            ? []
+            : packageFacts.scriptKeys
+                .map(script => invocationForScript(packageManager, script))
+                .filter(invocation => invocation !== undefined),
         scriptKeys: packageFacts.scriptKeys,
         sources: [...(layout.recognisedFiles.includes('package.json') ? ['package.json'] : []), ...workflows],
         summary:
