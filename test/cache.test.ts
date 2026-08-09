@@ -9,6 +9,7 @@ import { cacheReadTestHooks } from '../src/cache.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
+import { ordinalStringCompare } from '../src/order.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -272,7 +273,7 @@ describe('SQLite cache and reads', () => {
       query: 'portable persistence',
       root,
     })
-    assert.deepEqual(Object.keys(compact[0] ?? {}).sort(), [
+    assert.deepEqual(Object.keys(compact[0] ?? {}).sort(ordinalStringCompare), [
       'id',
       'kind',
       'path',

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { parseArgs } from 'node:util'
 import { cliErrorResponse, fail } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import {
@@ -20,20 +21,23 @@ import type { JsonValue } from './types.ts'
 const HELP = `Usage: encephalon [--root <path>] <command> [options]
 
 Commands:
-  init [--refresh-baseline | --remove]
-  add --kind <kind> --subject <subject> --source <source> --data <json>
+  init [--refresh-baseline] [--remove]
+  add [--id <id>] --kind <kind> --subject <subject> --source <source> --data <json>
+      [--confidence <0..1>] [--text <text>] [--supersedes <id> ...] [--artifact <path> ...]
   prepare
   hydrate
   validate
-  list [--kind <kind>] [--subject <subject>] [--include-superseded]
+  list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <1..1000>]
   show --id <id> [--active-only]
-  search <query> [--compact] [--kind <kind>] [--include-superseded]
-  gather [--search <query> ...] [--show <id> ...] [--hydrate]
+  search [--compact] [--kind <kind>] [--include-superseded] [--limit <1..1000>] [--] <query>
+  gather [--search <query> ...] [--show <id> ...] [--hydrate] [--include-superseded]
+         [--kind <kind>] [--limit <1..1000>]
 
 Global options:
   --root <path>   Use this exact Git repository root.
-  --help          Show help.
-  --version       Show the package version.
+  --help, -h      Show help when this is the only remaining argv token (not per-command).
+  --version, -v   Show the package version when this is the only remaining argv token.
+  Values that start with '-' must use --name=value (for example --subject=-draft).
 `
 
 type ParsedOptions = {
@@ -45,6 +49,7 @@ type ParsedOptions = {
 type CommandResult = {
   value: unknown
   exitCode?: number
+  format?: 'json' | 'text'
 }
 
 const invalid = (message: string, details: Record<string, JsonValue> = {}): never =>
@@ -53,14 +58,18 @@ const invalid = (message: string, details: Record<string, JsonValue> = {}): neve
 const extractRoot = (arguments_: string[]) => {
   const roots: string[] = []
   const remaining: string[] = []
+  let terminated = false
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index] ?? ''
-    if (argument === '--root') {
+    if (argument === '--') {
+      terminated = true
+      remaining.push(argument)
+    } else if (!terminated && argument === '--root') {
       const value = arguments_[index + 1]
       const requiredValue = value === undefined || value.startsWith('--') ? invalid('--root requires a path.') : value
       roots.push(requiredValue)
       index += 1
-    } else if (argument.startsWith('--root=')) {
+    } else if (!terminated && argument.startsWith('--root=')) {
       roots.push(argument.slice('--root='.length))
     } else {
       remaining.push(argument)
@@ -83,44 +92,71 @@ const parseOptions = (
   const valueOptions = new Set([...(configuration.values ?? []), ...(configuration.repeated ?? [])])
   const repeatedOptions = new Set(configuration.repeated ?? [])
   const flagOptions = new Set(configuration.flags ?? [])
-  const parsed: ParsedOptions = {
-    flags: new Set(),
-    positionals: [],
-    values: new Map(),
+  const options = Object.fromEntries([
+    ...[...valueOptions].map(name => [name, { multiple: repeatedOptions.has(name), type: 'string' }] as const),
+    ...[...flagOptions].map(name => [name, { type: 'boolean' }] as const),
+  ])
+
+  let parsed: ReturnType<typeof parseArgs>
+  try {
+    parsed = parseArgs({
+      allowPositionals: true,
+      args: arguments_,
+      options,
+      strict: true,
+      tokens: true,
+    })
+  } catch (error) {
+    const candidate = error as { code?: unknown; message?: unknown }
+    const message = typeof candidate.message === 'string' ? candidate.message : ''
+    const option = (/option '([^']+)'/i.exec(message)?.[1] ?? 'option').split(' ')[0] ?? 'option'
+    if (candidate.code === 'ERR_PARSE_ARGS_UNKNOWN_OPTION') {
+      invalid(`Unknown option ${option}.`)
+    }
+    if (candidate.code === 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE') {
+      invalid(
+        message.includes('does not take an argument')
+          ? `${option} does not take a value.`
+          : `${option} requires a value.`,
+      )
+    }
+    throw error
   }
 
-  for (let index = 0; index < arguments_.length; index += 1) {
-    const argument = arguments_[index] ?? ''
-    if (argument.startsWith('--')) {
-      const equals = argument.indexOf('=')
-      const name = equals === -1 ? argument.slice(2) : argument.slice(2, equals)
-      if (flagOptions.has(name)) {
-        if (equals !== -1 || parsed.flags.has(name)) {
-          invalid(`--${name} does not take a value and may be supplied once.`)
-        }
-        parsed.flags.add(name)
-      } else if (valueOptions.has(name)) {
-        const value = equals === -1 ? arguments_[index + 1] : argument.slice(equals + 1)
-        const requiredValue =
-          value === undefined || value.length === 0 || (equals === -1 && value.startsWith('--'))
-            ? invalid(`--${name} requires a value.`)
-            : value
-        if (equals === -1) {
-          index += 1
-        }
-        const existing = parsed.values.get(name) ?? []
-        if (!repeatedOptions.has(name) && existing.length > 0) {
-          invalid(`--${name} may be supplied only once.`)
-        }
-        parsed.values.set(name, [...existing, requiredValue])
-      } else {
-        invalid(`Unknown option --${name}.`)
-      }
-    } else {
-      parsed.positionals.push(argument)
+  const seen = new Map<string, number>()
+  for (const token of parsed.tokens ?? []) {
+    if (token.kind === 'option') {
+      seen.set(token.name, (seen.get(token.name) ?? 0) + 1)
     }
   }
-  return parsed
+  for (const [name, count] of seen.entries()) {
+    if (!repeatedOptions.has(name) && count > 1) {
+      invalid(`--${name} may be supplied only once.`)
+    }
+  }
+
+  const result: ParsedOptions = {
+    flags: new Set(),
+    positionals: parsed.positionals,
+    values: new Map(),
+  }
+  for (const name of flagOptions) {
+    if (parsed.values[name] === true) {
+      result.flags.add(name)
+    }
+  }
+  for (const name of valueOptions) {
+    const raw = parsed.values[name]
+    if (raw !== undefined) {
+      const values = (Array.isArray(raw) ? raw : [raw]).filter((value): value is string => typeof value === 'string')
+      const rawCount = Array.isArray(raw) ? raw.length : 1
+      if (values.length !== rawCount || values.some(value => value.length === 0)) {
+        invalid(`--${name} requires a value.`)
+      }
+      result.values.set(name, values)
+    }
+  }
+  return result
 }
 
 const one = (options: ParsedOptions, name: string) => options.values.get(name)?.[0]
@@ -156,13 +192,19 @@ const parsePayload = (value: string) => {
 const rootInput = (root: string | undefined): { root?: string } => (root === undefined ? {} : { root })
 
 const dispatch = (arguments_: string[]): CommandResult => {
-  if (arguments_.includes('--help') || arguments_.includes('-h')) {
-    return { value: HELP }
+  if (arguments_.length === 1 && (arguments_[0] === '--help' || arguments_[0] === '-h')) {
+    return { format: 'text', value: HELP }
   }
-  if (arguments_.includes('--version') || arguments_.includes('-v')) {
-    return { value: `${PACKAGE_VERSION}\n` }
+  if (arguments_.length === 1 && (arguments_[0] === '--version' || arguments_[0] === '-v')) {
+    return { format: 'text', value: `${PACKAGE_VERSION}\n` }
   }
   const extracted = extractRoot(arguments_)
+  if (extracted.remaining.length === 1 && (extracted.remaining[0] === '--help' || extracted.remaining[0] === '-h')) {
+    return { format: 'text', value: HELP }
+  }
+  if (extracted.remaining.length === 1 && (extracted.remaining[0] === '--version' || extracted.remaining[0] === '-v')) {
+    return { format: 'text', value: `${PACKAGE_VERSION}\n` }
+  }
   const [command, ...commandArguments] = extracted.remaining
   if (command === undefined) {
     invalid('A command is required. Use --help for usage.')
@@ -326,13 +368,7 @@ const writeJson = (stream: NodeJS.WriteStream, value: unknown) => {
 export const runCli = (arguments_: string[] = process.argv.slice(2)) => {
   try {
     const result = dispatch(arguments_)
-    if (
-      typeof result.value === 'string' &&
-      (arguments_.includes('--help') ||
-        arguments_.includes('-h') ||
-        arguments_.includes('--version') ||
-        arguments_.includes('-v'))
-    ) {
+    if (result.format === 'text' && typeof result.value === 'string') {
       process.stdout.write(result.value)
     } else {
       writeJson(process.stdout, result.value)

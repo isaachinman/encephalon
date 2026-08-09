@@ -1,6 +1,7 @@
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const root = resolve(import.meta.dir, '..')
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const command = ['npm', 'publish', '--dry-run', '--ignore-scripts', '--access', 'public', '--json']
 
 const result = Bun.spawnSync({

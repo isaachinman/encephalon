@@ -21,8 +21,16 @@ import { parseAddRecordInput, parseRootInput } from './api-input.ts'
 import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
+import { ordinalStringCompare } from './order.ts'
 import { resolveRepository } from './repository.ts'
-import { assertArtifactFile, createRecordFile, formatRecordFile, MAX_RECORD_BYTES, parseRecordFile } from './schema.ts'
+import {
+  assertArtifactFile,
+  createRecordFile,
+  formatRecordFile,
+  MAX_RECORD_BYTES,
+  parseRecordFile,
+  validateKind,
+} from './schema.ts'
 import type {
   AddRecordInput,
   BrainRecord,
@@ -51,19 +59,29 @@ type RecordWriteFault =
   | 'during-publication-flush'
   | 'during-staging-write'
 
-type RecordWriteHooks = {
+export type RecordWriteHooks = {
   fault?: (point: RecordWriteFault) => void
 }
 
 type RecordReadFault = 'after-record-fstat' | 'after-record-lstat' | 'after-record-open'
 
-type RecordReadHooks = {
+export type RecordReadHooks = {
+  canonicalScan?: () => void
   fault?: (point: RecordReadFault, path: string) => void
+  graphValidation?: () => void
 }
 
 type AddRecordOptions = {
   hooks?: RecordWriteHooks
   hydrate?: boolean
+}
+
+type PlannedRecord = {
+  formatted: string
+  path: string
+  record: BrainRecord
+  recordFile: BrainRecordFile
+  relativePath: string
 }
 
 type ValidateRecordsOptions = {
@@ -107,6 +125,11 @@ const postCommitError = (record: BrainRecord, phase: PostCommitPhase, cause: unk
     },
     { cause },
   )
+
+const canonicalRecordBytes = (record: BrainRecord) => {
+  const { path: _path, ...recordFile } = record
+  return Buffer.byteLength(formatRecordFile(recordFile), 'utf8')
+}
 
 const STAGING_DIRECTORY = '_staging'
 const RESERVED_DIRECTORIES = new Set(['_artifacts', STAGING_DIRECTORY])
@@ -300,6 +323,15 @@ const readRecord = (
   }
 }
 
+const kindDirectoryIssue = (name: string, path: string) => {
+  try {
+    validateKind(name)
+    return null
+  } catch {
+    return issue('INVALID_KIND_DIRECTORY', 'Kind directory name is not a portable kind.', path)
+  }
+}
+
 const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}): RecordScan => {
   const brainDirectory = resolve(root, 'encephalon')
   if (existsSync(brainDirectory)) {
@@ -312,6 +344,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       }
     }
 
+    const kindDirectoryNames = new Map<string, string>()
     const scanned: RecordScan = { bytes: 0, errors: [], records: [] }
     let recordBytes = 0
     let stopScanning = false
@@ -322,7 +355,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       }
     }
     for (const kindEntry of readdirSync(brainDirectory, { withFileTypes: true }).sort((first, second) =>
-      first.name.localeCompare(second.name),
+      ordinalStringCompare(first.name, second.name),
     )) {
       if (stopScanning) {
         break
@@ -351,9 +384,27 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
             )
             continue
           }
+          const relativeKindPath = posixRelative(root, kindPath)
+          const invalidKindDirectory = kindDirectoryIssue(kindEntry.name, relativeKindPath)
+          if (invalidKindDirectory !== null) {
+            addScanError(invalidKindDirectory)
+          }
+          const collisionKey = kindEntry.name.normalize('NFC').toLowerCase()
+          const collision = kindDirectoryNames.get(collisionKey)
+          if (collision === undefined) {
+            kindDirectoryNames.set(collisionKey, kindEntry.name)
+          } else if (collision !== kindEntry.name) {
+            addScanError(
+              issue(
+                'KIND_DIRECTORY_COLLISION',
+                'Kind directory names collide after portable normalization.',
+                relativeKindPath,
+              ),
+            )
+          }
           const kindIdentity = identityFor(kindMetadata)
           for (const recordEntry of readdirSync(kindPath, { withFileTypes: true }).sort((first, second) =>
-            first.name.localeCompare(second.name),
+            ordinalStringCompare(first.name, second.name),
           )) {
             if (stopScanning) {
               break
@@ -428,7 +479,8 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       bytes: recordBytes,
       errors: scanned.errors,
       records: scanned.records.sort(
-        (first, second) => first.createdAt.localeCompare(second.createdAt) || first.id.localeCompare(second.id),
+        (first, second) =>
+          ordinalStringCompare(first.createdAt, second.createdAt) || ordinalStringCompare(first.id, second.id),
       ),
     }
   }
@@ -438,21 +490,22 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
 const duplicateAndCaseIssues = (records: BrainRecord[]) => {
   const ids = new Map<string, BrainRecord>()
   const paths = new Map<string, BrainRecord>()
-  return records.reduce<ValidationIssue[]>((errors, record) => {
+  const errors: ValidationIssue[] = []
+  for (const record of records) {
     const idCollision = ids.get(record.id)
     const pathCollision = paths.get(record.path.normalize('NFC').toLowerCase())
     ids.set(record.id, record)
     paths.set(record.path.normalize('NFC').toLowerCase(), record)
-    return [
-      ...errors,
-      ...(idCollision === undefined
-        ? []
-        : [issue('DUPLICATE_RECORD_ID', `Duplicate record id ${record.id}.`, record.path, record.id)]),
-      ...(pathCollision === undefined || pathCollision.path === record.path
-        ? []
-        : [issue('CASE_COLLISION', 'Record paths collide on case-insensitive filesystems.', record.path, record.id)]),
-    ]
-  }, [])
+    if (idCollision !== undefined) {
+      errors.push(issue('DUPLICATE_RECORD_ID', `Duplicate record id ${record.id}.`, record.path, record.id))
+    }
+    if (pathCollision !== undefined && pathCollision.path !== record.path) {
+      errors.push(
+        issue('CASE_COLLISION', 'Record paths collide on case-insensitive filesystems.', record.path, record.id),
+      )
+    }
+  }
+  return errors
 }
 
 const supersessionIssues = (records: BrainRecord[]) => {
@@ -466,28 +519,28 @@ const supersessionIssues = (records: BrainRecord[]) => {
       ),
     ]
   }
-  const edgeIssues = records.flatMap(record =>
-    (record.supersedes ?? []).flatMap(targetId => {
+  const edgeIssues: ValidationIssue[] = []
+  for (const record of records) {
+    for (const targetId of record.supersedes ?? []) {
       const target = byId.get(targetId)
       if (target === undefined) {
-        return [issue('MISSING_SUPERSEDES', `Record supersedes missing record ${targetId}.`, record.path, record.id)]
-      }
-      if (targetId === record.id) {
-        return [issue('SELF_SUPERSEDES', 'A record may not supersede itself.', record.path, record.id)]
-      }
-      if (target.kind !== record.kind || target.subject !== record.subject) {
-        return [
+        edgeIssues.push(
+          issue('MISSING_SUPERSEDES', `Record supersedes missing record ${targetId}.`, record.path, record.id),
+        )
+      } else if (targetId === record.id) {
+        edgeIssues.push(issue('SELF_SUPERSEDES', 'A record may not supersede itself.', record.path, record.id))
+      } else if (target.kind !== record.kind || target.subject !== record.subject) {
+        edgeIssues.push(
           issue(
             'CROSS_SUBJECT_SUPERSEDES',
             'Superseded records must have the same kind and subject.',
             record.path,
             record.id,
           ),
-        ]
+        )
       }
-      return []
-    }),
-  )
+    }
+  }
 
   const cycleIssues: ValidationIssue[] = []
   const state = new Map<string, 'visited' | 'visiting'>()
@@ -529,26 +582,39 @@ const supersessionIssues = (records: BrainRecord[]) => {
     }
   }
 
-  const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-  const activeGroups = records
-    .filter(record => !superseded.has(record.id))
-    .reduce<Map<string, BrainRecord[]>>((groups, record) => {
+  const superseded = new Set<string>()
+  for (const record of records) {
+    for (const targetId of record.supersedes ?? []) {
+      superseded.add(targetId)
+    }
+  }
+  const activeGroups = new Map<string, BrainRecord[]>()
+  for (const record of records) {
+    if (!superseded.has(record.id)) {
       const key = `${record.kind}\0${record.subject}`
-      groups.set(key, [...(groups.get(key) ?? []), record])
-      return groups
-    }, new Map())
-  const activeIssues = [...activeGroups.values()].flatMap(group =>
-    group.length <= 1
-      ? []
-      : group.map(record =>
+      const group = activeGroups.get(key)
+      if (group === undefined) {
+        activeGroups.set(key, [record])
+      } else {
+        group.push(record)
+      }
+    }
+  }
+  const activeIssues: ValidationIssue[] = []
+  for (const group of activeGroups.values()) {
+    if (group.length > 1) {
+      for (const record of group) {
+        activeIssues.push(
           issue(
             'MULTIPLE_ACTIVE_HEADS',
             `Multiple active records exist for ${record.kind}/${record.subject}.`,
             record.path,
             record.id,
           ),
-        ),
-  )
+        )
+      }
+    }
+  }
   return [...edgeIssues, ...cycleIssues, ...activeIssues]
 }
 
@@ -564,24 +630,26 @@ const artifactIssues = (root: string, records: BrainRecord[]) => {
   }
   const brainDirectory = resolve(root, 'encephalon')
   const paths = new Map<string, string>()
-  return records.flatMap(record =>
-    (record.artifacts ?? []).flatMap(artifact => {
+  const errors: ValidationIssue[] = []
+  for (const record of records) {
+    for (const artifact of record.artifacts ?? []) {
       const collisionKey = artifact.normalize('NFC').toLowerCase()
       const collision = paths.get(collisionKey)
       paths.set(collisionKey, artifact)
-      const collisionIssues =
-        collision === undefined || collision === artifact
-          ? []
-          : [issue('CASE_COLLISION', 'Artifact paths collide on case-insensitive filesystems.', record.path, record.id)]
+      if (collision !== undefined && collision !== artifact) {
+        errors.push(
+          issue('CASE_COLLISION', 'Artifact paths collide on case-insensitive filesystems.', record.path, record.id),
+        )
+      }
       try {
         assertArtifactFile(brainDirectory, artifact)
-        return collisionIssues
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Artifact is invalid.'
-        return [...collisionIssues, issue('INVALID_ARTIFACT', message, record.path, record.id)]
+        errors.push(issue('INVALID_ARTIFACT', message, record.path, record.id))
       }
-    }),
-  )
+    }
+  }
+  return errors
 }
 
 const truncateValidationIssues = (errors: ValidationIssue[]) => {
@@ -625,7 +693,8 @@ const corpusBudgetIssues = (scan: RecordScan) => {
   ]
 }
 
-const validateScanned = (root: string, scan: RecordScan): ValidateResult => {
+const validateScanned = (root: string, scan: RecordScan, hooks: RecordReadHooks = {}): ValidateResult => {
+  hooks.graphValidation?.()
   const collectedErrors = [
     ...scan.errors,
     ...corpusBudgetIssues(scan),
@@ -643,28 +712,39 @@ const validateScanned = (root: string, scan: RecordScan): ValidateResult => {
 }
 
 const allowedMultiHeadRecordIds = (records: BrainRecord[], allowed: AllowedMultiHead[]) => {
-  const allowedKeys = new Set(allowed.map(candidate => `${candidate.kind}\0${candidate.subject}\0${candidate.source}`))
-  const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-  return [
-    ...records
-      .filter(record => !superseded.has(record.id))
-      .reduce<Map<string, BrainRecord[]>>((groups, record) => {
-        const key = `${record.kind}\0${record.subject}`
-        groups.set(key, [...(groups.get(key) ?? []), record])
-        return groups
-      }, new Map())
-      .values(),
-  ].reduce<Set<string>>((ids, group) => {
+  const allowedKeys = new Set(allowed.map(candidate => `${candidate.kind} ${candidate.subject} ${candidate.source}`))
+  const superseded = new Set<string>()
+  for (const record of records) {
+    for (const targetId of record.supersedes ?? []) {
+      superseded.add(targetId)
+    }
+  }
+  const activeGroups = new Map<string, BrainRecord[]>()
+  for (const record of records) {
+    if (!superseded.has(record.id)) {
+      const key = `${record.kind} ${record.subject}`
+      const group = activeGroups.get(key)
+      if (group === undefined) {
+        activeGroups.set(key, [record])
+      } else {
+        group.push(record)
+      }
+    }
+  }
+  const ids = new Set<string>()
+  for (const group of activeGroups.values()) {
     const [first] = group
     if (
       first !== undefined &&
       group.length > 1 &&
-      group.every(record => allowedKeys.has(`${record.kind}\0${record.subject}\0${record.source}`))
+      group.every(record => allowedKeys.has(`${record.kind} ${record.subject} ${record.source}`))
     ) {
-      return new Set([...ids, ...group.map(record => record.id)])
+      for (const record of group) {
+        ids.add(record.id)
+      }
     }
-    return ids
-  }, new Set())
+  }
+  return ids
 }
 
 export const validateRecordsResolved = (root: string, options: ValidateRecordsOptions = {}): ValidateResult => {
@@ -683,25 +763,21 @@ export const validateRecords = (input: RootInput = {}): ValidateResult => {
   return validateRecordsResolved(root)
 }
 
-export const readRecords = (input: RootInput = {}) => {
-  const root = resolveRepository(input)
+export const readRecordsResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
+  hooks.canonicalScan?.()
   const scan = scanCanonicalRecords(root)
-  const result = validateScanned(root, scan)
-  if (result.valid) {
-    return scan.records
+  const result = validateScanned(root, scan, hooks)
+  if (allowed === undefined) {
+    if (result.valid) {
+      return scan.records
+    }
+    return fail('VALIDATION_FAILED', 'Canonical records are invalid.', {
+      errors: result.errors.map(error => ({
+        code: error.code,
+        message: error.message,
+      })),
+    })
   }
-  return fail('VALIDATION_FAILED', 'Canonical records are invalid.', {
-    errors: result.errors.map(error => ({
-      code: error.code,
-      message: error.message,
-    })),
-  })
-}
-
-export const readRecordsAllowingGeneratedMultiHeads = (input: RootInput, allowed: AllowedMultiHead[]) => {
-  const root = resolveRepository(input)
-  const scan = scanCanonicalRecords(root)
-  const result = validateScanned(root, scan)
   const allowedIds = allowedMultiHeadRecordIds(scan.records, allowed)
   const blockingErrors = result.errors.filter(
     error =>
@@ -718,11 +794,13 @@ export const readRecordsAllowingGeneratedMultiHeads = (input: RootInput, allowed
   })
 }
 
-const addRecordFileResolved = (
-  root: string,
-  recordFile: BrainRecordFile,
-  options: AddRecordOptions = {},
-): BrainRecord => {
+export const readRecords = (input: RootInput = {}) => readRecordsResolved(resolveRepository(input))
+
+export const readRecordsAllowingGeneratedMultiHeads = (input: RootInput, allowed: AllowedMultiHead[]) =>
+  readRecordsResolved(resolveRepository(input), {}, allowed)
+
+export const planRecordAddition = (root: string, input: AddRecordInput): PlannedRecord => {
+  const recordFile = createRecordFile(input)
   const relativePath = `encephalon/${recordFile.kind}/${recordFile.id}.json`
   const path = resolve(root, ...relativePath.split('/'))
   if (existsSync(path)) {
@@ -730,33 +808,56 @@ const addRecordFileResolved = (
       path: relativePath,
     })
   }
-
-  cleanupStagingDirectory(root, options.hooks)
-  const scan = scanCanonicalRecords(root)
-  if (scan.errors.length > 0) {
-    return fail('VALIDATION_FAILED', 'Existing canonical records are invalid.', {
-      errors: scan.errors.map(error => ({
-        code: error.code,
-        message: error.message,
-      })),
-    })
+  const record: BrainRecord = { ...recordFile, path: relativePath }
+  return {
+    formatted: formatRecordFile(recordFile),
+    path,
+    record,
+    recordFile,
+    relativePath,
   }
-  const candidate: BrainRecord = { ...recordFile, path: relativePath }
-  const formatted = formatRecordFile(recordFile)
-  const candidateResult = validateScanned(root, {
-    bytes: scan.bytes + Buffer.byteLength(formatted, 'utf8'),
-    errors: [],
-    records: [...scan.records, candidate],
+}
+
+export const assertRecordGraph = (
+  root: string,
+  records: BrainRecord[],
+  message = 'Canonical records are invalid.',
+  hooks: RecordReadHooks = {},
+  bytes?: number,
+) => {
+  const result = validateScanned(
+    root,
+    {
+      bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
+      errors: [],
+      records,
+    },
+    hooks,
+  )
+  if (result.valid) {
+    return
+  }
+  return fail('VALIDATION_FAILED', message, {
+    errors: result.errors.map(error => ({
+      code: error.code,
+      message: error.message,
+    })),
   })
-  if (!candidateResult.valid) {
-    return fail('VALIDATION_FAILED', 'The new record would make canonical records invalid.', {
-      errors: candidateResult.errors.map(error => ({
-        code: error.code,
-        message: error.message,
-      })),
-    })
-  }
+}
 
+type PublishResult = {
+  committedError?: EncephalonError
+  committedErrorPhase?: PostCommitPhase
+  record: BrainRecord
+}
+
+const publishPlannedRecordInternal = (
+  root: string,
+  plan: PlannedRecord,
+  options: { hooks?: RecordWriteHooks } = {},
+): PublishResult => {
+  cleanupStagingDirectory(root, options.hooks)
+  const { formatted, path, record, recordFile, relativePath } = plan
   const kindDirectory = ensureDirectoryChain(root, ['encephalon', recordFile.kind])
   const stagingDirectory = ensureDirectoryChain(root, ['encephalon', STAGING_DIRECTORY])
   const stagingPath = resolve(stagingDirectory, `record-${process.pid}-${randomUUID()}.tmp`)
@@ -767,7 +868,7 @@ const addRecordFileResolved = (
   let committedErrorPhase: PostCommitPhase | undefined
   const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
     if (committedErrorPhase === undefined || postCommitPriority[phase] > postCommitPriority[committedErrorPhase]) {
-      committedError = postCommitError(candidate, phase, error)
+      committedError = postCommitError(record, phase, error)
       committedErrorPhase = phase
     }
   }
@@ -823,6 +924,67 @@ const addRecordFileResolved = (
   if (cleanupError !== undefined) {
     throw cleanupError
   }
+  return {
+    record,
+    ...(committedError === undefined ? {} : { committedError }),
+    ...(committedErrorPhase === undefined ? {} : { committedErrorPhase }),
+  }
+}
+
+export const publishPlannedRecord = (
+  root: string,
+  plan: PlannedRecord,
+  options: { hooks?: RecordWriteHooks } = {},
+): BrainRecord => {
+  const published = publishPlannedRecordInternal(root, plan, options)
+  if (published.committedError !== undefined) {
+    throw published.committedError
+  }
+  return published.record
+}
+
+const addRecordFileResolved = (
+  root: string,
+  recordFile: BrainRecordFile,
+  options: AddRecordOptions = {},
+): BrainRecord => {
+  const relativePath = `encephalon/${recordFile.kind}/${recordFile.id}.json`
+  const path = resolve(root, ...relativePath.split('/'))
+  if (existsSync(path)) {
+    return fail('RECORD_EXISTS', `Record ${recordFile.id} already exists.`, {
+      path: relativePath,
+    })
+  }
+  const record: BrainRecord = { ...recordFile, path: relativePath }
+  const formatted = formatRecordFile(recordFile)
+  const plan: PlannedRecord = { formatted, path, record, recordFile, relativePath }
+
+  const scan = scanCanonicalRecords(root)
+  if (scan.errors.length > 0) {
+    return fail('VALIDATION_FAILED', 'Existing canonical records are invalid.', {
+      errors: scan.errors.map(error => ({
+        code: error.code,
+        message: error.message,
+      })),
+    })
+  }
+  assertRecordGraph(
+    root,
+    [...scan.records, plan.record],
+    'The new record would make canonical records invalid.',
+    {},
+    scan.bytes + Buffer.byteLength(plan.formatted, 'utf8'),
+  )
+
+  const publishOptions = options.hooks === undefined ? {} : { hooks: options.hooks }
+  const published = publishPlannedRecordInternal(root, plan, publishOptions)
+  let { committedError, committedErrorPhase } = published
+  const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
+    if (committedErrorPhase === undefined || postCommitPriority[phase] > postCommitPriority[committedErrorPhase]) {
+      committedError = postCommitError(published.record, phase, error)
+      committedErrorPhase = phase
+    }
+  }
   if (committedErrorPhase !== 'publicationFlush' && options.hydrate !== false) {
     try {
       fault(options.hooks, 'during-hydration')
@@ -834,7 +996,7 @@ const addRecordFileResolved = (
   if (committedError !== undefined) {
     throw committedError
   }
-  return candidate
+  return published.record
 }
 
 export const addRecordResolved = (root: string, input: AddRecordInput, options: AddRecordOptions = {}): BrainRecord =>

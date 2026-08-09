@@ -715,6 +715,7 @@ Missing `show` results are represented as `null` and are not errors. Gather pres
 - Gather search groups: exact caller-provided order, including repeated queries.
 - Gather show entries: exact caller-provided order, including repeated IDs.
 - Gather does not silently deduplicate requests.
+- Canonical JSON keys, generated baseline arrays, source manifests, validation output derived from scans, and supersession ID arrays use locale-independent UTF-16 code unit ordering. Sorting does not normalise or otherwise alter stored strings.
 
 ### 12.5 Compact search
 
@@ -960,8 +961,9 @@ Persistable facts:
 
 - Safe top-level file and directory names, excluding secret-prone hidden paths.
 - Recognised root manifest, lockfile, and configuration filenames.
-- Root `package.json` package name, `packageManager`, workspace presence, and discovery-only script keys.
-- Derived package script invocations as structured `{ executable, arguments, scriptKey }` argv data; never shell command strings or the script body. Script keys beginning with `-` remain discoverable in `scriptKeys` but do not produce runnable invocations.
+- Root `package.json` package name, valid `packageManager` declaration, workspace presence, and discovery-only script keys.
+- Package-manager evidence is recorded as `unknown`, `declared`, `lockfile-derived`, `declared-and-lockfile`, or `conflicted`; `packageManager` is present only when declaration and lockfile evidence identify one unambiguous manager.
+- Derived package script invocations as structured `{ executable, arguments, scriptKey }` argv data; never shell command strings or the script body. These invocations are omitted when the package manager is unknown or conflicted. Script keys beginning with `-` remain discoverable in `scriptKeys` but do not produce runnable invocations.
 - CI workflow filenames under `.github/workflows`; never YAML content, triggers, jobs, steps, secrets, or environment values.
 - Recognised language/file counts derived from extensions.
 - Repository identity derived from a safe root package name, or the root directory basename when no manifest provides a name.
