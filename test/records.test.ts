@@ -14,6 +14,7 @@ import {
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import * as api from '../src/index.ts'
+import { ordinalStringCompare } from '../src/order.ts'
 import {
   addRecordResolved,
   assertRecordGraph,
@@ -287,7 +288,7 @@ describe('canonical records', () => {
     assert.equal(result.valid, false)
     const expected = created
       .map(name => ['INVALID_KIND_DIRECTORY', `encephalon/${name}`])
-      .sort((first, second) => String(first[1]).localeCompare(String(second[1])))
+      .sort((first, second) => ordinalStringCompare(String(first[1]), String(second[1])))
     assert.deepEqual(
       result.errors.map(error => [error.code, error.path]),
       expected,
@@ -297,12 +298,21 @@ describe('canonical records', () => {
   test('detects kind directory case and unicode-normalization collisions', () => {
     const root = createRoot()
     mkdirSync(join(root, 'encephalon', 'context'), { recursive: true })
-    const caseVariantCreated = canCreateDirectory(root, 'Context')
-    const unicodeNames = ['cafe\u0301', 'café'].filter(name => canCreateDirectory(root, name))
-    const unicodeOrderedNames = readdirSync(join(root, 'encephalon'))
-      .filter(name => unicodeNames.includes(name))
-      .sort((first, second) => first.localeCompare(second))
-    const unicodeCollisionPaths = unicodeOrderedNames.reduce<{ paths: string[]; seen: Set<string> }>(
+    canCreateDirectory(root, 'Context')
+    const unicodeKindCandidates = ['cafe\u0301', 'café']
+    for (const name of unicodeKindCandidates) {
+      canCreateDirectory(root, name)
+    }
+    const kindDirectoryNames = readdirSync(join(root, 'encephalon')).sort(ordinalStringCompare)
+    const invalidKindPaths = kindDirectoryNames.reduce<string[]>((paths, name) => {
+      try {
+        validateKind(name)
+        return paths
+      } catch {
+        return [...paths, `encephalon/${name}`]
+      }
+    }, [])
+    const collisionPaths = kindDirectoryNames.reduce<{ paths: string[]; seen: Set<string> }>(
       (accumulator, name) => {
         const collisionKey = name.normalize('NFC').toLowerCase()
         return {
@@ -313,15 +323,9 @@ describe('canonical records', () => {
       { paths: [], seen: new Set<string>() },
     ).paths
     const expected = [
-      ...(caseVariantCreated
-        ? [
-            ['INVALID_KIND_DIRECTORY', 'encephalon/Context'],
-            ['KIND_DIRECTORY_COLLISION', 'encephalon/Context'],
-          ]
-        : []),
-      ...unicodeOrderedNames.map(name => ['INVALID_KIND_DIRECTORY', `encephalon/${name}`]),
-      ...unicodeCollisionPaths.map(path => ['KIND_DIRECTORY_COLLISION', path]),
-    ].sort((first, second) => String(first[1]).localeCompare(String(second[1])))
+      ...invalidKindPaths.map(path => ['INVALID_KIND_DIRECTORY', path]),
+      ...collisionPaths.map(path => ['KIND_DIRECTORY_COLLISION', path]),
+    ].sort((first, second) => ordinalStringCompare(String(first[1]), String(second[1])))
 
     const result = api.validateRecords({ root })
     assert.equal(result.valid, expected.length === 0)

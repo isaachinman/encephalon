@@ -1,5 +1,6 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readFileSync } from 'node:fs'
 import { extname, resolve } from 'node:path'
+import { ordinalStringCompare } from './order.ts'
 import type { AddRecordInput, JsonValue } from './types.ts'
 
 const MAX_SCANNED_FILES = 100_000
@@ -238,12 +239,10 @@ const readPackageFacts = (root: string): PackageFacts => {
           ...(packageManager === undefined ? {} : { packageManager }),
           scriptKeys:
             value.scripts !== null && typeof value.scripts === 'object' && !Array.isArray(value.scripts)
-              ? Object.keys(value.scripts)
-                  .filter(safeName)
-                  .sort((first, second) => first.localeCompare(second))
+              ? Object.keys(value.scripts).filter(safeName).sort(ordinalStringCompare)
               : [],
           workspacePatterns: Array.isArray(workspaceValue)
-            ? workspaceValue.filter(safeWorkspacePattern).sort((first, second) => first.localeCompare(second))
+            ? workspaceValue.filter(safeWorkspacePattern).sort(ordinalStringCompare)
             : [],
         }
       }
@@ -256,21 +255,11 @@ const readPackageFacts = (root: string): PackageFacts => {
   return { scriptKeys: [], workspacePatterns: [] }
 }
 
-const compareEntryNames = (first: string, second: string) => {
-  if (first < second) {
-    return -1
-  }
-  if (first > second) {
-    return 1
-  }
-  return 0
-}
-
 export const selectBoundedDirectoryEntries = <T extends { name: string }>(
   entries: readonly T[],
   isAccepted: (entry: T) => boolean,
 ) => {
-  const accepted = entries.filter(isAccepted).sort((first, second) => compareEntryNames(first.name, second.name))
+  const accepted = entries.filter(isAccepted).sort((first, second) => ordinalStringCompare(first.name, second.name))
   return {
     entries: accepted.slice(0, MAX_DIRECTORY_ENTRIES),
     truncated: accepted.length > MAX_DIRECTORY_ENTRIES,
@@ -360,7 +349,7 @@ const workflowFiles = (root: string) => {
                 entry.isFile() && !entry.isSymbolicLink() && safeName(entry.name) && /\.ya?ml$/i.test(entry.name),
             )
             .map(entry => `.github/workflows/${entry.name}`)
-            .sort((first, second) => first.localeCompare(second))
+            .sort(ordinalStringCompare)
         }
       } finally {
         closeSync(descriptor)
@@ -377,7 +366,7 @@ const topLevelFacts = (root: string) => {
   }
   for (const entry of readdirSync(root, { withFileTypes: true })
     .filter(candidate => safeName(candidate.name) && !candidate.isSymbolicLink())
-    .sort((first, second) => first.name.localeCompare(second.name))) {
+    .sort((first, second) => ordinalStringCompare(first.name, second.name))) {
     if (entry.isDirectory() && !EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())) {
       facts.directories.push(entry.name)
     } else if (entry.isFile() && RECOGNISED_FILES.has(entry.name.toLowerCase())) {
@@ -408,12 +397,12 @@ export const scanBaseline = (root: string): AddRecordInput[] => {
       : packageEvidence.manager
   const scan = scanLanguages(root)
   const languages = [...scan.languageCounts.entries()]
-    .sort(([first], [second]) => first.localeCompare(second))
+    .sort(([first], [second]) => ordinalStringCompare(first, second))
     .map(([language, files]) => ({ files, language }))
   const workflows = workflowFiles(root)
   const safeSources = [
     ...new Set([...layout.recognisedFiles, ...(workflows.length === 0 ? [] : ['.github/workflows'])]),
-  ].sort((first, second) => first.localeCompare(second))
+  ].sort(ordinalStringCompare)
 
   return [
     {
@@ -423,7 +412,7 @@ export const scanBaseline = (root: string): AddRecordInput[] => {
         recognisedTopLevelFiles: layout.recognisedFiles,
         scannedRegularFiles: scan.filesSeen,
         scanTruncated: scan.truncationReasons.size > 0,
-        scanTruncationReasons: [...scan.truncationReasons].sort((first, second) => first.localeCompare(second)),
+        scanTruncationReasons: [...scan.truncationReasons].sort(ordinalStringCompare),
         sources: safeSources,
         summary: 'Derived repository overview captured during Encephalon initialisation.',
         topLevelDirectories: layout.directories,
@@ -474,7 +463,7 @@ const sortJson = (value: JsonValue): JsonValue => {
   if (value !== null && typeof value === 'object') {
     return Object.fromEntries(
       Object.keys(value)
-        .sort((first, second) => first.localeCompare(second))
+        .sort(ordinalStringCompare)
         .map(key => [key, sortJson(value[key] as JsonValue)]),
     )
   }
