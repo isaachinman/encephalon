@@ -13,6 +13,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
   writeSync,
 } from 'node:fs'
@@ -1060,6 +1061,56 @@ describe('initialisation', () => {
       replacementCase.assertReplacement(path, replacement)
     })
   }
+
+  test('detects byte-identical instruction replacement when inode identity is reused', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const originalTime = new Date('2000-01-01T00:00:00.000Z')
+    const replacementTime = new Date('2001-01-01T00:00:00.000Z')
+    api.initEncephalon({ root })
+    utimesSync(path, originalTime, originalTime)
+    const [agentsPlan] = planInstructionChanges(root, true)
+    assert.equal(agentsPlan?.action, 'delete')
+    type LegacyInstructionIdentity = { dev: number; ino: number }
+    type StrengthenedInstructionIdentity = {
+      birthtimeNs: string
+      ctimeNs: string
+      dev: string
+      ino: string
+      mtimeNs: string
+      size: string
+    }
+    type TestInstructionIdentity = LegacyInstructionIdentity | StrengthenedInstructionIdentity
+    const isStrengthenedIdentity = (identity: TestInstructionIdentity): identity is StrengthenedInstructionIdentity =>
+      typeof identity.dev === 'string'
+    const mutablePlan = agentsPlan as { originalIdentity?: TestInstructionIdentity }
+    const plannedIdentity = mutablePlan.originalIdentity
+    assert.ok(plannedIdentity)
+    const replacement = readFileSync(path)
+    rmSync(path)
+    writeFileSync(path, replacement)
+    utimesSync(path, replacementTime, replacementTime)
+    if (isStrengthenedIdentity(plannedIdentity)) {
+      const replacementMetadata = statSync(path, { bigint: true })
+      mutablePlan.originalIdentity = {
+        birthtimeNs: plannedIdentity.birthtimeNs,
+        ctimeNs: plannedIdentity.ctimeNs,
+        dev: replacementMetadata.dev.toString(),
+        ino: replacementMetadata.ino.toString(),
+        mtimeNs: plannedIdentity.mtimeNs,
+        size: plannedIdentity.size,
+      }
+    } else {
+      const replacementMetadata = statSync(path)
+      mutablePlan.originalIdentity = {
+        dev: replacementMetadata.dev,
+        ino: replacementMetadata.ino,
+      }
+    }
+
+    assertErrorCode(() => applyInstructionChanges(root, [agentsPlan]), 'REPOSITORY_CHANGED')
+    assert.deepEqual(readFileSync(path), replacement)
+  })
 
   test('does not delete a replacement created after deletion quarantine', () => {
     const root = createRoot()
