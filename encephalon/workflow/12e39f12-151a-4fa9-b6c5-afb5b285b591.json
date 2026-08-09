@@ -1,0 +1,18 @@
+{
+  "createdAt": "2026-08-08T23:58:40.865Z",
+  "id": "12e39f12-151a-4fa9-b6c5-afb5b285b591",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Regression tests that simulate old and new identity shapes must preserve the runtime type shape they are exercising.",
+    "lessons": [
+      "When a review notes that a test passes on the old implementation for the wrong reason, adjust the test so it preserves the old runtime shape as well as the new one.",
+      "For deterministic simulations of filesystem identity collisions, fake only the file-key fields under test and preserve all other identity fields field-by-field or via a clearly typed full-shape helper.",
+      "Do not let TypeScript casts hide runtime type asymmetries in tests that are meant to prove red-green behaviour."
+    ],
+    "verification": [
+      "Before replying to review feedback about a regression test, rerun the focused test and ensure the code explains why the simulated shape matches the intended failure mode."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.runtime-shape-regressions"
+}

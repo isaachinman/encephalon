@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-08-08T23:49:18.840Z",
+  "id": "6d42b754-55d7-49b5-8fe0-9c4ba63434a8",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Instruction-file replacement checks must not rely only on dev/inode plus bytes because CI filesystems can immediately reuse inode identities for byte-identical replacements.",
+    "lessons": [
+      "For safety checks that must distinguish a planned file from a later replacement, capture nanosecond stat metadata in addition to dev and ino.",
+      "Separate pre-rename identity checks from post-rename quarantine checks: ctime can change during a legitimate rename, so post-rename comparisons should use only rename-stable identity fields plus bytes.",
+      "When a flake reports a missing expected REPOSITORY_CHANGED exception, add a deterministic regression that simulates the filesystem collision rather than relying on the local filesystem to reproduce it."
+    ],
+    "verification": [
+      "Before committing identity-related flake fixes, run the affected node --test name pattern and the full init test file.",
+      "Verify Encephalon state after adding the learning record."
+    ]
+  },
+  "source": "agent",
+  "subject": "review.inode-reuse-file-identity"
+}

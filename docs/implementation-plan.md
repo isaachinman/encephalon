@@ -1,16 +1,18 @@
 # Encephalon v0.1.0 — Complete Implementation Plan
 
-Status: approved for implementation  
+Status: historical design input; not the maintained normative contract
 Target repository: `git@github.com:isaachinman/encephalon.git`  
 Local implementation repository: the dedicated checkout of `isaachinman/encephalon`  
 Initial npm package: `encephalon@0.1.0`  
 License: MIT  
 Runtime: Node.js 24.15.0 or newer  
 Maintainer toolchain: TypeScript and Bun  
+Audited implementation snapshot: `514f444fdaf428c2e41124020b40b7568af66b6b` on 2026-08-08
+Current maintained contract: [`docs/contract.md`](./contract.md), the README, package checks, and executable tests
 
 ## 1. Purpose of this document
 
-This document is the authoritative implementation specification for Encephalon v0.1.0. It expands every product, architecture, compatibility, security, testing, repository, and release decision into concrete implementation work. An engineer or coding agent should be able to implement the package from this document without inventing behaviour, revisiting settled architectural questions, or referring to private source-project records.
+This document is preserved as historical implementation input for Encephalon v0.1.0. It is not the maintained normative contract for the current codebase. When this document conflicts with [`docs/contract.md`](./contract.md), the README, package checks, or executable tests, the maintained contract wins.
 
 The implementation must satisfy two simultaneous goals:
 
@@ -326,13 +328,13 @@ npm install --save-dev encephalon
 npx --no-install encephalon init
 ```
 
-The packaged agent skill must invoke the installed binary through:
+Historical note: the maintained current contract uses the package-manager binary form after installation:
 
 ```bash
-node ./node_modules/encephalon/dist/cli.mjs
+npx --no-install encephalon <command>
 ```
 
-It must not use unqualified `npx`, which could access the network or run an ephemeral version.
+The direct Node entrypoint remains an implementation detail that package smoke tests exercise against the packed tarball. User and packaged-skill guidance uses `npx --no-install`, and runtime root-install verification rejects execution that is not the root `node_modules/encephalon` installation.
 
 ### 8.5 Package-manager support
 
@@ -713,6 +715,7 @@ Missing `show` results are represented as `null` and are not errors. Gather pres
 - Gather search groups: exact caller-provided order, including repeated queries.
 - Gather show entries: exact caller-provided order, including repeated IDs.
 - Gather does not silently deduplicate requests.
+- Canonical JSON keys, generated baseline arrays, source manifests, validation output derived from scans, and supersession ID arrays use locale-independent UTF-16 code unit ordering. Sorting does not normalise or otherwise alter stored strings.
 
 ### 12.5 Compact search
 
@@ -958,8 +961,9 @@ Persistable facts:
 
 - Safe top-level file and directory names, excluding secret-prone hidden paths.
 - Recognised root manifest, lockfile, and configuration filenames.
-- Root `package.json` package name, `packageManager`, workspace presence, and discovery-only script keys.
-- Derived package script invocations as structured `{ executable, arguments, scriptKey }` argv data; never shell command strings or the script body. Script keys beginning with `-` remain discoverable in `scriptKeys` but do not produce runnable invocations.
+- Root `package.json` package name, valid `packageManager` declaration, workspace presence, and discovery-only script keys.
+- Package-manager evidence is recorded as `unknown`, `declared`, `lockfile-derived`, `declared-and-lockfile`, or `conflicted`; `packageManager` is present only when declaration and lockfile evidence identify one unambiguous manager.
+- Derived package script invocations as structured `{ executable, arguments, scriptKey }` argv data; never shell command strings or the script body. These invocations are omitted when the package manager is unknown or conflicted. Script keys beginning with `-` remain discoverable in `scriptKeys` but do not produce runnable invocations.
 - CI workflow filenames under `.github/workflows`; never YAML content, triggers, jobs, steps, secrets, or environment values.
 - Recognised language/file counts derived from extensions.
 - Repository identity derived from a safe root package name, or the root directory basename when no manifest provides a name.
@@ -1103,7 +1107,7 @@ The body must teach the following behaviour:
 ### 17.1 Query before assumptions
 
 - Confirm the current repository contains the managed Encephalon instruction and root package installation.
-- Use `node ./node_modules/encephalon/dist/cli.mjs gather` or compact search before loading full records.
+- Use `npx --no-install encephalon gather` or compact search before loading full records.
 - Search broadly first, then show only relevant IDs.
 - Treat active records as durable repository knowledge while acknowledging that repository state may have changed after the record.
 - Cite record ID or subject when using stored knowledge.

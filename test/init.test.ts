@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
   closeSync,
@@ -12,23 +13,85 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
   writeSync,
 } from 'node:fs'
+
 import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
+import { selectBoundedDirectoryEntries } from '../src/baseline.ts'
 import * as api from '../src/index.ts'
+import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
+import { ordinalStringCompare } from '../src/order.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
+
+const generatedPayload = (records: api.BrainRecord[], subject: string) => {
+  const payload = records.find(record => record.subject === subject)?.payload
+  assert.equal(payload !== null && typeof payload === 'object' && !Array.isArray(payload), true)
+  return payload as Record<string, unknown>
+}
+
+type InitCounts = {
+  baselineScans: number
+  canonicalScans: number
+  graphValidations: number
+  hydrations: number
+}
+
+type InitFaultPoint =
+  | 'after-publication'
+  | 'before-publication'
+  | 'during-cleanup'
+  | 'during-hydration'
+  | 'during-publication-flush'
+  | 'during-staging-write'
+
+const initWithCounts = (
+  input: Parameters<typeof initEncephalonWithHooks>[0],
+  fault?: (point: InitFaultPoint) => void,
+) => {
+  const counts: InitCounts = {
+    baselineScans: 0,
+    canonicalScans: 0,
+    graphValidations: 0,
+    hydrations: 0,
+  }
+  const result = initEncephalonWithHooks(input, {
+    baselineScan: () => {
+      counts.baselineScans += 1
+    },
+    canonicalScan: () => {
+      counts.canonicalScans += 1
+    },
+    graphValidation: () => {
+      counts.graphValidations += 1
+    },
+    hydration: cacheResult => {
+      if (cacheResult.hydrated) {
+        counts.hydrations += 1
+      }
+    },
+    ...(fault === undefined ? {} : { recordWriteHooks: { fault } }),
+  })
+  return { counts, result }
+}
 
 const createRoot = () => {
   const root = createTestRepository()
   roots.push(root)
   return root
 }
+
+const runCli = (root: string, arguments_: string[]) =>
+  spawnSync(process.execPath, [join(import.meta.dirname, '..', 'src', 'cli.ts'), ...arguments_], {
+    cwd: root,
+    encoding: 'utf8',
+  })
 
 const MAX_INSTRUCTION_FILE_BYTES = 1024 * 1024
 
@@ -135,10 +198,11 @@ describe('initialisation', () => {
       root,
     })
     assert.equal(records.length, 3)
-    assert.deepEqual(
-      records.map(record => record.subject).sort((left, right) => left.localeCompare(right)),
-      ['encephalon:init/commands-ci', 'encephalon:init/repository-overview', 'encephalon:init/tooling-layout'],
-    )
+    assert.deepEqual(records.map(record => record.subject).sort(ordinalStringCompare), [
+      'encephalon:init/commands-ci',
+      'encephalon:init/repository-overview',
+      'encephalon:init/tooling-layout',
+    ])
     assert.equal(
       records.every(record => record.source === 'encephalon:init'),
       true,
@@ -176,6 +240,29 @@ describe('initialisation', () => {
     )
   })
 
+  test('does not persist or print unrelated instruction-file content', () => {
+    const root = createRoot()
+    const sentinel = 'PRIVATE_INSTRUCTION_SENTINEL_do_not_store'
+    writeFileSync(join(root, 'AGENTS.md'), `# Agent notes\n${sentinel}\n`)
+    writeFileSync(join(root, 'CLAUDE.md'), `# Claude notes\n${sentinel}\n`)
+
+    const initialized = runCli(root, ['--root', root, 'init'])
+    assert.equal(initialized.status, 0)
+    assert.equal(initialized.stderr, '')
+    assert.doesNotMatch(initialized.stdout, new RegExp(sentinel))
+
+    const records = api.listRecords({ includeSuperseded: true, limit: 20, root })
+    assert.doesNotMatch(JSON.stringify(records), new RegExp(sentinel))
+    assert.deepEqual(api.searchRecords({ query: sentinel, root }), [])
+
+    writeFileSync(join(root, 'AGENTS.md'), `${sentinel}\n<!-- encephalon:managed-instructions:start invalid -->\n`)
+    const failed = runCli(root, ['--root', root, 'init'])
+    assert.equal(failed.status, 2)
+    assert.equal(failed.stdout, '')
+    assert.doesNotMatch(failed.stderr, new RegExp(sentinel))
+    assert.equal(JSON.parse(failed.stderr).error.code, 'VALIDATION_FAILED')
+  })
+
   test('is idempotent and refreshes only changed generated facts by superseding the active head', () => {
     const root = createRoot()
     const packagePath = join(root, 'package.json')
@@ -186,6 +273,7 @@ describe('initialisation', () => {
         scripts: { test: 'node --test' },
       }),
     )
+    writeFileSync(join(root, 'package-lock.json'), '{}')
 
     const first = api.initEncephalon({ root })
     const second = api.initEncephalon({ root })
@@ -215,6 +303,286 @@ describe('initialisation', () => {
     ])
     assert.doesNotMatch(JSON.stringify(workflow[0]?.payload), /lint-private-body/)
     assert.equal(api.listRecords({ limit: 20, root }).length, 3)
+  })
+
+  test('records package-manager facts only when evidence supports them', () => {
+    const packageJson = {
+      name: 'sample-project',
+      scripts: { test: 'node --test' },
+    }
+    const cases = [
+      {
+        evidence: { status: 'unknown' },
+        files: { 'go.mod': 'module example.invalid/project\n' },
+        manager: undefined,
+        name: 'non-JavaScript repository',
+        scriptInvocations: [],
+        scriptKeys: [],
+      },
+      {
+        evidence: { status: 'unknown' },
+        files: { 'package.json': JSON.stringify(packageJson) },
+        manager: undefined,
+        name: 'package.json without manager evidence',
+        scriptInvocations: [],
+        scriptKeys: ['test'],
+      },
+      {
+        evidence: { lockfiles: [{ file: 'bun.lock', manager: 'bun' }], manager: 'bun', status: 'lockfile-derived' },
+        files: { 'bun.lock': '', 'package.json': JSON.stringify(packageJson) },
+        manager: 'bun',
+        name: 'bun text lockfile',
+        scriptInvocations: [{ arguments: ['run', 'test'], executable: 'bun', scriptKey: 'test' }],
+        scriptKeys: ['test'],
+      },
+      {
+        evidence: { lockfiles: [{ file: 'bun.lockb', manager: 'bun' }], manager: 'bun', status: 'lockfile-derived' },
+        files: { 'bun.lockb': '', 'package.json': JSON.stringify(packageJson) },
+        manager: 'bun',
+        name: 'bun binary lockfile',
+        scriptInvocations: [{ arguments: ['run', 'test'], executable: 'bun', scriptKey: 'test' }],
+        scriptKeys: ['test'],
+      },
+      {
+        evidence: {
+          lockfiles: [{ file: 'package-lock.json', manager: 'npm' }],
+          manager: 'npm',
+          status: 'lockfile-derived',
+        },
+        files: { 'package-lock.json': '{}', 'package.json': JSON.stringify(packageJson) },
+        manager: 'npm',
+        name: 'npm lockfile',
+        scriptInvocations: [{ arguments: ['run', 'test'], executable: 'npm', scriptKey: 'test' }],
+        scriptKeys: ['test'],
+      },
+      {
+        evidence: {
+          lockfiles: [{ file: 'pnpm-lock.yaml', manager: 'pnpm' }],
+          manager: 'pnpm',
+          status: 'lockfile-derived',
+        },
+        files: { 'package.json': JSON.stringify(packageJson), 'pnpm-lock.yaml': '' },
+        manager: 'pnpm',
+        name: 'pnpm lockfile',
+        scriptInvocations: [{ arguments: ['run', 'test'], executable: 'pnpm', scriptKey: 'test' }],
+        scriptKeys: ['test'],
+      },
+      {
+        evidence: { lockfiles: [{ file: 'yarn.lock', manager: 'yarn' }], manager: 'yarn', status: 'lockfile-derived' },
+        files: { 'package.json': JSON.stringify(packageJson), 'yarn.lock': '' },
+        manager: 'yarn',
+        name: 'yarn lockfile',
+        scriptInvocations: [{ arguments: ['run', 'test'], executable: 'yarn', scriptKey: 'test' }],
+        scriptKeys: ['test'],
+      },
+      {
+        evidence: { declared: 'pnpm', manager: 'pnpm', status: 'declared' },
+        files: { 'package.json': JSON.stringify({ ...packageJson, packageManager: 'pnpm@9.0.0' }) },
+        manager: 'pnpm',
+        name: 'valid declaration without lockfile',
+        scriptInvocations: [{ arguments: ['run', 'test'], executable: 'pnpm', scriptKey: 'test' }],
+        scriptKeys: ['test'],
+      },
+      {
+        evidence: {
+          declared: 'npm',
+          lockfiles: [{ file: 'package-lock.json', manager: 'npm' }],
+          manager: 'npm',
+          status: 'declared-and-lockfile',
+        },
+        files: {
+          'package-lock.json': '{}',
+          'package.json': JSON.stringify({ ...packageJson, packageManager: 'npm@11.0.0' }),
+        },
+        manager: 'npm',
+        name: 'matching declaration and lockfile',
+        scriptInvocations: [{ arguments: ['run', 'test'], executable: 'npm', scriptKey: 'test' }],
+        scriptKeys: ['test'],
+      },
+      {
+        evidence: {
+          candidates: ['npm', 'yarn'],
+          declared: 'npm',
+          lockfiles: [{ file: 'yarn.lock', manager: 'yarn' }],
+          status: 'conflicted',
+        },
+        files: { 'package.json': JSON.stringify({ ...packageJson, packageManager: 'npm@11.0.0' }), 'yarn.lock': '' },
+        manager: undefined,
+        name: 'conflicting declaration and lockfile',
+        scriptInvocations: [],
+        scriptKeys: ['test'],
+      },
+      {
+        evidence: {
+          candidates: ['npm', 'pnpm'],
+          lockfiles: [
+            { file: 'package-lock.json', manager: 'npm' },
+            { file: 'pnpm-lock.yaml', manager: 'pnpm' },
+          ],
+          status: 'conflicted',
+        },
+        files: { 'package-lock.json': '{}', 'package.json': JSON.stringify(packageJson), 'pnpm-lock.yaml': '' },
+        manager: undefined,
+        name: 'multiple package-manager lockfiles',
+        scriptInvocations: [],
+        scriptKeys: ['test'],
+      },
+    ] as const
+
+    for (const entry of cases) {
+      const root = createRoot()
+      for (const [relativePath, content] of Object.entries(entry.files)) {
+        writeFileSync(join(root, relativePath), content)
+      }
+
+      const result = api.initEncephalon({ root })
+      const architecture = generatedPayload(result.recordsCreated, 'encephalon:init/tooling-layout')
+      const workflow = generatedPayload(result.recordsCreated, 'encephalon:init/commands-ci')
+
+      assert.deepEqual(architecture.packageManagerEvidence, entry.evidence, entry.name)
+      assert.equal(architecture.packageManager, entry.manager, entry.name)
+      assert.deepEqual(workflow.scriptKeys, entry.scriptKeys, entry.name)
+      assert.deepEqual(workflow.scriptInvocations, entry.scriptInvocations, entry.name)
+    }
+  })
+
+  test('refreshes generated records when package-manager evidence changes', () => {
+    const root = createRoot()
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+
+    api.initEncephalon({ root })
+    writeFileSync(join(root, 'package-lock.json'), '{}')
+
+    const refreshed = api.initEncephalon({ refreshBaseline: true, root })
+    assert.deepEqual(refreshed.recordsCreated.map(record => record.subject).sort(ordinalStringCompare), [
+      'encephalon:init/commands-ci',
+      'encephalon:init/repository-overview',
+      'encephalon:init/tooling-layout',
+    ])
+    const architecture = generatedPayload(refreshed.recordsCreated, 'encephalon:init/tooling-layout')
+    const workflow = generatedPayload(refreshed.recordsCreated, 'encephalon:init/commands-ci')
+    assert.equal(architecture.packageManager, 'npm')
+    assert.deepEqual(workflow.scriptInvocations, [{ arguments: ['run', 'test'], executable: 'npm', scriptKey: 'test' }])
+  })
+
+  test('plans first and idempotent baseline additions against one canonical snapshot', () => {
+    const root = createRoot()
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+
+    const first = initWithCounts({ root })
+    assert.equal(first.result.recordsCreated.length, 3)
+    assert.deepEqual(first.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 2,
+      hydrations: 1,
+    })
+
+    const second = initWithCounts({ root })
+    assert.deepEqual(second.result.recordsCreated, [])
+    assert.deepEqual(second.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 1,
+      hydrations: 0,
+    })
+  })
+
+  test('refreshes one or three changed generated subjects with one planning scan', () => {
+    const root = createRoot()
+    const packagePath = join(root, 'package.json')
+    writeFileSync(
+      packagePath,
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+    initWithCounts({ root })
+
+    writeFileSync(
+      packagePath,
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { lint: 'lint-private-body', test: 'node --test' },
+      }),
+    )
+    const oneChanged = initWithCounts({ refreshBaseline: true, root })
+    assert.equal(oneChanged.result.recordsCreated.length, 1)
+    assert.deepEqual(oneChanged.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 2,
+      hydrations: 1,
+    })
+
+    writeFileSync(
+      packagePath,
+      JSON.stringify({
+        name: 'renamed-project',
+        scripts: { build: 'private-build-command', lint: 'lint-private-body', test: 'node --test' },
+      }),
+    )
+    ensureParent(join(root, 'src', 'index.ts'))
+    writeFileSync(join(root, 'src', 'index.ts'), 'export const value = 1')
+    const threeChanged = initWithCounts({ refreshBaseline: true, root })
+    assert.equal(threeChanged.result.recordsCreated.length, 3)
+    assert.deepEqual(threeChanged.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      graphValidations: 2,
+      hydrations: 1,
+    })
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('reruns safely after a mid-batch baseline publication failure', () => {
+    const root = createRoot()
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'sample-project',
+        scripts: { test: 'node --test' },
+      }),
+    )
+    let publicationAttempts = 0
+    assert.throws(
+      () =>
+        initWithCounts({ root }, point => {
+          if (point === 'before-publication') {
+            publicationAttempts += 1
+            if (publicationAttempts === 2) {
+              throw new Error('Injected mid-batch failure')
+            }
+          }
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        return true
+      },
+    )
+
+    assert.equal(api.validateRecords({ root }).valid, true)
+    assert.equal(api.listRecords({ includeSuperseded: true, limit: 20, root }).length, 1)
+
+    const rerun = initWithCounts({ root })
+    assert.equal(rerun.result.recordsCreated.length, 2)
+    assert.equal(api.validateRecords({ root }).valid, true)
+    const records = api.listRecords({ includeSuperseded: true, limit: 20, root })
+    assert.equal(records.length, 3)
+    assert.deepEqual(new Set(records.map(record => record.subject)).size, 3)
   })
 
   test('records package scripts as structured argv data instead of shell strings', () => {
@@ -252,9 +620,9 @@ describe('initialisation', () => {
     }
     assert.equal(payload.commands, undefined)
     assert.deepEqual(payload.scriptKeys, [
+      '$(date)',
       '--version',
       '`tick`',
-      '$(date)',
       'ci:unit',
       'path/name',
       'quote"key',
@@ -264,8 +632,8 @@ describe('initialisation', () => {
       'unicodé',
     ])
     assert.deepEqual(payload.scriptInvocations, [
-      { arguments: ['run', '`tick`'], executable: 'yarn', scriptKey: '`tick`' },
       { arguments: ['run', '$(date)'], executable: 'yarn', scriptKey: '$(date)' },
+      { arguments: ['run', '`tick`'], executable: 'yarn', scriptKey: '`tick`' },
       { arguments: ['run', 'ci:unit'], executable: 'yarn', scriptKey: 'ci:unit' },
       { arguments: ['run', 'path/name'], executable: 'yarn', scriptKey: 'path/name' },
       { arguments: ['run', 'quote"key'], executable: 'yarn', scriptKey: 'quote"key' },
@@ -288,10 +656,7 @@ describe('initialisation', () => {
     const [resolver] = refreshed.recordsCreated
     assert.ok(resolver)
     assert.equal(resolver.subject, subject)
-    assert.deepEqual(
-      resolver.supersedes,
-      [cloned.id, original.id].sort((first, second) => first.localeCompare(second)),
-    )
+    assert.deepEqual(resolver.supersedes, [cloned.id, original.id].sort(ordinalStringCompare))
     assert.equal(api.validateRecords({ root }).valid, true)
     assert.equal(activeRecordsForSubject(root, subject).length, 1)
     assert.equal(recordsForSubject(root, subject).length, 3)
@@ -313,10 +678,7 @@ describe('initialisation', () => {
     const [resolver] = refreshed.recordsCreated
     assert.ok(resolver)
     assert.equal(resolver.subject, subject)
-    assert.deepEqual(
-      resolver.supersedes,
-      [cloned.id, original.id].sort((first, second) => first.localeCompare(second)),
-    )
+    assert.deepEqual(resolver.supersedes, [cloned.id, original.id].sort(ordinalStringCompare))
     assert.equal(api.validateRecords({ root }).valid, true)
     assert.equal(activeRecordsForSubject(root, subject).length, 1)
   })
@@ -334,10 +696,10 @@ describe('initialisation', () => {
 
     const refreshed = api.initEncephalon({ refreshBaseline: true, root })
 
-    assert.deepEqual(
-      refreshed.recordsCreated.map(record => record.subject).sort((first, second) => first.localeCompare(second)),
-      ['encephalon:init/commands-ci', 'encephalon:init/tooling-layout'],
-    )
+    assert.deepEqual(refreshed.recordsCreated.map(record => record.subject).sort(ordinalStringCompare), [
+      'encephalon:init/commands-ci',
+      'encephalon:init/tooling-layout',
+    ])
     assert.deepEqual(refreshed.skippedConflicts, [
       {
         activeRecordIds: ['human-overview'],
@@ -459,6 +821,24 @@ describe('initialisation', () => {
     assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, [
       'directory-entry-limit',
     ])
+  })
+
+  test('selects directory entry caps from sorted names regardless of input order', () => {
+    const reverseGroupOrder = [
+      ...Array.from({ length: 300 }, (_, index) => ({ name: `z-${String(index).padStart(3, '0')}.py` })),
+      ...Array.from({ length: 300 }, (_, index) => ({ name: `a-${String(index).padStart(3, '0')}.ts` })),
+    ]
+    const { entries, truncated } = selectBoundedDirectoryEntries(reverseGroupOrder, () => true)
+
+    assert.equal(truncated, true)
+    assert.equal(entries.length, 512)
+    assert.deepEqual(
+      entries.map(entry => entry.name),
+      [
+        ...Array.from({ length: 300 }, (_, index) => `a-${String(index).padStart(3, '0')}.ts`),
+        ...Array.from({ length: 212 }, (_, index) => `z-${String(index).padStart(3, '0')}.py`),
+      ],
+    )
   })
 
   test('bounds baseline scanner depth without following deep chains forever', () => {
@@ -851,6 +1231,56 @@ describe('initialisation', () => {
       replacementCase.assertReplacement(path, replacement)
     })
   }
+
+  test('detects byte-identical instruction replacement when inode identity is reused', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const originalTime = new Date('2000-01-01T00:00:00.000Z')
+    const replacementTime = new Date('2001-01-01T00:00:00.000Z')
+    api.initEncephalon({ root })
+    utimesSync(path, originalTime, originalTime)
+    const [agentsPlan] = planInstructionChanges(root, true)
+    assert.equal(agentsPlan?.action, 'delete')
+    type LegacyInstructionIdentity = { dev: number; ino: number }
+    type StrengthenedInstructionIdentity = {
+      birthtimeNs: string
+      ctimeNs: string
+      dev: string
+      ino: string
+      mtimeNs: string
+      size: string
+    }
+    type TestInstructionIdentity = LegacyInstructionIdentity | StrengthenedInstructionIdentity
+    const isStrengthenedIdentity = (identity: TestInstructionIdentity): identity is StrengthenedInstructionIdentity =>
+      typeof identity.dev === 'string'
+    const mutablePlan = agentsPlan as { originalIdentity?: TestInstructionIdentity }
+    const plannedIdentity = mutablePlan.originalIdentity
+    assert.ok(plannedIdentity)
+    const replacement = readFileSync(path)
+    rmSync(path)
+    writeFileSync(path, replacement)
+    utimesSync(path, replacementTime, replacementTime)
+    if (isStrengthenedIdentity(plannedIdentity)) {
+      const replacementMetadata = statSync(path, { bigint: true })
+      mutablePlan.originalIdentity = {
+        birthtimeNs: plannedIdentity.birthtimeNs,
+        ctimeNs: plannedIdentity.ctimeNs,
+        dev: replacementMetadata.dev.toString(),
+        ino: replacementMetadata.ino.toString(),
+        mtimeNs: plannedIdentity.mtimeNs,
+        size: plannedIdentity.size,
+      }
+    } else {
+      const replacementMetadata = statSync(path)
+      mutablePlan.originalIdentity = {
+        dev: replacementMetadata.dev,
+        ino: replacementMetadata.ino,
+      }
+    }
+
+    assertErrorCode(() => applyInstructionChanges(root, [agentsPlan]), 'REPOSITORY_CHANGED')
+    assert.deepEqual(readFileSync(path), replacement)
+  })
 
   test('does not delete a replacement created after deletion quarantine', () => {
     const root = createRoot()
