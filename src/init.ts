@@ -4,6 +4,7 @@ import { hydrateResolvedRepository, prepareResolvedRepository } from './cache.ts
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { applyInstructionChanges, planInstructionChanges } from './instructions.ts'
 import { withOperationLock } from './lock.ts'
+import { ordinalStringCompare } from './order.ts'
 import {
   assertRecordGraph,
   planRecordAddition,
@@ -48,7 +49,7 @@ const baselineActions = (records: BrainRecord[], baseline: AddRecordInput[], ref
           conflicts: [
             ...result.conflicts,
             {
-              activeRecordIds: matching.map(record => record.id).sort((first, second) => first.localeCompare(second)),
+              activeRecordIds: matching.map(record => record.id).sort(ordinalStringCompare),
               kind: candidate.kind,
               subject: candidate.subject,
             },
@@ -66,7 +67,7 @@ const baselineActions = (records: BrainRecord[], baseline: AddRecordInput[], ref
             ...result.additions,
             {
               ...candidate,
-              supersedes: matching.map(record => record.id).sort((first, second) => first.localeCompare(second)),
+              supersedes: matching.map(record => record.id).sort(ordinalStringCompare),
             },
           ],
         }

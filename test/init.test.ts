@@ -17,12 +17,14 @@ import {
   writeFileSync,
   writeSync,
 } from 'node:fs'
+
 import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { selectBoundedDirectoryEntries } from '../src/baseline.ts'
 import * as api from '../src/index.ts'
 import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
+import { ordinalStringCompare } from '../src/order.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
@@ -190,10 +192,11 @@ describe('initialisation', () => {
       root,
     })
     assert.equal(records.length, 3)
-    assert.deepEqual(
-      records.map(record => record.subject).sort((left, right) => left.localeCompare(right)),
-      ['encephalon:init/commands-ci', 'encephalon:init/repository-overview', 'encephalon:init/tooling-layout'],
-    )
+    assert.deepEqual(records.map(record => record.subject).sort(ordinalStringCompare), [
+      'encephalon:init/commands-ci',
+      'encephalon:init/repository-overview',
+      'encephalon:init/tooling-layout',
+    ])
     assert.equal(
       records.every(record => record.source === 'encephalon:init'),
       true,
@@ -444,9 +447,9 @@ describe('initialisation', () => {
     }
     assert.equal(payload.commands, undefined)
     assert.deepEqual(payload.scriptKeys, [
+      '$(date)',
       '--version',
       '`tick`',
-      '$(date)',
       'ci:unit',
       'path/name',
       'quote"key',
@@ -456,8 +459,8 @@ describe('initialisation', () => {
       'unicodé',
     ])
     assert.deepEqual(payload.scriptInvocations, [
-      { arguments: ['run', '`tick`'], executable: 'yarn', scriptKey: '`tick`' },
       { arguments: ['run', '$(date)'], executable: 'yarn', scriptKey: '$(date)' },
+      { arguments: ['run', '`tick`'], executable: 'yarn', scriptKey: '`tick`' },
       { arguments: ['run', 'ci:unit'], executable: 'yarn', scriptKey: 'ci:unit' },
       { arguments: ['run', 'path/name'], executable: 'yarn', scriptKey: 'path/name' },
       { arguments: ['run', 'quote"key'], executable: 'yarn', scriptKey: 'quote"key' },
@@ -480,10 +483,7 @@ describe('initialisation', () => {
     const [resolver] = refreshed.recordsCreated
     assert.ok(resolver)
     assert.equal(resolver.subject, subject)
-    assert.deepEqual(
-      resolver.supersedes,
-      [cloned.id, original.id].sort((first, second) => first.localeCompare(second)),
-    )
+    assert.deepEqual(resolver.supersedes, [cloned.id, original.id].sort(ordinalStringCompare))
     assert.equal(api.validateRecords({ root }).valid, true)
     assert.equal(activeRecordsForSubject(root, subject).length, 1)
     assert.equal(recordsForSubject(root, subject).length, 3)
@@ -505,10 +505,7 @@ describe('initialisation', () => {
     const [resolver] = refreshed.recordsCreated
     assert.ok(resolver)
     assert.equal(resolver.subject, subject)
-    assert.deepEqual(
-      resolver.supersedes,
-      [cloned.id, original.id].sort((first, second) => first.localeCompare(second)),
-    )
+    assert.deepEqual(resolver.supersedes, [cloned.id, original.id].sort(ordinalStringCompare))
     assert.equal(api.validateRecords({ root }).valid, true)
     assert.equal(activeRecordsForSubject(root, subject).length, 1)
   })
@@ -526,10 +523,10 @@ describe('initialisation', () => {
 
     const refreshed = api.initEncephalon({ refreshBaseline: true, root })
 
-    assert.deepEqual(
-      refreshed.recordsCreated.map(record => record.subject).sort((first, second) => first.localeCompare(second)),
-      ['encephalon:init/commands-ci', 'encephalon:init/tooling-layout'],
-    )
+    assert.deepEqual(refreshed.recordsCreated.map(record => record.subject).sort(ordinalStringCompare), [
+      'encephalon:init/commands-ci',
+      'encephalon:init/tooling-layout',
+    ])
     assert.deepEqual(refreshed.skippedConflicts, [
       {
         activeRecordIds: ['human-overview'],

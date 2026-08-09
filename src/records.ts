@@ -21,6 +21,7 @@ import { parseAddRecordInput, parseRootInput } from './api-input.ts'
 import { hydrateResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
+import { ordinalStringCompare } from './order.ts'
 import { resolveRepository } from './repository.ts'
 import {
   assertArtifactFile,
@@ -354,7 +355,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       }
     }
     for (const kindEntry of readdirSync(brainDirectory, { withFileTypes: true }).sort((first, second) =>
-      first.name.localeCompare(second.name),
+      ordinalStringCompare(first.name, second.name),
     )) {
       if (stopScanning) {
         break
@@ -403,7 +404,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
           }
           const kindIdentity = identityFor(kindMetadata)
           for (const recordEntry of readdirSync(kindPath, { withFileTypes: true }).sort((first, second) =>
-            first.name.localeCompare(second.name),
+            ordinalStringCompare(first.name, second.name),
           )) {
             if (stopScanning) {
               break
@@ -478,7 +479,8 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       bytes: recordBytes,
       errors: scanned.errors,
       records: scanned.records.sort(
-        (first, second) => first.createdAt.localeCompare(second.createdAt) || first.id.localeCompare(second.id),
+        (first, second) =>
+          ordinalStringCompare(first.createdAt, second.createdAt) || ordinalStringCompare(first.id, second.id),
       ),
     }
   }
