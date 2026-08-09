@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T23:13:29.741Z",
+  "id": "b8c49db0-d5cd-4446-9b32-a77752fc4838",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Use canonical record serialisation for validation byte budgets, never runtime BrainRecord objects with path.",
+    "lessons": [
+      "BrainRecord includes a runtime-only path field that is not written to canonical JSON; budget calculations for canonical corpus bytes must remove path or use planned formatted record bytes.",
+      "Default validation helpers that reconstruct byte counts from records should mirror scanCanonicalRecords byte accounting, not cache/runtime row shapes.",
+      "Regression tests should exercise near-budget corpora so small runtime-only fields would cross the corpus byte limit or per-record formatter limit if counted."
+    ],
+    "verification": [
+      "For planning paths, compare default graph validation with explicit planned formatted byte totals.",
+      "Include a near-MAX_CANONICAL_RECORD_BYTES case where runtime JSON with path is over budget but canonical JSON is within budget."
+    ]
+  },
+  "searchText": "canonical record byte accounting runtime path formatRecordFile assertRecordGraph corpus byte limit",
+  "source": "agent",
+  "subject": "review.canonical-byte-accounting"
+}

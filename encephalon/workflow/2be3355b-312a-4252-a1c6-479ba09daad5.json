@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-08-08T23:22:40.496Z",
+  "id": "2be3355b-312a-4252-a1c6-479ba09daad5",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Keep source-regex regression guards tied to live code patterns, not stale accumulator names.",
+    "lessons": [
+      "When a test uses source regexes to prevent hot-loop copy regressions, verify the pattern would fail against the exact code shape the PR removed and still exists as a plausible reintroduction.",
+      "After merging main into a branch with source guards, re-check the guard against current source because nearby refactors can make old accumulator names unreachable.",
+      "Prefer guarding the risky syntax shape, such as return [...errors, ...] or new Set([...ids, ...]), over historical local variable names that can disappear."
+    ],
+    "verification": [
+      "Before committing source guards, inspect current source and the removed diff to confirm the regex would fail on the old pattern and pass on the new one.",
+      "Run the focused guard test after every main merge that touches the guarded file."
+    ]
+  },
+  "searchText": "source regex regression guards stale accumulator names hot loop copy patterns performance test",
+  "source": "agent",
+  "subject": "review.source-regex-guards"
+}
