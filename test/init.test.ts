@@ -26,6 +26,8 @@ import * as api from '../src/index.ts'
 import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { ordinalStringCompare } from '../src/order.ts'
+import type { RecordWriteHooks } from '../src/records.ts'
+import { createOwnedStagingName } from '../src/staging.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
@@ -44,15 +46,7 @@ type InitCounts = {
   hydrations: number
 }
 
-type InitFaultPoint =
-  | 'after-scan-validation'
-  | 'after-publication'
-  | 'before-publication'
-  | 'before-directory-preparation'
-  | 'during-cleanup'
-  | 'during-hydration'
-  | 'during-publication-flush'
-  | 'during-staging-write'
+type InitFaultPoint = Parameters<NonNullable<RecordWriteHooks['fault']>>[0]
 
 const initWithCounts = (
   input: Parameters<typeof initEncephalonWithHooks>[0],
@@ -166,6 +160,19 @@ afterEach(() => {
 })
 
 describe('initialisation', () => {
+  test('recovers a recognised stale staging entry before baseline publication', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    mkdirSync(stagingDirectory, { recursive: true })
+    writeFileSync(join(stagingDirectory, createOwnedStagingName(123, '550e8400-e29b-41d4-a716-446655440000')), 'stale')
+
+    const result = api.initEncephalon({ root })
+
+    assert.equal(result.recordsCreated.length > 0, true)
+    assert.deepEqual(readdirSync(stagingDirectory), [])
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
   test('rejects baseline kind-directory overflow before publishing any batch state', () => {
     const root = createRoot()
     for (const index of Array.from({ length: 999 }, (_, value) => value)) {
