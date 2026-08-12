@@ -33,6 +33,7 @@ describe('SQLite error classification', () => {
       { category: 'io', error: { errcode: 3 }, name: 'PERM' },
       { category: 'io', error: { errcode: 7 }, name: 'NOMEM' },
       { category: 'io', error: { errcode: 13 }, name: 'FULL' },
+      { category: 'schema', error: { errcode: 17 }, name: 'SCHEMA' },
       { category: 'unknown', error: { errcode: 19 }, name: 'CONSTRAINT' },
       { category: 'unknown', error: { errcode: 1555 }, name: 'CONSTRAINT_PRIMARYKEY' },
     ])
@@ -52,6 +53,9 @@ describe('SQLite error classification', () => {
       { category: 'cantopen', error: { code: 'SQLITE_CANTOPEN_ISDIR' }, name: 'symbolic CANTOPEN_ISDIR' },
       { category: 'io', error: { code: 'SQLITE_IOERR_FSYNC' }, name: 'symbolic IOERR_FSYNC' },
       { category: 'io', error: { code: 'SQLITE_FULL' }, name: 'symbolic FULL' },
+      { category: 'io', error: { code: 'SQLITE_NOMEM' }, name: 'symbolic NOMEM' },
+      { category: 'io', error: { code: 'SQLITE_PERM' }, name: 'symbolic PERM' },
+      { category: 'schema', error: { code: 'SQLITE_SCHEMA' }, name: 'symbolic SCHEMA' },
       {
         category: 'unknown',
         error: { code: 'SQLITE_BUSY_SNAPSHOT', errcode: 19, message: 'database is locked' },
@@ -66,6 +70,11 @@ describe('SQLite error classification', () => {
         category: 'unknown',
         error: { code: 'SQLITE_CONSTRAINT_UNIQUE', message: 'database is locked' },
         name: 'symbolic constraint contradicts busy message',
+      },
+      {
+        category: 'readonly',
+        error: { code: 'SQLITE_READONLY', message: 'database is locked' },
+        name: 'known read-only code contradicts busy message',
       },
     ])
   })
@@ -108,9 +117,52 @@ describe('SQLite error classification', () => {
         name: 'runtime-only I/O message',
       },
       {
+        category: 'io',
+        error: Object.assign(new Error('access permission denied'), { code: 'ERR_SQLITE_ERROR' }),
+        name: 'runtime-only permission message',
+      },
+      {
+        category: 'io',
+        error: Object.assign(new Error('database or disk is full'), { code: 'ERR_SQLITE_ERROR' }),
+        name: 'runtime-only full message',
+      },
+      {
+        category: 'io',
+        error: Object.assign(new Error('out of memory'), { code: 'ERR_SQLITE_ERROR' }),
+        name: 'runtime-only memory message',
+      },
+      {
         category: 'schema',
         error: Object.assign(new Error('no such table: metadata'), { code: 'ERR_SQLITE_ERROR', errcode: 1 }),
         name: 'generic SQLite result refined by schema message',
+      },
+      {
+        category: 'schema',
+        error: Object.assign(new Error('no such column: records.value'), { code: 'ERR_SQLITE_ERROR', errcode: 1 }),
+        name: 'generic SQLite result refined by no-such-column message',
+      },
+      {
+        category: 'schema',
+        error: Object.assign(new Error('table records has no column named value'), {
+          code: 'ERR_SQLITE_ERROR',
+          errcode: 1,
+        }),
+        name: 'generic SQLite result refined by has-no-column message',
+      },
+      {
+        category: 'schema',
+        error: Object.assign(new Error('no such table: metadata'), { code: 'ERR_SQLITE_ERROR' }),
+        name: 'generic runtime schema fallback',
+      },
+      {
+        category: 'schema',
+        error: Object.assign(new Error('no such table: metadata'), { code: 'SQLITE_ERROR' }),
+        name: 'symbolic primary schema fallback',
+      },
+      {
+        category: 'corrupt',
+        error: Object.assign(new Error('malformed database schema (metadata)'), { code: 'ERR_SQLITE_ERROR' }),
+        name: 'runtime-only malformed schema message',
       },
       {
         category: 'unknown',
@@ -119,9 +171,18 @@ describe('SQLite error classification', () => {
       },
       { category: 'unknown', error: new Error('database is locked'), name: 'arbitrary locked Error' },
       {
+        category: 'schema',
+        error: Object.assign(new Error(`table ${'x'.repeat(100)} has no column named value`), {
+          code: 'ERR_SQLITE_ERROR',
+        }),
+        name: 'schema message within fallback bound',
+      },
+      {
         category: 'unknown',
-        error: Object.assign(new Error(`${'x'.repeat(4096)}database is locked`), { code: 'ERR_SQLITE_ERROR' }),
-        name: 'message outside fallback bound',
+        error: Object.assign(new Error(`table ${'x'.repeat(600)} has no column named value`), {
+          code: 'ERR_SQLITE_ERROR',
+        }),
+        name: 'schema message outside fallback bound',
       },
     ])
   })

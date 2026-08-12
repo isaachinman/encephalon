@@ -44,11 +44,22 @@ const isRecognizedFilesystemError = (error: unknown) => {
   return typeof error.code === 'string' && FILESYSTEM_ERROR_CODES.has(error.code)
 }
 
-const isRecognizedSQLiteError = (error: unknown) => classifySQLiteError(error) !== 'unknown'
+const isEnvironmentalSQLiteError = (error: unknown) => {
+  const category = classifySQLiteError(error)
+  return (
+    category === 'busy' ||
+    category === 'cantopen' ||
+    category === 'corrupt' ||
+    category === 'io' ||
+    category === 'locked' ||
+    category === 'notadb' ||
+    category === 'readonly'
+  )
+}
 
 const hasRecognizedIoCause = (cause: unknown, remainingDepth = 8): boolean =>
   isRecognizedFilesystemError(cause) ||
-  isRecognizedSQLiteError(cause) ||
+  isEnvironmentalSQLiteError(cause) ||
   (remainingDepth > 0 && isRecord(cause) && hasRecognizedIoCause(cause.cause, remainingDepth - 1))
 
 const errorCodeForCause = (cause: unknown): EncephalonErrorCode =>
