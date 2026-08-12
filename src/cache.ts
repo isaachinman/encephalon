@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
-import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { type BigIntStats, lstatSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { resolve } from 'node:path'
+import { basename, dirname, resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import {
   parseGatherInput,
@@ -18,6 +18,23 @@ import {
   openVerifiedCacheDatabase,
   quarantineCacheDatabase,
 } from './cache-location.ts'
+import {
+  CanonicalDirectoryChangedError,
+  CanonicalDirectoryEntryLimitError,
+  captureCanonicalDirectory,
+  isCanonicalKindDirectoryEntry,
+  isCanonicalReservedDirectory,
+  MAX_CANONICAL_BRAIN_ROOT_ENTRIES,
+  MAX_CANONICAL_KIND_DIRECTORIES,
+  MAX_CANONICAL_KIND_ENTRIES,
+  revalidateCanonicalDirectory,
+} from './canonical-layout.ts'
+import {
+  captureDirectoryWitness,
+  type DirectoryWitness,
+  DirectoryWitnessError,
+  revalidateDirectoryWitness,
+} from './directory-witness.ts'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import { withOperationLock } from './lock.ts'
@@ -106,8 +123,13 @@ type CompactRow = {
 type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind' | 'limit'>
 
 type CacheReadTestHooks = {
+  afterCanonicalValidation?: (() => void) | undefined
+  afterManifestEntryLstat?: ((path: string) => void) | undefined
+  afterManifestKindEnumeration?: ((path: string) => void) | undefined
+  afterManifestRootEnumeration?: ((path: string) => void) | undefined
   afterCompactSearchRead?: ((query: string) => void) | undefined
   afterShowRead?: ((id: string) => void) | undefined
+  beforeManifestEntryLstat?: ((path: string) => void) | undefined
   duringDatabaseInitialisation?: ((mode: 'reader' | 'writer') => void) | undefined
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
@@ -156,7 +178,9 @@ const isRecoverableCacheFailure = (error: unknown) => {
 }
 
 const assertTableColumns = (database: DatabaseSync, table: string, expected: string[]) => {
-  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name?: unknown
+  }>
   const names = columns.map(column => column.name)
   if (JSON.stringify(names) !== JSON.stringify(expected)) {
     throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
@@ -291,17 +315,26 @@ const posixRelative = (root: string, path: string) =>
     .replace(/^[/\\]+/, '')
     .replaceAll('\\', '/')
 
-const statEntry = (root: string, path: string): ManifestEntry => {
-  if (!existsSync(path)) {
-    return { path: posixRelative(root, path), type: 'missing' }
+const statEntry = (root: string, path: string, missingAllowed = false): ManifestEntry => {
+  let metadata: BigIntStats
+  try {
+    cacheReadTestHooks.beforeManifestEntryLstat?.(path)
+    metadata = lstatSync(path, { bigint: true })
+    cacheReadTestHooks.afterManifestEntryLstat?.(path)
+  } catch (error) {
+    const { code } = error as NodeJS.ErrnoException
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      if (missingAllowed) {
+        return { path: posixRelative(root, path), type: 'missing' }
+      }
+      throw new CanonicalDirectoryChangedError(path, { cause: error })
+    }
+    throw error
   }
-  const linkMetadata = lstatSync(path)
-  if (linkMetadata.isSymbolicLink()) {
-    return { path: posixRelative(root, path), type: 'symlink' }
-  }
-  const metadata = statSync(path, { bigint: true })
   let type: ManifestEntry['type']
-  if (metadata.isDirectory()) {
+  if (metadata.isSymbolicLink()) {
+    type = 'symlink'
+  } else if (metadata.isDirectory()) {
     type = 'directory'
   } else if (metadata.isFile()) {
     type = 'file'
@@ -317,40 +350,142 @@ const statEntry = (root: string, path: string): ManifestEntry => {
   }
 }
 
+const captureManifestDirectory = (path: string) => {
+  try {
+    return captureDirectoryWitness(path, { allowLink: false })
+  } catch (error) {
+    if (
+      error instanceof DirectoryWitnessError ||
+      ['ELOOP', 'ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
+    ) {
+      throw new CanonicalDirectoryChangedError(path, { cause: error })
+    }
+    throw error
+  }
+}
+
+const revalidateManifestDirectories = (directories: readonly DirectoryWitness[]) => {
+  try {
+    for (const directory of directories) {
+      revalidateDirectoryWitness(directory)
+    }
+  } catch (error) {
+    if (
+      error instanceof DirectoryWitnessError ||
+      ['ELOOP', 'ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
+    ) {
+      throw new CanonicalDirectoryChangedError(directories[0]?.path ?? 'encephalon', {
+        cause: error,
+      })
+    }
+    throw error
+  }
+}
+
+const artifactManifestEntry = (root: string, artifactPath: string) => {
+  const brainDirectory = resolve(root, 'encephalon')
+  const segments = artifactPath.split('/')
+  const directorySegments = segments.slice(0, -1)
+  const brainWitness = captureManifestDirectory(brainDirectory)
+  const directories = directorySegments.reduce<DirectoryWitness[]>(
+    (witnesses, segment, index) => {
+      const path = resolve(brainDirectory, ...directorySegments.slice(0, index + 1))
+      const witness = captureManifestDirectory(path)
+      const parent = witnesses.at(-1)
+      if (parent === undefined) {
+        throw new CanonicalDirectoryChangedError(path)
+      }
+      const expectedCanonicalPath = resolve(parent.canonicalPath, segment)
+      if (witness.canonicalPath !== expectedCanonicalPath) {
+        throw new CanonicalDirectoryChangedError(path)
+      }
+      return [...witnesses, witness]
+    },
+    [brainWitness],
+  )
+  const parent = directories.at(-1)
+  if (parent === undefined) {
+    throw new CanonicalDirectoryChangedError(dirname(resolve(brainDirectory, ...segments)))
+  }
+  const entry = statEntry(root, resolve(parent.canonicalPath, basename(artifactPath)))
+  revalidateManifestDirectories(directories)
+  return entry
+}
+
 const recordManifestEntries = (root: string) => {
   const brainDirectory = resolve(root, 'encephalon')
-  if (!existsSync(brainDirectory)) {
-    return [{ path: 'encephalon', type: 'missing' as const }]
-  }
-  const brainEntry = statEntry(root, brainDirectory)
+  const brainEntry = statEntry(root, brainDirectory, true)
   if (brainEntry.type !== 'directory') {
     return [brainEntry]
   }
-  const children = readdirSync(brainDirectory, { withFileTypes: true })
-    .filter(entry => entry.name !== '_artifacts')
-    .sort((first, second) => ordinalStringCompare(first.name, second.name))
+  const rootEntries = captureCanonicalDirectory(
+    brainDirectory,
+    MAX_CANONICAL_BRAIN_ROOT_ENTRIES,
+    cacheReadTestHooks.afterManifestRootEnumeration,
+  )
+  if (rootEntries.overflow) {
+    throw new CanonicalDirectoryEntryLimitError()
+  }
+  const kindDirectoryCount = rootEntries.entries.filter(isCanonicalKindDirectoryEntry).length
+  if (kindDirectoryCount > MAX_CANONICAL_KIND_DIRECTORIES) {
+    throw new CanonicalDirectoryEntryLimitError()
+  }
+  const children = rootEntries.entries
+    .filter(entry => !isCanonicalReservedDirectory(entry.name))
     .flatMap(entry => {
       const kindPath = resolve(brainDirectory, entry.name)
       const kindEntry = statEntry(root, kindPath)
-      if (!entry.isDirectory() || entry.isSymbolicLink() || kindEntry.type !== 'directory') {
+      revalidateCanonicalDirectory(rootEntries)
+      if (!isCanonicalKindDirectoryEntry(entry) || kindEntry.type !== 'directory') {
         return [kindEntry]
       }
-      const recordEntries = readdirSync(kindPath, { withFileTypes: true })
-        .sort((first, second) => ordinalStringCompare(first.name, second.name))
-        .map(recordEntry => statEntry(root, resolve(kindPath, recordEntry.name)))
-      return [kindEntry, ...recordEntries]
+      const recordEntries = captureCanonicalDirectory(
+        kindPath,
+        MAX_CANONICAL_KIND_ENTRIES,
+        cacheReadTestHooks.afterManifestKindEnumeration,
+      )
+      if (recordEntries.overflow) {
+        throw new CanonicalDirectoryEntryLimitError()
+      }
+      const entries = [
+        kindEntry,
+        ...recordEntries.entries.map(recordEntry => statEntry(root, resolve(kindPath, recordEntry.name))),
+      ]
+      revalidateCanonicalDirectory(recordEntries)
+      revalidateCanonicalDirectory(rootEntries)
+      return entries
     })
+  revalidateCanonicalDirectory(rootEntries)
   return [brainEntry, ...children]
 }
 
 const repositoryManifest = (root: string, artifactPaths: string[]) => {
   const entries = [
     ...recordManifestEntries(root),
-    ...[...artifactPaths]
-      .sort(ordinalStringCompare)
-      .map(path => statEntry(root, resolve(root, 'encephalon', ...path.split('/')))),
+    ...[...artifactPaths].sort(ordinalStringCompare).map(path => artifactManifestEntry(root, path)),
   ]
   return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
+}
+
+type RepositoryManifestResult =
+  | { kind: 'changed' | 'overflow' }
+  | {
+      kind: 'stable'
+      value: string
+    }
+
+const boundedRepositoryManifest = (root: string, artifactPaths: string[]): RepositoryManifestResult => {
+  try {
+    return { kind: 'stable', value: repositoryManifest(root, artifactPaths) }
+  } catch (error) {
+    if (error instanceof CanonicalDirectoryChangedError) {
+      return { kind: 'changed' }
+    }
+    if (error instanceof CanonicalDirectoryEntryLimitError) {
+      return { kind: 'overflow' }
+    }
+    throw error
+  }
 }
 
 const byteLength = (value: string) => Buffer.byteLength(value, 'utf8')
@@ -384,7 +519,9 @@ const validateCachedArtifactPath = (value: unknown) => {
   try {
     return validateArtifactPath(value, kind, id)
   } catch (error) {
-    throw new CacheSchemaMismatch('Cached artifact metadata contains an invalid path.', { cause: error })
+    throw new CacheSchemaMismatch('Cached artifact metadata contains an invalid path.', {
+      cause: error,
+    })
   }
 }
 
@@ -557,7 +694,10 @@ const metadataIsFresh = (
   const fresh =
     metadata !== undefined &&
     metadata.schemaVersion === SCHEMA_VERSION &&
-    metadata.manifest === repositoryManifest(root, metadata.artifactPaths)
+    (() => {
+      const manifest = boundedRepositoryManifest(root, metadata.artifactPaths)
+      return manifest.kind === 'stable' && metadata.manifest === manifest.value
+    })()
   if (fresh) {
     assertCacheContentConsistent(database, metadata)
   }
@@ -603,13 +743,26 @@ const readFreshMetadata = (root: string, location: CacheLocation): Metadata | un
 
 const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocation(root)): PrepareResult => {
   const attempts = Array.from({ length: MAX_REPOSITORY_CHANGE_RETRIES }, (_, index) => index)
+  let repositoryChangeObserved = false
   for (const attempt of attempts) {
-    const recordManifestBefore = repositoryManifest(root, [])
+    const recordManifestBefore = boundedRepositoryManifest(root, [])
+    if (recordManifestBefore.kind !== 'stable') {
+      if (recordManifestBefore.kind === 'overflow' && !repositoryChangeObserved) {
+        readRecords({ root })
+      }
+      repositoryChangeObserved = true
+      if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {
+        return fail('REPOSITORY_CHANGED', 'The repository changed repeatedly while rebuilding the Encephalon cache.')
+      }
+      continue
+    }
     let records: BrainRecord[]
     try {
       records = readRecords({ root })
     } catch (error) {
-      if (repositoryManifest(root, []) !== recordManifestBefore) {
+      const recordManifestAfter = boundedRepositoryManifest(root, [])
+      if (recordManifestAfter.kind !== 'stable' || recordManifestAfter.value !== recordManifestBefore.value) {
+        repositoryChangeObserved = true
         if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {
           return fail('REPOSITORY_CHANGED', 'The repository changed repeatedly while rebuilding the Encephalon cache.')
         }
@@ -617,11 +770,18 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
       }
       throw error
     }
+    cacheReadTestHooks.afterCanonicalValidation?.()
     const artifactPaths = [...new Set(records.flatMap(record => record.artifacts ?? []))].sort((first, second) =>
       ordinalStringCompare(first, second),
     )
-    const manifestBefore = repositoryManifest(root, artifactPaths)
-    if (repositoryManifest(root, []) !== recordManifestBefore) {
+    const manifestBefore = boundedRepositoryManifest(root, artifactPaths)
+    const recordsAfterValidation = boundedRepositoryManifest(root, [])
+    if (
+      manifestBefore.kind !== 'stable' ||
+      recordsAfterValidation.kind !== 'stable' ||
+      recordsAfterValidation.value !== recordManifestBefore.value
+    ) {
+      repositoryChangeObserved = true
       if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {
         return fail('REPOSITORY_CHANGED', 'The repository changed repeatedly while rebuilding the Encephalon cache.')
       }
@@ -672,16 +832,18 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
         }
         writeMetadata(database, {
           artifactPaths,
-          manifest: manifestBefore,
+          manifest: manifestBefore.value,
           packageVersion: PACKAGE_VERSION,
           recordsIndexed: records.length,
           repositoryRealpath: realpathSync.native(root),
           schemaVersion: SCHEMA_VERSION,
         })
-        if (repositoryManifest(root, artifactPaths) === manifestBefore) {
+        const manifestAfter = boundedRepositoryManifest(root, artifactPaths)
+        if (manifestAfter.kind === 'stable' && manifestAfter.value === manifestBefore.value) {
           database.exec('COMMIT')
           return { hydrated: true, recordsIndexed: records.length }
         }
+        repositoryChangeObserved = true
         database.exec('ROLLBACK')
       } catch (error) {
         try {

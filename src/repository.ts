@@ -27,6 +27,9 @@ type PackageManifest = {
   version?: unknown
 }
 
+const executingPackageNotFound = (): never =>
+  fail('ROOT_INSTALL_REQUIRED', 'Unable to locate the executing Encephalon package.')
+
 type RepositoryTestHooks = {
   afterExecutingManifestRead?: ((path: string) => void) | undefined
   afterExecutingParentCapture?: ((path: string) => void) | undefined
@@ -35,9 +38,11 @@ type RepositoryTestHooks = {
   afterInstalledManifestRead?: ((path: string) => void) | undefined
   afterRepositoryParentCapture?: ((path: string) => void) | undefined
   afterRootInstallation?: (() => void) | undefined
+  executingPackageNotFound: () => never
 }
 
-export const repositoryTestHooks: RepositoryTestHooks = {}
+/** @internal */
+export const repositoryTestHooks: RepositoryTestHooks = { executingPackageNotFound }
 
 const MAX_GIT_MARKER_BYTES = 16_384
 const MAX_PACKAGE_MANIFEST_BYTES = 1024 * 1024
@@ -188,7 +193,7 @@ const findExecutingPackage = (): PackageIdentity => {
     }
     const parentPath = dirname(current.canonicalPath)
     if (parentPath === current.canonicalPath) {
-      return fail('ROOT_INSTALL_REQUIRED', 'Unable to locate the executing Encephalon package.')
+      return executingPackageNotFound()
     }
     try {
       const parent = captureLinkedDirectory(parentPath)

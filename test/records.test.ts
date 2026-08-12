@@ -7,6 +7,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -21,6 +22,8 @@ import {
   MAX_CANONICAL_RECORD_BYTES,
   MAX_CANONICAL_RECORDS,
   planRecordAddition,
+  projectedKindDirectoryOverflow,
+  recordWriteTestHooks,
   validateRecordsResolved,
 } from '../src/records.ts'
 import { discoverRepository } from '../src/repository.ts'
@@ -79,11 +82,27 @@ const assertErrorCode = (operation: () => unknown, code: string) => {
   })
 }
 
+const assertCommittedRepositoryChange = (operation: () => unknown, path: string, recordId: string) => {
+  assert.throws(operation, (error: unknown) => {
+    const actual = error as {
+      code?: unknown
+      details?: Record<string, unknown>
+    }
+    assert.equal(actual.code, 'REPOSITORY_CHANGED')
+    assert.equal(actual.details?.canonicalCommitted, true)
+    assert.equal(actual.details?.path, path)
+    assert.equal(actual.details?.postCommitPhase, 'publicationVerification')
+    assert.equal(actual.details?.recordId, recordId)
+    assert.equal(typeof actual.details?.recoveryAction, 'string')
+    return true
+  })
+}
+
 const postCommitRecoveryAction = {
   cacheHydration: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
   publicationFlush:
     'Confirm the canonical record file is present; prepare does not re-fsync the kind directory, so treat durability as unverified until that sync succeeds.',
-  stagingCleanup: 'Retry this add; leftovers under encephalon/_staging are cleared by the next add.',
+  stagingCleanup: 'Inspect encephalon/_staging and remove only a confirmed leftover from this operation.',
 } as const
 
 const assertPostCommitError = (
@@ -141,6 +160,7 @@ const canCreateDirectory = (root: string, name: string) => {
 }
 
 afterEach(() => {
+  recordWriteTestHooks.fault = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
 
@@ -385,6 +405,86 @@ describe('canonical records', () => {
     assert.deepEqual(readdirSync(outside), [])
   })
 
+  test('rejects a dangling canonical-root symlink during validation', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit directory symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    symlinkSync(join(root, 'missing-encephalon'), join(root, 'encephalon'), 'dir')
+
+    const result = api.validateRecords({ root })
+
+    assert.equal(result.valid, false)
+    assert.deepEqual(
+      result.errors.map(error => [error.code, error.path]),
+      [['INVALID_RECORD_LAYOUT', 'encephalon']],
+    )
+  })
+
+  test('does not create a cache for a dangling canonical-root symlink', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit directory symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    symlinkSync(join(root, 'missing-encephalon'), join(root, 'encephalon'), 'dir')
+    let failure: unknown
+
+    try {
+      api.prepare({ root })
+    } catch (error) {
+      failure = error
+    }
+
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+    assert.equal((failure as { code?: unknown } | undefined)?.code, 'VALIDATION_FAILED')
+  })
+
+  test('does not follow a staging directory replaced during cleanup', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit directory symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    const displacedStaging = join(root, 'displaced-staging')
+    const outside = join(root, 'outside-staging-cleanup')
+    const outsideSentinel = join(outside, 'sentinel')
+    mkdirSync(stagingDirectory, { recursive: true })
+    mkdirSync(outside)
+    writeFileSync(join(stagingDirectory, 'sentinel'), 'staged')
+    writeFileSync(outsideSentinel, 'outside')
+    let replaced = false
+    let failure: unknown
+
+    try {
+      addRecordResolved(
+        root,
+        {
+          id: 'staging-cleanup-replacement',
+          kind: 'decision',
+          payload: {},
+          source: 'agent',
+          subject: 'staging.cleanup-replacement',
+        },
+        {
+          hooks: {
+            fault: point => {
+              if (point === 'during-cleanup' && !replaced) {
+                replaced = true
+                renameSync(stagingDirectory, displacedStaging)
+                symlinkSync(outside, stagingDirectory, 'dir')
+              }
+            },
+          },
+          hydrate: false,
+        },
+      )
+    } catch (error) {
+      failure = error
+    }
+
+    assert.equal(replaced, true)
+    assert.equal(existsSync(outsideSentinel), true)
+    assert.equal((failure as { code?: unknown } | undefined)?.code, 'REPOSITORY_CHANGED')
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'staging-cleanup-replacement.json')), false)
+  })
+
   test('rejects a replaced kind directory immediately before publication', () => {
     const root = createRoot()
 
@@ -411,12 +511,12 @@ describe('canonical records', () => {
             hydrate: false,
           },
         ),
-      'VALIDATION_FAILED',
+      'REPOSITORY_CHANGED',
     )
     assert.equal(readFileSync(join(root, 'encephalon', 'decision'), 'utf8'), 'not a directory')
   })
 
-  test('cleans orphaned internal staging aliases on the next mutation', () => {
+  test('leaves unowned staging aliases untouched while publishing a new mutation', () => {
     const root = createRoot()
     const first = api.addRecord({
       id: 'orphan-source',
@@ -439,7 +539,7 @@ describe('canonical records', () => {
       subject: 'staging.next',
     })
 
-    assert.deepEqual(readdirSync(stagingDirectory), [])
+    assert.deepEqual(readdirSync(stagingDirectory), ['orphan.tmp'])
     assert.equal(existsSync(join(root, first.path)), true)
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'after-orphan.json')), true)
   })
@@ -542,7 +642,9 @@ describe('canonical records', () => {
             hooks: {
               fault: point => {
                 if (point === 'during-publication-flush') {
-                  throw Object.assign(new Error('Injected directory flush failure'), { code: 'EIO' })
+                  throw Object.assign(new Error('Injected directory flush failure'), {
+                    code: 'EIO',
+                  })
                 }
               },
             },
@@ -667,12 +769,27 @@ describe('canonical records', () => {
     assert.equal(result.truncated, false)
   })
 
+  test('preflights exact and overflowing planned kind directory entries', () => {
+    const witnessedEntryCounts = new Map([
+      ['context', 998],
+      ['decision', 999],
+    ])
+
+    assert.equal(projectedKindDirectoryOverflow(witnessedEntryCounts, ['decision']), null)
+    assert.equal(projectedKindDirectoryOverflow(witnessedEntryCounts, ['decision', 'decision']), 'decision')
+    assert.equal(
+      projectedKindDirectoryOverflow(witnessedEntryCounts, ['decision', 'context', 'context', 'context']),
+      'context',
+    )
+  })
+
   test('reports corpus budget overflows deterministically', () => {
     const recordCountRoot = createRoot()
     for (const index of Array.from({ length: 1001 }, (_, value) => value)) {
       writeCanonicalRecord(recordCountRoot, {
         createdAt: timestampAt(index),
         id: `count-${index}`,
+        ...(index === 1000 ? { kind: 'context' } : {}),
         subject: `validation.count.${index}`,
       })
     }
@@ -718,6 +835,315 @@ describe('canonical records', () => {
     const artifactResult = api.validateRecords({ root: artifactRoot })
     assert.equal(artifactResult.valid, false)
     assert.equal(artifactResult.errors[0]?.code, 'CORPUS_ARTIFACT_LIMIT')
+  })
+
+  test('bounds canonical brain-root entries and kind directories before reporting layout details', () => {
+    const rawEntryRoot = createRoot()
+    const brainDirectory = join(rawEntryRoot, 'encephalon')
+    mkdirSync(join(brainDirectory, '_artifacts'), { recursive: true })
+    mkdirSync(join(brainDirectory, '_staging'))
+    for (const index of Array.from({ length: 1001 }, (_, value) => value)) {
+      mkdirSync(join(brainDirectory, `kind-${String(index).padStart(4, '0')}`))
+    }
+
+    const rawEntryResult = api.validateRecords({ root: rawEntryRoot })
+    assert.deepEqual(rawEntryResult.errors, [
+      {
+        code: 'CORPUS_DIRECTORY_ENTRY_LIMIT',
+        message: 'encephalon may contain at most 1002 directory entries.',
+        path: 'encephalon',
+      },
+    ])
+    assert.equal(rawEntryResult.recordsChecked, 0)
+    assert.equal(rawEntryResult.truncated, false)
+
+    const kindDirectoryRoot = createRoot()
+    for (const index of Array.from({ length: 1001 }, (_, value) => value)) {
+      mkdirSync(join(kindDirectoryRoot, 'encephalon', `kind-${String(index).padStart(4, '0')}`), {
+        recursive: true,
+      })
+    }
+    const kindDirectoryResult = api.validateRecords({ root: kindDirectoryRoot })
+    assert.deepEqual(kindDirectoryResult.errors, [
+      {
+        code: 'CORPUS_DIRECTORY_ENTRY_LIMIT',
+        message: 'encephalon may contain at most 1000 kind directories.',
+        path: 'encephalon',
+      },
+    ])
+  })
+
+  test('accepts canonical directory limits exactly and rejects one excess kind entry without reading it', () => {
+    const root = createRoot()
+    const brainDirectory = join(root, 'encephalon')
+    mkdirSync(join(brainDirectory, '_artifacts'), { recursive: true })
+    mkdirSync(join(brainDirectory, '_staging'))
+    for (const index of Array.from({ length: 999 }, (_, value) => value)) {
+      mkdirSync(join(brainDirectory, `kind-${String(index).padStart(4, '0')}`))
+    }
+    writeCanonicalRecord(root, { id: 'first-boundary-record' })
+    for (const index of Array.from({ length: 999 }, (_, value) => value)) {
+      writeCanonicalRecord(root, {
+        id: `boundary-${String(index).padStart(4, '0')}`,
+        subject: `validation.boundary.${index}`,
+      })
+    }
+    assert.equal(api.validateRecords({ root }).valid, true)
+
+    writeFileSync(join(brainDirectory, 'decision', 'zzzz-excess-entry'), 'not JSON')
+    const overflow = api.validateRecords({ root })
+    assert.deepEqual(overflow.errors, [
+      {
+        code: 'CORPUS_DIRECTORY_ENTRY_LIMIT',
+        message: 'encephalon/decision may contain at most 1000 directory entries.',
+        path: 'encephalon/decision',
+      },
+    ])
+    assert.equal(overflow.recordsChecked, 0)
+  })
+
+  test('rejects a candidate new kind before creating canonical or cache state', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 1000 }, (_, value) => value)) {
+      mkdirSync(join(root, 'encephalon', `kind-${String(index).padStart(4, '0')}`), {
+        recursive: true,
+      })
+    }
+
+    assertValidationFailureCode(
+      () =>
+        api.addRecord({
+          id: 'new-kind-overflow',
+          kind: 'new-kind',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'validation.new-kind-overflow',
+        }),
+      'CORPUS_DIRECTORY_ENTRY_LIMIT',
+    )
+    assert.equal(existsSync(join(root, 'encephalon', 'new-kind')), false)
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+
+    assert.doesNotThrow(() =>
+      api.addRecord({
+        id: 'existing-kind-boundary',
+        kind: 'kind-0000',
+        payload: {},
+        root,
+        source: 'test',
+        subject: 'validation.existing-kind-boundary',
+      }),
+    )
+  })
+
+  test('does not publish a superseding record into a replacement canonical generation', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, {
+      id: 'predecessor',
+      subject: 'generation.subject',
+    })
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    const displaced = join(root, 'predecessor-decision')
+    let replaced = false
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-scan-validation' && !replaced) {
+        replaced = true
+        renameSync(kindDirectory, displaced)
+        writeCanonicalRecord(root, {
+          id: 'successor-head',
+          subject: 'generation.subject',
+        })
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'generation.subject',
+          supersedes: ['predecessor'],
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(replaced, true)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'candidate.json')), false)
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+  })
+
+  test('rejects an existing canonical root replacement before directory preparation', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'existing-root-before-preparation' })
+    const brainDirectory = join(root, 'encephalon')
+    let replaced = false
+
+    assertErrorCode(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'candidate-root-before-preparation',
+            kind: 'decision',
+            payload: {},
+            source: 'test',
+            subject: 'generation.root-before-preparation',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'before-directory-preparation' && !replaced) {
+                  replaced = true
+                  renameSync(brainDirectory, join(root, 'displaced-encephalon-before-preparation'))
+                  mkdirSync(join(brainDirectory, 'decision'), { recursive: true })
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(replaced, true)
+    assert.equal(existsSync(join(brainDirectory, 'decision', 'candidate-root-before-preparation.json')), false)
+    assert.equal(existsSync(join(brainDirectory, '_staging')), false)
+  })
+
+  test('rejects an existing canonical kind replacement before directory preparation', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'existing-kind-before-preparation' })
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    let replaced = false
+
+    assertErrorCode(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'candidate-kind-before-preparation',
+            kind: 'decision',
+            payload: {},
+            source: 'test',
+            subject: 'generation.kind-before-preparation',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'before-directory-preparation' && !replaced) {
+                  replaced = true
+                  renameSync(kindDirectory, join(root, 'displaced-decision-before-preparation'))
+                  mkdirSync(kindDirectory)
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(replaced, true)
+    assert.equal(existsSync(join(kindDirectory, 'candidate-kind-before-preparation.json')), false)
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+  })
+
+  test('does not publish after the validated kind is replaced at the publication boundary', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'existing' })
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    const displaced = join(root, 'displaced-decision-before-publication')
+    let replaced = false
+    recordWriteTestHooks.fault = point => {
+      if (point === 'before-publication' && !replaced) {
+        replaced = true
+        renameSync(kindDirectory, displaced)
+        mkdirSync(kindDirectory)
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate-before-publication',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'generation.publication',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(replaced, true)
+    assert.equal(existsSync(join(kindDirectory, 'candidate-before-publication.json')), false)
+  })
+
+  test('reports a canonical generation replacement after linking as a committed repository change', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'existing-after-publication' })
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    const displaced = join(root, 'displaced-decision-after-publication')
+    let replaced = false
+
+    assertCommittedRepositoryChange(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'candidate-after-publication',
+            kind: 'decision',
+            payload: {},
+            source: 'test',
+            subject: 'generation.after-publication',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'after-publication' && !replaced) {
+                  replaced = true
+                  renameSync(kindDirectory, displaced)
+                  mkdirSync(kindDirectory)
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      'encephalon/decision/candidate-after-publication.json',
+      'candidate-after-publication',
+    )
+    assert.equal(replaced, true)
+    assert.equal(existsSync(join(kindDirectory, 'candidate-after-publication.json')), false)
+    assert.equal(existsSync(join(displaced, 'candidate-after-publication.json')), true)
+  })
+
+  test('does not adopt a candidate kind created at the directory preparation boundary', () => {
+    const root = createRoot()
+    let created = false
+    recordWriteTestHooks.fault = point => {
+      if (point === 'before-directory-preparation' && !created) {
+        created = true
+        mkdirSync(join(root, 'encephalon', 'new-kind'), { recursive: true })
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate-kind-race',
+          kind: 'new-kind',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'generation.kind-race',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(created, true)
+    assert.deepEqual(readdirSync(join(root, 'encephalon', 'new-kind')), [])
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
   })
 
   test('rejects addRecord when the candidate would exceed corpus count or byte budgets', () => {
@@ -1152,7 +1578,9 @@ describe('canonical records', () => {
     })
 
     assert.equal(Object.is((record.payload as { value: number }).value, 0), true)
-    const persisted = JSON.parse(readFileSync(join(root, record.path), 'utf8')) as { payload: { value: number } }
+    const persisted = JSON.parse(readFileSync(join(root, record.path), 'utf8')) as {
+      payload: { value: number }
+    }
     assert.equal(Object.is(persisted.payload.value, 0), true)
     assert.deepEqual(record.payload, persisted.payload)
   })
@@ -1246,6 +1674,78 @@ describe('canonical records', () => {
     })
 
     assertInvalidRecord(result, record.path)
+  })
+
+  test('rejects a brain-root generation replaced after bounded enumeration', () => {
+    const root = createRoot()
+    const brainDirectory = join(root, 'encephalon')
+    const displaced = join(root, 'displaced-encephalon')
+    const replacement = join(root, 'replacement-encephalon')
+    mkdirSync(brainDirectory)
+    mkdirSync(replacement)
+    writeFileSync(join(replacement, 'outside-sentinel'), 'outside')
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        afterBrainRootEnumeration: () => {
+          renameSync(brainDirectory, displaced)
+          renameSync(replacement, brainDirectory)
+        },
+      },
+    })
+
+    assert.equal(result.valid, false)
+    assert.deepEqual(
+      result.errors.map(error => [error.code, error.path]),
+      [['INVALID_RECORD_LAYOUT', 'encephalon']],
+    )
+    assert.equal(readFileSync(join(brainDirectory, 'outside-sentinel'), 'utf8'), 'outside')
+  })
+
+  test('rejects an empty kind generation replaced after bounded enumeration', () => {
+    const root = createRoot()
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    const displaced = join(root, 'displaced-decision')
+    mkdirSync(kindDirectory, { recursive: true })
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        afterKindEnumeration: path => {
+          if (path === kindDirectory) {
+            renameSync(kindDirectory, displaced)
+            mkdirSync(kindDirectory)
+          }
+        },
+      },
+    })
+
+    assert.equal(result.valid, false)
+    assert.deepEqual(
+      result.errors.map(error => [error.code, error.path]),
+      [['INVALID_RECORD_LAYOUT', 'encephalon/decision']],
+    )
+  })
+
+  test('revalidates an empty kind generation at final scan acceptance', () => {
+    const root = createRoot()
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    const displaced = join(root, 'displaced-decision-final-validation')
+    mkdirSync(kindDirectory, { recursive: true })
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        beforeFinalWitnessValidation: () => {
+          renameSync(kindDirectory, displaced)
+          mkdirSync(kindDirectory)
+        },
+      },
+    })
+
+    assert.equal(result.valid, false)
+    assert.deepEqual(
+      result.errors.map(error => [error.code, error.path]),
+      [['INVALID_RECORD_LAYOUT', 'encephalon/decision']],
+    )
   })
 
   test('rejects a record when its parent kind directory is replaced during read', () => {

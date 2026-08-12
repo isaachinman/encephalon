@@ -6,12 +6,13 @@ import { applyInstructionChanges, planInstructionChanges } from './instructions.
 import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import {
+  assertCanonicalLayoutAdditions,
   assertRecordGraph,
   planRecordAddition,
   publishPlannedRecord,
   type RecordReadHooks,
   type RecordWriteHooks,
-  readRecordsResolved,
+  readRecordSnapshotResolved,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import type { AddRecordInput, BrainRecord, InitEncephalonInput, InitEncephalonResult, PrepareResult } from './types.ts'
@@ -98,7 +99,7 @@ const initResolved = (input: InitEncephalonInput, hooks: InitHooks = {}): InitEn
     hooks.baselineScan?.()
     const baseline = scanBaseline(root)
     const refresh = input.refreshBaseline === true
-    const records = readRecordsResolved(
+    const recordSnapshot = readRecordSnapshotResolved(
       root,
       hooks,
       refresh
@@ -109,6 +110,7 @@ const initResolved = (input: InitEncephalonInput, hooks: InitHooks = {}): InitEn
           }))
         : undefined,
     )
+    const { records } = recordSnapshot
     const actions = baselineActions(records, baseline, refresh)
     const plans = actions.additions.map(addition => planRecordAddition(root, { ...addition, root }))
     if (plans.length > 0) {
@@ -118,13 +120,27 @@ const initResolved = (input: InitEncephalonInput, hooks: InitHooks = {}): InitEn
         'The generated baseline would make canonical records invalid.',
         hooks,
       )
+      const authority = assertCanonicalLayoutAdditions(
+        plans.map(plan => plan.record.kind),
+        recordSnapshot.authority,
+      )
+      const recordWriteOptions = {
+        authority,
+        ...(hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }),
+      }
+      const recordsCreated = plans.map(plan => publishPlannedRecord(root, plan, recordWriteOptions))
+      const cacheResult = hydrateResolvedRepository(root, false, location)
+      hooks.hydration?.(cacheResult)
+      const instructionFiles = applyInstructionChanges(root, instructionPlans)
+      return {
+        instructionFiles,
+        nextAction: NEXT_ACTION,
+        recordsCreated,
+        skippedConflicts: actions.conflicts,
+      }
     }
-    const recordWriteOptions = hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }
-    const recordsCreated = plans.map(plan => publishPlannedRecord(root, plan, recordWriteOptions))
-    const cacheResult =
-      recordsCreated.length === 0
-        ? prepareResolvedRepository(root, false, location)
-        : hydrateResolvedRepository(root, false, location)
+    const recordsCreated: BrainRecord[] = []
+    const cacheResult = prepareResolvedRepository(root, false, location)
     hooks.hydration?.(cacheResult)
     const instructionFiles = applyInstructionChanges(root, instructionPlans)
     return {
@@ -147,6 +163,7 @@ export const initEncephalon = (input: InitEncephalonInput = {}): InitEncephalonR
   }
 }
 
+/** @internal */
 export const initEncephalonWithHooks = (
   input: InitEncephalonInput = {},
   hooks: InitHooks = {},
