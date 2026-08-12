@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { closeSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
@@ -11,10 +21,19 @@ const temporaryRoots: string[] = []
 const filesystemCapabilities = (() => {
   const root = mkdtempSync(join(tmpdir(), 'encephalon-artifact-capability-test-'))
   try {
-    const target = join(root, 'target')
+    const target = join(root, 'CaseProbe')
+    const caseAlias = join(root, 'caseprobe')
     const link = join(root, 'link')
     const fifo = join(root, 'fifo')
     mkdirSync(target)
+    let caseInsensitiveCanonicalPath = false
+    try {
+      caseInsensitiveCanonicalPath = realpathSync.native(caseAlias) === realpathSync.native(target)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error
+      }
+    }
     let directoryLink = true
     try {
       symlinkSync(target, link, 'junction')
@@ -25,7 +44,7 @@ const filesystemCapabilities = (() => {
         throw error
       }
     }
-    return { directoryLink, fifo: spawnSync('mkfifo', [fifo]).status === 0 }
+    return { caseInsensitiveCanonicalPath, directoryLink, fifo: spawnSync('mkfifo', [fifo]).status === 0 }
   } finally {
     rmSync(root, { force: true, recursive: true })
   }
@@ -86,11 +105,16 @@ test('rejects same-inode mutation between final lstat and descriptor open', () =
 
 test('returns immutable verified path metadata and closes its descriptor', () => {
   const { artifact, brainDirectory } = createArtifact()
+  let descriptorsOpened = 0
   let descriptorsClosed = 0
   const [result] = inspectArtifactFiles(brainDirectory, [artifact], {
     close: descriptor => {
       descriptorsClosed += 1
       closeSync(descriptor)
+    },
+    open: (path, flags) => {
+      descriptorsOpened += 1
+      return openSync(path, flags)
     },
   })
 
@@ -101,7 +125,8 @@ test('returns immutable verified path metadata and closes its descriptor', () =>
     assert.equal(Object.isFrozen(result.observation), true)
     assert.equal(Object.isFrozen(result.observation.metadata), true)
   }
-  assert.equal(descriptorsClosed, 1)
+  assert.equal(descriptorsOpened > 0, true)
+  assert.equal(descriptorsClosed, descriptorsOpened)
 })
 
 test('preserves an inspection failure when descriptor close also fails', () => {
@@ -352,6 +377,54 @@ test('rejects replacement or truncation after the final descriptor metadata chec
       mutation,
     )
   }
+})
+
+test('rejects same-file mutation before final directory revalidation', () => {
+  const { artifact, brainDirectory, path } = createArtifact()
+
+  assert.throws(
+    () =>
+      inspectArtifactFiles(brainDirectory, [artifact], {
+        fault: point => {
+          if (point === 'before-final-directory-revalidation') {
+            writeFileSync(path, 'mutated after final metadata')
+          }
+        },
+      }),
+    ArtifactChangedError,
+  )
+})
+
+test('rejects an earlier artifact changed while a later artifact is inspected', () => {
+  const { artifact, brainDirectory, path } = createArtifact()
+  const laterArtifact = artifact.replace('evidence.txt', 'later.txt')
+  writeFileSync(join(brainDirectory, ...laterArtifact.split('/')), 'later evidence')
+  let mutated = false
+
+  assert.throws(
+    () =>
+      inspectArtifactFiles(brainDirectory, [artifact, laterArtifact], {
+        fault: (point, currentArtifact) => {
+          if (!mutated && point === 'after-artifact-lstat' && currentArtifact === laterArtifact) {
+            mutated = true
+            writeFileSync(path, 'mutated while inspecting later artifact')
+          }
+        },
+      }),
+    ArtifactChangedError,
+  )
+})
+
+test('classifies a stable case-canonicalisation mismatch as invalid', {
+  skip: !filesystemCapabilities.caseInsensitiveCanonicalPath,
+}, () => {
+  const { artifact, brainDirectory } = createArtifact()
+  renameSync(join(brainDirectory, '_artifacts'), join(brainDirectory, '_ARTIFACTS'))
+
+  assert.deepEqual(
+    inspectArtifactFiles(brainDirectory, [artifact]).map(result => result.kind),
+    ['invalid'],
+  )
 })
 
 test('propagates operational descriptor errors without exposing the artifact path', () => {

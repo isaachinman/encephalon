@@ -101,11 +101,12 @@ const captureAncestor = (
     hooks.fault?.('after-ancestor-lstat', artifact)
     const witness = captureDirectoryWitness(path, { allowLink: false })
     hooks.fault?.('after-ancestor-capture', artifact)
-    if (
-      witness.canonicalPath !== resolve(parent.canonicalPath, segment) ||
-      !sameStableEntryMetadata(metadata, witness.pathMetadata)
-    ) {
+    if (!sameStableEntryMetadata(metadata, witness.pathMetadata)) {
       return changed()
+    }
+    if (witness.canonicalPath !== path) {
+      revalidateDirectories([parent, witness])
+      return invalid()
     }
     revalidateDirectoryWitness(parent)
     return witness
@@ -220,7 +221,17 @@ const inspectFinalFile = (
     }
     hooks.fault?.('before-final-directory-revalidation', artifact)
     revalidateDirectories(directories)
-    const immutableMetadata = Object.freeze(finalMetadata)
+    const acceptedMetadata = fstatSync(descriptor, { bigint: true })
+    const acceptedPathMetadata = lstatSync(path, { bigint: true })
+    if (
+      !acceptedPathMetadata.isFile() ||
+      acceptedPathMetadata.isSymbolicLink() ||
+      !sameStableEntryMetadata(finalMetadata, acceptedMetadata) ||
+      !sameStableEntryMetadata(acceptedMetadata, acceptedPathMetadata)
+    ) {
+      return changed()
+    }
+    const immutableMetadata = Object.freeze(acceptedMetadata)
     observation = Object.freeze({
       metadata: immutableMetadata,
       path: artifact,
@@ -289,7 +300,7 @@ export const inspectArtifactFiles = (
     }
     throw error
   }
-  const results = artifacts.map(artifact => {
+  const inspectArtifact = (artifact: string) => {
     try {
       return inspectFinalFile(captureAncestors(brain, artifact, effectiveHooks), artifact, effectiveHooks)
     } catch (error) {
@@ -298,7 +309,29 @@ export const inspectArtifactFiles = (
       }
       throw error
     }
-  })
+  }
+  const results = artifacts.map(inspectArtifact)
+  results.reduce<undefined>((verified, result) => {
+    if (result.kind === 'stable') {
+      let verification: StableArtifactInspection
+      try {
+        verification = inspectFinalFile(
+          captureAncestors(brain, result.observation.path, effectiveHooks),
+          result.observation.path,
+          effectiveHooks,
+        )
+      } catch (error) {
+        if (error instanceof ArtifactInvalidError) {
+          changed()
+        }
+        throw error
+      }
+      if (!sameStableEntryMetadata(result.observation.metadata, verification.observation.metadata)) {
+        changed()
+      }
+    }
+    return verified
+  }, undefined)
   revalidateDirectories([brain])
   return Object.freeze(results)
 }
