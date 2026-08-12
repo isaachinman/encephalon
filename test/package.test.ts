@@ -88,6 +88,8 @@ describe('package contract', () => {
     const runnerStart = verificationJob.indexOf('    runs-on:', matrixStart)
     const matrixBlock = verificationJob.slice(matrixStart, runnerStart)
     const verificationStepsStart = verificationJob.indexOf('    steps:\n')
+    const verificationHeader = verificationJob.slice(0, matrixStart)
+    const verificationRunner = verificationJob.slice(runnerStart, verificationStepsStart)
     const verificationSteps = verificationJob.slice(verificationStepsStart)
     const releaseStepsStart = releaseJob.indexOf('    steps:\n')
     const releaseHeader = releaseJob.slice(0, releaseStepsStart)
@@ -115,6 +117,16 @@ describe('package contract', () => {
     )
 
     assert.equal(
+      verificationHeader,
+      `
+jobs:
+  verify:
+    name: verify (\${{ matrix.context }})
+    strategy:
+      fail-fast: false
+`,
+    )
+    assert.equal(
       matrixBlock,
       `      matrix:
         include:
@@ -132,8 +144,8 @@ describe('package contract', () => {
             node: 26
 `,
     )
-    assert.match(verificationJob, /name: verify \(\$\{\{ matrix\.context \}\}\)/)
-    assert.match(verificationJob, /runs-on: \$\{\{ matrix\.os \}\}/)
+    assert.match(verificationRunner, /^ {4}runs-on: \$\{\{ matrix\.os \}\}\n$/)
+    assert.doesNotMatch(verificationHeader, /^\s{4}(?:if|continue-on-error):/m)
     assert.match(verificationSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
     assert.match(
       verificationSteps,
