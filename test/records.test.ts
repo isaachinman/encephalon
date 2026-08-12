@@ -323,7 +323,7 @@ describe('canonical records', () => {
             const publicError = error as { code?: unknown; details?: unknown; message?: unknown }
             assert.equal(publicError.code, entry.code)
             assert.equal(typeof publicError.message === 'string' && publicError.message.includes(root), false)
-            assert.equal(JSON.stringify(publicError.details).includes(root), false)
+            assert.equal(JSON.stringify(publicError.details ?? null).includes(root), false)
             return true
           },
         )
