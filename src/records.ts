@@ -51,6 +51,7 @@ import {
   parseRecordFile,
   validateKind,
 } from './schema.ts'
+import { cleanupStaleStagingEntries } from './staging.ts'
 import type {
   AddRecordInput,
   BrainRecord,
@@ -103,9 +104,11 @@ type RecordWriteFault =
   | 'after-publication'
   | 'before-directory-preparation'
   | 'before-publication'
+  | 'before-staging-cleanup-entry-lstat'
   | 'during-cleanup'
   | 'during-hydration'
   | 'during-publication-flush'
+  | 'during-staging-cleanup-flush'
   | 'during-staging-write'
 
 /** @internal */
@@ -1224,9 +1227,11 @@ const publishPlannedRecordInternal = (
   const brainDirectory = resolve(root, 'encephalon')
   const projection = options.authority.projection()
   if (projection.rootNames.has(STAGING_DIRECTORY_NAME)) {
-    const existingStaging = capturePublicationDirectory(resolve(brainDirectory, STAGING_DIRECTORY_NAME))
-    fault(options.hooks, 'during-cleanup')
-    revalidatePublicationDirectories([existingStaging])
+    cleanupStaleStagingEntries(resolve(brainDirectory, STAGING_DIRECTORY_NAME), {
+      afterPreflight: () => fault(options.hooks, 'during-cleanup'),
+      beforeEntryLstat: () => fault(options.hooks, 'before-staging-cleanup-entry-lstat'),
+      beforeFlush: () => fault(options.hooks, 'during-staging-cleanup-flush'),
+    })
     options.authority.assertCurrent()
   }
   options.authority.assertCurrent()

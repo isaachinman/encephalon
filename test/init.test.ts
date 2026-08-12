@@ -26,6 +26,7 @@ import * as api from '../src/index.ts'
 import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { ordinalStringCompare } from '../src/order.ts'
+import type { RecordWriteHooks } from '../src/records.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
@@ -44,15 +45,7 @@ type InitCounts = {
   hydrations: number
 }
 
-type InitFaultPoint =
-  | 'after-scan-validation'
-  | 'after-publication'
-  | 'before-publication'
-  | 'before-directory-preparation'
-  | 'during-cleanup'
-  | 'during-hydration'
-  | 'during-publication-flush'
-  | 'during-staging-write'
+type InitFaultPoint = Parameters<NonNullable<RecordWriteHooks['fault']>>[0]
 
 const initWithCounts = (
   input: Parameters<typeof initEncephalonWithHooks>[0],
