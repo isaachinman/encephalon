@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import {
   assertCacheLockCandidates,
@@ -54,6 +55,8 @@ type OwnedRecoveryMarker = {
   token: string
 }
 
+const abandonedRecoveryMarkers = new Map<string, OwnedRecoveryMarker>()
+
 const MAX_OWNER_BYTES = 4096
 const MAX_OWNER_PID = 2_147_483_647
 const MAX_OWNER_TIMESTAMP_LENGTH = 64
@@ -62,19 +65,22 @@ const MAX_OWNER_TOKEN_LENGTH = 128
 const readOwner = (location: CacheLocation, directory: CacheOwnedDirectory): LockOwner | undefined => {
   try {
     const contents = readCacheOwner(location, directory, MAX_OWNER_BYTES)
-    const value = JSON.parse(contents ?? '') as Partial<LockOwner>
-    if (
-      typeof value.token === 'string' &&
-      value.token.length > 0 &&
-      value.token.length <= MAX_OWNER_TOKEN_LENGTH &&
-      Number.isSafeInteger(value.pid) &&
-      (value.pid ?? 0) > 0 &&
-      (value.pid ?? 0) <= MAX_OWNER_PID &&
-      typeof value.acquiredAt === 'string' &&
-      value.acquiredAt.length > 0 &&
-      value.acquiredAt.length <= MAX_OWNER_TIMESTAMP_LENGTH
-    ) {
-      return value as LockOwner
+    const parsed: unknown = JSON.parse(contents ?? '')
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      const value = parsed as Partial<LockOwner>
+      if (
+        typeof value.token === 'string' &&
+        value.token.length > 0 &&
+        value.token.length <= MAX_OWNER_TOKEN_LENGTH &&
+        Number.isSafeInteger(value.pid) &&
+        (value.pid ?? 0) > 0 &&
+        (value.pid ?? 0) <= MAX_OWNER_PID &&
+        typeof value.acquiredAt === 'string' &&
+        value.acquiredAt.length > 0 &&
+        value.acquiredAt.length <= MAX_OWNER_TIMESTAMP_LENGTH
+      ) {
+        return value as LockOwner
+      }
     }
   } catch (error) {
     if (!(error instanceof SyntaxError)) {
@@ -121,6 +127,23 @@ export const withOperationLock = <Result>(
   let candidateDirectory: CacheOwnedDirectory | undefined
   let ownedLockDirectory: CacheOwnedDirectory | undefined
 
+  const recoveryMarkerWasAbandoned = (directory: CacheOwnedDirectory, owner: LockOwner | undefined) => {
+    const abandoned = abandonedRecoveryMarkers.get(directory.path)
+    if (abandoned !== undefined) {
+      const matches =
+        abandoned.directory.path === directory.path &&
+        abandoned.directory.name === directory.name &&
+        abandoned.directory.dev === directory.dev &&
+        abandoned.directory.ino === directory.ino &&
+        owner?.token === abandoned.token
+      if (!matches) {
+        abandonedRecoveryMarkers.delete(directory.path)
+      }
+      return matches
+    }
+    return false
+  }
+
   const remainingMilliseconds = () => Math.max(0, LOCK_WAIT_MILLISECONDS - (now() - startedAt))
 
   const wait = (milliseconds: number) => {
@@ -130,6 +153,7 @@ export const withOperationLock = <Result>(
   const recoveryMarkerObservation = (): RecoveryMarkerObservation => {
     const directoryObservation = observeCacheOwnedDirectory(location, recoveryName)
     if (directoryObservation.kind === 'missing') {
+      abandonedRecoveryMarkers.delete(resolve(location.directory, recoveryName))
       return { kind: 'absent' }
     }
     if (directoryObservation.kind === 'changed') {
@@ -140,13 +164,15 @@ export const withOperationLock = <Result>(
     try {
       const owner = readOwner(location, recoveryDirectory)
       if (owner !== undefined) {
+        const abandoned = recoveryMarkerWasAbandoned(recoveryDirectory, owner)
         return {
           directory: recoveryDirectory,
           kind: 'observed',
           owner: { pid: owner.pid, token: owner.token },
-          stale: !processIsRunning(owner.pid),
+          stale: abandoned || !processIsRunning(owner.pid),
         }
       }
+      recoveryMarkerWasAbandoned(recoveryDirectory, owner)
       return {
         directory: recoveryDirectory,
         kind: 'observed',
@@ -167,9 +193,10 @@ export const withOperationLock = <Result>(
       return (
         currentOwner?.token === observation.owner.token &&
         currentOwner.pid === observation.owner.pid &&
-        !processIsRunning(currentOwner.pid)
+        (recoveryMarkerWasAbandoned(observation.directory, currentOwner) || !processIsRunning(currentOwner.pid))
       )
     }
+    recoveryMarkerWasAbandoned(observation.directory, currentOwner)
     return (
       currentOwner === undefined &&
       now() - cacheOwnedDirectoryMtimeMilliseconds(location, observation.directory) > RECOVERY_STALE_MILLISECONDS
@@ -179,7 +206,12 @@ export const withOperationLock = <Result>(
   const reclaimRecoveryMarker = (observation: Extract<RecoveryMarkerObservation, { kind: 'observed' }>) => {
     testHooks.afterRecoveryStaleObservation?.()
     if (cacheOwnedDirectoryIsCurrent(location, observation.directory)) {
-      quarantineCacheOwnedDirectory(location, observation.directory, () => recoveryMarkerRemainsStale(observation))
+      const reclaimed = quarantineCacheOwnedDirectory(location, observation.directory, () =>
+        recoveryMarkerRemainsStale(observation),
+      )
+      if (reclaimed) {
+        abandonedRecoveryMarkers.delete(observation.directory.path)
+      }
     }
   }
 
@@ -240,6 +272,30 @@ export const withOperationLock = <Result>(
     gateTransaction = true
   }
 
+  const releaseGate = () => {
+    if (gateTransaction) {
+      try {
+        gate?.exec('ROLLBACK')
+      } catch {
+        // Closing the connection below releases its operating-system lock.
+      }
+    }
+    gateTransaction = false
+    gate?.close()
+    gate = undefined
+  }
+
+  const beginGateWhileRecoveryOwned = (ownedMarker: OwnedRecoveryMarker) => {
+    let owned = false
+    beginGateTransaction(true)
+    if (recoveryMarkerIsOwned(ownedMarker)) {
+      owned = true
+    } else {
+      releaseGate()
+    }
+    return owned
+  }
+
   const acquireRecoveryMarker = (): OwnedRecoveryMarker => {
     let ownedMarker: OwnedRecoveryMarker | undefined
     while (ownedMarker === undefined) {
@@ -290,8 +346,7 @@ export const withOperationLock = <Result>(
     let recovered = false
     if (recoveryMarkerIsOwned(ownedMarker)) {
       try {
-        beginGateTransaction(true)
-        recovered = true
+        recovered = beginGateWhileRecoveryOwned(ownedMarker)
       } catch (error) {
         const category = sqliteFailureCategory(error)
         if (category === 'busy' || category === 'locked') {
@@ -303,8 +358,7 @@ export const withOperationLock = <Result>(
           if (recoveryMarkerIsOwned(ownedMarker)) {
             quarantineCorruptGate(error)
             if (recoveryMarkerIsOwned(ownedMarker)) {
-              beginGateTransaction(true)
-              recovered = true
+              recovered = beginGateWhileRecoveryOwned(ownedMarker)
             }
           }
         } else {
@@ -328,7 +382,9 @@ export const withOperationLock = <Result>(
       let cleanupError: unknown
       try {
         releaseOwnedLock(location, ownedMarker.directory, ownedMarker.token)
+        abandonedRecoveryMarkers.delete(ownedMarker.directory.path)
       } catch (error) {
+        abandonedRecoveryMarkers.set(ownedMarker.directory.path, ownedMarker)
         cleanupError = error
       }
       if (recoveryError !== undefined) {
@@ -394,14 +450,7 @@ export const withOperationLock = <Result>(
     }
     return wrapIo('Unable to coordinate Encephalon cache access.', error)
   } finally {
-    if (gateTransaction) {
-      try {
-        gate?.exec('ROLLBACK')
-      } catch {
-        // Closing the connection below releases its operating-system lock.
-      }
-    }
-    gate?.close()
+    releaseGate()
     try {
       const remainingCandidate = candidateDirectory ?? inspectCacheOwnedDirectory(location, candidateName)
       if (remainingCandidate !== undefined) {

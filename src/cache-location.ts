@@ -823,8 +823,11 @@ export const readCacheOwner = (location: CacheLocation, directory: CacheOwnedDir
   const descriptor = openSync(path, constants.O_RDONLY | NO_FOLLOW)
   try {
     const metadata = fstatSync(descriptor, { bigint: true })
-    if (!sameCacheEntryIdentity(captured, identityFrom(metadata)) || metadata.size > BigInt(maximumBytes)) {
+    if (!sameCacheEntryIdentity(captured, identityFrom(metadata))) {
       return invalidLayout(`${ownedDirectoryRelativePath(directory.name)}/owner.json`, 'bounded-stable-owner-file')
+    }
+    if (metadata.size > BigInt(maximumBytes)) {
+      return
     }
     const bytes = Buffer.alloc(Number(metadata.size))
     const read = readSync(descriptor, bytes, 0, bytes.length, 0)

@@ -1964,6 +1964,36 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('reclaims stale owner metadata with non-record JSON shapes', () => {
+    for (const owner of [null, [], 42]) {
+      const root = createRoot()
+      const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
+      mkdirSync(recoveryPath, { recursive: true })
+      writeFileSync(join(recoveryPath, 'owner.json'), `${JSON.stringify(owner)}\n`)
+      const oldTimestamp = new Date('2026-08-06T10:00:00.000Z')
+      utimesSync(recoveryPath, oldTimestamp, oldTimestamp)
+
+      assert.equal(
+        withOperationLock(root, () => 'entered'),
+        'entered',
+      )
+    }
+  })
+
+  test('reclaims a stale oversized recovery owner without reading it', () => {
+    const root = createRoot()
+    const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
+    mkdirSync(recoveryPath, { recursive: true })
+    writeFileSync(join(recoveryPath, 'owner.json'), 'x'.repeat(4097))
+    const oldTimestamp = new Date('2026-08-06T10:00:00.000Z')
+    utimesSync(recoveryPath, oldTimestamp, oldTimestamp)
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
+  })
+
   test('reacquires recovery ownership when its owner token is replaced before gate recovery', () => {
     const root = createRoot()
     const cachePath = cacheDirectoryPath(root)
@@ -2020,7 +2050,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(readFileSync(join(recoveryPath, 'owner.json'), 'utf8'), replacementOwner)
   })
 
-  test('does not enter the protected operation after recovery-marker cleanup fails', () => {
+  test('reclaims an exact recovery marker after its cleanup fails', () => {
     const root = createRoot()
     const cachePath = cacheDirectoryPath(root)
     mkdirSync(cachePath, { recursive: true })
@@ -2045,6 +2075,16 @@ describe('SQLite cache and reads', () => {
       },
     )
     assert.equal(operationEntered, false)
+    let clockReads = 0
+    assert.equal(
+      withOperationLock(root, () => 'entered on retry', {
+        now: () => {
+          clockReads += 1
+          return clockReads <= 10 ? 0 : 60_000
+        },
+      }),
+      'entered on retry',
+    )
   })
 
   test('reobserves a recovery marker that disappears between directory lstat and realpath', () => {
@@ -2225,16 +2265,22 @@ describe('SQLite cache and reads', () => {
   test('reobserves a live owner token installed before stale-marker reclaim', () => {
     const root = createRoot()
     const recoveryPath = join(root, 'node_modules', '.cache', 'encephalon', 'operation-lock.recovery')
+    const completedProcess = spawnSync(process.execPath, ['-e', ''])
+    assert.equal(completedProcess.status, 0)
+    assert.ok(completedProcess.pid !== undefined)
     mkdirSync(recoveryPath, { recursive: true })
     writeFileSync(
       join(recoveryPath, 'owner.json'),
-      `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: 2_147_483_647, token: 'predecessor' })}\n`,
+      `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: completedProcess.pid, token: 'predecessor' })}\n`,
     )
     let observations = 0
+    let staleCallbacks = 0
 
     assert.equal(
       withOperationLock(root, () => 'entered', {
         afterRecoveryStaleObservation: () => {
+          staleCallbacks += 1
+          assert.equal(staleCallbacks, 1)
           writeFileSync(
             join(recoveryPath, 'owner.json'),
             `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: process.pid, token: 'successor' })}\n`,
@@ -2243,6 +2289,7 @@ describe('SQLite cache and reads', () => {
         duringRecoveryObservation: () => {
           observations += 1
           if (observations === 2) {
+            assert.match(readFileSync(join(recoveryPath, 'owner.json'), 'utf8'), /successor/u)
             rmSync(recoveryPath, { recursive: true })
           }
         },
@@ -2250,6 +2297,7 @@ describe('SQLite cache and reads', () => {
       'entered',
     )
     assert.equal(observations, 2)
+    assert.equal(staleCallbacks, 1)
   })
 
   test('applies the total deadline after recovery ownership is repeatedly lost', () => {
@@ -2342,6 +2390,42 @@ describe('SQLite cache and reads', () => {
         writeFileSync(
           join(recoveryPath, 'owner.json'),
           `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: process.pid, token: 'gate-successor' })}\n`,
+        )
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered', {
+        afterRecoveryCreation: () => {
+          recoveryCreations += 1
+        },
+        duringRecoveryObservation: () => {
+          replacementObservations += 1
+          rmSync(recoveryPath, { recursive: true })
+        },
+      }),
+      'entered',
+    )
+    assert.equal(recoveryLost, true)
+    assert.equal(recoveryCreations, 2)
+    assert.equal(replacementObservations, 1)
+  })
+
+  test('reacquires recovery ownership lost after the recovered gate begins', () => {
+    const root = createRoot()
+    const cachePath = cacheDirectoryPath(root)
+    const recoveryPath = join(cachePath, 'operation-lock.recovery')
+    mkdirSync(cachePath, { recursive: true })
+    writeFileSync(join(cachePath, 'operation-lock.sqlite'), 'not a sqlite database')
+    let recoveryCreations = 0
+    let replacementObservations = 0
+    let recoveryLost = false
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (!recoveryLost && database.name === 'operation-lock.sqlite' && existsSync(recoveryPath)) {
+        recoveryLost = true
+        writeFileSync(
+          join(recoveryPath, 'owner.json'),
+          `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: process.pid, token: 'initialisation-successor' })}\n`,
         )
       }
     }
