@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
+import { CacheDatabaseFailure } from '../src/cache-location.ts'
 import { cliErrorResponse, EncephalonError, wrapIo } from '../src/errors.ts'
 import type { EncephalonErrorCode } from '../src/types.ts'
 
@@ -46,6 +47,35 @@ describe('error classification', () => {
 
   test('classifies plain errors without errno as internal defects', () => {
     assertWrappedCode(new Error('Unable to write file.'), 'INTERNAL_ERROR')
+  })
+
+  test('classifies wrapped SQLite I/O failures as expected public errors', () => {
+    const database = {
+      dev: 1n,
+      ino: 2n,
+      name: 'brain.sqlite' as const,
+      path: 'brain.sqlite',
+      relativePath: 'node_modules/.cache/encephalon/brain.sqlite',
+      sidecars: {},
+    }
+    for (const errcode of [10, 14]) {
+      const failure = Object.assign(new Error(`SQLite failure ${errcode}`), {
+        code: 'ERR_SQLITE_ERROR',
+        errcode,
+      })
+      const wrapped = new CacheDatabaseFailure(failure, database, { cause: failure })
+
+      assert.throws(
+        () => wrapIo('Unable to access the cache.', wrapped),
+        (error: unknown) => {
+          const classified = error as EncephalonError
+          assert.equal(classified.code, 'IO_ERROR')
+          assert.equal(classified.cause, wrapped)
+          assert.equal(cliErrorResponse(classified).exitCode, 2)
+          return true
+        },
+      )
+    }
   })
 })
 

@@ -5,8 +5,10 @@ import {
   assertCacheLockCandidates,
   type CacheDatabase,
   CacheDatabaseFailure,
+  CacheDatabaseSidecarChanged,
   type CacheLocation,
   type CacheOwnedDirectory,
+  cacheDatabaseDidOpen,
   cacheDatabaseWillOpen,
   cacheOwnedDirectoryIsCurrent,
   cacheOwnedDirectoryMtimeMilliseconds,
@@ -14,6 +16,7 @@ import {
   failCacheDatabase,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
+  MAX_CACHE_DATABASE_OPEN_ATTEMPTS,
   prepareCacheDatabase,
   promoteCacheOwnedDirectory,
   quarantineCacheDatabase,
@@ -37,7 +40,13 @@ type LockTestHooks = {
   afterRecoveryCreation?: (() => void) | undefined
   afterRecoveryStaleObservation?: (() => void) | undefined
   afterStaleObservation?: (() => void) | undefined
+  duringRecoveryObservation?: (() => void) | undefined
 }
+
+type RecoveryMarkerObservation =
+  | { kind: 'absent' }
+  | { kind: 'observed'; directory: CacheOwnedDirectory; stale: boolean }
+  | { kind: 'retry' }
 
 const MAX_OWNER_BYTES = 4096
 
@@ -127,24 +136,34 @@ export const withOperationLock = <Result>(
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds)
   }
 
-  const recoveryMarkerObservation = () => {
+  const recoveryMarkerObservation = (): RecoveryMarkerObservation => {
     const recoveryDirectory = inspectCacheOwnedDirectory(location, recoveryName)
     if (recoveryDirectory === undefined) {
-      return
+      return { kind: 'absent' }
     }
-    const owner = readOwner(location, recoveryDirectory)
-    if (owner !== undefined) {
-      const acquiredAt = Date.parse(owner.acquiredAt)
-      const age = Number.isFinite(acquiredAt) ? Date.now() - acquiredAt : RECOVERY_STALE_MILLISECONDS + 1
+    testHooks.duringRecoveryObservation?.()
+    try {
+      const owner = readOwner(location, recoveryDirectory)
+      if (owner !== undefined) {
+        const acquiredAt = Date.parse(owner.acquiredAt)
+        const age = Number.isFinite(acquiredAt) ? Date.now() - acquiredAt : RECOVERY_STALE_MILLISECONDS + 1
+        return {
+          directory: recoveryDirectory,
+          kind: 'observed',
+          stale: !processIsRunning(owner.pid) || age > RECOVERY_STALE_MILLISECONDS,
+        }
+      }
       return {
         directory: recoveryDirectory,
-        stale: !processIsRunning(owner.pid) || age > RECOVERY_STALE_MILLISECONDS,
+        kind: 'observed',
+        stale:
+          Date.now() - cacheOwnedDirectoryMtimeMilliseconds(location, recoveryDirectory) > RECOVERY_STALE_MILLISECONDS,
       }
-    }
-    return {
-      directory: recoveryDirectory,
-      stale:
-        Date.now() - cacheOwnedDirectoryMtimeMilliseconds(location, recoveryDirectory) > RECOVERY_STALE_MILLISECONDS,
+    } catch (error) {
+      if (cacheOwnedDirectoryIsCurrent(location, recoveryDirectory)) {
+        throw error
+      }
+      return { kind: 'retry' }
     }
   }
 
@@ -157,16 +176,18 @@ export const withOperationLock = <Result>(
 
   const waitForGateRecovery = () => {
     let observation = recoveryMarkerObservation()
-    while (observation !== undefined) {
+    while (observation.kind !== 'absent') {
       if (remainingMilliseconds() === 0) {
         return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
           timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
         })
       }
-      if (observation.stale) {
+      if (observation.kind === 'observed' && observation.stale) {
         reclaimRecoveryMarker(observation.directory)
       }
-      wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))
+      if (observation.kind === 'observed') {
+        wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))
+      }
       observation = recoveryMarkerObservation()
     }
   }
@@ -183,36 +204,51 @@ export const withOperationLock = <Result>(
       waitForGateRecovery()
     }
     gateDatabase = prepareCacheDatabase(location, 'operation-lock.sqlite')
-    cacheDatabaseWillOpen(gateDatabase)
-    gateDatabase = assertCacheDatabase(location, gateDatabase)
-    try {
-      gate = new DatabaseSync(gateDatabase.path, { timeout: remainingMilliseconds() })
-    } catch (error) {
-      return failCacheDatabase(error, gateDatabase)
-    }
-    try {
-      // Node's SQLite API accepts only pathnames, leaving a narrow replacement race
-      // between this identity check and SQLite's internal open.
+    const attempts = Array.from({ length: MAX_CACHE_DATABASE_OPEN_ATTEMPTS }, (_, index) => index)
+    for (const attempt of attempts) {
+      cacheDatabaseWillOpen(gateDatabase)
       gateDatabase = assertCacheDatabase(location, gateDatabase)
-      gate.exec('BEGIN IMMEDIATE')
-      gateTransaction = true
-    } catch (error) {
-      let validationError: unknown
       try {
+        gate = new DatabaseSync(gateDatabase.path, { timeout: remainingMilliseconds() })
+      } catch (error) {
+        return failCacheDatabase(error, gateDatabase)
+      }
+      try {
+        cacheDatabaseDidOpen(gateDatabase)
+        // Node's SQLite API accepts only pathnames, leaving a narrow replacement race
+        // between this identity check and SQLite's internal open.
         gateDatabase = assertCacheDatabase(location, gateDatabase)
-      } catch (candidate) {
-        validationError = candidate
+        gate.exec('BEGIN IMMEDIATE')
+        gateTransaction = true
+        return
+      } catch (error) {
+        if (error instanceof CacheDatabaseSidecarChanged) {
+          gate.close()
+          gate = undefined
+          gateDatabase = error.database
+          if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
+            throw error
+          }
+        } else {
+          let validationError: unknown
+          try {
+            gateDatabase = assertCacheDatabase(location, gateDatabase)
+          } catch (candidate) {
+            validationError = candidate
+          }
+          gate.close()
+          gate = undefined
+          if (validationError !== undefined) {
+            throw validationError
+          }
+          if (error instanceof EncephalonError) {
+            throw error
+          }
+          return failCacheDatabase(error, gateDatabase)
+        }
       }
-      gate.close()
-      gate = undefined
-      if (validationError !== undefined) {
-        throw validationError
-      }
-      if (error instanceof EncephalonError) {
-        throw error
-      }
-      return failCacheDatabase(error, gateDatabase)
     }
+    return fail('INTERNAL_ERROR', 'The Encephalon gate database open ended unexpectedly.')
   }
 
   const recoverCorruptGate = () => {
@@ -245,7 +281,7 @@ export const withOperationLock = <Result>(
           })
         }
         const observation = recoveryMarkerObservation()
-        if (observation?.stale === true) {
+        if (observation.kind === 'observed' && observation.stale) {
           reclaimRecoveryMarker(observation.directory)
         }
         wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))

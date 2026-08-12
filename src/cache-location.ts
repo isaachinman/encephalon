@@ -16,11 +16,12 @@ import {
   writeSync,
 } from 'node:fs'
 import { isAbsolute, relative, resolve } from 'node:path'
-import { fail } from './errors.ts'
+import { EncephalonError, fail } from './errors.ts'
 
 const CACHE_COMPONENTS = ['node_modules', '.cache', 'encephalon'] as const
 const DATABASE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'] as const
 const OPTIONAL_FILE_OBSERVATION_ATTEMPTS = 3
+export const MAX_CACHE_DATABASE_OPEN_ATTEMPTS = 3
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0
 
 export type CacheEntryIdentity = {
@@ -70,13 +71,28 @@ export class CacheDatabaseFailure extends Error {
   }
 }
 
+export class CacheDatabaseSidecarChanged extends EncephalonError {
+  readonly database: CacheDatabase
+
+  constructor(database: CacheDatabase, relativePath: string) {
+    super('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
+      entry: relativePath,
+      invariant: 'stable-identity',
+    })
+    this.name = 'CacheDatabaseSidecarChanged'
+    this.database = database
+  }
+}
+
 export const failCacheDatabase = (failure: unknown, database: CacheDatabase): never => {
   throw new CacheDatabaseFailure(failure, database, { cause: failure })
 }
 
 type CacheLocationTestHooks = {
+  afterDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
   afterQuarantineRename?: ((path: string) => void) | undefined
   beforeDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
+  beforeLocationInspection?: (() => void) | undefined
   beforeQuarantineRename?: ((path: string) => void) | undefined
 }
 
@@ -181,6 +197,7 @@ const assertContained = (repository: string, directory: string) => {
 }
 
 export const inspectCacheLocation = (root: string): CacheLocation => {
+  cacheLocationTestHooks.beforeLocationInspection?.()
   const repository = realpathSync.native(resolve(root))
   const repositoryEntry = inspectDirectory(repository, '.', repository, false)
   const entries = CACHE_COMPONENTS.reduce<CacheDirectoryEntry[]>(
@@ -285,13 +302,16 @@ const inspectSidecars = (location: CacheLocation, name: CacheDatabaseName) =>
     return file === undefined ? sidecars : { ...sidecars, [suffix]: file }
   }, {})
 
-const assertSidecars = (location: CacheLocation, database: CacheDatabase) => {
+const reconcileSidecars = (location: CacheLocation, database: CacheDatabase) => {
   const observed = inspectSidecars(location, database.name)
   for (const suffix of DATABASE_SIDECAR_SUFFIXES) {
     const expected = database.sidecars[suffix]
     const current = observed[suffix]
-    if (expected !== undefined && (current === undefined || !sameCacheEntryIdentity(expected, current))) {
-      return changedLayout(`${databaseRelativePath(database.name)}${suffix}`, 'stable-identity')
+    if (expected !== undefined && current !== undefined && !sameCacheEntryIdentity(expected, current)) {
+      throw new CacheDatabaseSidecarChanged(
+        { ...database, sidecars: observed },
+        `${databaseRelativePath(database.name)}${suffix}`,
+      )
     }
   }
   return observed
@@ -341,7 +361,7 @@ export const assertCacheDatabase = (location: CacheLocation, database: CacheData
   if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
     return changedLayout(databaseRelativePath(database.name), 'stable-identity')
   }
-  return { ...database, sidecars: { ...database.sidecars, ...assertSidecars(location, database) } }
+  return { ...database, sidecars: reconcileSidecars(location, database) }
 }
 
 export const refreshCacheDatabase = (location: CacheLocation, database: CacheDatabase) => {
@@ -350,11 +370,15 @@ export const refreshCacheDatabase = (location: CacheLocation, database: CacheDat
   if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
     return changedLayout(database.relativePath, 'stable-identity')
   }
-  return { ...database, sidecars: inspectSidecars(location, database.name) }
+  return { ...database, sidecars: reconcileSidecars(location, database) }
 }
 
 export const cacheDatabaseWillOpen = (database: CacheDatabase) => {
   cacheLocationTestHooks.beforeDatabaseOpen?.(database)
+}
+
+export const cacheDatabaseDidOpen = (database: CacheDatabase) => {
+  cacheLocationTestHooks.afterDatabaseOpen?.(database)
 }
 
 const quarantineFile = (location: CacheLocation, expected: CacheFile, required: boolean) => {
