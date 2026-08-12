@@ -145,7 +145,7 @@ jobs:
 `,
     )
     assert.match(verificationRunner, /^ {4}runs-on: \$\{\{ matrix\.os \}\}\n$/)
-    assert.doesNotMatch(verificationHeader, /^\s{4}(?:if|continue-on-error):/m)
+    assert.doesNotMatch(verificationJob, /^ {4}(?:if|continue-on-error):/m)
     assert.match(verificationSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
     assert.match(
       verificationSteps,
