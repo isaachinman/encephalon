@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-12 for audited snapshot `eaff22439ae593b4d38a5a801a7d56704b9b5754`.
+Last reviewed: 2026-08-12 for audited snapshot `1c7c219ed52c23e56da060ae4082dc5eca9e3e78`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -12,8 +12,8 @@ This document is the concise contract maintainers should update when public beha
 - API failures that users can reasonably handle throw `EncephalonError` with a stable code from `src/types.ts`.
 - CLI success writes one JSON value to stdout for JSON commands and exits `0`. Expected user errors write one structured JSON error to stderr and exit `2`. Validation failures print the validation result to stdout and exit `2`.
 - User and agent command examples use the installed package manager binary form, `npx --no-install encephalon ...`, after the package has been installed at the repository root. Runtime execution still verifies that the executing package is the root `node_modules/encephalon` installation.
-- Git marker files and package manifests used for repository or executing-package identity are read through bounded, no-follow regular-file descriptors with stable identity and fatal UTF-8 decoding. Worktree administration targets are accepted only when their real-directory identity remains stable across native realpath resolution.
-- Executing package identity is cached only after its manifest has been verified successfully. Each repository root still reverifies its installed Encephalon manifest on every resolution.
+- Git marker files and package manifests used for repository or executing-package identity are read through bounded, no-follow regular-file descriptors with stable identity and fatal UTF-8 decoding. Their input and canonical directory generations must remain stable around the dependent read. Worktree administration targets are accepted only when their real-directory identity remains stable across native realpath resolution.
+- Executing package identity is cached only after its manifest and directory generation have been verified successfully. Each repository root still reverifies its installed Encephalon manifest and directory generation on every resolution; unsafe installed manifests use the generic root-install-required failure.
 
 ## Canonical Storage
 
