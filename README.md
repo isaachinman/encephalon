@@ -26,7 +26,7 @@ npm install --save-dev encephalon
 npx --no-install encephalon init
 ```
 
-`init` safely derives bounded repository metadata, creates up to three baseline records, builds the local cache, and adds a reversible managed block to root `AGENTS.md` and `CLAUDE.md`. For baseline records, it reads only bounded `package.json` fields such as package name, package manager, workspace globs, and script keys. It enumerates safe top-level names, recognised package/config filenames, source file extensions for language counts, and workflow YAML filenames.
+`init` safely derives bounded repository metadata, creates up to three baseline records, builds the local cache, and adds a reversible managed block to root `AGENTS.md` and `CLAUDE.md`. For baseline records, it reads only a bounded, verified `package.json` and extracts fields such as package name, package manager, workspace globs, and script keys. It streams at most 513 raw entries from each top-level, language-scan, or workflow directory to distinguish the 512-entry limit from overflow before filtering. An overflowed or unreadable source contributes no partial facts; the repository overview reports bounded, stable reason codes instead.
 
 `init` reads root `AGENTS.md` and `CLAUDE.md` byte-for-byte only to preserve, replace, or remove the managed Encephalon block safely. Unrelated instruction text is not semantically scanned, stored in generated records, indexed for search, printed to stdout, or included in error details. `init` does not read source bodies, README content, environment files, registry configuration, Git history, Git remotes, or CI workflow contents.
 

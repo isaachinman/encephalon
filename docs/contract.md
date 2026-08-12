@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-12 for audited snapshot `a862d8ca229b07463ac45a4b442b29b7f92eb6a8`.
+Last reviewed: 2026-08-12 for audited snapshot `0c065e8360617e0c34795b57f89f6328efb3f01a`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -33,6 +33,7 @@ This document is the concise contract maintainers should update when public beha
 ## Initialisation and Privacy
 
 - `init` creates a bounded, deterministic, non-semantic baseline from package metadata, safe filesystem enumeration, language-count extensions, and workflow filenames.
+- Every baseline directory source reads at most 513 raw entries before filtering and is bound to a stable real-directory generation. Overflow, unreadable directories, workflow enumeration failures, and invalid, oversized, unreadable, or replaced package metadata omit that source's facts and set `scanTruncated` with bounded, ordinal-sorted reason codes in the repository overview.
 - `init` may read root `AGENTS.md` and `CLAUDE.md` byte-for-byte only to manage the Encephalon block while preserving unrelated bytes.
 - Unrelated instruction text, source bodies, README content, environment files, registry configuration, Git history, Git remotes, and CI workflow contents must not enter generated records, cache search text, stdout, or structured error details.
 - The managed instruction block points agents to `./node_modules/encephalon/skills/encephalon/SKILL.md` and remains exactly reversible where Encephalon created or updated it.
