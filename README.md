@@ -133,7 +133,7 @@ Payload values are validated without invoking accessors. They may contain at mos
 
 The disposable cache lives at `node_modules/.cache/encephalon/brain.sqlite` and should not be committed. Encephalon verifies that its cache ancestors, SQLite files, sidecars, and operation-lock entries are real contained entries before use and identity-specific cleanup. It uses SQLite WAL mode, FTS5, a repository-scoped operation lock, manifest-based freshness, and transactional table rebuilds. Canonical records remain the source of truth.
 
-Artifacts must be regular, non-symlink files beneath `_artifacts/<kind>/<id>/`. Record IDs and artifact paths are checked for traversal, platform portability, Windows-reserved names, case collisions, size limits, and containment.
+Artifacts must be regular, non-symlink files beneath `_artifacts/<kind>/<id>/`. Record IDs and artifact paths are checked for traversal, platform portability, Windows-reserved names, case collisions, size limits, and containment. Validation binds every ancestor to the verified brain-root generation and derives cache metadata from one stable, read-only artifact descriptor; cache freshness reuses the same no-follow inspection.
 
 ## Synchronous API
 
