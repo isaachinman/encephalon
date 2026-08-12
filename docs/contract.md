@@ -22,6 +22,7 @@ This document is the concise contract maintainers should update when public beha
 - The runtime-only `path` field is never written to canonical record files.
 - Supersession records must use the same kind and subject as their targets. Active records are records not listed in any other record’s `supersedes`.
 - Existing records are not rewritten or deleted by normal mutations; changed knowledge is represented by a new record that supersedes the active head.
+- Canonical layout validation reads at most 1,003 entries from `encephalon` and 1,001 entries from any kind directory to distinguish the inclusive limits from overflow. The root permits 1,002 total entries and 1,000 kind directories; `_artifacts` and `_staging` consume root-entry capacity but not kind-directory capacity. Each kind directory permits 1,000 entries. Overflow returns one deterministic `CORPUS_DIRECTORY_ENTRY_LIMIT` issue naming only the repository-relative containing directory and its maximum.
 
 ## Initialisation and Privacy
 
@@ -43,6 +44,7 @@ This document is the concise contract maintainers should update when public beha
 - Disposable cache recovery is limited to corrupt, not-a-database, schema, read-only, and cannot-open failures. Busy, locked, general I/O, and unknown failures are terminal for that rebuild attempt; the operation gate separately reports busy or locked contention and recovers only corrupt or not-a-database state.
 - Public I/O wrapping recognises busy, locked, corrupt, not-a-database, read-only, cannot-open, and general I/O categories as environmental failures. Schema and unknown SQLite failures remain internal errors after any cache recovery is exhausted.
 - Freshness is determined from explicit cache metadata and a manifest of canonical records plus referenced artifacts.
+- Cache manifests use the same bounded canonical directory enumeration as validation. A bound crossed after canonical validation is treated as a repository change and retried rather than cached.
 - Node's pathname-only SQLite API leaves a narrow replacement race inside SQLite's open after the surrounding identity checks. Defending against arbitrary same-user mutation between those boundaries is not a supported security boundary.
 
 ## Package and Release Gates
@@ -73,3 +75,7 @@ When an implementation change intentionally alters this contract:
 | CI and release gates evolved after the original plan. | Owned by MAR-2527 for CI package gates. The maintained release contract remains the checked package scripts plus manual publishing. |
 | Initialisation result and managed-file mutation details changed during implementation. | Implemented and tested in the init, instruction-file, package, and CLI suites; the README and this contract describe the maintained behaviour. |
 | `canonicalRecordPath` was exported from `src/records.ts` without a public API surface. | Retained as an internal helper used by cache path validation; not exported from `src/index.ts`. |
+
+## Change Provenance
+
+- MAR-2556 canonical directory bounds and behavioural coverage: `7576b5452a11d068fd290621e074d1415ed5c19e`.

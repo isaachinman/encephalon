@@ -127,6 +127,8 @@ type BrainRecord = BrainRecordFile & { path: string };
 
 The v0.x canonical corpus may contain at most 1,000 records, 8 MiB of aggregate record JSON, 1,000 supersession edges, and 1,000 artifact references. Validation returns at most 100 issues; when more issues exist, the result sets `truncated: true` and ends with a `VALIDATION_ISSUES_TRUNCATED` sentinel.
 
+Canonical directory enumeration is also bounded before record contents are read. The `encephalon` root may contain at most 1,002 entries and 1,000 kind directories, while each kind directory may contain at most 1,000 entries. `_artifacts` and `_staging` count towards the 1,002 root-entry limit but not the kind-directory limit. An overflow produces one deterministic `CORPUS_DIRECTORY_ENTRY_LIMIT` issue for the containing repository-relative directory without reporting excess filenames.
+
 Payload values are validated without invoking accessors. They may contain at most 64 nested levels and 10,000 JSON nodes, counting the root value, arrays, objects, and primitive values.
 
 The disposable cache lives at `node_modules/.cache/encephalon/brain.sqlite` and should not be committed. Encephalon verifies that its cache ancestors, SQLite files, sidecars, and operation-lock entries are real contained entries before use and identity-specific cleanup. It uses SQLite WAL mode, FTS5, a repository-scoped operation lock, manifest-based freshness, and transactional table rebuilds. Canonical records remain the source of truth.
