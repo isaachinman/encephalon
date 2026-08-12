@@ -156,6 +156,7 @@ type PackageManagerEvidence =
 
 type BaselineScanHooks = {
   afterBaselineSources?: (() => void) | undefined
+  afterLanguageDirectoryCapture?: ((path: string) => void) | undefined
   afterOptionalDirectoryLstat?: ((path: string) => void) | undefined
   afterPackageMetadataLstat?: (() => void) | undefined
   afterWorkflowEnumeration?: (() => void) | undefined
@@ -164,6 +165,7 @@ type BaselineScanHooks = {
   beforeTopLevelRevalidation?: (() => void) | undefined
   beforeWorkflowDirectoryCapture?: (() => void) | undefined
   maximumScannedDirectories?: number | undefined
+  maximumScannedFiles?: number | undefined
   onLanguageDirectoryScheduled?: (() => void) | undefined
 }
 
@@ -348,6 +350,7 @@ const readBoundedDirectoryEntries = (
     revalidateCanonicalDirectory(parent)
   }
   const snapshot = captureCanonicalDirectory(directory, MAX_LANGUAGE_DIRECTORY_ENTRIES)
+  hooks.afterLanguageDirectoryCapture?.(directory)
   if (parent !== undefined) {
     revalidateCanonicalDirectory(parent)
   }
@@ -372,6 +375,7 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
     truncationReasons: new Set(),
   }
   const maximumDirectories = hooks.maximumScannedDirectories ?? MAX_SCANNED_DIRECTORIES
+  const maximumFiles = hooks.maximumScannedFiles ?? MAX_SCANNED_FILES
   const queue: { depth: number; directory: string; parent?: CanonicalDirectorySnapshot }[] = [
     { depth: 0, directory: root },
   ]
@@ -397,7 +401,7 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
               hooks.onLanguageDirectoryScheduled?.()
             }
           } else if (entry.isFile()) {
-            if (state.filesSeen >= MAX_SCANNED_FILES) {
+            if (state.filesSeen >= maximumFiles) {
               state.truncationReasons.add('regular-file-limit')
               break scanDirectories
             }
