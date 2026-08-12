@@ -49,6 +49,7 @@ const createOutsideDirectory = () => {
 }
 
 afterEach(() => {
+  cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
   cacheLocationTestHooks.afterDatabaseOpen = undefined
   cacheLocationTestHooks.afterQuarantineRename = undefined
   cacheLocationTestHooks.beforeDatabaseOpen = undefined
@@ -545,6 +546,74 @@ describe('cache filesystem containment', () => {
         cacheReadTestHooks.duringDatabaseInitialisation = undefined
       }
     }
+  })
+
+  test('retries sidecar replacement immediately after the gate transaction begins', () => {
+    for (const persistent of [false, true]) {
+      const root = createRoot()
+      withOperationLock(root, () => 'prepared')
+      const sidecarPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
+      writeFileSync(sidecarPath, '')
+      let attempts = 0
+      cacheLocationTestHooks.afterDatabaseOpen = database => {
+        if (database.name === 'operation-lock.sqlite' && !existsSync(sidecarPath)) {
+          writeFileSync(sidecarPath, '')
+        }
+      }
+      cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+        if (database.name === 'operation-lock.sqlite') {
+          attempts += 1
+          if (persistent || attempts === 1) {
+            renameSync(sidecarPath, join(root, `gate-sidecar-generation-${attempts}`))
+            writeFileSync(sidecarPath, '')
+          }
+        }
+      }
+
+      if (persistent) {
+        assert.throws(
+          () => withOperationLock(root, () => 'entered'),
+          (error: unknown) => {
+            assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+            return true
+          },
+        )
+      } else {
+        assert.equal(
+          withOperationLock(root, () => 'entered'),
+          'entered',
+        )
+      }
+      assert.equal(attempts, persistent ? 3 : 2)
+      cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+      cacheLocationTestHooks.afterDatabaseOpen = undefined
+    }
+  })
+
+  test('rejects an unsafe sidecar introduced after the gate transaction begins', () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    withOperationLock(root, () => 'prepared')
+    const sidecarPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
+    const displacedPath = join(root, 'safe-gate-journal')
+    const targetPath = join(outside, 'gate-journal-target')
+    writeFileSync(sidecarPath, '')
+    writeFileSync(targetPath, 'outside gate journal')
+    cacheLocationTestHooks.afterDatabaseOpen = database => {
+      if (database.name === 'operation-lock.sqlite' && !existsSync(sidecarPath)) {
+        writeFileSync(sidecarPath, '')
+      }
+    }
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        renameSync(sidecarPath, displacedPath)
+        symlinkSync(targetPath, sidecarPath)
+      }
+    }
+
+    assertCacheLayoutRejected(() => withOperationLock(root, () => 'entered'))
+    assert.equal(readFileSync(targetPath, 'utf8'), 'outside gate journal')
   })
 
   test('carries the locked cache location through add-record hydration', () => {
@@ -2198,6 +2267,47 @@ describe('SQLite cache and reads', () => {
     assert.equal(existsSync(firstEntered), true)
     assert.equal(existsSync(secondEntered), true)
     assert.equal(existsSync(join(cachePath, 'operation-lock.sqlite')), true)
+  })
+
+  test('keeps a persistent WAL operation gate exclusive until its holder releases', async () => {
+    const root = createRoot()
+    withOperationLock(root, () => 'prepared')
+    const gatePath = join(cacheDirectoryPath(root), 'operation-lock.sqlite')
+    const database = new DatabaseSync(gatePath)
+    try {
+      const mode = database.prepare('PRAGMA journal_mode = WAL').get() as { journal_mode?: unknown }
+      assert.equal(mode.journal_mode, 'wal')
+    } finally {
+      database.close()
+    }
+    const fixture = join(import.meta.dirname, 'fixtures', 'hold-operation-lock-until-release.ts')
+    const releasePath = join(root, 'release-wal-operation-lock')
+    const firstAttempted = join(root, 'first-wal-lock-attempted')
+    const firstEntered = join(root, 'first-wal-lock-entered')
+    const secondAttempted = join(root, 'second-wal-lock-attempted')
+    const secondEntered = join(root, 'second-wal-lock-entered')
+    const first = spawn(process.execPath, [fixture, root, firstAttempted, firstEntered, releasePath], {
+      stdio: 'inherit',
+    })
+    waitForPath(firstEntered, first)
+    const second = spawn(process.execPath, [fixture, root, secondAttempted, secondEntered, releasePath], {
+      stdio: 'inherit',
+    })
+    waitForPath(secondAttempted, second)
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300)
+    const secondEnteredBeforeRelease = existsSync(secondEntered)
+    writeFileSync(releasePath, 'release')
+
+    if (first.exitCode === null) {
+      await once(first, 'exit')
+    }
+    if (second.exitCode === null) {
+      await once(second, 'exit')
+    }
+    assert.equal(first.exitCode, 0)
+    assert.equal(second.exitCode, 0)
+    assert.equal(secondEnteredBeforeRelease, false)
+    assert.equal(existsSync(secondEntered), true)
   })
 
   test('rejects a symlinked canonical root without traversing it', {

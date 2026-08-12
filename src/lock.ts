@@ -200,7 +200,7 @@ export const withOperationLock = <Result>(
     if (!recoveryLockHeld) {
       waitForGateRecovery()
     }
-    const opened = openVerifiedCacheDatabase({
+    gate = openVerifiedCacheDatabase({
       afterVerifiedOpen: database => {
         database.exec('BEGIN IMMEDIATE')
       },
@@ -211,7 +211,6 @@ export const withOperationLock = <Result>(
       openOptions: { timeout: remainingMilliseconds() },
       preserveDatabaseLocksAfterInitialisation: true,
     })
-    gate = opened.database
     gateTransaction = true
   }
 

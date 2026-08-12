@@ -111,6 +111,7 @@ export const failCacheDatabase = (failure: unknown, database: CacheDatabase): ne
 }
 
 type CacheLocationTestHooks = {
+  afterDatabaseLockInitialisation?: ((database: CacheDatabase) => void) | undefined
   afterDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
   afterQuarantineRename?: ((path: string) => void) | undefined
   beforeDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
@@ -316,6 +317,65 @@ const inspectRegularFile = (path: string, relativePath: string, optional = false
   return changedLayout(relativePath, 'stable-open-identity')
 }
 
+const inspectRegularFileMetadataOnce = (path: string, relativePath: string): RegularFileInspection => {
+  let initialMetadata: BigIntStats
+  try {
+    initialMetadata = lstatSync(path, { bigint: true })
+  } catch (error) {
+    if (missingPath(error)) {
+      return { kind: 'missing' }
+    }
+    throw error
+  }
+  if (!initialMetadata.isFile() || initialMetadata.isSymbolicLink()) {
+    return invalidLayout(relativePath, 'regular-non-symlink-file')
+  }
+  const captured = identityFrom(initialMetadata)
+  let actualRealpath: string
+  try {
+    actualRealpath = realpathSync.native(path)
+  } catch (error) {
+    if (missingPath(error)) {
+      return { kind: 'changed' }
+    }
+    throw error
+  }
+  if (!samePath(actualRealpath, path)) {
+    return invalidLayout(relativePath, 'expected-realpath')
+  }
+  let finalMetadata: BigIntStats
+  try {
+    finalMetadata = lstatSync(path, { bigint: true })
+  } catch (error) {
+    if (missingPath(error)) {
+      return { kind: 'changed' }
+    }
+    throw error
+  }
+  if (
+    !finalMetadata.isFile() ||
+    finalMetadata.isSymbolicLink() ||
+    !sameCacheEntryIdentity(captured, identityFrom(finalMetadata))
+  ) {
+    return { kind: 'changed' }
+  }
+  return { file: { ...captured, path, relativePath }, kind: 'stable' }
+}
+
+const inspectRegularFileMetadata = (path: string, relativePath: string, optional = false): CacheFile | undefined => {
+  const attempts = optional ? OPTIONAL_FILE_OBSERVATION_ATTEMPTS : 1
+  for (const attempt of Array.from({ length: attempts }, (_, index) => index)) {
+    const inspection = inspectRegularFileMetadataOnce(path, relativePath)
+    if (inspection.kind === 'stable') {
+      return inspection.file
+    }
+    if (inspection.kind === 'missing' && (!optional || attempt === attempts - 1)) {
+      return
+    }
+  }
+  return changedLayout(relativePath, 'stable-metadata-identity')
+}
+
 const inspectSidecars = (location: CacheLocation, name: CacheDatabaseName) =>
   DATABASE_SIDECAR_SUFFIXES.reduce<Partial<Record<CacheDatabaseSidecarSuffix, CacheFile>>>((sidecars, suffix) => {
     const file = inspectRegularFile(
@@ -326,8 +386,20 @@ const inspectSidecars = (location: CacheLocation, name: CacheDatabaseName) =>
     return file === undefined ? sidecars : { ...sidecars, [suffix]: file }
   }, {})
 
-const reconcileSidecars = (location: CacheLocation, database: CacheDatabase) => {
-  const observed = inspectSidecars(location, database.name)
+const inspectSidecarMetadata = (location: CacheLocation, name: CacheDatabaseName) =>
+  DATABASE_SIDECAR_SUFFIXES.reduce<Partial<Record<CacheDatabaseSidecarSuffix, CacheFile>>>((sidecars, suffix) => {
+    const file = inspectRegularFileMetadata(
+      resolve(location.directory, `${name}${suffix}`),
+      `${databaseRelativePath(name)}${suffix}`,
+      true,
+    )
+    return file === undefined ? sidecars : { ...sidecars, [suffix]: file }
+  }, {})
+
+const reconcileSidecarSnapshots = (
+  database: CacheDatabase,
+  observed: Partial<Record<CacheDatabaseSidecarSuffix, CacheFile>>,
+) => {
   for (const suffix of DATABASE_SIDECAR_SUFFIXES) {
     const expected = database.sidecars[suffix]
     const current = observed[suffix]
@@ -340,6 +412,12 @@ const reconcileSidecars = (location: CacheLocation, database: CacheDatabase) => 
   }
   return observed
 }
+
+const reconcileSidecars = (location: CacheLocation, database: CacheDatabase) =>
+  reconcileSidecarSnapshots(database, inspectSidecars(location, database.name))
+
+const reconcileSidecarMetadata = (location: CacheLocation, database: CacheDatabase) =>
+  reconcileSidecarSnapshots(database, inspectSidecarMetadata(location, database.name))
 
 const bootstrapPrimary = (location: CacheLocation, name: CacheDatabaseName) => {
   const path = resolve(location.directory, name)
@@ -389,53 +467,17 @@ export const assertCacheDatabase = (location: CacheLocation, database: CacheData
 }
 
 const assertCacheDatabaseMetadata = (location: CacheLocation, database: CacheDatabase) => {
-  // Closing another descriptor for this file can release process-scoped POSIX
-  // locks, so the operation gate uses metadata continuity after BEGIN.
+  // Opening and closing any sibling file descriptor after BEGIN can release
+  // process-scoped SQLite locks on POSIX, so this boundary observes metadata only.
   assertCacheLocation(location)
-  let initialMetadata: BigIntStats
-  try {
-    initialMetadata = lstatSync(database.path, { bigint: true })
-  } catch (error) {
-    if (missingPath(error)) {
-      return changedLayout(databaseRelativePath(database.name), 'stable-identity')
-    }
-    throw error
-  }
-  if (!initialMetadata.isFile() || initialMetadata.isSymbolicLink()) {
-    return invalidLayout(databaseRelativePath(database.name), 'regular-non-symlink-file')
-  }
-  const captured = identityFrom(initialMetadata)
-  let actualRealpath: string
-  try {
-    actualRealpath = realpathSync.native(database.path)
-  } catch (error) {
-    if (missingPath(error)) {
-      return changedLayout(databaseRelativePath(database.name), 'stable-identity')
-    }
-    throw error
-  }
-  if (!samePath(actualRealpath, database.path)) {
-    return invalidLayout(databaseRelativePath(database.name), 'expected-realpath')
-  }
-  let finalMetadata: BigIntStats
-  try {
-    finalMetadata = lstatSync(database.path, { bigint: true })
-  } catch (error) {
-    if (missingPath(error)) {
-      return changedLayout(databaseRelativePath(database.name), 'stable-identity')
-    }
-    throw error
-  }
-  if (
-    !finalMetadata.isFile() ||
-    finalMetadata.isSymbolicLink() ||
-    !sameCacheEntryIdentity(database, captured) ||
-    !sameCacheEntryIdentity(captured, identityFrom(finalMetadata))
-  ) {
+  const identity = inspectRegularFileMetadata(database.path, databaseRelativePath(database.name))
+  if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
     return changedLayout(databaseRelativePath(database.name), 'stable-identity')
   }
   assertCacheLocation(location)
-  return { ...database, sidecars: reconcileSidecars(location, database) }
+  const sidecars = reconcileSidecarMetadata(location, database)
+  assertCacheLocation(location)
+  return { ...database, sidecars }
 }
 
 export const openVerifiedCacheDatabase = <Database extends { close: () => void }>(
@@ -476,10 +518,13 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
       cacheLocationTestHooks.afterDatabaseOpen?.(snapshot)
       snapshot = assertCacheDatabase(options.location, snapshot)
       options.afterVerifiedOpen?.(database)
+      if (options.preserveDatabaseLocksAfterInitialisation) {
+        cacheLocationTestHooks.afterDatabaseLockInitialisation?.(snapshot)
+      }
       snapshot = options.preserveDatabaseLocksAfterInitialisation
         ? assertCacheDatabaseMetadata(options.location, snapshot)
         : assertCacheDatabase(options.location, snapshot)
-      return { database, snapshot }
+      return database
     } catch (error) {
       if (error instanceof CacheDatabaseSidecarChanged) {
         database.close()
@@ -490,7 +535,9 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
       } else {
         let validationError: unknown
         try {
-          snapshot = assertCacheDatabase(options.location, snapshot)
+          snapshot = options.preserveDatabaseLocksAfterInitialisation
+            ? assertCacheDatabaseMetadata(options.location, snapshot)
+            : assertCacheDatabase(options.location, snapshot)
         } catch (candidate) {
           validationError = candidate
         }

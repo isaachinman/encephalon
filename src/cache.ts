@@ -250,7 +250,7 @@ const createCacheSchema = (database: DatabaseSync) => {
 const openWriterDatabase = (location: CacheLocation) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  const opened = openVerifiedCacheDatabase({
+  return openVerifiedCacheDatabase({
     afterVerifiedOpen: database => {
       database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
       createCacheSchema(database)
@@ -263,13 +263,12 @@ const openWriterDatabase = (location: CacheLocation) => {
     name: 'brain.sqlite',
     openOptions: { timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS },
   })
-  return opened.database
 }
 
 const openReaderDatabase = (location: CacheLocation) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  const opened = openVerifiedCacheDatabase({
+  return openVerifiedCacheDatabase({
     afterVerifiedOpen: database => {
       assertCacheSchema(database)
       cacheReadTestHooks.duringDatabaseInitialisation?.('reader')
@@ -286,7 +285,6 @@ const openReaderDatabase = (location: CacheLocation) => {
       timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
     },
   })
-  return opened.database
 }
 
 const posixRelative = (root: string, path: string) =>
