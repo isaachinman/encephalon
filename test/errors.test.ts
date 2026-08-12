@@ -43,10 +43,19 @@ describe('error classification', () => {
       Object.assign(new Error('UNIQUE constraint failed'), { code: 'ERR_SQLITE_ERROR', errcode: 1555 }),
       'INTERNAL_ERROR',
     )
+    assertWrappedCode(
+      Object.assign(new Error('database is locked'), {
+        code: 'SQLITE_BUSY_SNAPSHOT',
+        errcode: 19,
+      }),
+      'INTERNAL_ERROR',
+    )
+    assertWrappedCode(Object.assign(new Error('snapshot is busy'), { code: 'SQLITE_BUSY_SNAPSHOT' }), 'IO_ERROR')
   })
 
   test('classifies plain errors without errno as internal defects', () => {
     assertWrappedCode(new Error('Unable to write file.'), 'INTERNAL_ERROR')
+    assertWrappedCode(new Error('database is locked'), 'INTERNAL_ERROR')
   })
 
   test('classifies wrapped SQLite I/O failures as expected public errors', () => {
