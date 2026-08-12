@@ -20,6 +20,12 @@ import { TextDecoder } from 'node:util'
 import { parseAddRecordInput, parseRootInput } from './api-input.ts'
 import { hydrateResolvedRepository } from './cache.ts'
 import type { CacheLocation } from './cache-location.ts'
+import {
+  collectBoundedDirectoryEntries,
+  MAX_CANONICAL_BRAIN_ROOT_ENTRIES,
+  MAX_CANONICAL_KIND_DIRECTORIES,
+  MAX_CANONICAL_KIND_ENTRIES,
+} from './canonical-layout.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
@@ -156,6 +162,9 @@ const issue = (code: string, message: string, path?: string, recordId?: string):
 })
 
 const corpusIssue = (code: string, message: string, path = 'encephalon') => issue(code, message, path)
+
+const directoryEntryLimitIssue = (path: string, maximum: number, entryKind = 'directory entries') =>
+  corpusIssue('CORPUS_DIRECTORY_ENTRY_LIMIT', `${path} may contain at most ${maximum} ${entryKind}.`, path)
 
 const fault = (hooks: RecordWriteHooks | undefined, point: RecordWriteFault) => hooks?.fault?.(point)
 
@@ -348,6 +357,35 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       }
     }
 
+    const rootEntries = collectBoundedDirectoryEntries(brainDirectory, MAX_CANONICAL_BRAIN_ROOT_ENTRIES)
+    if (rootEntries.overflow) {
+      return {
+        bytes: 0,
+        errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_BRAIN_ROOT_ENTRIES)],
+        records: [],
+      }
+    }
+    const kindEntries = rootEntries.entries.filter(
+      entry => !entry.name.startsWith('_') && entry.isDirectory() && !entry.isSymbolicLink(),
+    )
+    if (kindEntries.length > MAX_CANONICAL_KIND_DIRECTORIES) {
+      return {
+        bytes: 0,
+        errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_KIND_DIRECTORIES, 'kind directories')],
+        records: [],
+      }
+    }
+    for (const kindEntry of kindEntries) {
+      const relativeKindPath = `encephalon/${kindEntry.name}`
+      if (collectBoundedDirectoryEntries(join(brainDirectory, kindEntry.name), MAX_CANONICAL_KIND_ENTRIES).overflow) {
+        return {
+          bytes: 0,
+          errors: [directoryEntryLimitIssue(relativeKindPath, MAX_CANONICAL_KIND_ENTRIES)],
+          records: [],
+        }
+      }
+    }
+
     const kindDirectoryNames = new Map<string, string>()
     const scanned: RecordScan = { bytes: 0, errors: [], records: [] }
     let recordBytes = 0
@@ -358,9 +396,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
         stopScanning = true
       }
     }
-    for (const kindEntry of readdirSync(brainDirectory, { withFileTypes: true }).sort((first, second) =>
-      ordinalStringCompare(first.name, second.name),
-    )) {
+    for (const kindEntry of rootEntries.entries) {
       if (stopScanning) {
         break
       }
@@ -407,9 +443,15 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
             )
           }
           const kindIdentity = identityFor(kindMetadata)
-          for (const recordEntry of readdirSync(kindPath, { withFileTypes: true }).sort((first, second) =>
-            ordinalStringCompare(first.name, second.name),
-          )) {
+          const recordEntries = collectBoundedDirectoryEntries(kindPath, MAX_CANONICAL_KIND_ENTRIES)
+          if (recordEntries.overflow) {
+            return {
+              bytes: 0,
+              errors: [directoryEntryLimitIssue(relativeKindPath, MAX_CANONICAL_KIND_ENTRIES)],
+              records: [],
+            }
+          }
+          for (const recordEntry of recordEntries.entries) {
             if (stopScanning) {
               break
             }

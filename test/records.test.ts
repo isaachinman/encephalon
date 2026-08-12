@@ -673,6 +673,7 @@ describe('canonical records', () => {
       writeCanonicalRecord(recordCountRoot, {
         createdAt: timestampAt(index),
         id: `count-${index}`,
+        ...(index === 1000 ? { kind: 'context' } : {}),
         subject: `validation.count.${index}`,
       })
     }
@@ -718,6 +719,71 @@ describe('canonical records', () => {
     const artifactResult = api.validateRecords({ root: artifactRoot })
     assert.equal(artifactResult.valid, false)
     assert.equal(artifactResult.errors[0]?.code, 'CORPUS_ARTIFACT_LIMIT')
+  })
+
+  test('bounds canonical brain-root entries and kind directories before reporting layout details', () => {
+    const rawEntryRoot = createRoot()
+    const brainDirectory = join(rawEntryRoot, 'encephalon')
+    mkdirSync(join(brainDirectory, '_artifacts'), { recursive: true })
+    mkdirSync(join(brainDirectory, '_staging'))
+    for (const index of Array.from({ length: 1001 }, (_, value) => value)) {
+      mkdirSync(join(brainDirectory, `kind-${String(index).padStart(4, '0')}`))
+    }
+
+    const rawEntryResult = api.validateRecords({ root: rawEntryRoot })
+    assert.deepEqual(rawEntryResult.errors, [
+      {
+        code: 'CORPUS_DIRECTORY_ENTRY_LIMIT',
+        message: 'encephalon may contain at most 1002 directory entries.',
+        path: 'encephalon',
+      },
+    ])
+    assert.equal(rawEntryResult.recordsChecked, 0)
+    assert.equal(rawEntryResult.truncated, false)
+
+    const kindDirectoryRoot = createRoot()
+    for (const index of Array.from({ length: 1001 }, (_, value) => value)) {
+      mkdirSync(join(kindDirectoryRoot, 'encephalon', `kind-${String(index).padStart(4, '0')}`), {
+        recursive: true,
+      })
+    }
+    const kindDirectoryResult = api.validateRecords({ root: kindDirectoryRoot })
+    assert.deepEqual(kindDirectoryResult.errors, [
+      {
+        code: 'CORPUS_DIRECTORY_ENTRY_LIMIT',
+        message: 'encephalon may contain at most 1000 kind directories.',
+        path: 'encephalon',
+      },
+    ])
+  })
+
+  test('accepts canonical directory limits exactly and rejects one excess kind entry without reading it', () => {
+    const root = createRoot()
+    const brainDirectory = join(root, 'encephalon')
+    mkdirSync(join(brainDirectory, '_artifacts'), { recursive: true })
+    mkdirSync(join(brainDirectory, '_staging'))
+    for (const index of Array.from({ length: 999 }, (_, value) => value)) {
+      mkdirSync(join(brainDirectory, `kind-${String(index).padStart(4, '0')}`))
+    }
+    writeCanonicalRecord(root, { id: 'first-boundary-record' })
+    for (const index of Array.from({ length: 999 }, (_, value) => value)) {
+      writeCanonicalRecord(root, {
+        id: `boundary-${String(index).padStart(4, '0')}`,
+        subject: `validation.boundary.${index}`,
+      })
+    }
+    assert.equal(api.validateRecords({ root }).valid, true)
+
+    writeFileSync(join(brainDirectory, 'decision', 'zzzz-excess-entry'), 'not JSON')
+    const overflow = api.validateRecords({ root })
+    assert.deepEqual(overflow.errors, [
+      {
+        code: 'CORPUS_DIRECTORY_ENTRY_LIMIT',
+        message: 'encephalon/decision may contain at most 1000 directory entries.',
+        path: 'encephalon/decision',
+      },
+    ])
+    assert.equal(overflow.recordsChecked, 0)
   })
 
   test('rejects addRecord when the candidate would exceed corpus count or byte budgets', () => {

@@ -58,6 +58,7 @@ afterEach(() => {
   cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
   cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
+  cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   recordWriteTestHooks.fault = undefined
   roots.splice(0).forEach(removeTestRepository)
@@ -894,6 +895,59 @@ describe('SQLite cache and reads', () => {
       >('prepare')
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
+  })
+
+  test('does not create a cache when canonical root enumeration overflows', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 1003 }, (_, value) => value)) {
+      mkdirSync(join(root, 'encephalon', `kind-${String(index).padStart(4, '0')}`), { recursive: true })
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: { errors?: Array<{ code?: unknown }> } }
+        assert.equal(actual.code, 'VALIDATION_FAILED')
+        assert.equal(actual.details?.errors?.[0]?.code, 'CORPUS_DIRECTORY_ENTRY_LIMIT')
+        return true
+      },
+    )
+    assert.equal(existsSync(cacheDatabasePath(root)), false)
+  })
+
+  test('classifies a manifest directory overflow after validation as repository change', () => {
+    const root = createRoot()
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    mkdirSync(kindDirectory, { recursive: true })
+    writeFileSync(
+      join(kindDirectory, 'stable.json'),
+      `${JSON.stringify({
+        createdAt: '2026-08-06T10:00:00.000Z',
+        id: 'stable',
+        kind: 'decision',
+        payload: {},
+        source: 'test',
+        subject: 'cache.manifest-bound',
+      })}\n`,
+    )
+    let mutated = false
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      if (!mutated) {
+        mutated = true
+        for (const index of Array.from({ length: 1000 }, (_, value) => value)) {
+          writeFileSync(join(kindDirectory, `extra-${String(index).padStart(4, '0')}`), '')
+        }
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(existsSync(cacheDatabasePath(root)), false)
   })
 
   test('keeps one stable real cache directory during concurrent first use', async () => {
