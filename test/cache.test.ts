@@ -2273,6 +2273,7 @@ describe('SQLite cache and reads', () => {
     const root = createRoot()
     withOperationLock(root, () => 'prepared')
     const gatePath = join(cacheDirectoryPath(root), 'operation-lock.sqlite')
+    const verifiedCacheDirectory = inspectCacheLocation(root).directory
     const database = new DatabaseSync(gatePath)
     try {
       const mode = database.prepare('PRAGMA journal_mode = WAL').get() as { journal_mode?: unknown }
@@ -2294,8 +2295,26 @@ describe('SQLite cache and reads', () => {
       stdio: 'inherit',
     })
     waitForPath(secondAttempted, second)
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300)
+    const candidateDeadline = Date.now() + 5000
+    let secondCandidateObserved = false
+    while (
+      !(secondCandidateObserved || existsSync(secondEntered)) &&
+      first.exitCode === null &&
+      second.exitCode === null &&
+      Date.now() < candidateDeadline
+    ) {
+      secondCandidateObserved = readdirSync(verifiedCacheDirectory, { withFileTypes: true }).some(
+        entry => entry.isDirectory() && /^operation\.lock\.[0-9a-f-]{36}$/u.test(entry.name),
+      )
+      if (!secondCandidateObserved) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+      }
+    }
     const secondEnteredBeforeRelease = existsSync(secondEntered)
+    assert.equal(secondCandidateObserved || secondEnteredBeforeRelease, true)
+    assert.equal(first.exitCode, null)
+    assert.equal(second.exitCode, null)
+    assert.equal(secondEnteredBeforeRelease, false)
     writeFileSync(releasePath, 'release')
 
     if (first.exitCode === null) {
@@ -2306,7 +2325,6 @@ describe('SQLite cache and reads', () => {
     }
     assert.equal(first.exitCode, 0)
     assert.equal(second.exitCode, 0)
-    assert.equal(secondEnteredBeforeRelease, false)
     assert.equal(existsSync(secondEntered), true)
   })
 
