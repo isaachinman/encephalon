@@ -182,4 +182,33 @@ describe('SQLite consumer policies', () => {
       cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
     }
   })
+
+  test('operation gate reports contention after one corrupt recovery retry', () => {
+    const contentionCases = policyCases.filter(entry => entry.category === 'busy' || entry.category === 'locked')
+    for (const entry of contentionCases) {
+      const root = createRoot()
+      let gateInitialisations = 0
+      cacheLocationTestHooks.afterDatabaseLockInitialisation = () => {
+        gateInitialisations += 1
+        if (gateInitialisations <= 2) {
+          throw corruptRecoveryError
+        }
+        if (gateInitialisations === 3) {
+          throw entry.error
+        }
+      }
+
+      assert.throws(
+        () => withOperationLock(root, () => 'entered'),
+        (error: unknown) => {
+          assert.ok(error instanceof EncephalonError)
+          assert.equal(error.code, 'CACHE_BUSY', entry.category)
+          assert.deepEqual(error.details, { timeoutMilliseconds: 60_000 }, entry.category)
+          return true
+        },
+      )
+      assert.equal(gateInitialisations, 3, entry.category)
+      cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+    }
+  })
 })

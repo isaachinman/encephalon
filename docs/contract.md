@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-12 for audited snapshot `5f50f2bd3c9e896480bf954b44fdc13c74bc5bd2`.
+Last reviewed: 2026-08-12 for audited snapshot `eaff22439ae593b4d38a5a801a7d56704b9b5754`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -33,6 +33,8 @@ This document is the concise contract maintainers should update when public beha
 - SQLite is disposable derived state under `node_modules/.cache/encephalon`.
 - The repository, cache ancestors, SQLite databases and sidecars, operation-lock metadata, recovery entries, and quarantine entries must be real contained filesystem entries verified by type, native realpath, and stable identity. Static symlinks, junction redirects, unexpected types, and replacements at validation boundaries fail closed.
 - Missing cache ancestors are created individually. New primary databases use exclusive no-follow descriptor creation before SQLite opens the verified pathname, and destructive recovery removes only the exact identity moved to a verified sibling quarantine.
+- Corrupt operation-gate recovery is serialised by a bounded owner marker and one total deadline. A well-formed live owner is never reclaimed because of age; oversized, non-record, otherwise malformed, dead, or ownerless markers remain reclaimable only while their observed state remains current at the destructive boundary. Recovery work, successful gate initialisation, and cleanup are conditional on the captured directory identity and random owner token. Cleanup failure prevents entry into the protected operation, and a later call may reclaim only that exact abandoned identity and token.
+- Recovery-marker exclusion begins with atomic directory creation. An owner file that is briefly absent is age-reclaimed rather than published by candidate-directory rename because Node has no cross-platform no-replace directory rename, and replacement semantics could displace an empty live marker.
 - Every `list`, `show`, `search`, and `gather` operation prepares the cache before reading.
 - Cache rebuilds are transactional and repository-scoped. Corrupt or incompatible cache state is removed and rebuilt rather than treated as canonical data.
 - SQLite result classification normalises extended numeric codes to their primary result, gives structured numeric and symbolic codes precedence over messages, and uses bounded message fallback only for generic SQLite runtime errors.
