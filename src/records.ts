@@ -16,7 +16,12 @@ import {
 import { basename, join, relative, resolve } from 'node:path'
 import { TextDecoder } from 'node:util'
 import { parseAddRecordInput, parseRootInput } from './api-input.ts'
-import { ArtifactChangedError, type ArtifactObservation, inspectArtifactFiles } from './artifact-inspection.ts'
+import {
+  ArtifactChangedError,
+  type ArtifactInspectionResult,
+  type ArtifactObservation,
+  inspectArtifactFiles,
+} from './artifact-inspection.ts'
 import { hydrateResolvedRepository } from './cache.ts'
 import type { CacheLocation } from './cache-location.ts'
 import {
@@ -829,12 +834,15 @@ const artifactIssues = (root: string, records: BrainRecord[]) => {
   const paths = new Map<string, string>()
   const errors: ValidationIssue[] = []
   const artifactPaths = [...new Set(records.flatMap(record => record.artifacts ?? []))].sort(ordinalStringCompare)
-  const inspectionResults = new Map(
-    inspectArtifactFiles(brainDirectory, artifactPaths).map(result => [
-      result.kind === 'stable' ? result.observation.path : result.path,
-      result,
-    ]),
-  )
+  const inspectionResults =
+    artifactPaths.length === 0
+      ? new Map<string, ArtifactInspectionResult>()
+      : new Map(
+          inspectArtifactFiles(brainDirectory, artifactPaths).map(result => [
+            result.kind === 'stable' ? result.observation.path : result.path,
+            result,
+          ]),
+        )
   for (const record of records) {
     for (const artifact of record.artifacts ?? []) {
       const collisionKey = artifact.normalize('NFC').toLowerCase()

@@ -270,8 +270,10 @@ test('keeps operational artifact I/O errors classified as IO_ERROR', () => {
   assert.throws(
     () => api.hydrate({ root }),
     (error: unknown) => {
-      assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
-      assert.equal(JSON.stringify(error).includes(root), false)
+      const failure = error as { code?: unknown; details?: unknown; message?: unknown }
+      assert.equal(failure.code, 'IO_ERROR')
+      assert.equal(typeof failure.message === 'string' && failure.message.includes(root), false)
+      assert.equal(JSON.stringify(failure.details ?? null).includes(root), false)
       return true
     },
   )

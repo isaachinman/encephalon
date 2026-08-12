@@ -273,6 +273,18 @@ describe('canonical records', () => {
     assert.equal(Object.isFrozen(validated.artifacts[0]), true)
   })
 
+  test('does not inspect the artifact filesystem for an artifact-free corpus', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'artifact-free' })
+    artifactInspectionTestHooks.fault = point => {
+      if (point === 'after-brain-lstat') {
+        throw new Error('artifact inspection should not run')
+      }
+    }
+
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
   test('classifies public artifact validation failures without leaking repository paths', () => {
     const cases = [
       { code: undefined, expected: 'INVALID_ARTIFACT', name: 'stable-invalid' },
