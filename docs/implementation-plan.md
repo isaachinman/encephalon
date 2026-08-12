@@ -7,7 +7,7 @@ Initial npm package: `encephalon@0.1.0`
 License: MIT  
 Runtime: Node.js 24.15.0 or newer  
 Maintainer toolchain: TypeScript and Bun  
-Audited implementation snapshot: `4e362626c63e89bf28b4a6a6e67b97f86360b57d` on 2026-08-12
+Audited implementation snapshot: `7216079634592eccd4d4a4ac19b775d985997e0c` on 2026-08-13
 Current maintained contract: [`docs/contract.md`](./contract.md), the README, package checks, and executable tests
 
 ## 1. Purpose of this document
