@@ -1984,14 +1984,35 @@ describe('SQLite cache and reads', () => {
     const root = createRoot()
     const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
     mkdirSync(recoveryPath, { recursive: true })
-    writeFileSync(join(recoveryPath, 'owner.json'), 'x'.repeat(4097))
+    const oversizedOwner = `${JSON.stringify({
+      acquiredAt: new Date().toISOString(),
+      padding: 'x'.repeat(4096),
+      pid: process.pid,
+      token: 'oversized-live-owner',
+    })}\n`
+    assert.ok(Buffer.byteLength(oversizedOwner) > 4096)
+    writeFileSync(join(recoveryPath, 'owner.json'), oversizedOwner)
     const oldTimestamp = new Date('2026-08-06T10:00:00.000Z')
     utimesSync(recoveryPath, oldTimestamp, oldTimestamp)
+    let observations = 0
+    let staleCallbacks = 0
 
     assert.equal(
-      withOperationLock(root, () => 'entered'),
+      withOperationLock(root, () => 'entered', {
+        afterRecoveryStaleObservation: () => {
+          staleCallbacks += 1
+        },
+        duringRecoveryObservation: () => {
+          observations += 1
+          if (observations === 2) {
+            rmSync(recoveryPath, { recursive: true })
+          }
+        },
+      }),
       'entered',
     )
+    assert.equal(observations, 1)
+    assert.equal(staleCallbacks, 1)
   })
 
   test('reacquires recovery ownership when its owner token is replaced before gate recovery', () => {
@@ -2085,6 +2106,68 @@ describe('SQLite cache and reads', () => {
       }),
       'entered on retry',
     )
+  })
+
+  test('preserves live token and identity replacements for an abandoned recovery marker', () => {
+    const cases = ['replacement-token', 'replacement-identity'] as const
+    for (const replacement of cases) {
+      const root = createRoot()
+      const cachePath = cacheDirectoryPath(root)
+      const recoveryPath = join(cachePath, 'operation-lock.recovery')
+      const displacedAbandonedPath = join(root, `${replacement}-abandoned`)
+      const preservedReplacementPath = join(root, `${replacement}-preserved`)
+      mkdirSync(cachePath, { recursive: true })
+      writeFileSync(join(cachePath, 'operation-lock.sqlite'), 'not a sqlite database')
+      cacheLocationTestHooks.beforeQuarantineRename = path => {
+        if (basename(path) === 'operation-lock.recovery') {
+          cacheLocationTestHooks.beforeQuarantineRename = undefined
+          throw new Error('recovery cleanup fault')
+        }
+      }
+
+      assert.throws(() => withOperationLock(root, () => 'not entered'))
+      const abandonedIdentity = statSync(recoveryPath, { bigint: true })
+      const abandonedOwner = JSON.parse(readFileSync(join(recoveryPath, 'owner.json'), 'utf8')) as {
+        acquiredAt: string
+        pid: number
+        token: string
+      }
+      const replacementOwner =
+        replacement === 'replacement-token' ? { ...abandonedOwner, token: 'live-replacement-token' } : abandonedOwner
+      if (replacement === 'replacement-identity') {
+        renameSync(recoveryPath, displacedAbandonedPath)
+        mkdirSync(recoveryPath)
+      }
+      writeFileSync(join(recoveryPath, 'owner.json'), `${JSON.stringify(replacementOwner)}\n`)
+      const replacementIdentity = statSync(recoveryPath, { bigint: true })
+      assert.equal(sameCacheEntryIdentity(abandonedIdentity, replacementIdentity), replacement === 'replacement-token')
+      let observations = 0
+      let staleCallbacks = 0
+
+      assert.equal(
+        withOperationLock(root, () => 'entered', {
+          afterRecoveryStaleObservation: () => {
+            staleCallbacks += 1
+          },
+          duringRecoveryObservation: () => {
+            observations += 1
+            assert.deepEqual(JSON.parse(readFileSync(join(recoveryPath, 'owner.json'), 'utf8')), replacementOwner)
+            assert.equal(sameCacheEntryIdentity(replacementIdentity, statSync(recoveryPath, { bigint: true })), true)
+            if (observations === 2) {
+              renameSync(recoveryPath, preservedReplacementPath)
+            }
+          },
+        }),
+        'entered',
+      )
+      assert.equal(observations, 2, replacement)
+      assert.equal(staleCallbacks, 0, replacement)
+      assert.equal(
+        sameCacheEntryIdentity(replacementIdentity, statSync(preservedReplacementPath, { bigint: true })),
+        true,
+      )
+      assert.deepEqual(JSON.parse(readFileSync(join(preservedReplacementPath, 'owner.json'), 'utf8')), replacementOwner)
+    }
   })
 
   test('reobserves a recovery marker that disappears between directory lstat and realpath', () => {

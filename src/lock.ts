@@ -17,6 +17,7 @@ import {
   quarantineCacheDatabase,
   quarantineCacheOwnedDirectory,
   readCacheOwner,
+  sameCacheEntryIdentity,
   writeCacheOwner,
 } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
@@ -56,11 +57,23 @@ type OwnedRecoveryMarker = {
 }
 
 const abandonedRecoveryMarkers = new Map<string, OwnedRecoveryMarker>()
+const MAX_ABANDONED_RECOVERY_MARKERS = 64
 
 const MAX_OWNER_BYTES = 4096
 const MAX_OWNER_PID = 2_147_483_647
 const MAX_OWNER_TIMESTAMP_LENGTH = 64
 const MAX_OWNER_TOKEN_LENGTH = 128
+
+const rememberAbandonedRecoveryMarker = (marker: OwnedRecoveryMarker) => {
+  abandonedRecoveryMarkers.delete(marker.directory.path)
+  abandonedRecoveryMarkers.set(marker.directory.path, marker)
+  if (abandonedRecoveryMarkers.size > MAX_ABANDONED_RECOVERY_MARKERS) {
+    const oldestPath = abandonedRecoveryMarkers.keys().next().value
+    if (oldestPath !== undefined) {
+      abandonedRecoveryMarkers.delete(oldestPath)
+    }
+  }
+}
 
 const readOwner = (location: CacheLocation, directory: CacheOwnedDirectory): LockOwner | undefined => {
   try {
@@ -133,8 +146,7 @@ export const withOperationLock = <Result>(
       const matches =
         abandoned.directory.path === directory.path &&
         abandoned.directory.name === directory.name &&
-        abandoned.directory.dev === directory.dev &&
-        abandoned.directory.ino === directory.ino &&
+        sameCacheEntryIdentity(abandoned.directory, directory) &&
         owner?.token === abandoned.token
       if (!matches) {
         abandonedRecoveryMarkers.delete(directory.path)
@@ -296,6 +308,20 @@ export const withOperationLock = <Result>(
     return owned
   }
 
+  const beginRecoveryGate = (ownedMarker: OwnedRecoveryMarker) => {
+    try {
+      return { category: undefined, recovered: beginGateWhileRecoveryOwned(ownedMarker) }
+    } catch (error) {
+      const category = sqliteFailureCategory(error)
+      if (category === 'busy' || category === 'locked') {
+        return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
+          timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
+        })
+      }
+      return { category, error, recovered: false }
+    }
+  }
+
   const acquireRecoveryMarker = (): OwnedRecoveryMarker => {
     let ownedMarker: OwnedRecoveryMarker | undefined
     while (ownedMarker === undefined) {
@@ -345,24 +371,22 @@ export const withOperationLock = <Result>(
   const recoverGateWhileOwned = (ownedMarker: OwnedRecoveryMarker) => {
     let recovered = false
     if (recoveryMarkerIsOwned(ownedMarker)) {
-      try {
-        recovered = beginGateWhileRecoveryOwned(ownedMarker)
-      } catch (error) {
-        const category = sqliteFailureCategory(error)
-        if (category === 'busy' || category === 'locked') {
-          return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
-            timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
-          })
-        }
-        if (category === 'corrupt' || category === 'notadb') {
+      const initial = beginRecoveryGate(ownedMarker)
+      ;({ recovered } = initial)
+      if (initial.error !== undefined) {
+        if (initial.category === 'corrupt' || initial.category === 'notadb') {
           if (recoveryMarkerIsOwned(ownedMarker)) {
-            quarantineCorruptGate(error)
+            quarantineCorruptGate(initial.error)
             if (recoveryMarkerIsOwned(ownedMarker)) {
-              recovered = beginGateWhileRecoveryOwned(ownedMarker)
+              const retried = beginRecoveryGate(ownedMarker)
+              ;({ recovered } = retried)
+              if (retried.error !== undefined) {
+                throw retried.error
+              }
             }
           }
         } else {
-          throw error
+          throw initial.error
         }
       }
     }
@@ -384,7 +408,7 @@ export const withOperationLock = <Result>(
         releaseOwnedLock(location, ownedMarker.directory, ownedMarker.token)
         abandonedRecoveryMarkers.delete(ownedMarker.directory.path)
       } catch (error) {
-        abandonedRecoveryMarkers.set(ownedMarker.directory.path, ownedMarker)
+        rememberAbandonedRecoveryMarker(ownedMarker)
         cleanupError = error
       }
       if (recoveryError !== undefined) {
