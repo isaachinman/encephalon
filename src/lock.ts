@@ -5,19 +5,15 @@ import {
   assertCacheLockCandidates,
   type CacheDatabase,
   CacheDatabaseFailure,
-  CacheDatabaseSidecarChanged,
   type CacheLocation,
   type CacheOwnedDirectory,
-  cacheDatabaseDidOpen,
-  cacheDatabaseWillOpen,
   cacheOwnedDirectoryIsCurrent,
   cacheOwnedDirectoryMtimeMilliseconds,
   createCacheOwnedDirectory,
   failCacheDatabase,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
-  MAX_CACHE_DATABASE_OPEN_ATTEMPTS,
-  prepareCacheDatabase,
+  openVerifiedCacheDatabase,
   promoteCacheOwnedDirectory,
   quarantineCacheDatabase,
   quarantineCacheOwnedDirectory,
@@ -203,52 +199,35 @@ export const withOperationLock = <Result>(
     if (!recoveryLockHeld) {
       waitForGateRecovery()
     }
-    gateDatabase = prepareCacheDatabase(location, 'operation-lock.sqlite')
-    const attempts = Array.from({ length: MAX_CACHE_DATABASE_OPEN_ATTEMPTS }, (_, index) => index)
-    for (const attempt of attempts) {
-      cacheDatabaseWillOpen(gateDatabase)
-      gateDatabase = assertCacheDatabase(location, gateDatabase)
+    const opened = openVerifiedCacheDatabase({
+      create: true,
+      DatabaseConstructor: DatabaseSync,
+      location,
+      name: 'operation-lock.sqlite',
+      openOptions: { timeout: remainingMilliseconds() },
+    })
+    gate = opened.database
+    gateDatabase = opened.snapshot
+    try {
+      gate.exec('BEGIN IMMEDIATE')
+      gateTransaction = true
+    } catch (error) {
+      let validationError: unknown
       try {
-        gate = new DatabaseSync(gateDatabase.path, { timeout: remainingMilliseconds() })
-      } catch (error) {
-        return failCacheDatabase(error, gateDatabase)
-      }
-      try {
-        cacheDatabaseDidOpen(gateDatabase)
-        // Node's SQLite API accepts only pathnames, leaving a narrow replacement race
-        // between this identity check and SQLite's internal open.
         gateDatabase = assertCacheDatabase(location, gateDatabase)
-        gate.exec('BEGIN IMMEDIATE')
-        gateTransaction = true
-        return
-      } catch (error) {
-        if (error instanceof CacheDatabaseSidecarChanged) {
-          gate.close()
-          gate = undefined
-          gateDatabase = error.database
-          if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
-            throw error
-          }
-        } else {
-          let validationError: unknown
-          try {
-            gateDatabase = assertCacheDatabase(location, gateDatabase)
-          } catch (candidate) {
-            validationError = candidate
-          }
-          gate.close()
-          gate = undefined
-          if (validationError !== undefined) {
-            throw validationError
-          }
-          if (error instanceof EncephalonError) {
-            throw error
-          }
-          return failCacheDatabase(error, gateDatabase)
-        }
+      } catch (candidate) {
+        validationError = candidate
       }
+      gate.close()
+      gate = undefined
+      if (validationError !== undefined) {
+        throw validationError
+      }
+      if (error instanceof EncephalonError) {
+        throw error
+      }
+      return failCacheDatabase(error, gateDatabase)
     }
-    return fail('INTERNAL_ERROR', 'The Encephalon gate database open ended unexpectedly.')
   }
 
   const recoverCorruptGate = () => {

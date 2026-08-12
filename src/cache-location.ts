@@ -21,7 +21,7 @@ import { EncephalonError, fail } from './errors.ts'
 const CACHE_COMPONENTS = ['node_modules', '.cache', 'encephalon'] as const
 const DATABASE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'] as const
 const OPTIONAL_FILE_OBSERVATION_ATTEMPTS = 3
-export const MAX_CACHE_DATABASE_OPEN_ATTEMPTS = 3
+const MAX_CACHE_DATABASE_OPEN_ATTEMPTS = 3
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0
 
 export type CacheEntryIdentity = {
@@ -54,6 +54,27 @@ export type CacheDatabase = CacheFile & {
 
 export type CacheDatabaseName = 'brain.sqlite' | 'operation-lock.sqlite'
 
+type CacheDatabaseConstructor<Database> = new (
+  path: string,
+  options?: {
+    readOnly?: boolean
+    timeout?: number
+  },
+) => Database
+
+type VerifiedCacheDatabaseOptions<Database> = {
+  afterVerifiedOpen?: ((database: Database) => void) | undefined
+  create: boolean
+  DatabaseConstructor: CacheDatabaseConstructor<Database>
+  location: CacheLocation
+  missing?: (() => never) | undefined
+  name: CacheDatabaseName
+  openOptions?: {
+    readOnly?: boolean
+    timeout?: number
+  }
+}
+
 export type CacheOwnedDirectory = CacheEntryIdentity & {
   name: string
   path: string
@@ -71,7 +92,7 @@ export class CacheDatabaseFailure extends Error {
   }
 }
 
-export class CacheDatabaseSidecarChanged extends EncephalonError {
+class CacheDatabaseSidecarChanged extends EncephalonError {
   readonly database: CacheDatabase
 
   constructor(database: CacheDatabase, relativePath: string) {
@@ -94,6 +115,7 @@ type CacheLocationTestHooks = {
   beforeDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
   beforeLocationInspection?: (() => void) | undefined
   beforeQuarantineRename?: ((path: string) => void) | undefined
+  duringOwnedDirectoryInspection?: ((path: string) => void) | undefined
 }
 
 export const cacheLocationTestHooks: CacheLocationTestHooks = {}
@@ -337,7 +359,7 @@ const bootstrapPrimary = (location: CacheLocation, name: CacheDatabaseName) => {
   return identity
 }
 
-export const prepareCacheDatabase = (location: CacheLocation, name: CacheDatabaseName): CacheDatabase => {
+const prepareCacheDatabase = (location: CacheLocation, name: CacheDatabaseName): CacheDatabase => {
   assertCacheLocation(location)
   const sidecars = inspectSidecars(location, name)
   const path = resolve(location.directory, name)
@@ -364,21 +386,72 @@ export const assertCacheDatabase = (location: CacheLocation, database: CacheData
   return { ...database, sidecars: reconcileSidecars(location, database) }
 }
 
-export const refreshCacheDatabase = (location: CacheLocation, database: CacheDatabase) => {
-  assertCacheLocation(location)
-  const identity = inspectRegularFile(database.path, database.relativePath)
-  if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
-    return changedLayout(database.relativePath, 'stable-identity')
+export const openVerifiedCacheDatabase = <Database extends { close: () => void }>(
+  options: VerifiedCacheDatabaseOptions<Database>,
+) => {
+  const initial = options.create
+    ? prepareCacheDatabase(options.location, options.name)
+    : inspectCacheDatabase(options.location, options.name)
+  if (initial === undefined) {
+    if (options.missing !== undefined) {
+      return options.missing()
+    }
+    return fail('INTERNAL_ERROR', 'The requested Encephalon cache database is missing.')
   }
-  return { ...database, sidecars: reconcileSidecars(location, database) }
-}
-
-export const cacheDatabaseWillOpen = (database: CacheDatabase) => {
-  cacheLocationTestHooks.beforeDatabaseOpen?.(database)
-}
-
-export const cacheDatabaseDidOpen = (database: CacheDatabase) => {
-  cacheLocationTestHooks.afterDatabaseOpen?.(database)
+  let snapshot = initial
+  const attempts = Array.from({ length: MAX_CACHE_DATABASE_OPEN_ATTEMPTS }, (_, index) => index)
+  for (const attempt of attempts) {
+    try {
+      cacheLocationTestHooks.beforeDatabaseOpen?.(snapshot)
+      snapshot = assertCacheDatabase(options.location, snapshot)
+    } catch (error) {
+      if (error instanceof CacheDatabaseSidecarChanged) {
+        snapshot = error.database
+        if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
+          throw error
+        }
+        continue
+      }
+      throw error
+    }
+    let database: Database
+    try {
+      database = new options.DatabaseConstructor(snapshot.path, options.openOptions)
+    } catch (error) {
+      return failCacheDatabase(error, snapshot)
+    }
+    try {
+      cacheLocationTestHooks.afterDatabaseOpen?.(snapshot)
+      snapshot = assertCacheDatabase(options.location, snapshot)
+      options.afterVerifiedOpen?.(database)
+      snapshot = assertCacheDatabase(options.location, snapshot)
+      return { database, snapshot }
+    } catch (error) {
+      if (error instanceof CacheDatabaseSidecarChanged) {
+        database.close()
+        snapshot = error.database
+        if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
+          throw error
+        }
+      } else {
+        let validationError: unknown
+        try {
+          snapshot = assertCacheDatabase(options.location, snapshot)
+        } catch (candidate) {
+          validationError = candidate
+        }
+        database.close()
+        if (validationError !== undefined) {
+          throw validationError
+        }
+        if (error instanceof EncephalonError) {
+          throw error
+        }
+        return failCacheDatabase(error, snapshot)
+      }
+    }
+  }
+  return fail('INTERNAL_ERROR', 'The verified Encephalon cache database open ended unexpectedly.')
 }
 
 const quarantineFile = (location: CacheLocation, expected: CacheFile, required: boolean) => {
@@ -437,19 +510,48 @@ const inspectOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
     return fail('INTERNAL_ERROR', 'An unsupported cache directory name was requested.')
   }
   const path = resolve(location.directory, name)
-  let metadata: BigIntStats
+  let initialMetadata: BigIntStats
   try {
-    metadata = lstatSync(path, { bigint: true })
+    initialMetadata = lstatSync(path, { bigint: true })
   } catch (error) {
     if (missingPath(error)) {
       return
     }
     throw error
   }
-  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !samePath(realpathSync.native(path), path)) {
+  if (!initialMetadata.isDirectory() || initialMetadata.isSymbolicLink()) {
     return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
   }
-  return { ...identityFrom(metadata), name, path }
+  const captured = identityFrom(initialMetadata)
+  cacheLocationTestHooks.duringOwnedDirectoryInspection?.(path)
+  let actualRealpath: string
+  try {
+    actualRealpath = realpathSync.native(path)
+  } catch (error) {
+    if (missingPath(error)) {
+      return
+    }
+    throw error
+  }
+  if (!samePath(actualRealpath, path)) {
+    return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
+  }
+  let finalMetadata: BigIntStats
+  try {
+    finalMetadata = lstatSync(path, { bigint: true })
+  } catch (error) {
+    if (missingPath(error)) {
+      return
+    }
+    throw error
+  }
+  if (!finalMetadata.isDirectory() || finalMetadata.isSymbolicLink()) {
+    return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
+  }
+  if (!sameCacheEntryIdentity(captured, identityFrom(finalMetadata))) {
+    return
+  }
+  return { ...captured, name, path }
 }
 
 export const inspectCacheOwnedDirectory = (location: CacheLocation, name: string) => {

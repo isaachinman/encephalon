@@ -13,17 +13,12 @@ import {
 import {
   assertCacheDatabase,
   CacheDatabaseFailure,
-  CacheDatabaseSidecarChanged,
   type CacheLocation,
-  cacheDatabaseDidOpen,
-  cacheDatabaseWillOpen,
   failCacheDatabase,
   inspectCacheDatabase,
   inspectCacheLocation,
-  MAX_CACHE_DATABASE_OPEN_ATTEMPTS,
-  prepareCacheDatabase,
+  openVerifiedCacheDatabase,
   quarantineCacheDatabase,
-  refreshCacheDatabase,
 } from './cache-location.ts'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
@@ -256,110 +251,77 @@ const createCacheSchema = (database: DatabaseSync) => {
 const openWriterDatabase = (location: CacheLocation) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  let cacheDatabase = prepareCacheDatabase(location, 'brain.sqlite')
-  const attempts = Array.from({ length: MAX_CACHE_DATABASE_OPEN_ATTEMPTS }, (_, index) => index)
-  for (const attempt of attempts) {
-    cacheDatabaseWillOpen(cacheDatabase)
-    cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-    let database: DatabaseSync
-    try {
-      database = new DatabaseConstructor(cacheDatabase.path, {
-        timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
-      })
-    } catch (error) {
-      return failCacheDatabase(error, cacheDatabase)
-    }
-    try {
-      cacheDatabaseDidOpen(cacheDatabase)
-      // Node's SQLite API accepts only pathnames, leaving a narrow replacement race
-      // between this identity check and SQLite's internal open.
-      cacheDatabase = assertCacheDatabase(location, cacheDatabase)
+  const opened = openVerifiedCacheDatabase({
+    afterVerifiedOpen: database => {
       database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
-      cacheDatabase = refreshCacheDatabase(location, cacheDatabase)
-      createCacheSchema(database)
-      assertCacheSchema(database)
+    },
+    create: true,
+    DatabaseConstructor,
+    location,
+    name: 'brain.sqlite',
+    openOptions: { timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS },
+  })
+  let cacheDatabase = opened.snapshot
+  try {
+    createCacheSchema(opened.database)
+    assertCacheSchema(opened.database)
+    cacheDatabase = assertCacheDatabase(location, cacheDatabase)
+    return opened.database
+  } catch (error) {
+    let validationError: unknown
+    try {
       cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-      return database
-    } catch (error) {
-      if (error instanceof CacheDatabaseSidecarChanged) {
-        database.close()
-        cacheDatabase = error.database
-        if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
-          throw error
-        }
-      } else {
-        let validationError: unknown
-        try {
-          cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-        } catch (candidate) {
-          validationError = candidate
-        }
-        database.close()
-        if (validationError !== undefined) {
-          throw validationError
-        }
-        if (error instanceof EncephalonError) {
-          throw error
-        }
-        return failCacheDatabase(error, cacheDatabase)
-      }
+    } catch (candidate) {
+      validationError = candidate
     }
+    opened.database.close()
+    if (validationError !== undefined) {
+      throw validationError
+    }
+    if (error instanceof EncephalonError) {
+      throw error
+    }
+    return failCacheDatabase(error, cacheDatabase)
   }
-  return fail('INTERNAL_ERROR', 'The Encephalon writer database open ended unexpectedly.')
 }
 
 const openReaderDatabase = (location: CacheLocation) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  let cacheDatabase = inspectCacheDatabase(location, 'brain.sqlite')
-  if (cacheDatabase === undefined) {
-    throw new CacheSchemaMismatch('The cache database disappeared before it was opened.')
-  }
-  const attempts = Array.from({ length: MAX_CACHE_DATABASE_OPEN_ATTEMPTS }, (_, index) => index)
-  for (const attempt of attempts) {
-    cacheDatabaseWillOpen(cacheDatabase)
+  const opened = openVerifiedCacheDatabase({
+    create: false,
+    DatabaseConstructor,
+    location,
+    missing: () => {
+      throw new CacheSchemaMismatch('The cache database disappeared before it was opened.')
+    },
+    name: 'brain.sqlite',
+    openOptions: {
+      readOnly: true,
+      timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
+    },
+  })
+  let cacheDatabase = opened.snapshot
+  try {
+    assertCacheSchema(opened.database)
     cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-    let database: DatabaseSync
+    return opened.database
+  } catch (error) {
+    let validationError: unknown
     try {
-      database = new DatabaseConstructor(cacheDatabase.path, {
-        readOnly: true,
-        timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
-      })
-    } catch (error) {
-      return failCacheDatabase(error, cacheDatabase)
-    }
-    try {
-      cacheDatabaseDidOpen(cacheDatabase)
       cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-      assertCacheSchema(database)
-      cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-      return database
-    } catch (error) {
-      if (error instanceof CacheDatabaseSidecarChanged) {
-        database.close()
-        cacheDatabase = error.database
-        if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
-          throw error
-        }
-      } else {
-        let validationError: unknown
-        try {
-          cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-        } catch (candidate) {
-          validationError = candidate
-        }
-        database.close()
-        if (validationError !== undefined) {
-          throw validationError
-        }
-        if (error instanceof EncephalonError) {
-          throw error
-        }
-        return failCacheDatabase(error, cacheDatabase)
-      }
+    } catch (candidate) {
+      validationError = candidate
     }
+    opened.database.close()
+    if (validationError !== undefined) {
+      throw validationError
+    }
+    if (error instanceof EncephalonError) {
+      throw error
+    }
+    return failCacheDatabase(error, cacheDatabase)
   }
-  return fail('INTERNAL_ERROR', 'The Encephalon reader database open ended unexpectedly.')
 }
 
 const posixRelative = (root: string, path: string) =>
