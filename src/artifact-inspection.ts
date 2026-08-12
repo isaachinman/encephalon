@@ -11,28 +11,25 @@ import { sameStableEntryMetadata } from './filesystem-entry.ts'
 
 export type ArtifactInspectionFault =
   | 'after-ancestor-capture'
+  | 'after-ancestor-lstat'
   | 'after-artifact-fstat'
   | 'after-artifact-lstat'
+  | 'after-artifact-open'
+  | 'after-brain-lstat'
+  | 'after-final-artifact-fstat'
   | 'before-ancestor-lstat'
   | 'before-final-directory-revalidation'
 
 export type ArtifactInspectionHooks = {
   close?: ((descriptor: number) => void) | undefined
   fault?: ((point: ArtifactInspectionFault, artifact: string) => void) | undefined
+  open?: ((path: string, flags: number) => number) | undefined
 }
 
 /** @internal */
 export const artifactInspectionTestHooks: ArtifactInspectionHooks = {}
 
-export type ArtifactManifestFields = Readonly<{
-  ctimeNanoseconds: string
-  mtimeNanoseconds: string
-  size: string
-  type: 'file'
-}>
-
 export type ArtifactObservation = Readonly<{
-  manifest: ArtifactManifestFields
   metadata: BigIntStats
   path: string
 }>
@@ -40,6 +37,8 @@ export type ArtifactObservation = Readonly<{
 export type ArtifactInspectionResult =
   | Readonly<{ error: ArtifactInvalidError; kind: 'invalid'; path: string }>
   | Readonly<{ kind: 'stable'; observation: ArtifactObservation }>
+
+type StableArtifactInspection = Extract<ArtifactInspectionResult, { kind: 'stable' }>
 
 export class ArtifactInvalidError extends Error {
   constructor(message = 'Artifact must be an existing regular non-symlink file.') {
@@ -56,6 +55,9 @@ export class ArtifactChangedError extends Error {
 }
 
 const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
+const nonBlockFlag = typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0
+const noControllingTerminalFlag = typeof constants.O_NOCTTY === 'number' ? constants.O_NOCTTY : 0
+const artifactOpenFlags = constants.O_RDONLY | noFollowFlag | nonBlockFlag | noControllingTerminalFlag
 
 const changed = (): never => {
   throw new ArtifactChangedError()
@@ -93,11 +95,16 @@ const captureAncestor = (
     hooks.fault?.('before-ancestor-lstat', artifact)
     const metadata = lstatSync(path, { bigint: true })
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      revalidateDirectoryWitness(parent)
       return invalid()
     }
+    hooks.fault?.('after-ancestor-lstat', artifact)
     const witness = captureDirectoryWitness(path, { allowLink: false })
     hooks.fault?.('after-ancestor-capture', artifact)
-    if (witness.canonicalPath !== resolve(parent.canonicalPath, segment)) {
+    if (
+      witness.canonicalPath !== resolve(parent.canonicalPath, segment) ||
+      !sameStableEntryMetadata(metadata, witness.pathMetadata)
+    ) {
       return changed()
     }
     revalidateDirectoryWitness(parent)
@@ -143,13 +150,13 @@ const inspectFinalFile = (
   directories: readonly DirectoryWitness[],
   artifact: string,
   hooks: ArtifactInspectionHooks,
-): ArtifactInspectionResult => {
+): StableArtifactInspection => {
   const parent = directories.at(-1)
   if (parent === undefined) {
     return changed()
   }
   const name = artifact.split('/').at(-1)
-  if (name === undefined) {
+  if (name === undefined || name.length === 0) {
     return invalid()
   }
   const path = resolve(parent.canonicalPath, name)
@@ -159,43 +166,49 @@ const inspectFinalFile = (
   } catch (error) {
     if (isReplacementError(error)) {
       revalidateDirectories(directories)
-      return Object.freeze({
-        error: new ArtifactInvalidError(),
-        kind: 'invalid' as const,
-        path: artifact,
-      })
+      return invalid()
     }
     throw error
   }
   if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink()) {
     revalidateDirectories(directories)
-    return Object.freeze({
-      error: new ArtifactInvalidError(),
-      kind: 'invalid' as const,
-      path: artifact,
-    })
+    return invalid()
   }
   hooks.fault?.('after-artifact-lstat', artifact)
 
   let descriptor: number
   try {
-    descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
+    descriptor = (hooks.open ?? openSync)(path, artifactOpenFlags)
   } catch (error) {
     if (isReplacementError(error)) {
       return changed()
     }
+    let current: BigIntStats
+    try {
+      current = lstatSync(path, { bigint: true })
+    } catch (revalidationError) {
+      if (isReplacementError(revalidationError)) {
+        return changed()
+      }
+      throw error
+    }
+    if (!current.isFile() || current.isSymbolicLink() || !sameStableEntryMetadata(pathMetadata, current)) {
+      return changed()
+    }
+    revalidateDirectories(directories)
     throw error
   }
-
   let observation: ArtifactObservation | undefined
   let primaryError: unknown
   try {
+    hooks.fault?.('after-artifact-open', artifact)
     const metadata = fstatSync(descriptor, { bigint: true })
     if (!(metadata.isFile() && sameStableEntryMetadata(pathMetadata, metadata))) {
       return changed()
     }
     hooks.fault?.('after-artifact-fstat', artifact)
     const finalMetadata = fstatSync(descriptor, { bigint: true })
+    hooks.fault?.('after-final-artifact-fstat', artifact)
     const finalPathMetadata = lstatSync(path, { bigint: true })
     if (
       !finalPathMetadata.isFile() ||
@@ -209,12 +222,6 @@ const inspectFinalFile = (
     revalidateDirectories(directories)
     const immutableMetadata = Object.freeze(finalMetadata)
     observation = Object.freeze({
-      manifest: Object.freeze({
-        ctimeNanoseconds: immutableMetadata.ctimeNs.toString(),
-        mtimeNanoseconds: immutableMetadata.mtimeNs.toString(),
-        size: immutableMetadata.size.toString(),
-        type: 'file' as const,
-      }),
       metadata: immutableMetadata,
       path: artifact,
     })
@@ -251,22 +258,32 @@ export const inspectArtifactFiles = (
   const effectiveHooks: ArtifactInspectionHooks = {
     close: hooks.close ?? artifactInspectionTestHooks.close,
     fault: hooks.fault ?? artifactInspectionTestHooks.fault,
+    open: hooks.open ?? artifactInspectionTestHooks.open,
   }
-  let brain: DirectoryWitness
+  let brainMetadata: BigIntStats
   try {
-    const metadata = lstatSync(brainDirectory, { bigint: true })
-    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-      return Object.freeze(
-        artifacts.map(path => Object.freeze({ error: new ArtifactInvalidError(), kind: 'invalid' as const, path })),
-      )
-    }
-    brain = captureDirectoryWitness(brainDirectory, { allowLink: false })
+    brainMetadata = lstatSync(brainDirectory, { bigint: true })
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return Object.freeze(
         artifacts.map(path => Object.freeze({ error: new ArtifactInvalidError(), kind: 'invalid' as const, path })),
       )
     }
+    throw error
+  }
+  if (!brainMetadata.isDirectory() || brainMetadata.isSymbolicLink()) {
+    return Object.freeze(
+      artifacts.map(path => Object.freeze({ error: new ArtifactInvalidError(), kind: 'invalid' as const, path })),
+    )
+  }
+  effectiveHooks.fault?.('after-brain-lstat', '')
+  let brain: DirectoryWitness
+  try {
+    brain = captureDirectoryWitness(brainDirectory, { allowLink: false })
+    if (!sameStableEntryMetadata(brainMetadata, brain.pathMetadata)) {
+      return changed()
+    }
+  } catch (error) {
     if (error instanceof DirectoryWitnessError || isReplacementError(error)) {
       return changed()
     }

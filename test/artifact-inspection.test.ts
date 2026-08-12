@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { closeSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -6,6 +7,29 @@ import { afterEach, test } from 'node:test'
 import { ArtifactChangedError, inspectArtifactFiles } from '../src/artifact-inspection.ts'
 
 const temporaryRoots: string[] = []
+
+const filesystemCapabilities = (() => {
+  const root = mkdtempSync(join(tmpdir(), 'encephalon-artifact-capability-test-'))
+  try {
+    const target = join(root, 'target')
+    const link = join(root, 'link')
+    const fifo = join(root, 'fifo')
+    mkdirSync(target)
+    let directoryLink = true
+    try {
+      symlinkSync(target, link, 'junction')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+        directoryLink = false
+      } else {
+        throw error
+      }
+    }
+    return { directoryLink, fifo: spawnSync('mkfifo', [fifo]).status === 0 }
+  } finally {
+    rmSync(root, { force: true, recursive: true })
+  }
+})()
 
 const createArtifact = () => {
   const root = mkdtempSync(join(tmpdir(), 'encephalon-artifact-inspection-test-'))
@@ -60,7 +84,7 @@ test('rejects same-inode mutation between final lstat and descriptor open', () =
   )
 })
 
-test('returns immutable manifest fields from the verified descriptor and closes it', () => {
+test('returns immutable verified path metadata and closes its descriptor', () => {
   const { artifact, brainDirectory } = createArtifact()
   let descriptorsClosed = 0
   const [result] = inspectArtifactFiles(brainDirectory, [artifact], {
@@ -72,14 +96,10 @@ test('returns immutable manifest fields from the verified descriptor and closes 
 
   assert.equal(result?.kind, 'stable')
   if (result?.kind === 'stable') {
-    assert.deepEqual(result.observation.manifest, {
-      ctimeNanoseconds: result.observation.metadata.ctimeNs.toString(),
-      mtimeNanoseconds: result.observation.metadata.mtimeNs.toString(),
-      size: '17',
-      type: 'file',
-    })
+    assert.equal(result.observation.path, artifact)
+    assert.equal(result.observation.metadata.size, 17n)
     assert.equal(Object.isFrozen(result.observation), true)
-    assert.equal(Object.isFrozen(result.observation.manifest), true)
+    assert.equal(Object.isFrozen(result.observation.metadata), true)
   }
   assert.equal(descriptorsClosed, 1)
 })
@@ -152,6 +172,60 @@ test('rejects ancestor replacement immediately after child witness capture', () 
   )
 })
 
+test('rejects an observed ancestor that becomes a link or disappears before capture', () => {
+  const capabilityRoot = createArtifact().root
+  const linkProbe = join(capabilityRoot, 'ancestor-link-probe')
+  let linkSupported = true
+  try {
+    symlinkSync(capabilityRoot, linkProbe, 'junction')
+    rmSync(linkProbe)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+      linkSupported = false
+    } else {
+      throw error
+    }
+  }
+  const mutations = linkSupported ? (['link', 'missing'] as const) : (['missing'] as const)
+  for (const mutation of mutations) {
+    const { artifact, brainDirectory, root } = createArtifact()
+    const artifactsDirectory = join(brainDirectory, '_artifacts')
+    const captured = join(root, `captured-${mutation}`)
+    const outside = join(root, `outside-${mutation}`)
+    mkdirSync(outside)
+    assert.throws(
+      () =>
+        inspectArtifactFiles(brainDirectory, [artifact], {
+          fault: point => {
+            if (point === 'after-ancestor-lstat') {
+              renameSync(artifactsDirectory, captured)
+              if (mutation === 'link') {
+                symlinkSync(outside, artifactsDirectory, 'junction')
+              }
+            }
+          },
+        }),
+      ArtifactChangedError,
+    )
+  }
+})
+
+test('rejects brain-root disappearance between preliminary lstat and witness capture', () => {
+  const { artifact, brainDirectory, root } = createArtifact()
+  const captured = join(root, 'captured-brain')
+  assert.throws(
+    () =>
+      inspectArtifactFiles(brainDirectory, [artifact], {
+        fault: point => {
+          if (point === 'after-brain-lstat') {
+            renameSync(brainDirectory, captured)
+          }
+        },
+      }),
+    ArtifactChangedError,
+  )
+})
+
 test('distinguishes a stable missing ancestor from concurrent ancestor removal', () => {
   const stable = createArtifact()
   rmSync(join(stable.brainDirectory, '_artifacts'), { recursive: true })
@@ -191,12 +265,93 @@ test('reports static missing, non-regular, and symlink artifact paths as invalid
     }
   }
 
-  const paths = linkCreated ? [artifact, missing, linked] : [artifact, missing]
+  const paths = linkCreated ? [artifact, missing, linked, ''] : [artifact, missing, '']
   const results = inspectArtifactFiles(brainDirectory, paths)
   assert.deepEqual(
     results.map(result => result.kind),
     paths.map(() => 'invalid'),
   )
+})
+
+test('rejects replacement and restoration of an artifact ancestor', {
+  skip: !filesystemCapabilities.directoryLink,
+}, () => {
+  const { artifact, brainDirectory, root } = createArtifact()
+  const artifactDirectory = join(brainDirectory, '_artifacts', 'decision', 'artifact-inspection')
+  const captured = join(root, 'captured-artifact-directory')
+  const outside = join(root, 'outside-artifact-directory')
+  mkdirSync(outside)
+  writeFileSync(join(outside, 'evidence.txt'), 'outside evidence')
+  assert.throws(
+    () =>
+      inspectArtifactFiles(brainDirectory, [artifact], {
+        fault: point => {
+          if (point === 'after-artifact-lstat') {
+            renameSync(artifactDirectory, captured)
+            symlinkSync(outside, artifactDirectory, 'junction')
+          }
+          if (point === 'after-artifact-open') {
+            rmSync(artifactDirectory)
+            renameSync(captured, artifactDirectory)
+          }
+        },
+      }),
+    ArtifactChangedError,
+  )
+})
+
+test('does not block when a final artifact is replaced by a FIFO', { skip: !filesystemCapabilities.fifo }, () => {
+  const { artifact, brainDirectory, path } = createArtifact()
+  const script = `
+    import { spawnSync } from 'node:child_process'
+    import { rmSync } from 'node:fs'
+    import { ArtifactChangedError, inspectArtifactFiles } from ${JSON.stringify(new URL('../src/artifact-inspection.ts', import.meta.url).href)}
+    try {
+      inspectArtifactFiles(process.argv[1], [process.argv[2]], {
+        fault: point => {
+          if (point === 'after-artifact-lstat') {
+            rmSync(process.argv[3])
+            const result = spawnSync('mkfifo', [process.argv[3]])
+            if (result.status !== 0) throw result.error ?? new Error('mkfifo failed')
+          }
+        },
+      })
+      process.exitCode = 2
+    } catch (error) {
+      process.exitCode = error instanceof ArtifactChangedError ? 0 : 3
+    }
+  `
+  const child = spawnSync(process.execPath, ['--input-type=module', '--eval', script, brainDirectory, artifact, path], {
+    timeout: 2000,
+  })
+  assert.equal(child.error, undefined)
+  assert.equal(child.status, 0, child.stderr.toString())
+})
+
+test('rejects replacement or truncation after the final descriptor metadata check', () => {
+  for (const mutation of ['replacement', 'truncation'] as const) {
+    const { artifact, brainDirectory, path, root } = createArtifact()
+    const captured = join(root, `captured-${mutation}.txt`)
+    const replacement = join(root, `replacement-${mutation}.txt`)
+    writeFileSync(replacement, 'replacement evidence')
+    assert.throws(
+      () =>
+        inspectArtifactFiles(brainDirectory, [artifact], {
+          fault: point => {
+            if (point === 'after-final-artifact-fstat') {
+              if (mutation === 'replacement') {
+                renameSync(path, captured)
+                renameSync(replacement, path)
+              } else {
+                writeFileSync(path, '')
+              }
+            }
+          },
+        }),
+      ArtifactChangedError,
+      mutation,
+    )
+  }
 })
 
 test('propagates operational descriptor errors without exposing the artifact path', () => {
@@ -217,4 +372,26 @@ test('propagates operational descriptor errors without exposing the artifact pat
       return true
     },
   )
+})
+
+test('reclassifies open failure only when the final entry changed', () => {
+  for (const changed of [false, true]) {
+    const { artifact, brainDirectory, path, root } = createArtifact()
+    const captured = join(root, `captured-open-${changed}.txt`)
+    const failure = Object.assign(new Error('simulated open I/O failure'), { code: 'EIO' })
+    const operation = () =>
+      inspectArtifactFiles(brainDirectory, [artifact], {
+        open: () => {
+          if (changed) {
+            renameSync(path, captured)
+          }
+          throw failure
+        },
+      })
+    if (changed) {
+      assert.throws(operation, ArtifactChangedError)
+    } else {
+      assert.throws(operation, error => error === failure)
+    }
+  }
 })

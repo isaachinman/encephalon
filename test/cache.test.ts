@@ -55,6 +55,7 @@ const createOutsideDirectory = () => {
 afterEach(() => {
   artifactInspectionTestHooks.close = undefined
   artifactInspectionTestHooks.fault = undefined
+  artifactInspectionTestHooks.open = undefined
   cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
   cacheLocationTestHooks.afterDatabaseOpen = undefined
   cacheLocationTestHooks.afterQuarantineRename = undefined
@@ -274,6 +275,78 @@ test('keeps operational artifact I/O errors classified as IO_ERROR', () => {
       return true
     },
   )
+})
+
+test('does not accept an artifact mutation during fresh record-manifest enumeration', () => {
+  const root = createRoot()
+  const id = 'artifact-freshness-enumeration'
+  const artifact = `_artifacts/architecture/${id}/diagram.svg`
+  const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+  ensureParent(artifactPath)
+  writeFileSync(artifactPath, '<svg>before</svg>')
+  api.addRecord({
+    artifacts: [artifact],
+    id,
+    kind: 'architecture',
+    payload: { summary: 'Freshness enumeration' },
+    root,
+    source: 'test',
+    subject: 'cache.artifact-freshness-enumeration',
+  })
+  let mutated = false
+  cacheReadTestHooks.afterManifestRootEnumeration = () => {
+    if (!mutated) {
+      writeFileSync(artifactPath, '<svg>after-enumeration</svg>')
+      mutated = true
+    }
+  }
+
+  assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
+  assert.equal(mutated, true)
+  assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+})
+
+test('retries artifact mutation after canonical validation without committing a stale manifest', () => {
+  for (const persistent of [false, true]) {
+    const root = createRoot()
+    const id = `after-validation-${persistent}`
+    const artifact = `_artifacts/architecture/${id}/diagram.svg`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, '<svg>before</svg>')
+    api.addRecord({
+      artifacts: [artifact],
+      id,
+      kind: 'architecture',
+      payload: { summary: 'After validation mutation' },
+      root,
+      source: 'test',
+      subject: `cache.after-validation-${persistent}`,
+    })
+    let mutations = 0
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      if (persistent || mutations === 0) {
+        mutations += 1
+        writeFileSync(artifactPath, `<svg>mutation-${mutations}</svg>`)
+      }
+    }
+
+    if (persistent) {
+      assert.throws(
+        () => api.hydrate({ root }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+      assert.equal(mutations, 3)
+    } else {
+      assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+      assert.equal(mutations, 1)
+      assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+    }
+    cacheReadTestHooks.afterCanonicalValidation = undefined
+  }
 })
 
 const mutateCache = (root: string, mutation: (database: DatabaseSync) => void) => {

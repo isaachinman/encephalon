@@ -346,11 +346,11 @@ const statEntry = (root: string, path: string, missingAllowed = false): Manifest
 }
 
 const artifactManifestEntry = (observation: ArtifactObservation): ManifestEntry => ({
-  ctimeNanoseconds: observation.manifest.ctimeNanoseconds,
-  mtimeNanoseconds: observation.manifest.mtimeNanoseconds,
+  ctimeNanoseconds: observation.metadata.ctimeNs.toString(),
+  mtimeNanoseconds: observation.metadata.mtimeNs.toString(),
   path: `encephalon/${observation.path}`,
-  size: observation.manifest.size,
-  type: observation.manifest.type,
+  size: observation.metadata.size.toString(),
+  type: 'file',
 })
 
 const recordManifestEntries = (root: string) => {
@@ -400,9 +400,9 @@ const recordManifestEntries = (root: string) => {
   return [brainEntry, ...children]
 }
 
-const repositoryManifest = (root: string, artifacts: readonly ArtifactObservation[]) => {
+const repositoryManifest = (records: readonly ManifestEntry[], artifacts: readonly ArtifactObservation[]) => {
   const entries = [
-    ...recordManifestEntries(root),
+    ...records,
     ...[...artifacts].sort((first, second) => ordinalStringCompare(first.path, second.path)).map(artifactManifestEntry),
   ]
   return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
@@ -417,12 +417,13 @@ type RepositoryManifestResult =
 
 const boundedRepositoryManifest = (root: string, artifactPaths: string[]): RepositoryManifestResult => {
   try {
+    const records = recordManifestEntries(root)
     const results = artifactPaths.length === 0 ? [] : inspectArtifactFiles(resolve(root, 'encephalon'), artifactPaths)
     if (results.some(result => result.kind === 'invalid')) {
       return { kind: 'changed' }
     }
     const artifacts = results.flatMap(result => (result.kind === 'stable' ? [result.observation] : []))
-    return { kind: 'stable', value: repositoryManifest(root, artifacts) }
+    return { kind: 'stable', value: repositoryManifest(records, artifacts) }
   } catch (error) {
     if (error instanceof ArtifactChangedError || error instanceof CanonicalDirectoryChangedError) {
       return { kind: 'changed' }
@@ -439,7 +440,7 @@ const boundedRepositoryManifestFromObservations = (
   artifacts: readonly ArtifactObservation[],
 ): RepositoryManifestResult => {
   try {
-    return { kind: 'stable', value: repositoryManifest(root, artifacts) }
+    return { kind: 'stable', value: repositoryManifest(recordManifestEntries(root), artifacts) }
   } catch (error) {
     if (error instanceof CanonicalDirectoryChangedError) {
       return { kind: 'changed' }
