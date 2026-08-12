@@ -46,6 +46,7 @@ import {
   validateKind,
 } from './schema.ts'
 import {
+  assertStagingEmpty,
   cleanupOwnedStagingEntry,
   cleanupStaleStagingEntries,
   createOwnedStagingName,
@@ -106,6 +107,7 @@ type RecordWriteFault =
   | 'after-staging-cleanup-quarantine'
   | 'after-staging-cleanup-preflight'
   | 'before-directory-preparation'
+  | 'before-final-publication-revalidation'
   | 'before-publication'
   | 'before-staging-cleanup-empty-probe'
   | 'before-staging-cleanup-entry-lstat'
@@ -1271,6 +1273,7 @@ const publishPlannedRecordInternal = (
   let committedErrorPhase: PostCommitPhase | undefined
   let descriptor: number | undefined
   let descriptorMetadata: BigIntStats | undefined
+  let postCleanupStagingWitness: DirectoryWitness | undefined
   let stagingWitness: DirectoryWitness | undefined
   const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
     if (committedErrorPhase === undefined || postCommitPriority[phase] > postCommitPriority[committedErrorPhase]) {
@@ -1343,20 +1346,19 @@ const publishPlannedRecordInternal = (
     } catch (error) {
       stagingCleanupFault = error
     }
-    if (descriptorCloseError !== undefined && published && !operationFailed) {
-      capturePostCommitError('publicationVerification', descriptorCloseError)
-    } else if (descriptorCloseError !== undefined && !operationFailed) {
+    if (descriptorCloseError !== undefined && !operationFailed) {
       cleanupError = descriptorCloseError
     }
     if (stagingCleanupFault === undefined && descriptorCloseError === undefined) {
       try {
+        fault(options.hooks, 'before-final-publication-revalidation')
         revalidateCanonicalDirectory(publicationRoot)
         if (stagingWitness !== undefined) {
           revalidatePublicationDirectories([stagingWitness])
         }
       } catch (error) {
         if (published) {
-          committedError = publicationVerificationError(record, error)
+          committedError = classifyPublicationVerificationError(record, error)
           committedErrorPhase = 'publicationVerification'
         } else if (!operationFailed) {
           cleanupError = error
@@ -1374,7 +1376,9 @@ const publishPlannedRecordInternal = (
     ) {
       try {
         if (descriptorMetadata !== undefined) {
-          cleanupOwnedStagingEntry(stagingDirectory, stagingName, descriptorMetadata, {
+          const cleanupMetadata =
+            descriptor === undefined ? descriptorMetadata : fstatSync(descriptor, { bigint: true })
+          postCleanupStagingWitness = cleanupOwnedStagingEntry(stagingDirectory, stagingName, cleanupMetadata, {
             afterQuarantine: () => fault(options.hooks, 'after-staging-cleanup-quarantine'),
             beforeEmptyProbe: () => fault(options.hooks, 'before-staging-cleanup-empty-probe'),
             beforeEntryLstat: () => fault(options.hooks, 'before-staging-cleanup-entry-lstat'),
@@ -1384,7 +1388,12 @@ const publishPlannedRecordInternal = (
         }
       } catch (error) {
         if (published) {
-          capturePostCommitError('stagingCleanup', error)
+          if (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED') {
+            committedError = publicationVerificationError(record, error)
+            committedErrorPhase = 'publicationVerification'
+          } else {
+            capturePostCommitError('stagingCleanup', error)
+          }
         } else if (!operationFailed) {
           cleanupError = error
         }
@@ -1394,16 +1403,28 @@ const publishPlannedRecordInternal = (
   if (cleanupError !== undefined) {
     throw cleanupError
   }
-  if (committedErrorPhase !== 'publicationVerification' && descriptor !== undefined) {
+  if (
+    committedErrorPhase !== 'publicationVerification' &&
+    descriptor !== undefined &&
+    postCleanupStagingWitness !== undefined
+  ) {
     try {
       assertCanonicalPublicationIdentity(path, descriptor)
+      assertStagingEmpty(postCleanupStagingWitness)
       options.authority.acceptPublication(recordFile.kind, `${recordFile.id}.json`, publicationRoot, publicationKind)
       fault(options.hooks, 'after-publication-accept')
       assertCanonicalPublicationIdentity(path, descriptor)
+      assertStagingEmpty(postCleanupStagingWitness)
     } catch (error) {
       committedError = classifyPublicationVerificationError(record, error)
       committedErrorPhase = 'publicationVerification'
     }
+  } else if (committedErrorPhase === undefined && descriptor !== undefined) {
+    committedError = publicationVerificationError(
+      record,
+      new CanonicalPublicationIdentityError('The verified empty staging generation is unavailable.'),
+    )
+    committedErrorPhase = 'publicationVerification'
   }
   if (descriptor !== undefined) {
     try {

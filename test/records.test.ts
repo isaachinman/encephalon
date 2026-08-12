@@ -847,6 +847,37 @@ describe('canonical records', () => {
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'after-hard-link-aliases.json')), true)
   })
 
+  test('preserves a stale entry whose incarnation changes after cleanup preflight', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    const stalePath = join(stagingDirectory, ownedStagingName(0))
+    const temporaryAlias = join(root, 'temporary-staging-alias')
+    mkdirSync(stagingDirectory, { recursive: true })
+    writeFileSync(stalePath, 'stale')
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-staging-cleanup-preflight') {
+        linkSync(stalePath, temporaryAlias)
+        rmSync(temporaryAlias)
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'staging-incarnation-change',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'staging.incarnation-change',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+
+    assert.equal(readFileSync(stalePath, 'utf8'), 'stale')
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'staging-incarnation-change.json')), false)
+  })
+
   test('preserves a quarantine pathname replacement at the immediate unlink boundary', () => {
     const root = createRoot()
     const stagingDirectory = join(root, 'encephalon', '_staging')
@@ -1171,6 +1202,38 @@ describe('canonical records', () => {
     )
   })
 
+  test('reports operational final directory revalidation failure as committed I/O', () => {
+    const root = createRoot()
+    assertPostCommitError(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'final-directory-revalidation-io',
+            kind: 'decision',
+            payload: {},
+            source: 'agent',
+            subject: 'staging.final-directory-revalidation-io',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if ((point as string) === 'before-final-publication-revalidation') {
+                  throw Object.assign(new Error('injected final directory revalidation I/O'), { code: 'EIO' })
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      {
+        path: 'encephalon/decision/final-directory-revalidation-io.json',
+        phase: 'publicationVerification',
+        recordId: 'final-directory-revalidation-io',
+      },
+    )
+  })
+
   test('classifies a staging entry disappearance without leaking its name', () => {
     for (const code of ['ENOENT', 'EIO'] as const) {
       const root = createRoot()
@@ -1253,6 +1316,76 @@ describe('canonical records', () => {
     assert.equal(reachedPublication, false)
   })
 
+  test('does not accept a late child introduced during current-operation cleanup', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    const latePath = join(stagingDirectory, 'late-during-current-cleanup.tmp')
+
+    assertCommittedRepositoryChange(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'late-during-current-cleanup',
+            kind: 'decision',
+            payload: {},
+            source: 'agent',
+            subject: 'staging.late-during-current-cleanup',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'before-staging-cleanup-empty-probe') {
+                  writeFileSync(latePath, 'late')
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      'encephalon/decision/late-during-current-cleanup.json',
+      'late-during-current-cleanup',
+    )
+
+    assert.equal(readFileSync(latePath, 'utf8'), 'late')
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'late-during-current-cleanup.json')), true)
+  })
+
+  test('does not accept a late staging child after publication authority acceptance', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    const latePath = join(stagingDirectory, 'late-after-publication-accept.tmp')
+
+    assertCommittedRepositoryChange(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'late-after-publication-accept',
+            kind: 'decision',
+            payload: {},
+            source: 'agent',
+            subject: 'staging.late-after-publication-accept',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'after-publication-accept') {
+                  writeFileSync(latePath, 'late')
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      'encephalon/decision/late-after-publication-accept.json',
+      'late-after-publication-accept',
+    )
+
+    assert.equal(readFileSync(latePath, 'utf8'), 'late')
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'late-after-publication-accept.json')), true)
+  })
+
   test('recovers a canonical crash-quarantine staging leftover', () => {
     const root = createRoot()
     const stagingDirectory = join(root, 'encephalon', '_staging')
@@ -1266,7 +1399,8 @@ describe('canonical records', () => {
         const [currentName] = readdirSync(stagingDirectory)
         assert.notEqual(currentName, undefined)
         if (currentName !== undefined) {
-          recoveredQuarantineWriterName = stagingInternals.parseOwnedStagingQuarantineName(currentName)?.writerName
+          const quarantine = stagingInternals.parseOwnedStagingQuarantineName(currentName)
+          recoveredQuarantineWriterName = quarantine === undefined ? undefined : quarantine.writerName
         }
       }
     }

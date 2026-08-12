@@ -21,10 +21,9 @@ import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.t
 export const MAX_STAGING_DIRECTORY_ENTRIES = 1000
 
 const STAGING_RELATIVE_PATH = `encephalon/${STAGING_DIRECTORY_NAME}`
-const OWNED_STAGING_NAME =
-  /^record-([1-9]\d*)-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.tmp$/u
-const OWNED_STAGING_QUARANTINE_NAME =
-  /^\.(record-[1-9]\d*-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp)\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.quarantine$/u
+const UUID_V4_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+const OWNED_STAGING_NAME = new RegExp(`^record-([1-9]\\d*)-(${UUID_V4_PATTERN})\\.tmp$`, 'u')
+const OWNED_STAGING_QUARANTINE_NAME = new RegExp(`^\\.(.+)\\.(${UUID_V4_PATTERN})\\.quarantine$`, 'u')
 const directoryFlag = constants.O_DIRECTORY ?? 0
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
 
@@ -44,28 +43,32 @@ type StagingEntry = {
 }
 
 /** @internal */
-export const parseOwnedStagingName = (name: string) => {
-  const match = OWNED_STAGING_NAME.exec(name)
-  if (match === null) {
-    return
+export const parseOwnedStagingName = (name: string): { pid: number; uuid: string } | undefined => {
+  const match = name.match(OWNED_STAGING_NAME)
+  if (match !== null) {
+    const [, pidText, uuid] = match
+    const pid = Number(pidText)
+    if (pidText !== undefined && uuid !== undefined && Number.isSafeInteger(pid) && String(pid) === pidText) {
+      return { pid, uuid }
+    }
   }
-  const pid = Number(match[1])
-  if (!(Number.isSafeInteger(pid) && String(pid) === match[1])) {
-    return
-  }
-  return { pid, uuid: match[2] as string }
 }
 
 /** @internal */
 export const createOwnedStagingName = (pid: number, uuid: string) => `record-${pid}-${uuid}.tmp`
 
 /** @internal */
-export const parseOwnedStagingQuarantineName = (name: string) => {
-  const writerName = OWNED_STAGING_QUARANTINE_NAME.exec(name)?.[1]
-  if (writerName === undefined || parseOwnedStagingName(writerName) === undefined) {
-    return
+export const parseOwnedStagingQuarantineName = (name: string): { writerName: string } | undefined => {
+  const match = name.match(OWNED_STAGING_QUARANTINE_NAME)
+  if (match !== null) {
+    const [, writerName] = match
+    if (writerName !== undefined) {
+      const parsedWriter = parseOwnedStagingName(writerName)
+      if (parsedWriter !== undefined) {
+        return { writerName }
+      }
+    }
   }
-  return { writerName }
 }
 
 /** @internal */
@@ -122,7 +125,8 @@ const captureNextGeneration = (current: DirectoryWitness) => {
 }
 
 const inspectStagingEntry = (stagingDirectory: string, name: string): StagingEntry => {
-  const writerName = parseOwnedStagingQuarantineName(name)?.writerName ?? name
+  const quarantine = parseOwnedStagingQuarantineName(name)
+  const writerName = quarantine === undefined ? name : quarantine.writerName
   if (parseOwnedStagingName(writerName) === undefined) {
     return invalidStagingLayout()
   }
@@ -132,15 +136,6 @@ const inspectStagingEntry = (stagingDirectory: string, name: string): StagingEnt
   }
   return { metadata, name, writerName }
 }
-
-const sameRecoveredRegularEntry = (expected: BigIntStats, current: BigIntStats) =>
-  expected.isFile() &&
-  current.isFile() &&
-  sameEntryIdentity(expected, current) &&
-  expected.size === current.size &&
-  expected.mode === current.mode &&
-  expected.birthtimeNs === current.birthtimeNs &&
-  expected.mtimeNs === current.mtimeNs
 
 const sameRecoveredSymbolicLink = (expected: BigIntStats, current: BigIntStats) =>
   expected.isSymbolicLink() &&
@@ -159,7 +154,7 @@ const quarantineStagingEntry = (
 ) => {
   const sourcePath = resolve(stagingDirectory, entry.name)
   let descriptor: number | undefined
-  let result: DirectoryWitness | undefined
+  let result: { metadata?: BigIntStats; witness: DirectoryWitness } | undefined
   let primaryError: unknown
   try {
     mapReplacement(() => revalidateDirectoryWitness(witness))
@@ -171,7 +166,7 @@ const quarantineStagingEntry = (
       const descriptorMetadata = fstatSync(descriptor, { bigint: true })
       if (
         !(
-          sameRecoveredRegularEntry(entry.metadata, descriptorMetadata) &&
+          sameStableEntryMetadata(entry.metadata, descriptorMetadata) &&
           sameStableEntryMetadata(current, descriptorMetadata)
         )
       ) {
@@ -195,9 +190,7 @@ const quarantineStagingEntry = (
     const nextWitness = captureNextGeneration(witness)
     const moved = mapReplacement(() => lstatSync(quarantinePath, { bigint: true }))
     const movedAccepted = regular
-      ? descriptor !== undefined &&
-        sameRecoveredRegularEntry(entry.metadata, moved) &&
-        sameStableEntryMetadata(moved, fstatSync(descriptor, { bigint: true }))
+      ? descriptor !== undefined && sameStableEntryMetadata(moved, fstatSync(descriptor, { bigint: true }))
       : sameRecoveredSymbolicLink(entry.metadata, moved)
     if (!movedAccepted) {
       return repositoryChanged()
@@ -212,7 +205,11 @@ const quarantineStagingEntry = (
       return repositoryChanged()
     }
     mapReplacement(() => unlinkSync(quarantinePath))
-    result = captureNextGeneration(nextWitness)
+    const metadata = descriptor === undefined ? undefined : fstatSync(descriptor, { bigint: true })
+    result = {
+      ...(metadata === undefined ? {} : { metadata }),
+      witness: captureNextGeneration(nextWitness),
+    }
   } catch (error) {
     primaryError = error
   }
@@ -230,7 +227,7 @@ const quarantineStagingEntry = (
   if (closeError !== undefined) {
     throw closeError
   }
-  return result as DirectoryWitness
+  return result as { metadata?: BigIntStats; witness: DirectoryWitness }
 }
 
 /** @internal */
@@ -254,10 +251,17 @@ export const cleanupOwnedStagingEntry = (
   hooks: StagingCleanupHooks = {},
 ) => {
   const witness = mapReplacement(() => captureDirectoryWitness(stagingDirectory, { allowLink: false }))
-  const nextWitness = quarantineStagingEntry(stagingDirectory, { metadata, name, writerName: name }, witness, hooks)
+  const { witness: nextWitness } = quarantineStagingEntry(
+    stagingDirectory,
+    { metadata, name, writerName: name },
+    witness,
+    hooks,
+  )
+  assertStagingEmpty(nextWitness, hooks)
   hooks.beforeFlush?.()
   mapReplacement(() => revalidateDirectoryWitness(nextWitness))
   mapReplacement(() => fsyncDirectory(nextWitness))
+  return nextWitness
 }
 
 const fsyncDirectory = (witness: DirectoryWitness) => {
@@ -302,7 +306,8 @@ const fsyncDirectory = (witness: DirectoryWitness) => {
   }
 }
 
-const assertStagingEmpty = (witness: DirectoryWitness, hooks: StagingCleanupHooks) => {
+/** @internal */
+export const assertStagingEmpty = (witness: DirectoryWitness, hooks: StagingCleanupHooks = {}) => {
   hooks.beforeEmptyProbe?.()
   mapReplacement(() => revalidateDirectoryWitness(witness))
   const remaining = mapReplacement(() => collectBoundedDirectoryEntries(witness.canonicalPath, 0))
@@ -310,6 +315,7 @@ const assertStagingEmpty = (witness: DirectoryWitness, hooks: StagingCleanupHook
   if (remaining.overflow) {
     return repositoryChanged()
   }
+  return witness
 }
 
 /** @internal */
@@ -322,9 +328,31 @@ export const cleanupStaleStagingEntries = (stagingDirectory: string, hooks: Stag
   const { witness: initialWitness } = snapshot
   mapReplacement(() => revalidateDirectoryWitness(initialWitness))
   hooks.afterPreflight?.()
+  const regularIncarnations = new Map<string, BigIntStats>()
+  for (const entry of entries) {
+    if (entry.metadata.isFile()) {
+      const key = `${entry.metadata.dev}:${entry.metadata.ino}`
+      const expected = regularIncarnations.get(key)
+      if (expected !== undefined && !sameStableEntryMetadata(expected, entry.metadata)) {
+        return repositoryChanged()
+      }
+      regularIncarnations.set(key, entry.metadata)
+    }
+  }
   let witness = initialWitness
   for (const entry of entries) {
-    witness = quarantineStagingEntry(stagingDirectory, entry, witness, hooks)
+    const key = `${entry.metadata.dev}:${entry.metadata.ino}`
+    const expected = entry.metadata.isFile() ? (regularIncarnations.get(key) ?? entry.metadata) : entry.metadata
+    const { metadata, witness: nextWitness } = quarantineStagingEntry(
+      stagingDirectory,
+      { ...entry, metadata: expected },
+      witness,
+      hooks,
+    )
+    witness = nextWitness
+    if (metadata !== undefined) {
+      regularIncarnations.set(key, metadata)
+    }
   }
   assertStagingEmpty(witness, hooks)
   hooks.beforeFlush?.()
