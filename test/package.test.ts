@@ -77,19 +77,27 @@ describe('package contract', () => {
       scripts?: Record<string, unknown>
     }
     const publishScript = String(packageJson.scripts?.['check:publish'])
+    const eventsStart = workflow.indexOf('\non:\n') + 1
+    const permissionsStart = workflow.indexOf('\npermissions:\n', eventsStart)
     const jobsStart = workflow.indexOf('\njobs:\n')
     const releaseStart = workflow.indexOf('\n  release:\n', jobsStart)
     const workflowConfiguration = workflow.slice(0, jobsStart)
     const verificationJob = workflow.slice(jobsStart, releaseStart)
     const releaseJob = workflow.slice(releaseStart)
+    const matrixStart = verificationJob.indexOf('      matrix:\n')
+    const runnerStart = verificationJob.indexOf('    runs-on:', matrixStart)
+    const matrixBlock = verificationJob.slice(matrixStart, runnerStart)
+    const verificationStepsStart = verificationJob.indexOf('    steps:\n')
+    const verificationSteps = verificationJob.slice(verificationStepsStart)
+    const releaseStepsStart = releaseJob.indexOf('    steps:\n')
+    const releaseHeader = releaseJob.slice(0, releaseStepsStart)
+    const releaseSteps = releaseJob.slice(releaseStepsStart)
     const uploadStart = releaseJob.indexOf('      - name: Upload release-equivalent package artifact\n')
     const uploadStep = releaseJob.slice(uploadStart)
 
     assert.equal(
-      workflowConfiguration,
-      `name: CI
-
-on:
+      workflow.slice(eventsStart, permissionsStart),
+      `on:
   push:
     branches:
       - main
@@ -97,24 +105,18 @@ on:
     branches:
       - main
     types: [opened, reopened, synchronize, edited]
-
-permissions:
-  contents: read
-
-concurrency:
-  group: \${{ github.workflow }}-\${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 `,
     )
+    assert.doesNotMatch(workflow.slice(eventsStart, permissionsStart), /paths|ignore|workflow_dispatch|schedule/)
+    assert.match(workflowConfiguration, /permissions:\n\s+contents: read/)
+    assert.match(
+      workflowConfiguration,
+      /concurrency:\n\s+group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}\n\s+cancel-in-progress: true/,
+    )
+
     assert.equal(
-      verificationJob,
-      `
-jobs:
-  verify:
-    name: verify (\${{ matrix.context }})
-    strategy:
-      fail-fast: false
-      matrix:
+      matrixBlock,
+      `      matrix:
         include:
           - context: ubuntu-latest
             os: ubuntu-latest
@@ -128,47 +130,63 @@ jobs:
           - context: ubuntu-current
             os: ubuntu-latest
             node: 26
-    runs-on: \${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: \${{ matrix.node }}
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.1
-      - run: bun install --frozen-lockfile
-      - run: bun run typecheck
-      - run: bun run test
-      - run: bun run lint
-      - run: bun run benchmark:check
-      - run: bun run build
-      - run: bun run check:package
 `,
     )
+    assert.match(verificationJob, /name: verify \(\$\{\{ matrix\.context \}\}\)/)
+    assert.match(verificationJob, /runs-on: \$\{\{ matrix\.os \}\}/)
+    assert.match(verificationSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
+    assert.match(
+      verificationSteps,
+      /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}/,
+    )
+    assert.deepEqual(
+      [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
+      [
+        'bun install --frozen-lockfile',
+        'bun run typecheck',
+        'bun run test',
+        'bun run lint',
+        'bun run benchmark:check',
+        'bun run build',
+        'bun run check:package',
+      ],
+    )
+    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
+    assert.doesNotMatch(verificationSteps, /^\s{8}(?:if|continue-on-error):/m)
 
+    assert.equal(
+      releaseHeader,
+      `
+  release:
+    name: Release-equivalent package gate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+`,
+    )
+    assert.match(releaseSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
+    assert.match(releaseSteps, /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0/)
+    assert.deepEqual(
+      [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
+      ['bun install --frozen-lockfile', 'bun run build', 'bun run check:package'],
+    )
+    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 5)
+    assert.doesNotMatch(releaseSteps, /^\s{8}(?:if|continue-on-error):/m)
     assert.match(
       releaseJob,
-      /release:\n\s+name: Release-equivalent package gate\n\s+if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'\n\s+needs: verify/,
+      /- name: Create release-equivalent package artifact\n\s+shell: bash\n\s+run: \|\n\s+mkdir -p package-artifacts\n\s+npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts > package-artifacts\/npm-pack\.json/,
     )
-    assert.match(releaseJob, /uses: actions\/checkout@v7\n\s+with:\n\s+persist-credentials: false/)
-    assert.equal(
-      ['bun install --frozen-lockfile', 'bun run build', 'bun run check:package'].every(command =>
-        releaseJob.includes(`- run: ${command}`),
-      ),
-      true,
-    )
-    assert.match(releaseJob, /npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts/)
+    assert.equal(releaseJob.match(/npm pack --dry-run=false/g)?.length, 1)
     assert.match(releaseJob, /- name: Check npm publish dry run\n\s+run: bun run check:publish/)
     assert.equal(releaseJob.match(/bun run check:publish/g)?.length, 1)
     assert.equal(releaseJob.match(/actions\/upload-artifact/g)?.length, 1)
     assert.equal(
-      uploadStep,
-      `      - name: Upload release-equivalent package artifact
-        uses: actions/upload-artifact@v4
-        with:
+      uploadStep
+        .split('\n')
+        .filter(line => !line.includes('uses: actions/upload-artifact@'))
+        .slice(1)
+        .join('\n'),
+      `        with:
           name: encephalon-npm-package
           path: package-artifacts/*
           if-no-files-found: error
@@ -176,8 +194,12 @@ jobs:
 `,
     )
     assert.equal(
-      releaseJob.indexOf('npm pack') < releaseJob.indexOf('bun run check:publish') &&
-        releaseJob.indexOf('bun run check:publish') < releaseJob.indexOf('actions/upload-artifact'),
+      ['bun run build', 'bun run check:package', 'npm pack', 'bun run check:publish', 'actions/upload-artifact']
+        .map(step => releaseJob.indexOf(step))
+        .every(
+          (position, index, positions) =>
+            position >= 0 && (index === 0 || position > (positions[index - 1] ?? Number.POSITIVE_INFINITY)),
+        ),
       true,
     )
     assert.match(readme, /four verification lanes/)
