@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { existsSync, lstatSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
@@ -10,9 +10,17 @@ import {
   parseSearchRecordsInput,
   parseShowRecordInput,
 } from './api-input.ts'
+import {
+  CacheDatabaseFailure,
+  type CacheLocation,
+  inspectCacheDatabase,
+  inspectCacheLocation,
+  openVerifiedCacheDatabase,
+  quarantineCacheDatabase,
+} from './cache-location.ts'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
-import { cacheDirectory, withOperationLock } from './lock.ts'
+import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import { canonicalRecordPath, readRecords } from './records.ts'
 import { resolveRepository } from './repository.ts'
@@ -32,7 +40,6 @@ import type {
 
 const SCHEMA_VERSION = '1'
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
-const DATABASE_FILENAME = 'brain.sqlite'
 export const MAX_QUERY_BYTES = 1024
 export const MAX_QUERY_TERMS = 32
 export const MAX_GATHER_SEARCHES = 16
@@ -100,6 +107,7 @@ type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind
 type CacheReadTestHooks = {
   afterCompactSearchRead?: ((query: string) => void) | undefined
   afterShowRead?: ((id: string) => void) | undefined
+  duringDatabaseInitialisation?: ((mode: 'reader' | 'writer') => void) | undefined
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
 }
@@ -133,12 +141,11 @@ const loadSQLite = () => {
   return sqliteModule
 }
 
-const databasePath = (root: string) => resolve(cacheDirectory(root), DATABASE_FILENAME)
-
 const isRecoverableCacheFailure = (error: unknown) => {
-  const sqlite = error as { errcode?: unknown; message?: unknown }
+  const failure = error instanceof CacheDatabaseFailure ? error.failure : error
+  const sqlite = failure as { errcode?: unknown; message?: unknown }
   return (
-    error instanceof CacheSchemaMismatch ||
+    failure instanceof CacheSchemaMismatch ||
     sqlite.errcode === 8 ||
     sqlite.errcode === 14 ||
     sqlite.errcode === 11 ||
@@ -158,11 +165,11 @@ const assertTableColumns = (database: DatabaseSync, table: string, expected: str
   }
 }
 
-const removeCorruptCache = (root: string) => {
-  const path = databasePath(root)
-  for (const candidate of [path, `${path}-wal`, `${path}-shm`, `${path}-journal`]) {
-    rmSync(candidate, { force: true })
+const removeCorruptCache = (location: CacheLocation, error: unknown) => {
+  if (error instanceof CacheDatabaseFailure) {
+    return quarantineCacheDatabase(location, error.database)
   }
+  throw error
 }
 
 const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync']) => {
@@ -240,37 +247,44 @@ const createCacheSchema = (database: DatabaseSync) => {
   `)
 }
 
-const openWriterDatabase = (root: string) => {
+const openWriterDatabase = (location: CacheLocation) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  const database = new DatabaseConstructor(databasePath(root), {
-    timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
+  return openVerifiedCacheDatabase({
+    afterVerifiedOpen: database => {
+      database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
+      createCacheSchema(database)
+      assertCacheSchema(database)
+      cacheReadTestHooks.duringDatabaseInitialisation?.('writer')
+    },
+    create: true,
+    DatabaseConstructor,
+    location,
+    name: 'brain.sqlite',
+    openOptions: { timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS },
   })
-  try {
-    database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
-    createCacheSchema(database)
-    assertCacheSchema(database)
-    return database
-  } catch (error) {
-    database.close()
-    throw error
-  }
 }
 
-const openReaderDatabase = (root: string) => {
+const openReaderDatabase = (location: CacheLocation) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  const database = new DatabaseConstructor(databasePath(root), {
-    readOnly: true,
-    timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
+  return openVerifiedCacheDatabase({
+    afterVerifiedOpen: database => {
+      assertCacheSchema(database)
+      cacheReadTestHooks.duringDatabaseInitialisation?.('reader')
+    },
+    create: false,
+    DatabaseConstructor,
+    location,
+    missing: () => {
+      throw new CacheSchemaMismatch('The cache database disappeared before it was opened.')
+    },
+    name: 'brain.sqlite',
+    openOptions: {
+      readOnly: true,
+      timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
+    },
   })
-  try {
-    assertCacheSchema(database)
-    return database
-  } catch (error) {
-    database.close()
-    throw error
-  }
 }
 
 const posixRelative = (root: string, path: string) =>
@@ -579,8 +593,8 @@ const writeMetadata = (database: DatabaseSync, metadata: Metadata) => {
   }
 }
 
-const readFreshMetadata = (root: string): Metadata | undefined => {
-  const database = openReaderDatabase(root)
+const readFreshMetadata = (root: string, location: CacheLocation): Metadata | undefined => {
+  const database = openReaderDatabase(location)
   try {
     const metadata = readMetadata(database)
     return metadataIsFresh(root, database, metadata) ? metadata : undefined
@@ -589,7 +603,7 @@ const readFreshMetadata = (root: string): Metadata | undefined => {
   }
 }
 
-const rebuildCache = (root: string): PrepareResult => {
+const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocation(root)): PrepareResult => {
   const attempts = Array.from({ length: MAX_REPOSITORY_CHANGE_RETRIES }, (_, index) => index)
   for (const attempt of attempts) {
     const recordManifestBefore = repositoryManifest(root, [])
@@ -618,13 +632,13 @@ const rebuildCache = (root: string): PrepareResult => {
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
     let database: DatabaseSync
     try {
-      database = openWriterDatabase(root)
+      database = openWriterDatabase(location)
     } catch (error) {
       if (!isRecoverableCacheFailure(error)) {
         throw error
       }
-      removeCorruptCache(root)
-      database = openWriterDatabase(root)
+      removeCorruptCache(location, error)
+      database = openWriterDatabase(location)
     }
     try {
       let existingMetadata: Metadata | undefined
@@ -689,13 +703,18 @@ const rebuildCache = (root: string): PrepareResult => {
   return fail('INTERNAL_ERROR', 'The Encephalon cache rebuild ended unexpectedly.')
 }
 
-const prepareResolvedWithoutCorruptionRecovery = (root: string, lock = true): PrepareResult => {
-  const serialize = <Result>(operation: () => Result) => (lock ? withOperationLock(root, operation) : operation())
-  if (!existsSync(databasePath(root))) {
-    return serialize(() => {
-      if (existsSync(databasePath(root))) {
+const prepareResolvedWithoutCorruptionRecovery = (
+  root: string,
+  location: CacheLocation,
+  lock = true,
+): PrepareResult => {
+  const serialize = <Result>(operation: (captured: CacheLocation) => Result) =>
+    lock ? withOperationLock(root, operation, {}, location) : operation(location)
+  if (inspectCacheDatabase(location, 'brain.sqlite') === undefined) {
+    return serialize(captured => {
+      if (inspectCacheDatabase(captured, 'brain.sqlite') !== undefined) {
         try {
-          const metadata = readFreshMetadata(root)
+          const metadata = readFreshMetadata(root, captured)
           if (metadata !== undefined) {
             return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
           }
@@ -705,16 +724,16 @@ const prepareResolvedWithoutCorruptionRecovery = (root: string, lock = true): Pr
           }
         }
       }
-      return rebuildCache(root)
+      return rebuildCache(root, captured)
     })
   }
-  const cachedMetadata = readFreshMetadata(root)
+  const cachedMetadata = readFreshMetadata(root, location)
   if (cachedMetadata !== undefined) {
     return { hydrated: false, recordsIndexed: cachedMetadata.recordsIndexed }
   }
-  return serialize(() => {
+  return serialize(captured => {
     try {
-      const metadata = readFreshMetadata(root)
+      const metadata = readFreshMetadata(root, captured)
       if (metadata !== undefined) {
         return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
       }
@@ -723,25 +742,36 @@ const prepareResolvedWithoutCorruptionRecovery = (root: string, lock = true): Pr
         throw error
       }
     }
-    return rebuildCache(root)
+    return rebuildCache(root, captured)
   })
 }
 
-const prepareResolved = (root: string, lock = true): PrepareResult => {
+const prepareResolved = (
+  root: string,
+  lock = true,
+  capturedLocation: CacheLocation = inspectCacheLocation(root),
+): PrepareResult => {
   try {
-    return prepareResolvedWithoutCorruptionRecovery(root, lock)
+    return prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lock)
   } catch (error) {
     if (!isRecoverableCacheFailure(error)) {
       throw error
     }
-    return lock ? withOperationLock(root, () => rebuildCache(root)) : rebuildCache(root)
+    return lock
+      ? withOperationLock(root, location => rebuildCache(root, location), {}, capturedLocation)
+      : rebuildCache(root, capturedLocation)
   }
 }
 
-export const prepareResolvedRepository = (root: string, lock = true): PrepareResult => prepareResolved(root, lock)
+export const prepareResolvedRepository = (root: string, lock = true, location?: CacheLocation): PrepareResult =>
+  prepareResolved(root, lock, location)
 
-export const hydrateResolvedRepository = (root: string, lock = true): PrepareResult =>
-  lock ? withOperationLock(root, () => rebuildCache(root)) : rebuildCache(root)
+export const hydrateResolvedRepository = (root: string, lock = true, location?: CacheLocation): PrepareResult => {
+  const captured = location ?? inspectCacheLocation(root)
+  return lock
+    ? withOperationLock(root, heldLocation => rebuildCache(root, heldLocation), {}, captured)
+    : rebuildCache(root, captured)
+}
 
 export const prepare = (input: RootInput = {}): PrepareResult => {
   const root = resolveRepository(parseRootInput(input, 'prepare'))
@@ -787,8 +817,8 @@ const fullResultLimit = (value: unknown) => positiveLimit(value, MAX_FULL_RESULT
 
 const compactResultLimit = (value: unknown) => positiveLimit(value, MAX_COMPACT_RESULT_LIMIT, 'compactResultLimit')
 
-const readFreshDatabase = <Result>(root: string, read: (database: DatabaseSync) => Result) => {
-  const database = openReaderDatabase(root)
+const readFreshDatabase = <Result>(root: string, location: CacheLocation, read: (database: DatabaseSync) => Result) => {
+  const database = openReaderDatabase(location)
   try {
     const metadata = readMetadata(database)
     if (!metadataIsFresh(root, database, metadata)) {
@@ -802,17 +832,19 @@ const readFreshDatabase = <Result>(root: string, read: (database: DatabaseSync) 
 
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
   const root = resolveRepository(input)
+  let location: CacheLocation | undefined
   try {
-    prepareResolved(root)
-    return readFreshDatabase(root, read)
+    location = inspectCacheLocation(root)
+    prepareResolved(root, true, location)
+    return readFreshDatabase(root, location, read)
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
     }
-    if (isRecoverableCacheFailure(error)) {
-      withOperationLock(root, () => rebuildCache(root))
+    if (isRecoverableCacheFailure(error) && location !== undefined) {
+      withOperationLock(root, captured => rebuildCache(root, captured), {}, location)
       try {
-        return readFreshDatabase(root, read)
+        return readFreshDatabase(root, location, read)
       } catch (retryError) {
         if (retryError instanceof EncephalonError) {
           throw retryError
@@ -1070,8 +1102,12 @@ const assertGatherBudgets = (input: GatherInput) => {
   searches.forEach(literalMatchQuery)
 }
 
-const readFreshTransaction = <Result>(root: string, read: (database: DatabaseSync) => Result) => {
-  const database = openReaderDatabase(root)
+const readFreshTransaction = <Result>(
+  root: string,
+  location: CacheLocation,
+  read: (database: DatabaseSync) => Result,
+) => {
+  const database = openReaderDatabase(location)
   try {
     database.exec('BEGIN')
     const metadata = readMetadata(database)
@@ -1118,24 +1154,26 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
   assertGatherBudgets(parsed)
   compactResultLimit(parsed.limit)
   const root = resolveRepository(parsed)
+  let location: CacheLocation | undefined
   try {
+    location = inspectCacheLocation(root)
     let hydrated: HydrateResult | null = null
     if (parsed.hydrate === true) {
       hydrated = {
-        recordsIndexed: hydrateResolvedRepository(root).recordsIndexed,
+        recordsIndexed: hydrateResolvedRepository(root, true, location).recordsIndexed,
       }
     } else {
-      prepareResolved(root)
+      prepareResolved(root, true, location)
     }
-    return readFreshTransaction(root, database => readGatherFromDatabase(database, parsed, hydrated))
+    return readFreshTransaction(root, location, database => readGatherFromDatabase(database, parsed, hydrated))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
     }
-    if (isRecoverableCacheFailure(error)) {
-      const recovered = withOperationLock(root, () => rebuildCache(root))
+    if (isRecoverableCacheFailure(error) && location !== undefined) {
+      const recovered = withOperationLock(root, captured => rebuildCache(root, captured), {}, location)
       try {
-        return readFreshTransaction(root, database =>
+        return readFreshTransaction(root, location, database =>
           readGatherFromDatabase(
             database,
             parsed,

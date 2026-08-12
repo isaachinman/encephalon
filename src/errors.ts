@@ -70,8 +70,13 @@ const isRecognizedSQLiteError = (error: unknown) => {
   )
 }
 
+const hasRecognizedIoCause = (cause: unknown, remainingDepth = 8): boolean =>
+  isRecognizedFilesystemError(cause) ||
+  isRecognizedSQLiteError(cause) ||
+  (remainingDepth > 0 && isRecord(cause) && hasRecognizedIoCause(cause.cause, remainingDepth - 1))
+
 const errorCodeForCause = (cause: unknown): EncephalonErrorCode =>
-  isRecognizedFilesystemError(cause) || isRecognizedSQLiteError(cause) ? 'IO_ERROR' : 'INTERNAL_ERROR'
+  hasRecognizedIoCause(cause) ? 'IO_ERROR' : 'INTERNAL_ERROR'
 
 const isCliSafeString = (value: string) =>
   value.length <= MAX_CLI_STRING_LENGTH && !/[\r\n]/.test(value) && !containsAbsolutePath(value)
