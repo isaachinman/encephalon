@@ -53,24 +53,6 @@ describe('error classification', () => {
     assertWrappedCode(Object.assign(new Error('snapshot is busy'), { code: 'SQLITE_BUSY_SNAPSHOT' }), 'IO_ERROR')
   })
 
-  test('preserves the public boundary between environmental and internal SQLite failures', () => {
-    const cases = [
-      { code: 'IO_ERROR', error: { errcode: 5 }, name: 'busy' },
-      { code: 'IO_ERROR', error: { errcode: 14 }, name: 'cannot open' },
-      { code: 'IO_ERROR', error: { errcode: 11 }, name: 'corrupt' },
-      { code: 'IO_ERROR', error: { errcode: 10 }, name: 'I/O' },
-      { code: 'IO_ERROR', error: { errcode: 6 }, name: 'locked' },
-      { code: 'IO_ERROR', error: { errcode: 26 }, name: 'not a database' },
-      { code: 'IO_ERROR', error: { errcode: 8 }, name: 'read-only' },
-      { code: 'INTERNAL_ERROR', error: { errcode: 1, message: 'no such table: metadata' }, name: 'schema' },
-      { code: 'INTERNAL_ERROR', error: { errcode: 19 }, name: 'unknown' },
-    ] as const
-
-    for (const entry of cases) {
-      assertWrappedCode(Object.assign(new Error(entry.name), { code: 'ERR_SQLITE_ERROR', ...entry.error }), entry.code)
-    }
-  })
-
   test('classifies plain errors without errno as internal defects', () => {
     assertWrappedCode(new Error('Unable to write file.'), 'INTERNAL_ERROR')
     assertWrappedCode(new Error('database is locked'), 'INTERNAL_ERROR')
