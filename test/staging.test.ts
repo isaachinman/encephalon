@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
-import { createOwnedStagingName, MAX_STAGING_DIRECTORY_ENTRIES, parseOwnedStagingName } from '../src/staging.ts'
+import {
+  createOwnedStagingName,
+  MAX_STAGING_DIRECTORY_ENTRIES,
+  parseOwnedStagingName,
+  parseOwnedStagingQuarantineName,
+} from '../src/staging.ts'
 
 describe('owned staging names', () => {
   test('accepts only the exact writer filename grammar and fixes the recovery bound', () => {
@@ -34,5 +39,22 @@ describe('owned staging names', () => {
       createOwnedStagingName(123, '550e8400-e29b-41d4-a716-446655440000'),
       'record-123-550e8400-e29b-41d4-a716-446655440000.tmp',
     )
+  })
+
+  test('accepts only canonical crash-quarantine names', () => {
+    const writerName = 'record-123-550e8400-e29b-41d4-a716-446655440000.tmp'
+    assert.deepEqual(
+      parseOwnedStagingQuarantineName(`.${writerName}.00000000-0000-4000-8000-000000000001.quarantine`),
+      { writerName },
+    )
+    for (const name of [
+      `${writerName}.00000000-0000-4000-8000-000000000001.quarantine`,
+      `.${writerName}.00000000-0000-4000-7000-000000000001.quarantine`,
+      `.${writerName}.00000000-0000-4000-8000-000000000001.QUARANTINE`,
+      `..${writerName}.00000000-0000-4000-8000-000000000001.quarantine`,
+      `.${writerName}.00000000-0000-4000-8000-000000000001.quarantine.extra`,
+    ]) {
+      assert.equal(parseOwnedStagingQuarantineName(name), undefined, name)
+    }
   })
 })

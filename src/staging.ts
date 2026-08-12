@@ -23,6 +23,8 @@ export const MAX_STAGING_DIRECTORY_ENTRIES = 1000
 const STAGING_RELATIVE_PATH = `encephalon/${STAGING_DIRECTORY_NAME}`
 const OWNED_STAGING_NAME =
   /^record-([1-9]\d*)-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.tmp$/u
+const OWNED_STAGING_QUARANTINE_NAME =
+  /^\.(record-[1-9]\d*-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp)\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.quarantine$/u
 const directoryFlag = constants.O_DIRECTORY ?? 0
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
 
@@ -30,6 +32,7 @@ type StagingCleanupHooks = {
   afterQuarantine?: (() => void) | undefined
   afterPreflight?: (() => void) | undefined
   beforeEntryLstat?: (() => void) | undefined
+  beforeEmptyProbe?: (() => void) | undefined
   beforeFlush?: (() => void) | undefined
   beforeQuarantine?: (() => void) | undefined
 }
@@ -37,6 +40,7 @@ type StagingCleanupHooks = {
 type StagingEntry = {
   metadata: BigIntStats
   name: string
+  writerName: string
 }
 
 /** @internal */
@@ -54,6 +58,15 @@ export const parseOwnedStagingName = (name: string) => {
 
 /** @internal */
 export const createOwnedStagingName = (pid: number, uuid: string) => `record-${pid}-${uuid}.tmp`
+
+/** @internal */
+export const parseOwnedStagingQuarantineName = (name: string) => {
+  const writerName = OWNED_STAGING_QUARANTINE_NAME.exec(name)?.[1]
+  if (writerName === undefined || parseOwnedStagingName(writerName) === undefined) {
+    return
+  }
+  return { writerName }
+}
 
 /** @internal */
 export const stagingTestHooks: { fsyncDirectory?: ((descriptor: number) => void) | undefined } = {}
@@ -75,7 +88,11 @@ const stagingEntryLimit = (): never =>
     `${STAGING_RELATIVE_PATH} may contain at most ${MAX_STAGING_DIRECTORY_ENTRIES} entries. Remove excess or unrecognised entries from ${STAGING_RELATIVE_PATH} and retry.`,
   )
 
-const repositoryChanged = (): never => fail('REPOSITORY_CHANGED', 'Canonical layout changed before publication.')
+const repositoryChanged = (): never =>
+  fail('REPOSITORY_CHANGED', 'Staging layout changed before publication.', {
+    action: 'Inspect the staging directory and retry.',
+    path: STAGING_RELATIVE_PATH,
+  })
 
 const isPermittedStagingType = (metadata: BigIntStats) => metadata.isFile() || metadata.isSymbolicLink()
 
@@ -105,14 +122,15 @@ const captureNextGeneration = (current: DirectoryWitness) => {
 }
 
 const inspectStagingEntry = (stagingDirectory: string, name: string): StagingEntry => {
-  if (parseOwnedStagingName(name) === undefined) {
+  const writerName = parseOwnedStagingQuarantineName(name)?.writerName ?? name
+  if (parseOwnedStagingName(writerName) === undefined) {
     return invalidStagingLayout()
   }
   const metadata = mapReplacement(() => lstatSync(resolve(stagingDirectory, name), { bigint: true }))
   if (!isPermittedStagingType(metadata)) {
     return invalidStagingLayout()
   }
-  return { metadata, name }
+  return { metadata, name, writerName }
 }
 
 const sameRecoveredRegularEntry = (expected: BigIntStats, current: BigIntStats) =>
@@ -132,35 +150,6 @@ const sameRecoveredSymbolicLink = (expected: BigIntStats, current: BigIntStats) 
   expected.mode === current.mode &&
   expected.birthtimeNs === current.birthtimeNs &&
   expected.mtimeNs === current.mtimeNs
-
-const lstatIfExists = (path: string) => {
-  try {
-    return lstatSync(path, { bigint: true })
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return
-    }
-    throw error
-  }
-}
-
-const restoreQuarantinedEntry = (
-  sourcePath: string,
-  quarantinePath: string,
-  witness: DirectoryWitness,
-  quarantineMetadata: BigIntStats,
-) => {
-  try {
-    revalidateDirectoryWitness(witness)
-    const source = lstatIfExists(sourcePath)
-    const quarantine = lstatIfExists(quarantinePath)
-    if (source === undefined && quarantine !== undefined && sameStableEntryMetadata(quarantineMetadata, quarantine)) {
-      renameSync(quarantinePath, sourcePath)
-    }
-  } catch {
-    // Keep the verified quarantine entry recoverable rather than deleting an uncertain path.
-  }
-}
 
 const quarantineStagingEntry = (
   stagingDirectory: string,
@@ -201,7 +190,7 @@ const quarantineStagingEntry = (
       return repositoryChanged()
     }
     mapReplacement(() => revalidateDirectoryWitness(witness))
-    const quarantinePath = resolve(stagingDirectory, `.${entry.name}.${randomUUID()}.quarantine`)
+    const quarantinePath = resolve(stagingDirectory, `.${entry.writerName}.${randomUUID()}.quarantine`)
     mapReplacement(() => renameSync(sourcePath, quarantinePath))
     const nextWitness = captureNextGeneration(witness)
     const moved = mapReplacement(() => lstatSync(quarantinePath, { bigint: true }))
@@ -211,7 +200,6 @@ const quarantineStagingEntry = (
         sameStableEntryMetadata(moved, fstatSync(descriptor, { bigint: true }))
       : sameRecoveredSymbolicLink(entry.metadata, moved)
     if (!movedAccepted) {
-      restoreQuarantinedEntry(sourcePath, quarantinePath, nextWitness, moved)
       return repositoryChanged()
     }
     hooks.afterQuarantine?.()
@@ -223,7 +211,6 @@ const quarantineStagingEntry = (
     if (!quarantineAccepted) {
       return repositoryChanged()
     }
-    mapReplacement(() => revalidateDirectoryWitness(nextWitness))
     mapReplacement(() => unlinkSync(quarantinePath))
     result = captureNextGeneration(nextWitness)
   } catch (error) {
@@ -246,6 +233,7 @@ const quarantineStagingEntry = (
   return result as DirectoryWitness
 }
 
+/** @internal */
 export const inspectCurrentStagingFile = (stagingDirectory: string, name: string, descriptorMetadata: BigIntStats) => {
   const snapshot = mapReplacement(() => captureCanonicalDirectory(stagingDirectory, 1))
   if (snapshot.overflow || snapshot.entries.length !== 1 || snapshot.entries[0]?.name !== name) {
@@ -266,7 +254,7 @@ export const cleanupOwnedStagingEntry = (
   hooks: StagingCleanupHooks = {},
 ) => {
   const witness = mapReplacement(() => captureDirectoryWitness(stagingDirectory, { allowLink: false }))
-  const nextWitness = quarantineStagingEntry(stagingDirectory, { metadata, name }, witness, hooks)
+  const nextWitness = quarantineStagingEntry(stagingDirectory, { metadata, name, writerName: name }, witness, hooks)
   hooks.beforeFlush?.()
   mapReplacement(() => revalidateDirectoryWitness(nextWitness))
   mapReplacement(() => fsyncDirectory(nextWitness))
@@ -282,16 +270,20 @@ const fsyncDirectory = (witness: DirectoryWitness) => {
       if (!sameStableEntryMetadata(metadata, witness.canonicalMetadata)) {
         return repositoryChanged()
       }
-      if (stagingTestHooks.fsyncDirectory === undefined) {
-        fsyncSync(descriptor)
-      } else {
-        stagingTestHooks.fsyncDirectory(descriptor)
+      try {
+        if (stagingTestHooks.fsyncDirectory === undefined) {
+          fsyncSync(descriptor)
+        } else {
+          stagingTestHooks.fsyncDirectory(descriptor)
+        }
+      } catch (error) {
+        const { code } = error as NodeJS.ErrnoException
+        if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'EPERM') {
+          throw error
+        }
       }
     } catch (error) {
-      const { code } = error as NodeJS.ErrnoException
-      if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'EPERM') {
-        primaryError = error
-      }
+      primaryError = error
     }
     let closeError: unknown
     if (descriptor !== undefined) {
@@ -310,7 +302,8 @@ const fsyncDirectory = (witness: DirectoryWitness) => {
   }
 }
 
-const assertStagingEmpty = (witness: DirectoryWitness) => {
+const assertStagingEmpty = (witness: DirectoryWitness, hooks: StagingCleanupHooks) => {
+  hooks.beforeEmptyProbe?.()
   mapReplacement(() => revalidateDirectoryWitness(witness))
   const remaining = mapReplacement(() => collectBoundedDirectoryEntries(witness.canonicalPath, 0))
   mapReplacement(() => revalidateDirectoryWitness(witness))
@@ -333,7 +326,7 @@ export const cleanupStaleStagingEntries = (stagingDirectory: string, hooks: Stag
   for (const entry of entries) {
     witness = quarantineStagingEntry(stagingDirectory, entry, witness, hooks)
   }
-  assertStagingEmpty(witness)
+  assertStagingEmpty(witness, hooks)
   hooks.beforeFlush?.()
   mapReplacement(() => revalidateDirectoryWitness(witness))
   mapReplacement(() => fsyncDirectory(witness))

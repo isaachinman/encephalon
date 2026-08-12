@@ -44,7 +44,7 @@ const createRoot = () => {
 const timestampAt = (index: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, 0, index)).toISOString()
 
 const ownedStagingName = (index: number) =>
-  `record-123-00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}.tmp`
+  stagingInternals.createOwnedStagingName(123, `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`)
 
 const writeCanonicalRecord = (
   root: string,
@@ -107,6 +107,8 @@ const postCommitRecoveryAction = {
   cacheHydration: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
   publicationFlush:
     'Confirm the canonical record file is present; prepare does not re-fsync the kind directory, so treat durability as unverified until that sync succeeds.',
+  publicationVerification:
+    'Inspect the canonical directory generation before retrying; the linked record may have been displaced by a concurrent replacement.',
   stagingCleanup: 'Inspect encephalon/_staging and remove only a confirmed leftover from this operation.',
 } as const
 
@@ -567,6 +569,11 @@ describe('canonical records', () => {
         stagingName: 'record-0123-00000000-0000-4000-8000-000000000000.tmp',
       },
       {
+        create: (path: string) => writeFileSync(path, 'malformed quarantine'),
+        name: 'malformed crash quarantine',
+        stagingName: `.${ownedStagingName(12)}.00000000-0000-4000-7000-000000000001.quarantine`,
+      },
+      {
         create: (path: string) => mkdirSync(path),
         name: 'owned-name directory',
         stagingName: ownedStagingName(10),
@@ -752,6 +759,37 @@ describe('canonical records', () => {
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'late-staging-entry.json')), false)
   })
 
+  test('preserves an entry that arrives before the final staging emptiness probe', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    const stalePath = join(stagingDirectory, ownedStagingName(0))
+    const latePath = join(stagingDirectory, 'late-before-empty-probe.tmp')
+    mkdirSync(stagingDirectory, { recursive: true })
+    writeFileSync(stalePath, 'stale')
+    recordWriteTestHooks.fault = point => {
+      if ((point as string) === 'before-staging-cleanup-empty-probe') {
+        writeFileSync(latePath, 'late')
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'late-before-empty-probe',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'staging.late-empty-probe',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+
+    assert.equal(readFileSync(latePath, 'utf8'), 'late')
+    assert.equal(existsSync(stalePath), false)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'late-before-empty-probe.json')), false)
+  })
+
   test('preserves a replacement installed at the immediate staging deletion boundary', () => {
     const root = createRoot()
     const stagingDirectory = join(root, 'encephalon', '_staging')
@@ -812,8 +850,9 @@ describe('canonical records', () => {
   test('preserves a quarantine pathname replacement at the immediate unlink boundary', () => {
     const root = createRoot()
     const stagingDirectory = join(root, 'encephalon', '_staging')
+    const sourcePath = join(stagingDirectory, ownedStagingName(0))
     mkdirSync(stagingDirectory, { recursive: true })
-    writeFileSync(join(stagingDirectory, ownedStagingName(0)), 'preflight')
+    writeFileSync(sourcePath, 'preflight')
     const displaced = join(root, 'displaced-staging-quarantine')
     let replacementPath: string | undefined
     recordWriteTestHooks.fault = point => {
@@ -824,6 +863,7 @@ describe('canonical records', () => {
           replacementPath = join(stagingDirectory, quarantineName)
           renameSync(replacementPath, displaced)
           writeFileSync(replacementPath, 'replacement')
+          writeFileSync(sourcePath, 'successor')
         }
       }
     }
@@ -843,27 +883,24 @@ describe('canonical records', () => {
 
     assert.equal(replacementPath === undefined ? undefined : readFileSync(replacementPath, 'utf8'), 'replacement')
     assert.equal(readFileSync(displaced, 'utf8'), 'preflight')
+    assert.equal(readFileSync(sourcePath, 'utf8'), 'successor')
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'staging-quarantine-replacement.json')), false)
   })
 
-  test('does not unlink through a staging ancestor replaced before entry inspection', {
-    skip: process.platform === 'win32' ? 'Windows runners may not permit directory symlink creation.' : false,
-  }, () => {
+  test('does not unlink through a staging directory generation replaced before entry inspection', () => {
     const root = createRoot()
     const stagingDirectory = join(root, 'encephalon', '_staging')
     const displacedStaging = join(root, 'displaced-staging-entry')
-    const outside = join(root, 'outside-staging-entry')
     const name = ownedStagingName(0)
     mkdirSync(stagingDirectory, { recursive: true })
-    mkdirSync(outside)
     writeFileSync(join(stagingDirectory, name), 'same inode')
-    linkSync(join(stagingDirectory, name), join(outside, name))
     let replaced = false
     recordWriteTestHooks.fault = point => {
       if (point === 'before-staging-cleanup-entry-lstat' && !replaced) {
         replaced = true
         renameSync(stagingDirectory, displacedStaging)
-        symlinkSync(outside, stagingDirectory, 'dir')
+        mkdirSync(stagingDirectory)
+        linkSync(join(displacedStaging, name), join(stagingDirectory, name))
       }
     }
 
@@ -881,7 +918,8 @@ describe('canonical records', () => {
     )
 
     assert.equal(replaced, true)
-    assert.equal(readFileSync(join(outside, name), 'utf8'), 'same inode')
+    assert.equal(readFileSync(join(stagingDirectory, name), 'utf8'), 'same inode')
+    assert.equal(readFileSync(join(displacedStaging, name), 'utf8'), 'same inode')
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'staging-ancestor-replacement.json')), false)
   })
 
@@ -913,7 +951,9 @@ describe('canonical records', () => {
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'staging-cleanup-flush.json')), false)
   })
 
-  test('retries staging durability after cleanup before publishing', () => {
+  test('retries staging durability after cleanup before publishing', {
+    skip: process.platform === 'win32' ? 'Windows does not flush staging directories.' : false,
+  }, () => {
     const root = createRoot()
     const stagingDirectory = join(root, 'encephalon', '_staging')
     mkdirSync(stagingDirectory, { recursive: true })
@@ -927,19 +967,26 @@ describe('canonical records', () => {
       fsyncSync(descriptor)
     }
 
-    assertErrorCode(
-      () =>
-        api.addRecord({
-          id: 'staging-durability-first',
-          kind: 'decision',
-          payload: {},
-          root,
-          source: 'agent',
-          subject: 'staging.durability-first',
-        }),
-      'IO_ERROR',
+    let failure: unknown
+    try {
+      api.addRecord({
+        id: 'staging-durability-first',
+        kind: 'decision',
+        payload: {},
+        root,
+        source: 'agent',
+        subject: 'staging.durability-first',
+      })
+    } catch (error) {
+      failure = error
+    }
+    assert.equal((failure as { code?: unknown } | undefined)?.code, 'IO_ERROR')
+    assert.equal(
+      (failure as { details?: { canonicalCommitted?: unknown } } | undefined)?.details?.canonicalCommitted ?? false,
+      false,
     )
     assert.deepEqual(readdirSync(stagingDirectory), [])
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'staging-durability-first.json')), false)
 
     api.addRecord({
       id: 'staging-durability-retry',
@@ -1052,20 +1099,204 @@ describe('canonical records', () => {
     assert.match(readFileSync(displaced, 'utf8'), /"id": "canonical-link-substitution"/)
   })
 
-  test('does not flush a staging-root replacement after cleanup', {
-    skip: process.platform === 'win32' ? 'Windows runners may not permit symlink creation.' : false,
-  }, () => {
+  test('does not accept a canonical successor across final publication verification', () => {
+    for (const point of ['after-publication', 'after-publication-accept'] as const) {
+      const root = createRoot()
+      const id = `final-canonical-substitution-${point}`
+      const relativePath = `encephalon/decision/${id}.json`
+      const canonicalPath = join(root, ...relativePath.split('/'))
+      const displaced = join(root, `displaced-final-canonical-link-${point}`)
+
+      assertCommittedRepositoryChange(
+        () =>
+          addRecordResolved(
+            root,
+            {
+              id,
+              kind: 'decision',
+              payload: {},
+              source: 'agent',
+              subject: `staging.final-canonical-substitution.${point}`,
+            },
+            {
+              hooks: {
+                fault: actualPoint => {
+                  if ((actualPoint as string) === point) {
+                    renameSync(canonicalPath, displaced)
+                    writeFileSync(canonicalPath, 'successor')
+                  }
+                },
+              },
+              hydrate: false,
+            },
+          ),
+        relativePath,
+        id,
+      )
+
+      assert.equal(readFileSync(canonicalPath, 'utf8'), 'successor')
+      assert.match(readFileSync(displaced, 'utf8'), new RegExp(`"id": "${id}"`, 'u'))
+    }
+  })
+
+  test('reports an operational final publication verification failure as committed I/O', () => {
+    const root = createRoot()
+    assertPostCommitError(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'final-publication-verification-io',
+            kind: 'decision',
+            payload: {},
+            source: 'agent',
+            subject: 'staging.final-verification-io',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if ((point as string) === 'after-publication-accept') {
+                  throw Object.assign(new Error('injected verification I/O'), { code: 'EIO' })
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      {
+        path: 'encephalon/decision/final-publication-verification-io.json',
+        phase: 'publicationVerification',
+        recordId: 'final-publication-verification-io',
+      },
+    )
+  })
+
+  test('classifies a staging entry disappearance without leaking its name', () => {
+    for (const code of ['ENOENT', 'EIO'] as const) {
+      const root = createRoot()
+      const stagingDirectory = join(root, 'encephalon', '_staging')
+      const stagingPath = join(stagingDirectory, ownedStagingName(0))
+      mkdirSync(stagingDirectory, { recursive: true })
+      writeFileSync(stagingPath, 'stale')
+      let failure: unknown
+      recordWriteTestHooks.fault = point => {
+        if (point === 'before-staging-cleanup-entry-lstat') {
+          if (code === 'ENOENT') {
+            rmSync(stagingPath)
+          } else {
+            throw Object.assign(new Error('injected EIO'), { code })
+          }
+        }
+      }
+
+      try {
+        api.addRecord({
+          id: `staging-race-${code.toLowerCase()}`,
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: `staging.race.${code.toLowerCase()}`,
+        })
+      } catch (error) {
+        failure = error
+      }
+
+      const typed = failure as { code?: unknown; details?: Record<string, unknown> }
+      assert.equal(typed.code, code === 'EIO' ? 'IO_ERROR' : 'REPOSITORY_CHANGED', code)
+      if (code !== 'EIO') {
+        assert.deepEqual(typed.details, {
+          action: 'Inspect the staging directory and retry.',
+          path: 'encephalon/_staging',
+        })
+      }
+      assert.equal(existsSync(join(root, 'encephalon', 'decision', `staging-race-${code.toLowerCase()}.json`)), false)
+    }
+  })
+
+  test('reports a late staging child after linking as a committed repository change', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    const latePath = join(stagingDirectory, 'late-after-link.tmp')
+    let reachedPublication = false
+
+    assertCommittedRepositoryChange(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id: 'late-staging-after-link',
+            kind: 'decision',
+            payload: {},
+            source: 'agent',
+            subject: 'staging.late-after-link',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if ((point as string) === 'after-canonical-link') {
+                  writeFileSync(latePath, 'late')
+                } else if (point === 'after-publication') {
+                  reachedPublication = true
+                }
+              },
+            },
+            hydrate: false,
+          },
+        ),
+      'encephalon/decision/late-staging-after-link.json',
+      'late-staging-after-link',
+    )
+
+    assert.equal(readFileSync(latePath, 'utf8'), 'late')
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'late-staging-after-link.json')), true)
+    assert.equal(reachedPublication, false)
+  })
+
+  test('recovers a canonical crash-quarantine staging leftover', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    const writerName = ownedStagingName(0)
+    const quarantineName = `.${writerName}.550e8400-e29b-41d4-a716-446655440000.quarantine`
+    mkdirSync(stagingDirectory, { recursive: true })
+    writeFileSync(join(stagingDirectory, quarantineName), 'crash leftover')
+    let recoveredQuarantineWriterName: string | undefined
+    recordWriteTestHooks.fault = point => {
+      if ((point as string) === 'after-staging-cleanup-quarantine' && recoveredQuarantineWriterName === undefined) {
+        const [currentName] = readdirSync(stagingDirectory)
+        assert.notEqual(currentName, undefined)
+        if (currentName !== undefined) {
+          recoveredQuarantineWriterName = stagingInternals.parseOwnedStagingQuarantineName(currentName)?.writerName
+        }
+      }
+    }
+
+    api.addRecord({
+      id: 'after-crash-quarantine',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'staging.after-crash-quarantine',
+    })
+
+    assert.deepEqual(readdirSync(stagingDirectory), [])
+    assert.equal(recoveredQuarantineWriterName, writerName)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'after-crash-quarantine.json')), true)
+  })
+
+  test('does not flush a staging-root replacement after cleanup', () => {
     const root = createRoot()
     const stagingDirectory = join(root, 'encephalon', '_staging')
     const displacedStaging = join(root, 'displaced-staging-flush')
-    const outside = join(root, 'outside-staging-flush')
+    const successorSentinel = join(stagingDirectory, 'successor-sentinel')
     mkdirSync(stagingDirectory, { recursive: true })
     writeFileSync(join(stagingDirectory, ownedStagingName(0)), 'stale')
-    writeFileSync(outside, 'outside')
     recordWriteTestHooks.fault = point => {
       if (point === 'during-staging-cleanup-flush') {
         renameSync(stagingDirectory, displacedStaging)
-        symlinkSync(outside, stagingDirectory, 'file')
+        mkdirSync(stagingDirectory)
+        writeFileSync(successorSentinel, 'successor')
       }
     }
 
@@ -1082,7 +1313,7 @@ describe('canonical records', () => {
       'REPOSITORY_CHANGED',
     )
 
-    assert.equal(readFileSync(outside, 'utf8'), 'outside')
+    assert.equal(readFileSync(successorSentinel, 'utf8'), 'successor')
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'staging-cleanup-flush-replacement.json')), false)
   })
 

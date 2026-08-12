@@ -101,11 +101,13 @@ type FileIdentity = {
 type RecordWriteFault =
   | 'after-scan-validation'
   | 'after-publication'
+  | 'after-publication-accept'
   | 'after-canonical-link'
   | 'after-staging-cleanup-quarantine'
   | 'after-staging-cleanup-preflight'
   | 'before-directory-preparation'
   | 'before-publication'
+  | 'before-staging-cleanup-empty-probe'
   | 'before-staging-cleanup-entry-lstat'
   | 'before-staging-cleanup-quarantine'
   | 'during-cleanup'
@@ -206,6 +208,28 @@ const publicationVerificationError = (record: BrainRecord, cause: unknown) =>
     },
     { cause },
   )
+
+class CanonicalPublicationIdentityError extends Error {}
+
+const assertCanonicalPublicationIdentity = (path: string, descriptor: number) => {
+  const descriptorMetadata = fstatSync(descriptor, { bigint: true })
+  const pathMetadata = lstatSync(path, { bigint: true })
+  if (!(pathMetadata.isFile() && sameStableEntryMetadata(descriptorMetadata, pathMetadata))) {
+    throw new CanonicalPublicationIdentityError('The canonical path does not identify the staged descriptor.')
+  }
+}
+
+const classifyPublicationVerificationError = (record: BrainRecord, error: unknown) => {
+  if (
+    error instanceof CanonicalPublicationIdentityError ||
+    error instanceof DirectoryWitnessError ||
+    isCanonicalDirectoryReplacementError(error) ||
+    (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED')
+  ) {
+    return publicationVerificationError(record, error)
+  }
+  return postCommitError(record, 'publicationVerification', error)
+}
 
 const canonicalRecordBytes = (record: BrainRecord) => {
   const { path: _path, ...recordFile } = record
@@ -1222,6 +1246,7 @@ const publishPlannedRecordInternal = (
     cleanupStaleStagingEntries(resolve(brainDirectory, STAGING_DIRECTORY_NAME), {
       afterPreflight: () => fault(options.hooks, 'after-staging-cleanup-preflight'),
       afterQuarantine: () => fault(options.hooks, 'after-staging-cleanup-quarantine'),
+      beforeEmptyProbe: () => fault(options.hooks, 'before-staging-cleanup-empty-probe'),
       beforeEntryLstat: () => fault(options.hooks, 'before-staging-cleanup-entry-lstat'),
       beforeFlush: () => fault(options.hooks, 'during-staging-cleanup-flush'),
       beforeQuarantine: () => fault(options.hooks, 'before-staging-cleanup-quarantine'),
@@ -1274,19 +1299,15 @@ const publishPlannedRecordInternal = (
       published = true
       try {
         fault(options.hooks, 'after-canonical-link')
-        const linkedDescriptorMetadata = fstatSync(descriptor, { bigint: true })
+        revalidatePublicationDirectories([stagingWitness])
         const linkedStagingMetadata = lstatSync(stagingPath, { bigint: true })
-        const linkedCanonicalMetadata = lstatSync(path, { bigint: true })
-        if (
-          !(
-            sameStableEntryMetadata(linkedDescriptorMetadata, linkedStagingMetadata) &&
-            sameStableEntryMetadata(linkedDescriptorMetadata, linkedCanonicalMetadata)
-          )
-        ) {
-          throw new Error('The canonical link does not match the staged descriptor.')
+        const linkedDescriptorMetadata = fstatSync(descriptor, { bigint: true })
+        if (!sameStableEntryMetadata(linkedDescriptorMetadata, linkedStagingMetadata)) {
+          throw new CanonicalPublicationIdentityError('The staged path does not identify the staged descriptor.')
         }
+        assertCanonicalPublicationIdentity(path, descriptor)
       } catch (error) {
-        throw publicationVerificationError(record, error)
+        throw classifyPublicationVerificationError(record, error)
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
@@ -1308,7 +1329,7 @@ const publishPlannedRecordInternal = (
     throw error
   } finally {
     let descriptorCloseError: unknown
-    if (descriptor !== undefined) {
+    if (descriptor !== undefined && (operationFailed || !published)) {
       try {
         closeSync(descriptor)
       } catch (error) {
@@ -1355,6 +1376,7 @@ const publishPlannedRecordInternal = (
         if (descriptorMetadata !== undefined) {
           cleanupOwnedStagingEntry(stagingDirectory, stagingName, descriptorMetadata, {
             afterQuarantine: () => fault(options.hooks, 'after-staging-cleanup-quarantine'),
+            beforeEmptyProbe: () => fault(options.hooks, 'before-staging-cleanup-empty-probe'),
             beforeEntryLstat: () => fault(options.hooks, 'before-staging-cleanup-entry-lstat'),
             beforeFlush: () => fault(options.hooks, 'during-staging-cleanup-flush'),
             beforeQuarantine: () => fault(options.hooks, 'before-staging-cleanup-quarantine'),
@@ -1372,10 +1394,27 @@ const publishPlannedRecordInternal = (
   if (cleanupError !== undefined) {
     throw cleanupError
   }
-  try {
-    options.authority.acceptPublication(recordFile.kind, `${recordFile.id}.json`, publicationRoot, publicationKind)
-  } catch (error) {
-    throw publicationVerificationError(record, error)
+  if (committedErrorPhase !== 'publicationVerification' && descriptor !== undefined) {
+    try {
+      assertCanonicalPublicationIdentity(path, descriptor)
+      options.authority.acceptPublication(recordFile.kind, `${recordFile.id}.json`, publicationRoot, publicationKind)
+      fault(options.hooks, 'after-publication-accept')
+      assertCanonicalPublicationIdentity(path, descriptor)
+    } catch (error) {
+      committedError = classifyPublicationVerificationError(record, error)
+      committedErrorPhase = 'publicationVerification'
+    }
+  }
+  if (descriptor !== undefined) {
+    try {
+      closeSync(descriptor)
+    } catch (error) {
+      if (committedErrorPhase !== 'publicationVerification') {
+        committedError = classifyPublicationVerificationError(record, error)
+        committedErrorPhase = 'publicationVerification'
+      }
+    }
+    descriptor = undefined
   }
   return {
     record,

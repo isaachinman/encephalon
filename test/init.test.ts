@@ -27,6 +27,7 @@ import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import type { RecordWriteHooks } from '../src/records.ts'
+import { createOwnedStagingName } from '../src/staging.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
@@ -163,7 +164,7 @@ describe('initialisation', () => {
     const root = createRoot()
     const stagingDirectory = join(root, 'encephalon', '_staging')
     mkdirSync(stagingDirectory, { recursive: true })
-    writeFileSync(join(stagingDirectory, 'record-123-550e8400-e29b-41d4-a716-446655440000.tmp'), 'stale')
+    writeFileSync(join(stagingDirectory, createOwnedStagingName(123, '550e8400-e29b-41d4-a716-446655440000')), 'stale')
 
     const result = api.initEncephalon({ root })
 
