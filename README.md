@@ -197,7 +197,7 @@ bun run benchmark:check
 
 See [docs/performance.md](./docs/performance.md) for benchmark profiles, budgets, baseline results, and scale guidance.
 
-`check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything. The Ubuntu CI job is the release-equivalent package gate: it runs both checks and uploads the generated `npm pack` tarball for inspection.
+`check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything. CI runs four verification lanes: Node 24.15.0 on Ubuntu, macOS, and Windows, plus Node 26 on Ubuntu. Only trusted pushes to `main` run the separate release-equivalent package gate, which validates the publish dry run before uploading the generated `npm pack` tarball for inspection.
 
 ## Licence
 
