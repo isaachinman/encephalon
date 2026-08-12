@@ -15,6 +15,7 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
+import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import * as api from '../src/index.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import {
@@ -24,6 +25,7 @@ import {
   MAX_CANONICAL_RECORDS,
   planRecordAddition,
   projectedKindDirectoryOverflow,
+  readValidatedRecordSnapshotResolved,
   recordWriteTestHooks,
   validateRecordsResolved,
 } from '../src/records.ts'
@@ -167,6 +169,9 @@ const canCreateDirectory = (root: string, name: string) => {
 }
 
 afterEach(() => {
+  artifactInspectionTestHooks.close = undefined
+  artifactInspectionTestHooks.fault = undefined
+  artifactInspectionTestHooks.open = undefined
   recordWriteTestHooks.fault = undefined
   stagingInternals.stagingTestHooks.fsyncDirectory = undefined
   roots.splice(0).forEach(removeTestRepository)
@@ -261,6 +266,111 @@ describe('canonical records', () => {
     assert.deepEqual(record.artifacts, [artifact])
     assert.deepEqual(readdirSync(join(root, 'encephalon', '_artifacts', 'architecture', id)), ['diagram.svg'])
     assert.equal(api.validateRecords({ root }).valid, true)
+    const validated = readValidatedRecordSnapshotResolved(root)
+    assert.equal(Object.isFrozen(validated), true)
+    assert.equal(Object.isFrozen(validated.artifacts), true)
+    assert.equal(validated.artifacts.length, 1)
+    assert.equal(Object.isFrozen(validated.artifacts[0]), true)
+  })
+
+  test('does not inspect the artifact filesystem for an artifact-free corpus', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'artifact-free' })
+    artifactInspectionTestHooks.fault = point => {
+      if (point === 'after-brain-lstat') {
+        throw new Error('artifact inspection should not run')
+      }
+    }
+
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('classifies public artifact validation failures without leaking repository paths', () => {
+    const cases = [
+      { code: undefined, expected: 'INVALID_ARTIFACT', name: 'stable-invalid' },
+      { code: 'REPOSITORY_CHANGED', expected: undefined, name: 'concurrent-change' },
+      { code: 'IO_ERROR', expected: undefined, name: 'operational-io' },
+    ] as const
+    for (const entry of cases) {
+      const root = createRoot()
+      const artifact = `_artifacts/decision/${entry.name}/evidence.txt`
+      const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+      ensureParent(artifactPath)
+      writeFileSync(artifactPath, 'evidence')
+      writeCanonicalRecord(root, {
+        artifacts: [artifact],
+        id: entry.name,
+        subject: `validation.${entry.name}`,
+      })
+      if (entry.name === 'stable-invalid') {
+        rmSync(artifactPath)
+      } else {
+        artifactInspectionTestHooks.fault = (point, path) => {
+          if (path === artifact && point === 'after-artifact-fstat') {
+            if (entry.name === 'concurrent-change') {
+              writeFileSync(artifactPath, 'changed evidence')
+            } else {
+              throw Object.assign(new Error('simulated artifact I/O failure'), { code: 'EIO' })
+            }
+          }
+        }
+      }
+
+      if (entry.expected === undefined) {
+        assert.throws(
+          () => api.validateRecords({ root }),
+          (error: unknown) => {
+            const publicError = error as { code?: unknown; details?: unknown; message?: unknown }
+            assert.equal(publicError.code, entry.code)
+            assert.equal(typeof publicError.message === 'string' && publicError.message.includes(root), false)
+            assert.equal(JSON.stringify(publicError.details ?? null).includes(root), false)
+            return true
+          },
+        )
+      } else {
+        const result = api.validateRecords({ root })
+        const [issue] = result.errors
+        assert.ok(issue)
+        assert.equal(result.valid, false)
+        assert.equal(issue.code, entry.expected)
+        assert.equal(typeof issue.path === 'string' && issue.path.startsWith('encephalon/'), true)
+        assert.equal(issue.message.includes(root), false)
+      }
+      artifactInspectionTestHooks.fault = undefined
+    }
+  })
+
+  test('classifies existing artifact mutation during addRecord validation before publication', () => {
+    const root = createRoot()
+    const artifact = '_artifacts/decision/existing-artifact/evidence.txt'
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    const candidatePath = join(root, 'encephalon', 'decision', 'artifact-validation-candidate.json')
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, 'stable evidence')
+    writeCanonicalRecord(root, {
+      artifacts: [artifact],
+      id: 'existing-artifact',
+      subject: 'validation.existing-artifact',
+    })
+    artifactInspectionTestHooks.fault = (point, path) => {
+      if (point === 'after-artifact-fstat' && path === artifact) {
+        writeFileSync(artifactPath, 'mutated evidence with different metadata')
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'artifact-validation-candidate',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'validation.candidate',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(existsSync(candidatePath), false)
   })
 
   test('validates planned graph bytes without counting runtime paths', () => {

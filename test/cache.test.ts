@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -21,6 +25,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
+import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
 import {
   cacheLocationTestHooks,
@@ -37,6 +42,34 @@ import { createTestRepository, ensureParent, removeTestRepository } from '../tes
 
 const roots: string[] = []
 
+const canRenameParentWithOpenChild = () => {
+  const root = mkdtempSync(join(tmpdir(), 'encephalon-open-child-rename-test-'))
+  try {
+    const parent = join(root, 'parent')
+    const renamed = join(root, 'renamed')
+    const child = join(parent, 'child')
+    mkdirSync(parent)
+    writeFileSync(child, 'probe')
+    const descriptor = openSync(child, 'r')
+    try {
+      renameSync(parent, renamed)
+      return true
+    } catch (error) {
+      const { code } = error as NodeJS.ErrnoException
+      if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
+        return false
+      }
+      throw error
+    } finally {
+      closeSync(descriptor)
+    }
+  } finally {
+    rmSync(root, { force: true, recursive: true })
+  }
+}
+
+const renameParentWithOpenChildSupported = canRenameParentWithOpenChild()
+
 const createRoot = () => {
   const root = createTestRepository()
   roots.push(root)
@@ -50,6 +83,9 @@ const createOutsideDirectory = () => {
 }
 
 afterEach(() => {
+  artifactInspectionTestHooks.close = undefined
+  artifactInspectionTestHooks.fault = undefined
+  artifactInspectionTestHooks.open = undefined
   cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
   cacheLocationTestHooks.afterDatabaseOpen = undefined
   cacheLocationTestHooks.afterQuarantineRename = undefined
@@ -121,6 +157,229 @@ const addCacheRecord = (root: string) =>
     source: 'agent',
     subject: 'cache.validation',
   })
+
+test('uses verified artifact observations without a detached cache lstat', () => {
+  const root = createRoot()
+  const id = 'handed-artifact-observation'
+  const artifact = `_artifacts/architecture/${id}/diagram.svg`
+  const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+  ensureParent(artifactPath)
+  writeFileSync(artifactPath, '<svg>stable</svg>')
+  api.addRecord({
+    artifacts: [artifact],
+    id,
+    kind: 'architecture',
+    payload: { summary: 'Stable observation' },
+    root,
+    source: 'test',
+    subject: 'cache.handed-artifact-observation',
+  })
+
+  let detachedArtifactStats = 0
+  cacheReadTestHooks.beforeManifestEntryLstat = path => {
+    if (path === artifactPath) {
+      detachedArtifactStats += 1
+      throw Object.assign(new Error('detached artifact stat'), { code: 'EIO' })
+    }
+  }
+
+  assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+  assert.equal(detachedArtifactStats, 0)
+})
+
+test('preserves artifact manifest field ordering while converting verified observations', () => {
+  const root = createRoot()
+  const id = 'artifact-manifest-conversion'
+  const artifact = `_artifacts/architecture/${id}/diagram.svg`
+  const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+  ensureParent(artifactPath)
+  writeFileSync(artifactPath, '<svg>stable</svg>')
+  api.addRecord({
+    artifacts: [artifact],
+    id,
+    kind: 'architecture',
+    payload: { summary: 'Manifest conversion' },
+    root,
+    source: 'test',
+    subject: 'cache.artifact-manifest-conversion',
+  })
+
+  const manifestEntry = (path: string, type: 'directory' | 'file') => {
+    const metadata = lstatSync(join(root, ...path.split('/')), { bigint: true })
+    return {
+      ctimeNanoseconds: metadata.ctimeNs.toString(),
+      mtimeNanoseconds: metadata.mtimeNs.toString(),
+      path,
+      size: metadata.size.toString(),
+      type,
+    }
+  }
+  const expected = createHash('sha256')
+    .update(
+      JSON.stringify([
+        manifestEntry('encephalon', 'directory'),
+        manifestEntry('encephalon/architecture', 'directory'),
+        manifestEntry(`encephalon/architecture/${id}.json`, 'file'),
+        manifestEntry(`encephalon/${artifact}`, 'file'),
+      ]),
+    )
+    .digest('hex')
+  const database = new DatabaseSync(cacheDatabasePath(root), { readOnly: true })
+  const actual = database.prepare("SELECT value FROM metadata WHERE key = 'manifest'").get() as { value?: unknown }
+  database.close()
+
+  assert.equal(actual.value, expected)
+})
+
+test('retries transient artifact mutation and bounds persistent mutation as repository change', () => {
+  for (const persistent of [false, true]) {
+    const root = createRoot()
+    const id = persistent ? 'persistent-artifact-mutation' : 'transient-artifact-mutation'
+    const artifact = `_artifacts/architecture/${id}/diagram.svg`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, '<svg>initial</svg>')
+    api.addRecord({
+      artifacts: [artifact],
+      id,
+      kind: 'architecture',
+      payload: { summary: 'Artifact mutation retry' },
+      root,
+      source: 'test',
+      subject: `cache.${id}`,
+    })
+
+    let mutations = 0
+    artifactInspectionTestHooks.fault = (point, path) => {
+      if (point === 'after-artifact-fstat' && path === artifact && (persistent || mutations === 0)) {
+        mutations += 1
+        writeFileSync(artifactPath, `<svg>mutation-${mutations}</svg>`)
+      }
+    }
+
+    if (persistent) {
+      assert.throws(
+        () => api.hydrate({ root }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+      assert.equal(mutations, 3)
+    } else {
+      assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+      assert.equal(mutations, 1)
+      assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+    }
+    artifactInspectionTestHooks.fault = undefined
+  }
+})
+
+test('keeps operational artifact I/O errors classified as IO_ERROR', () => {
+  const root = createRoot()
+  const id = 'artifact-operational-io'
+  const artifact = `_artifacts/architecture/${id}/diagram.svg`
+  const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+  ensureParent(artifactPath)
+  writeFileSync(artifactPath, '<svg>stable</svg>')
+  api.addRecord({
+    artifacts: [artifact],
+    id,
+    kind: 'architecture',
+    payload: { summary: 'Operational artifact failure' },
+    root,
+    source: 'test',
+    subject: 'cache.artifact-operational-io',
+  })
+  artifactInspectionTestHooks.fault = (point, path) => {
+    if (point === 'after-artifact-fstat' && path === artifact) {
+      throw Object.assign(new Error('simulated artifact I/O failure'), { code: 'EIO' })
+    }
+  }
+
+  assert.throws(
+    () => api.hydrate({ root }),
+    (error: unknown) => {
+      const failure = error as { code?: unknown; details?: unknown; message?: unknown }
+      assert.equal(failure.code, 'IO_ERROR')
+      assert.equal(typeof failure.message === 'string' && failure.message.includes(root), false)
+      assert.equal(JSON.stringify(failure.details ?? null).includes(root), false)
+      return true
+    },
+  )
+})
+
+test('does not accept an artifact mutation during fresh record-manifest enumeration', () => {
+  const root = createRoot()
+  const id = 'artifact-freshness-enumeration'
+  const artifact = `_artifacts/architecture/${id}/diagram.svg`
+  const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+  ensureParent(artifactPath)
+  writeFileSync(artifactPath, '<svg>before</svg>')
+  api.addRecord({
+    artifacts: [artifact],
+    id,
+    kind: 'architecture',
+    payload: { summary: 'Freshness enumeration' },
+    root,
+    source: 'test',
+    subject: 'cache.artifact-freshness-enumeration',
+  })
+  let mutated = false
+  cacheReadTestHooks.afterManifestRootEnumeration = () => {
+    if (!mutated) {
+      writeFileSync(artifactPath, '<svg>after-enumeration</svg>')
+      mutated = true
+    }
+  }
+
+  assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
+  assert.equal(mutated, true)
+  assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+})
+
+test('retries artifact mutation after canonical validation without committing a stale manifest', () => {
+  for (const persistent of [false, true]) {
+    const root = createRoot()
+    const id = `after-validation-${persistent}`
+    const artifact = `_artifacts/architecture/${id}/diagram.svg`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, '<svg>before</svg>')
+    api.addRecord({
+      artifacts: [artifact],
+      id,
+      kind: 'architecture',
+      payload: { summary: 'After validation mutation' },
+      root,
+      source: 'test',
+      subject: `cache.after-validation-${persistent}`,
+    })
+    let mutations = 0
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      if (persistent || mutations === 0) {
+        mutations += 1
+        writeFileSync(artifactPath, `<svg>mutation-${mutations}</svg>`)
+      }
+    }
+
+    if (persistent) {
+      assert.throws(
+        () => api.hydrate({ root }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+      assert.equal(mutations, 3)
+    } else {
+      assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+      assert.equal(mutations, 1)
+      assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+    }
+    cacheReadTestHooks.afterCanonicalValidation = undefined
+  }
+})
 
 const mutateCache = (root: string, mutation: (database: DatabaseSync) => void) => {
   const database = new DatabaseSync(cacheDatabasePath(root))
@@ -1103,7 +1362,9 @@ describe('SQLite cache and reads', () => {
     assert.equal(readFileSync(sentinel, 'utf8'), 'outside kind sentinel')
   })
 
-  test('classifies an artifact ancestor replacement after manifest entry lstat as repository change', () => {
+  test('classifies an artifact ancestor replacement after descriptor verification as repository change', {
+    skip: !renameParentWithOpenChildSupported,
+  }, () => {
     const root = createRoot()
     const canonicalRoot = realpathSync.native(root)
     const id = 'manifest-artifact-ancestor'
@@ -1138,8 +1399,8 @@ describe('SQLite cache and reads', () => {
         replaced = false
       }
     }
-    cacheReadTestHooks.afterManifestEntryLstat = path => {
-      if (path === artifactPath && !replaced) {
+    artifactInspectionTestHooks.fault = (point, path) => {
+      if (point === 'before-final-directory-revalidation' && path === artifact && !replaced) {
         renameSync(artifactDirectory, preservedArtifactDirectory)
         symlinkSync(outside, artifactDirectory, process.platform === 'win32' ? 'junction' : 'dir')
         replaced = true

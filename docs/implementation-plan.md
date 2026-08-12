@@ -7,7 +7,7 @@ Initial npm package: `encephalon@0.1.0`
 License: MIT  
 Runtime: Node.js 24.15.0 or newer  
 Maintainer toolchain: TypeScript and Bun  
-Audited implementation snapshot: `514f444fdaf428c2e41124020b40b7568af66b6b` on 2026-08-08
+Audited implementation snapshot: `9681b6c03f1cbf73263570f923493d45da1aa291` on 2026-08-13
 Current maintained contract: [`docs/contract.md`](./contract.md), the README, package checks, and executable tests
 
 ## 1. Purpose of this document
@@ -592,9 +592,9 @@ The artifact manifest contains the same metadata for every artifact referenced b
 Freshness checking proceeds in two stages:
 
 1. Scan and fingerprint the one-level record set.
-2. If the record fingerprint matches, `lstat` the previously indexed artifact set and compare its metadata.
+2. If the record fingerprint matches, re-inspect the previously indexed artifact set through stable, descriptor-backed, no-follow validation and compare its metadata.
 
-Any missing artifact, type change, symlink introduction, size change, modification-time change, or change-time change makes the cache stale. Hydration recomputes the artifact set from parsed records.
+Any missing artifact, type change, symlink introduction, size change, modification-time change, or change-time change makes the cache stale. Hydration recomputes the artifact set from parsed records, validates each referenced artifact once, and constructs the new manifest directly from those verified observations.
 
 ### 11.5 One repository operation lock
 
