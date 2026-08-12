@@ -35,6 +35,7 @@ type RepositoryTestHooks = {
   afterInstalledManifestRead?: ((path: string) => void) | undefined
   afterRepositoryParentCapture?: ((path: string) => void) | undefined
   afterRootInstallation?: (() => void) | undefined
+  executingSearchBoundary?: string | undefined
 }
 
 export const repositoryTestHooks: RepositoryTestHooks = {}
@@ -185,6 +186,12 @@ const findExecutingPackage = (): PackageIdentity => {
         return identity
       }
       return wrapIo('Unable to inspect the executing package.', new VerifiedFileError())
+    }
+    if (
+      repositoryTestHooks.executingSearchBoundary !== undefined &&
+      comparablePath(current.canonicalPath) === comparablePath(repositoryTestHooks.executingSearchBoundary)
+    ) {
+      return fail('ROOT_INSTALL_REQUIRED', 'Unable to locate the executing Encephalon package.')
     }
     const parentPath = dirname(current.canonicalPath)
     if (parentPath === current.canonicalPath) {

@@ -22,6 +22,7 @@ import {
   MAX_CANONICAL_RECORD_BYTES,
   MAX_CANONICAL_RECORDS,
   planRecordAddition,
+  recordWriteTestHooks,
   validateRecordsResolved,
 } from '../src/records.ts'
 import { discoverRepository } from '../src/repository.ts'
@@ -142,6 +143,7 @@ const canCreateDirectory = (root: string, name: string) => {
 }
 
 afterEach(() => {
+  recordWriteTestHooks.fault = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
 
@@ -412,7 +414,7 @@ describe('canonical records', () => {
             hydrate: false,
           },
         ),
-      'VALIDATION_FAILED',
+      'REPOSITORY_CHANGED',
     )
     assert.equal(readFileSync(join(root, 'encephalon', 'decision'), 'utf8'), 'not a directory')
   })
@@ -819,6 +821,101 @@ describe('canonical records', () => {
         subject: 'validation.existing-kind-boundary',
       }),
     )
+  })
+
+  test('does not publish a superseding record into a replacement canonical generation', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, {
+      id: 'predecessor',
+      subject: 'generation.subject',
+    })
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    const displaced = join(root, 'predecessor-decision')
+    let replaced = false
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-scan-validation' && !replaced) {
+        replaced = true
+        renameSync(kindDirectory, displaced)
+        writeCanonicalRecord(root, {
+          id: 'successor-head',
+          subject: 'generation.subject',
+        })
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'generation.subject',
+          supersedes: ['predecessor'],
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(replaced, true)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'candidate.json')), false)
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+  })
+
+  test('does not publish after the validated kind is replaced at the publication boundary', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'existing' })
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    const displaced = join(root, 'displaced-decision-before-publication')
+    let replaced = false
+    recordWriteTestHooks.fault = point => {
+      if (point === 'before-publication' && !replaced) {
+        replaced = true
+        renameSync(kindDirectory, displaced)
+        mkdirSync(kindDirectory)
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate-before-publication',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'generation.publication',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(replaced, true)
+    assert.equal(existsSync(join(kindDirectory, 'candidate-before-publication.json')), false)
+  })
+
+  test('does not adopt a candidate kind created at the directory preparation boundary', () => {
+    const root = createRoot()
+    let created = false
+    recordWriteTestHooks.fault = point => {
+      if (point === 'before-directory-preparation' && !created) {
+        created = true
+        mkdirSync(join(root, 'encephalon', 'new-kind'), { recursive: true })
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate-kind-race',
+          kind: 'new-kind',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'generation.kind-race',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(created, true)
+    assert.deepEqual(readdirSync(join(root, 'encephalon', 'new-kind')), [])
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
   })
 
   test('rejects addRecord when the candidate would exceed corpus count or byte budgets', () => {
@@ -1388,6 +1485,28 @@ describe('canonical records', () => {
             renameSync(kindDirectory, displaced)
             mkdirSync(kindDirectory)
           }
+        },
+      },
+    })
+
+    assert.equal(result.valid, false)
+    assert.deepEqual(
+      result.errors.map(error => [error.code, error.path]),
+      [['INVALID_RECORD_LAYOUT', 'encephalon/decision']],
+    )
+  })
+
+  test('revalidates an empty kind generation at final scan acceptance', () => {
+    const root = createRoot()
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    const displaced = join(root, 'displaced-decision-final-validation')
+    mkdirSync(kindDirectory, { recursive: true })
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        beforeFinalWitnessValidation: () => {
+          renameSync(kindDirectory, displaced)
+          mkdirSync(kindDirectory)
         },
       },
     })

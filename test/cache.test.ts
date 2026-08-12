@@ -61,6 +61,7 @@ afterEach(() => {
   cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.afterManifestKindEnumeration = undefined
   cacheReadTestHooks.afterManifestRootEnumeration = undefined
+  cacheReadTestHooks.beforeManifestEntryLstat = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   recordWriteTestHooks.fault = undefined
   roots.splice(0).forEach(removeTestRepository)
@@ -965,10 +966,84 @@ describe('SQLite cache and reads', () => {
       hydrated: true,
       recordsIndexed: 0,
     })
+    writeFileSync(join(stagingDirectory, 'after-prepare'), '')
+    const fixedTime = new Date('2025-01-02T03:04:05.000Z')
+    utimesSync(stagingDirectory, fixedTime, fixedTime)
     assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
       hydrated: false,
       recordsIndexed: 0,
     })
+  })
+
+  test('retries record disappearance at the manifest lstat boundary', () => {
+    const root = createRoot()
+    const recordPath = join(realpathSync.native(root), 'encephalon', 'context', 'manifest-disappearance.json')
+    ensureParent(recordPath)
+    writeFileSync(
+      recordPath,
+      `${JSON.stringify({
+        createdAt: '2026-08-12T00:00:00.000Z',
+        id: 'manifest-disappearance',
+        kind: 'context',
+        payload: {},
+        source: 'test',
+        subject: 'cache.manifest-disappearance',
+      })}\n`,
+    )
+    let removed = false
+    cacheReadTestHooks.beforeManifestEntryLstat = path => {
+      if (path === recordPath && !removed) {
+        removed = true
+        rmSync(recordPath)
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 0,
+    })
+    assert.equal(removed, true)
+  })
+
+  test('does not follow a symlink replacement at the manifest lstat boundary', {
+    skip: process.platform === 'win32' ? 'Windows runners may not permit symlink creation.' : false,
+  }, () => {
+    const root = createRoot()
+    const recordPath = join(realpathSync.native(root), 'encephalon', 'context', 'manifest-symlink.json')
+    ensureParent(recordPath)
+    writeFileSync(
+      recordPath,
+      `${JSON.stringify({
+        createdAt: '2026-08-12T00:00:00.000Z',
+        id: 'manifest-symlink',
+        kind: 'context',
+        payload: {},
+        source: 'test',
+        subject: 'cache.manifest-symlink',
+      })}\n`,
+    )
+    const outside = createOutsideDirectory()
+    const sentinel = join(outside, 'outside-record')
+    writeFileSync(sentinel, 'outside')
+    let replaced = false
+    cacheReadTestHooks.beforeManifestEntryLstat = path => {
+      if (path === recordPath && !replaced) {
+        replaced = true
+        rmSync(recordPath)
+        symlinkSync(sentinel, recordPath)
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+        assert.equal(JSON.stringify(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.equal(replaced, true)
+    assert.equal(readFileSync(sentinel, 'utf8'), 'outside')
   })
 
   test('retries a kind disappearance during manifest collection without an I/O failure', () => {
@@ -1016,7 +1091,8 @@ describe('SQLite cache and reads', () => {
     )
 
     cacheReadTestHooks.afterCanonicalValidation = undefined
-    cacheReadTestHooks.afterManifestRootEnumeration = () => {
+    cacheReadTestHooks.afterManifestRootEnumeration = undefined
+    cacheReadTestHooks.beforeManifestEntryLstat = () => {
       throw Object.assign(new Error('injected I/O failure'), { code: 'EIO' })
     }
     const ioRoot = createRoot()

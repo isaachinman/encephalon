@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { existsSync, lstatSync, realpathSync, statSync } from 'node:fs'
+import { type BigIntStats, lstatSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
@@ -122,6 +122,7 @@ type CacheReadTestHooks = {
   afterManifestRootEnumeration?: ((path: string) => void) | undefined
   afterCompactSearchRead?: ((query: string) => void) | undefined
   afterShowRead?: ((id: string) => void) | undefined
+  beforeManifestEntryLstat?: ((path: string) => void) | undefined
   duringDatabaseInitialisation?: ((mode: 'reader' | 'writer') => void) | undefined
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
@@ -305,17 +306,25 @@ const posixRelative = (root: string, path: string) =>
     .replace(/^[/\\]+/, '')
     .replaceAll('\\', '/')
 
-const statEntry = (root: string, path: string): ManifestEntry => {
-  if (!existsSync(path)) {
-    return { path: posixRelative(root, path), type: 'missing' }
+const statEntry = (root: string, path: string, missingAllowed = false): ManifestEntry => {
+  let metadata: BigIntStats
+  try {
+    cacheReadTestHooks.beforeManifestEntryLstat?.(path)
+    metadata = lstatSync(path, { bigint: true })
+  } catch (error) {
+    const { code } = error as NodeJS.ErrnoException
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      if (missingAllowed) {
+        return { path: posixRelative(root, path), type: 'missing' }
+      }
+      throw new CanonicalDirectoryChangedError(path, { cause: error })
+    }
+    throw error
   }
-  const linkMetadata = lstatSync(path)
-  if (linkMetadata.isSymbolicLink()) {
-    return { path: posixRelative(root, path), type: 'symlink' }
-  }
-  const metadata = statSync(path, { bigint: true })
   let type: ManifestEntry['type']
-  if (metadata.isDirectory()) {
+  if (metadata.isSymbolicLink()) {
+    type = 'symlink'
+  } else if (metadata.isDirectory()) {
     type = 'directory'
   } else if (metadata.isFile()) {
     type = 'file'
@@ -333,10 +342,7 @@ const statEntry = (root: string, path: string): ManifestEntry => {
 
 const recordManifestEntries = (root: string) => {
   const brainDirectory = resolve(root, 'encephalon')
-  if (!existsSync(brainDirectory)) {
-    return [{ path: 'encephalon', type: 'missing' as const }]
-  }
-  const brainEntry = statEntry(root, brainDirectory)
+  const brainEntry = statEntry(root, brainDirectory, true)
   if (brainEntry.type !== 'directory') {
     return [brainEntry]
   }

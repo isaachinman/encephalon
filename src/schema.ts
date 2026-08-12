@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { lstatSync, realpathSync } from 'node:fs'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { ARTIFACTS_DIRECTORY_NAME } from './canonical-layout.ts'
 import { fail } from './errors.ts'
 import type { AddRecordInput, BrainRecordFile, JsonValue } from './types.ts'
 
@@ -350,7 +351,11 @@ const portableArtifactSegments = (value: unknown) => {
 
 export const validateArtifactPath = (value: unknown, kind: string, id: string) => {
   const artifact = portableArtifactSegments(value)
-  if (artifact.segments[0] === '_artifacts' && artifact.segments[1] === kind && artifact.segments[2] === id) {
+  if (
+    artifact.segments[0] === ARTIFACTS_DIRECTORY_NAME &&
+    artifact.segments[1] === kind &&
+    artifact.segments[2] === id
+  ) {
     return artifact.path
   }
   return fail('INVALID_ARGUMENT', 'artifact must remain beneath the matching record artifact directory.', {

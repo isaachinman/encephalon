@@ -10,6 +10,8 @@ import { ordinalStringCompare } from './order.ts'
 export const MAX_CANONICAL_BRAIN_ROOT_ENTRIES = 1002
 export const MAX_CANONICAL_KIND_DIRECTORIES = 1000
 export const MAX_CANONICAL_KIND_ENTRIES = 1000
+export const ARTIFACTS_DIRECTORY_NAME = '_artifacts'
+export const STAGING_DIRECTORY_NAME = '_staging'
 
 export class CanonicalDirectoryEntryLimitError extends Error {}
 
@@ -23,7 +25,7 @@ export class CanonicalDirectoryChangedError extends Error {
   }
 }
 
-export const CANONICAL_RESERVED_DIRECTORIES = new Set(['_artifacts', '_staging'])
+const CANONICAL_RESERVED_DIRECTORIES = new Set([ARTIFACTS_DIRECTORY_NAME, STAGING_DIRECTORY_NAME])
 
 export const isCanonicalReservedDirectory = (name: string) => CANONICAL_RESERVED_DIRECTORIES.has(name)
 
@@ -43,22 +45,36 @@ export const collectBoundedDirectoryEntries = <Entry extends { name: string } = 
   openDirectory: OpenDirectory<Entry> = opendirSync as unknown as OpenDirectory<Entry>,
 ) => {
   const reader = openDirectory(directory)
+  let primaryError: unknown
+  let result: { entries: Entry[]; overflow: false } | { entries: never[]; overflow: true } | undefined
   try {
     const entries: Entry[] = []
     while (entries.length <= maximum) {
       const entry = reader.readSync()
       if (entry === null) {
-        return {
+        result = {
           entries: entries.sort((first, second) => ordinalStringCompare(first.name, second.name)),
           overflow: false as const,
         }
+        break
       }
       entries.push(entry)
     }
-    return { entries: [], overflow: true as const }
-  } finally {
-    reader.closeSync()
+    result ??= { entries: [], overflow: true as const }
+  } catch (error) {
+    primaryError = error
   }
+  try {
+    reader.closeSync()
+  } catch (error) {
+    if (primaryError === undefined) {
+      throw error
+    }
+  }
+  if (primaryError !== undefined) {
+    throw primaryError
+  }
+  return result as NonNullable<typeof result>
 }
 
 export const isCanonicalDirectoryReplacementError = (error: unknown) => {

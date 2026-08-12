@@ -4,7 +4,7 @@ import { collectBoundedDirectoryEntries } from '../src/canonical-layout.ts'
 
 type Entry = { name: string }
 
-const readerFor = (entries: Entry[], failureAt?: number) => {
+const readerFor = (entries: Entry[], failureAt?: number, closeFailure = false) => {
   let closed = 0
   let entriesRead = 0
   let index = 0
@@ -12,6 +12,9 @@ const readerFor = (entries: Entry[], failureAt?: number) => {
     open: () => ({
       closeSync: () => {
         closed += 1
+        if (closeFailure) {
+          throw new Error('injected directory close failure')
+        }
       },
       readSync: () => {
         if (index === failureAt) {
@@ -67,5 +70,20 @@ describe('bounded canonical directory collection', () => {
     const failure = readerFor([{ name: 'a' }], 1)
     assert.throws(() => collectBoundedDirectoryEntries('ignored', 2, failure.open), /injected directory read failure/)
     assert.deepEqual(failure.state(), { closed: 1, entriesRead: 1 })
+  })
+
+  test('preserves a directory read failure when closing also fails', () => {
+    const dualFailure = readerFor([{ name: 'a' }], 1, true)
+    assert.throws(
+      () => collectBoundedDirectoryEntries('ignored', 2, dualFailure.open),
+      /injected directory read failure/,
+    )
+    assert.deepEqual(dualFailure.state(), { closed: 1, entriesRead: 1 })
+
+    const closeFailure = readerFor([], undefined, true)
+    assert.throws(
+      () => collectBoundedDirectoryEntries('ignored', 2, closeFailure.open),
+      /injected directory close failure/,
+    )
   })
 })

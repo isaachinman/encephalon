@@ -50,7 +50,7 @@ const createIsolatedPackage = (options: { packageManifest?: boolean } = {}) => {
     process.platform === 'win32' ? 'junction' : 'dir',
   )
   temporaryRoots.push(testRoot)
-  return { executingRoot, repositoryRoot }
+  return { executingRoot, repositoryRoot, testRoot }
 }
 
 afterEach(() => {
@@ -61,6 +61,7 @@ afterEach(() => {
   repositoryTestHooks.afterInstalledManifestRead = undefined
   repositoryTestHooks.afterRepositoryParentCapture = undefined
   repositoryTestHooks.afterRootInstallation = undefined
+  repositoryTestHooks.executingSearchBoundary = undefined
   for (const root of temporaryRoots.splice(0)) {
     rmSync(root, { force: true, recursive: true })
   }
@@ -350,10 +351,11 @@ test('rejects an executing child generation change while accepting its package p
 })
 
 test('preserves root-install-required when no executing package can be found', async () => {
-  const { executingRoot, repositoryRoot } = createIsolatedPackage({ packageManifest: false })
+  const { executingRoot, repositoryRoot, testRoot } = createIsolatedPackage({ packageManifest: false })
   const repositoryModule = await import(
     `${pathToFileURL(join(executingRoot, 'src', 'repository.ts')).href}?missing-executing=${Date.now()}`
   )
+  repositoryModule.repositoryTestHooks.executingSearchBoundary = testRoot
 
   assert.throws(
     () => repositoryModule.assertRootInstallation(repositoryRoot),
@@ -362,6 +364,7 @@ test('preserves root-install-required when no executing package can be found', a
       return true
     },
   )
+  repositoryModule.repositoryTestHooks.executingSearchBoundary = undefined
 })
 
 test('normalises an initial executing-directory failure', async () => {

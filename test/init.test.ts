@@ -10,6 +10,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -44,8 +45,10 @@ type InitCounts = {
 }
 
 type InitFaultPoint =
+  | 'after-scan-validation'
   | 'after-publication'
   | 'before-publication'
+  | 'before-directory-preparation'
   | 'during-cleanup'
   | 'during-hydration'
   | 'during-publication-flush'
@@ -175,6 +178,38 @@ describe('initialisation', () => {
     }
     assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
     assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('rejects a replacement canonical generation before publishing any baseline record', () => {
+    const root = createRoot()
+    mkdirSync(join(root, 'encephalon', 'decision'), { recursive: true })
+    const brainDirectory = join(root, 'encephalon')
+    const displaced = join(root, 'displaced-encephalon-before-init')
+    let graphValidations = 0
+    let replaced = false
+
+    assertErrorCode(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            graphValidation: () => {
+              graphValidations += 1
+              if (graphValidations === 2) {
+                replaced = true
+                renameSync(brainDirectory, displaced)
+                mkdirSync(join(brainDirectory, 'decision'), { recursive: true })
+              }
+            },
+          },
+        ),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(replaced, true)
+    assert.deepEqual(readdirSync(join(brainDirectory, 'decision')), [])
+    assert.equal(existsSync(join(brainDirectory, '_staging')), false)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
