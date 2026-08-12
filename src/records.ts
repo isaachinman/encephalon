@@ -85,7 +85,12 @@ type CanonicalPublicationAuthority = {
     rootSnapshot: CanonicalDirectorySnapshot,
     kindSnapshot: CanonicalDirectorySnapshot,
   ) => void
-  projection: () => { kindCount: number; rootExists: boolean; rootNames: ReadonlySet<string> }
+  projection: () => {
+    kindCount: number
+    kindEntryCounts: ReadonlyMap<string, number>
+    rootExists: boolean
+    rootNames: ReadonlySet<string>
+  }
 }
 
 type FileIdentity = {
@@ -962,6 +967,7 @@ const canonicalPublicationAuthority = (
     const rootEntries = layout.root === null ? [] : layout.root.entries
     return {
       kindCount: rootEntries.filter(isCanonicalKindDirectoryEntry).length,
+      kindEntryCounts: new Map([...layout.kinds.entries()].map(([kind, snapshot]) => [kind, snapshot.entries.length])),
       rootExists: layout.root !== null,
       rootNames: new Set(rootEntries.map(entry => entry.name)),
     }
@@ -1130,6 +1136,24 @@ const assertLayoutWitnessCurrent = (root: string, layout: CanonicalLayoutWitness
 }
 
 /** @internal */
+export const projectedKindDirectoryOverflow = (
+  witnessedEntryCounts: ReadonlyMap<string, number>,
+  plannedKinds: readonly string[],
+) => {
+  const plannedEntryCounts = plannedKinds.reduce((counts, kind) => {
+    counts.set(kind, (counts.get(kind) ?? 0) + 1)
+    return counts
+  }, new Map<string, number>())
+  return (
+    [...plannedEntryCounts.entries()]
+      .sort(([first], [second]) => ordinalStringCompare(first, second))
+      .find(
+        ([kind, additions]) => (witnessedEntryCounts.get(kind) ?? 0) + additions > MAX_CANONICAL_KIND_ENTRIES,
+      )?.[0] ?? null
+  )
+}
+
+/** @internal */
 export const assertCanonicalLayoutAdditions = (
   kinds: readonly string[],
   authority: CanonicalPublicationAuthority,
@@ -1146,6 +1170,12 @@ export const assertCanonicalLayoutAdditions = (
   if (current.kindCount + addedKinds > MAX_CANONICAL_KIND_DIRECTORIES) {
     return fail('VALIDATION_FAILED', 'Canonical layout additions would exceed directory limits.', {
       errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_KIND_DIRECTORIES, 'kind directories')],
+    })
+  }
+  const overflowingKind = projectedKindDirectoryOverflow(current.kindEntryCounts, kinds)
+  if (overflowingKind !== null) {
+    return fail('VALIDATION_FAILED', 'Canonical layout additions would exceed directory limits.', {
+      errors: [directoryEntryLimitIssue(`encephalon/${overflowingKind}`, MAX_CANONICAL_KIND_ENTRIES)],
     })
   }
   authority.assertCurrent()

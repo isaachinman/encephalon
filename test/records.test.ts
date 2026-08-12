@@ -22,6 +22,7 @@ import {
   MAX_CANONICAL_RECORD_BYTES,
   MAX_CANONICAL_RECORDS,
   planRecordAddition,
+  projectedKindDirectoryOverflow,
   recordWriteTestHooks,
   validateRecordsResolved,
 } from '../src/records.ts'
@@ -766,6 +767,20 @@ describe('canonical records', () => {
     assert.equal(result.recordsChecked, 1000)
     assert.equal(result.errors.length, 0)
     assert.equal(result.truncated, false)
+  })
+
+  test('preflights exact and overflowing planned kind directory entries', () => {
+    const witnessedEntryCounts = new Map([
+      ['context', 998],
+      ['decision', 999],
+    ])
+
+    assert.equal(projectedKindDirectoryOverflow(witnessedEntryCounts, ['decision']), null)
+    assert.equal(projectedKindDirectoryOverflow(witnessedEntryCounts, ['decision', 'decision']), 'decision')
+    assert.equal(
+      projectedKindDirectoryOverflow(witnessedEntryCounts, ['decision', 'context', 'context', 'context']),
+      'context',
+    )
   })
 
   test('reports corpus budget overflows deterministically', () => {
