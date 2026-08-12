@@ -1430,10 +1430,7 @@ const publishPlannedRecordInternal = (
     try {
       closeSync(descriptor)
     } catch (error) {
-      if (committedErrorPhase !== 'publicationVerification') {
-        committedError = classifyPublicationVerificationError(record, error)
-        committedErrorPhase = 'publicationVerification'
-      }
+      capturePostCommitError('publicationVerification', error)
     }
     descriptor = undefined
   }
