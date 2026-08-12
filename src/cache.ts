@@ -25,6 +25,7 @@ import { ordinalStringCompare } from './order.ts'
 import { canonicalRecordPath, readRecords } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import { MAX_RECORD_BYTES, parseRecordFile, validateArtifactPath } from './schema.ts'
+import { classifySQLiteError } from './sqlite-error.ts'
 import type {
   BrainRecord,
   CompactBrainRecord,
@@ -143,17 +144,14 @@ const loadSQLite = () => {
 
 const isRecoverableCacheFailure = (error: unknown) => {
   const failure = error instanceof CacheDatabaseFailure ? error.failure : error
-  const sqlite = failure as { errcode?: unknown; message?: unknown }
+  const category = classifySQLiteError(failure)
   return (
     failure instanceof CacheSchemaMismatch ||
-    sqlite.errcode === 8 ||
-    sqlite.errcode === 14 ||
-    sqlite.errcode === 11 ||
-    sqlite.errcode === 26 ||
-    (typeof sqlite.message === 'string' &&
-      /database disk image is malformed|file is not a database|malformed database schema|no such (?:column|table)|has no column named/i.test(
-        sqlite.message,
-      ))
+    category === 'cantopen' ||
+    category === 'corrupt' ||
+    category === 'notadb' ||
+    category === 'readonly' ||
+    category === 'schema'
   )
 }
 

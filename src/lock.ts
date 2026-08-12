@@ -19,6 +19,7 @@ import {
   writeCacheOwner,
 } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
+import { classifySQLiteError, type SQLiteErrorCategory } from './sqlite-error.ts'
 
 const LOCK_WAIT_MILLISECONDS = 60_000
 const RECOVERY_POLL_MILLISECONDS = 50
@@ -79,31 +80,8 @@ const processIsRunning = (pid: number) => {
   }
 }
 
-const sqliteBusy = (error: unknown) => {
-  const candidate = (error instanceof CacheDatabaseFailure ? error.failure : error) as {
-    errcode?: unknown
-    message?: unknown
-  }
-  return (
-    candidate.errcode === 5 ||
-    candidate.errcode === 6 ||
-    (typeof candidate.message === 'string' &&
-      /(?:database is locked|SQLITE_BUSY|SQLITE_LOCKED)/i.test(candidate.message))
-  )
-}
-
-const sqliteCorrupt = (error: unknown) => {
-  const candidate = (error instanceof CacheDatabaseFailure ? error.failure : error) as {
-    errcode?: unknown
-    message?: unknown
-  }
-  return (
-    candidate.errcode === 11 ||
-    candidate.errcode === 26 ||
-    (typeof candidate.message === 'string' &&
-      /database disk image is malformed|file is not a database|malformed database schema/i.test(candidate.message))
-  )
-}
+const sqliteFailureCategory = (error: unknown): SQLiteErrorCategory =>
+  classifySQLiteError(error instanceof CacheDatabaseFailure ? error.failure : error)
 
 export const withOperationLock = <Result>(
   root: string,
@@ -254,16 +232,18 @@ export const withOperationLock = <Result>(
       try {
         beginGateTransaction(true)
       } catch (error) {
-        if (sqliteBusy(error)) {
+        const category = sqliteFailureCategory(error)
+        if (category === 'busy' || category === 'locked') {
           return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
             timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
           })
         }
-        if (!sqliteCorrupt(error)) {
+        if (category === 'corrupt' || category === 'notadb') {
+          quarantineCorruptGate(error)
+          beginGateTransaction(true)
+        } else {
           throw error
         }
-        quarantineCorruptGate(error)
-        beginGateTransaction(true)
       }
     } catch (error) {
       recoveryError = error
@@ -301,15 +281,17 @@ export const withOperationLock = <Result>(
     try {
       beginGateTransaction()
     } catch (error) {
-      if (sqliteBusy(error)) {
+      const category = sqliteFailureCategory(error)
+      if (category === 'busy' || category === 'locked') {
         return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
           timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
         })
       }
-      if (!sqliteCorrupt(error)) {
+      if (category === 'corrupt' || category === 'notadb') {
+        recoverCorruptGate()
+      } else {
         throw error
       }
-      recoverCorruptGate()
     }
 
     // The SQLite transaction is the authoritative operation lock. A valid owner

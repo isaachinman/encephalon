@@ -1,3 +1,4 @@
+import { classifySQLiteError } from './sqlite-error.ts'
 import type { EncephalonErrorCode, JsonValue } from './types.ts'
 
 const FILESYSTEM_ERROR_CODES = new Set([
@@ -21,19 +22,6 @@ const FILESYSTEM_ERROR_CODES = new Set([
   'ESTALE',
   'EXDEV',
 ])
-const SQLITE_IO_ERROR_CODES = new Set([3, 5, 6, 7, 8, 10, 11, 13, 14, 26])
-const SQLITE_IO_STRING_CODES = new Set([
-  'SQLITE_BUSY',
-  'SQLITE_CANTOPEN',
-  'SQLITE_CORRUPT',
-  'SQLITE_FULL',
-  'SQLITE_IOERR',
-  'SQLITE_LOCKED',
-  'SQLITE_NOMEM',
-  'SQLITE_NOTADB',
-  'SQLITE_PERM',
-  'SQLITE_READONLY',
-])
 const MAX_CLI_STRING_LENGTH = 256
 const MAX_CLI_ARRAY_LENGTH = 25
 const MAX_CLI_OBJECT_KEYS = 25
@@ -56,23 +44,22 @@ const isRecognizedFilesystemError = (error: unknown) => {
   return typeof error.code === 'string' && FILESYSTEM_ERROR_CODES.has(error.code)
 }
 
-const isRecognizedSQLiteError = (error: unknown) => {
-  if (!isRecord(error)) {
-    return false
-  }
+const isEnvironmentalSQLiteError = (error: unknown) => {
+  const category = classifySQLiteError(error)
   return (
-    (typeof error.code === 'string' && SQLITE_IO_STRING_CODES.has(error.code)) ||
-    (typeof error.errcode === 'number' && SQLITE_IO_ERROR_CODES.has(error.errcode & 0xff)) ||
-    (typeof error.message === 'string' &&
-      /database disk image is malformed|database is locked|file is not a database|SQLITE_(?:BUSY|CANTOPEN|CORRUPT|FULL|IOERR|LOCKED|NOMEM|NOTADB|PERM|READONLY)/i.test(
-        error.message,
-      ))
+    category === 'busy' ||
+    category === 'cantopen' ||
+    category === 'corrupt' ||
+    category === 'io' ||
+    category === 'locked' ||
+    category === 'notadb' ||
+    category === 'readonly'
   )
 }
 
 const hasRecognizedIoCause = (cause: unknown, remainingDepth = 8): boolean =>
   isRecognizedFilesystemError(cause) ||
-  isRecognizedSQLiteError(cause) ||
+  isEnvironmentalSQLiteError(cause) ||
   (remainingDepth > 0 && isRecord(cause) && hasRecognizedIoCause(cause.cause, remainingDepth - 1))
 
 const errorCodeForCause = (cause: unknown): EncephalonErrorCode =>
