@@ -12,6 +12,8 @@ This document is the concise contract maintainers should update when public beha
 - API failures that users can reasonably handle throw `EncephalonError` with a stable code from `src/types.ts`.
 - CLI success writes one JSON value to stdout for JSON commands and exits `0`. Expected user errors write one structured JSON error to stderr and exit `2`. Validation failures print the validation result to stdout and exit `2`.
 - User and agent command examples use the installed package manager binary form, `npx --no-install encephalon ...`, after the package has been installed at the repository root. Runtime execution still verifies that the executing package is the root `node_modules/encephalon` installation.
+- Git marker files and package manifests used for repository or executing-package identity are read through bounded, no-follow regular-file descriptors with stable identity and fatal UTF-8 decoding. Worktree administration targets are accepted only when their real-directory identity remains stable across native realpath resolution.
+- Executing package identity is cached only after its manifest has been verified successfully. Each repository root still reverifies its installed Encephalon manifest on every resolution.
 
 ## Canonical Storage
 
