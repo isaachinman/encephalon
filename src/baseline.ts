@@ -6,7 +6,12 @@ import {
   collectBoundedDirectoryEntries,
   revalidateCanonicalDirectory,
 } from './canonical-layout.ts'
-import { captureDirectoryWitness, revalidateDirectoryWitness } from './directory-witness.ts'
+import {
+  captureDirectoryWitness,
+  type DirectoryWitness,
+  DirectoryWitnessError,
+  revalidateDirectoryWitness,
+} from './directory-witness.ts'
 import { ordinalStringCompare } from './order.ts'
 import type { AddRecordInput, JsonValue } from './types.ts'
 import { decodeVerifiedUtf8, readVerifiedRegularFile } from './verified-file.ts'
@@ -155,7 +160,9 @@ type BaselineScanHooks = {
   afterPackageMetadataLstat?: (() => void) | undefined
   afterWorkflowEnumeration?: (() => void) | undefined
   beforeLanguageDirectoryCapture?: ((path: string) => void) | undefined
+  beforePackageMetadataRead?: (() => void) | undefined
   beforeTopLevelRevalidation?: (() => void) | undefined
+  beforeWorkflowDirectoryCapture?: (() => void) | undefined
   maximumScannedDirectories?: number | undefined
   onLanguageDirectoryScheduled?: (() => void) | undefined
 }
@@ -172,7 +179,6 @@ type BaselineReason =
   | 'workflow-enumeration-error'
 
 type ScanState = {
-  directoriesSeen: number
   filesSeen: number
   languageCounts: Map<string, number>
   truncationReasons: Set<BaselineReason>
@@ -185,6 +191,7 @@ type SourceResult<Value> = {
 
 type PackageSource = {
   facts: PackageFacts
+  manifestSource?: string
   source?: string
 }
 
@@ -252,20 +259,31 @@ const safeWorkspacePattern = (value: unknown): value is string =>
 
 const emptyPackageFacts = (): PackageFacts => ({ scriptKeys: [], workspacePatterns: [] })
 
-const readPackageFacts = (root: string, hooks: BaselineScanHooks, sourceName: string): SourceResult<PackageSource> => {
-  const path = resolve(root, sourceName)
+const readPackageFacts = (
+  root: string,
+  hooks: BaselineScanHooks,
+  sourceName: string,
+  expected: boolean,
+): SourceResult<PackageSource> => {
+  const path = resolve(root, 'package.json')
   let result: SourceResult<PackageSource> = {
     reasons: [],
     value: { facts: emptyPackageFacts() },
   }
+  let manifestObserved = false
   try {
+    hooks.beforePackageMetadataRead?.()
     const bytes = readVerifiedRegularFile(path, MAX_PACKAGE_BYTES, {
       fault: point => {
         if (point === 'after-lstat') {
+          manifestObserved = true
           hooks.afterPackageMetadataLstat?.()
         }
       },
     })
+    if (bytes === undefined && expected) {
+      throw new DirectoryWitnessError()
+    }
     if (bytes !== undefined) {
       const parsed: unknown = JSON.parse(decodeVerifiedUtf8(bytes))
       if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -300,6 +318,7 @@ const readPackageFacts = (root: string, hooks: BaselineScanHooks, sourceName: st
                 ? workspaceValue.filter(safeWorkspacePattern).sort(ordinalStringCompare)
                 : [],
             },
+            manifestSource: sourceName,
             source: sourceName,
           },
         }
@@ -310,7 +329,10 @@ const readPackageFacts = (root: string, hooks: BaselineScanHooks, sourceName: st
   } catch {
     result = {
       reasons: ['package-metadata-error'],
-      value: { facts: emptyPackageFacts() },
+      value: {
+        facts: emptyPackageFacts(),
+        ...(expected || manifestObserved ? { manifestSource: sourceName } : {}),
+      },
     }
   }
   return result
@@ -345,7 +367,6 @@ const readBoundedDirectoryEntries = (
 
 const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
   const state: ScanState = {
-    directoriesSeen: 0,
     filesSeen: 0,
     languageCounts: new Map(),
     truncationReasons: new Set(),
@@ -357,7 +378,6 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
   let directoriesScheduled = 1
   hooks.onLanguageDirectoryScheduled?.()
   scanDirectories: for (const { depth, directory, parent } of queue) {
-    state.directoriesSeen += 1
     try {
       const { entries, snapshot } = readBoundedDirectoryEntries(directory, hooks, parent)
       if (snapshot.overflow) {
@@ -398,11 +418,11 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
 
 const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
 
-const captureOptionalDirectory = (path: string, hooks: BaselineScanHooks) => {
+const captureOptionalDirectory = (path: string, hooks: BaselineScanHooks, expected = false) => {
   try {
     lstatSync(path, { bigint: true })
   } catch (error) {
-    if (isMissing(error)) {
+    if (isMissing(error) && !expected) {
       return
     }
     throw error
@@ -411,10 +431,11 @@ const captureOptionalDirectory = (path: string, hooks: BaselineScanHooks) => {
   return captureDirectoryWitness(path, { allowLink: false })
 }
 
-const workflowFiles = (root: string, hooks: BaselineScanHooks): SourceResult<string[]> => {
+const workflowFiles = (root: string, hooks: BaselineScanHooks, expectedGithub: boolean): SourceResult<string[]> => {
   let result: SourceResult<string[]> = { reasons: [], value: [] }
   try {
-    const githubWitness = captureOptionalDirectory(resolve(root, '.github'), hooks)
+    hooks.beforeWorkflowDirectoryCapture?.()
+    const githubWitness = captureOptionalDirectory(resolve(root, '.github'), hooks, expectedGithub)
     if (githubWitness !== undefined) {
       const workflowsPath = resolve(githubWitness.canonicalPath, 'workflows')
       const workflowsWitness = captureOptionalDirectory(workflowsPath, hooks)
@@ -493,49 +514,92 @@ const invocationForScript = (manager: string, scriptKey: string) => {
 }
 
 const emptyScanState = (): ScanState => ({
-  directoriesSeen: 0,
   filesSeen: 0,
   languageCounts: new Map(),
   truncationReasons: new Set(),
 })
 
-const collectBaselineSources = (root: string, hooks: BaselineScanHooks) => {
-  let observedReasons: BaselineReason[] = []
-  try {
-    const rootWitness = captureDirectoryWitness(root, { allowLink: false })
-    const layoutResult = topLevelFacts(root, hooks)
-    const packageName =
-      layoutResult.value.recognisedFiles.find(file => file.toLowerCase() === 'package.json') ?? 'package.json'
-    const packageResult = readPackageFacts(root, hooks, packageName)
-    const scan = scanLanguages(root, hooks)
-    const workflowResult = workflowFiles(root, hooks)
-    observedReasons = [
-      ...layoutResult.reasons,
-      ...packageResult.reasons,
-      ...scan.truncationReasons,
-      ...workflowResult.reasons,
-    ]
-    hooks.afterBaselineSources?.()
-    revalidateDirectoryWitness(rootWitness)
-    return { layoutResult, packageResult, scan, workflowResult }
-  } catch {
-    return {
-      layoutResult: {
-        reasons: [...new Set([...observedReasons, 'unreadable-directory' as const])].sort(ordinalStringCompare),
-        value: emptyTopLevelFacts(),
-      },
-      packageResult: {
-        reasons: [],
-        value: { facts: emptyPackageFacts() },
-      } satisfies SourceResult<PackageSource>,
-      scan: emptyScanState(),
-      workflowResult: { reasons: [], value: [] } satisfies SourceResult<string[]>,
-    }
-  }
+type CollectedBaselineSources = {
+  globalReasons: readonly BaselineReason[]
+  layoutResult: SourceResult<ReturnType<typeof emptyTopLevelFacts>>
+  packageResult: SourceResult<PackageSource>
+  scan: ScanState
+  workflowResult: SourceResult<string[]>
 }
 
-export const scanBaseline = (root: string, hooks: BaselineScanHooks = {}): AddRecordInput[] => {
-  const { layoutResult, packageResult, scan, workflowResult } = collectBaselineSources(root, hooks)
+const rootAuthorityFailure = (error: unknown) => {
+  const { code } = error as NodeJS.ErrnoException
+  return error instanceof DirectoryWitnessError || (typeof code === 'string' && /^E[A-Z0-9]+$/.test(code))
+}
+
+const emptyCollectedBaselineSources = (
+  globalReasons: readonly BaselineReason[],
+  observed: Omit<CollectedBaselineSources, 'globalReasons'> = {
+    layoutResult: { reasons: [], value: emptyTopLevelFacts() },
+    packageResult: { reasons: [], value: { facts: emptyPackageFacts() } },
+    scan: emptyScanState(),
+    workflowResult: { reasons: [], value: [] },
+  },
+): CollectedBaselineSources => ({
+  globalReasons,
+  layoutResult: {
+    reasons: observed.layoutResult.reasons,
+    value: emptyTopLevelFacts(),
+  },
+  packageResult: {
+    reasons: observed.packageResult.reasons,
+    value: { facts: emptyPackageFacts() },
+  },
+  scan: {
+    ...emptyScanState(),
+    truncationReasons: new Set(observed.scan.truncationReasons),
+  },
+  workflowResult: {
+    reasons: observed.workflowResult.reasons,
+    value: [],
+  },
+})
+
+const collectBaselineSources = (root: string, hooks: BaselineScanHooks) => {
+  let rootWitness: DirectoryWitness
+  try {
+    rootWitness = captureDirectoryWitness(root, { allowLink: false })
+  } catch (error) {
+    if (rootAuthorityFailure(error)) {
+      return emptyCollectedBaselineSources(['unreadable-directory'])
+    }
+    throw error
+  }
+
+  const layoutResult = topLevelFacts(root, hooks)
+  const packageSource =
+    layoutResult.value.recognisedFiles.find(file => file === 'package.json') ??
+    layoutResult.value.recognisedFiles.find(file => file.toLowerCase() === 'package.json') ??
+    'package.json'
+  const packageResult = readPackageFacts(
+    root,
+    hooks,
+    packageSource,
+    layoutResult.value.recognisedFiles.includes('package.json'),
+  )
+  const scan = scanLanguages(root, hooks)
+  const workflowResult = workflowFiles(root, hooks, layoutResult.value.directories.includes('.github'))
+  const observed = { layoutResult, packageResult, scan, workflowResult }
+  hooks.afterBaselineSources?.()
+  try {
+    revalidateDirectoryWitness(rootWitness)
+  } catch (error) {
+    if (rootAuthorityFailure(error)) {
+      return emptyCollectedBaselineSources(['unreadable-directory'], observed)
+    }
+    throw error
+  }
+  return { globalReasons: [], ...observed }
+}
+
+/** @internal */
+export const scanBaselineWithHooks = (root: string, hooks: BaselineScanHooks): AddRecordInput[] => {
+  const { globalReasons, layoutResult, packageResult, scan, workflowResult } = collectBaselineSources(root, hooks)
   const layout = layoutResult.value
   const packageFacts = packageResult.value.facts
   const packageEvidence = packageManagerEvidence(packageFacts.packageManager, lockfileEvidence(layout.recognisedFiles))
@@ -548,6 +612,7 @@ export const scanBaseline = (root: string, hooks: BaselineScanHooks = {}): AddRe
     .map(([language, files]) => ({ files, language }))
   const workflows = workflowResult.value
   const truncationReasons = new Set([
+    ...globalReasons,
     ...layoutResult.reasons,
     ...packageResult.reasons,
     ...scan.truncationReasons,
@@ -555,7 +620,7 @@ export const scanBaseline = (root: string, hooks: BaselineScanHooks = {}): AddRe
   ])
   const packageSource = packageResult.value.source === undefined ? [] : [packageResult.value.source]
   const layoutSources = [
-    ...layout.recognisedFiles.filter(file => file.toLowerCase() !== 'package.json'),
+    ...layout.recognisedFiles.filter(file => file !== packageResult.value.manifestSource),
     ...packageSource,
   ].sort(ordinalStringCompare)
   const safeSources = [...new Set([...layoutSources, ...(workflows.length === 0 ? [] : ['.github/workflows'])])].sort(
@@ -613,6 +678,8 @@ export const scanBaseline = (root: string, hooks: BaselineScanHooks = {}): AddRe
     },
   ]
 }
+
+export const scanBaseline = (root: string): AddRecordInput[] => scanBaselineWithHooks(root, {})
 
 const sortJson = (value: JsonValue): JsonValue => {
   if (Array.isArray(value)) {

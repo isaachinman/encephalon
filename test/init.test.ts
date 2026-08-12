@@ -21,7 +21,7 @@ import {
 
 import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
-import { scanBaseline } from '../src/baseline.ts'
+import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
 import { DirectoryWitnessError } from '../src/directory-witness.ts'
 import * as api from '../src/index.ts'
 import { initEncephalonWithHooks } from '../src/init.ts'
@@ -37,6 +37,17 @@ const unreadableDirectorySkip =
   process.platform === 'win32' || process.getuid?.() === 0
     ? 'Windows permission handling differs or root bypasses POSIX directory permissions.'
     : false
+const caseProbeRoot = createTestRepository()
+const caseDistinctNamesSupported = (() => {
+  const lower = join(caseProbeRoot, 'private-case-probe')
+  const upper = join(caseProbeRoot, 'PRIVATE-case-probe')
+  writeFileSync(lower, '')
+  writeFileSync(upper, '')
+  return readdirSync(caseProbeRoot).filter(entry => entry.toLowerCase() === 'private-case-probe').length === 2
+})()
+removeTestRepository(caseProbeRoot)
+const caseInsensitiveSkip = caseDistinctNamesSupported ? 'Requires a case-insensitive file system.' : false
+const caseSensitiveSkip = caseDistinctNamesSupported ? false : 'Requires a case-sensitive file system.'
 
 const generatedPayload = (records: readonly { payload: unknown; subject: string }[], subject: string) => {
   const payload = records.find(record => record.subject === subject)?.payload
@@ -954,7 +965,7 @@ describe('initialisation', () => {
     const root = createRoot()
     writeFileSync(join(root, 'package-lock.json'), '{}')
 
-    const baseline = scanBaseline(root, {
+    const baseline = scanBaselineWithHooks(root, {
       beforeTopLevelRevalidation: () => {
         throw new DirectoryWitnessError()
       },
@@ -977,7 +988,7 @@ describe('initialisation', () => {
     }
     let scheduled = 0
 
-    const baseline = scanBaseline(root, {
+    const baseline = scanBaselineWithHooks(root, {
       maximumScannedDirectories: 2,
       onLanguageDirectoryScheduled: () => {
         scheduled += 1
@@ -990,17 +1001,18 @@ describe('initialisation', () => {
     assert.deepEqual(overview.scanTruncationReasons, ['directory-limit'])
   })
 
-  test('does not combine a queued parent generation with a replacement child', () => {
+  test('does not combine a queued parent generation with a replacement grandchild', () => {
     const root = createRoot()
-    const child = join(root, 'src')
-    const moved = join(root, 'moved-src')
-    const replacement = join(root, 'replacement-src')
+    const parent = join(root, 'area')
+    const child = join(parent, 'src')
+    const moved = join(parent, 'moved-src')
+    const replacement = join(parent, 'private-replacement-src')
     ensureParent(join(child, 'old.ts'))
     ensureParent(join(replacement, 'new.py'))
     writeFileSync(join(child, 'old.ts'), 'export {}\n')
     writeFileSync(join(replacement, 'new.py'), 'pass\n')
 
-    const baseline = scanBaseline(root, {
+    const baseline = scanBaselineWithHooks(root, {
       beforeLanguageDirectoryCapture: path => {
         if (path === child) {
           renameSync(child, moved)
@@ -1024,7 +1036,7 @@ describe('initialisation', () => {
     ensureParent(join(root, '.github', 'workflows', 'private.yml'))
     writeFileSync(join(root, '.github', 'workflows', 'private.yml'), 'name: private\n')
 
-    const baseline = scanBaseline(root, {
+    const baseline = scanBaselineWithHooks(root, {
       afterBaselineSources: () => {
         renameSync(root, moved)
         mkdirSync(root)
@@ -1041,6 +1053,21 @@ describe('initialisation', () => {
     assert.deepEqual(tooling.sources, [])
     assert.deepEqual(workflow.sources, [])
     assert.doesNotMatch(JSON.stringify(baseline), /private-project|index\.ts|private\.yml/)
+  })
+
+  test('propagates unexpected failures after collecting baseline sources', () => {
+    const root = createRoot()
+    const unexpected = new Error('unexpected test hook failure')
+
+    assert.throws(
+      () =>
+        scanBaselineWithHooks(root, {
+          afterBaselineSources: () => {
+            throw unexpected
+          },
+        }),
+      error => error === unexpected,
+    )
   })
 
   test('omits an overflowing nested language directory without dropping sibling facts', () => {
@@ -1110,7 +1137,7 @@ describe('initialisation', () => {
     writeFileSync(packagePath, JSON.stringify({ name: 'old-private-project' }))
     writeFileSync(replacementPath, JSON.stringify({ name: 'new-private-project' }))
 
-    const baseline = scanBaseline(root, {
+    const baseline = scanBaselineWithHooks(root, {
       afterPackageMetadataLstat: () => {
         renameSync(packagePath, movedPath)
         renameSync(replacementPath, packagePath)
@@ -1128,11 +1155,34 @@ describe('initialisation', () => {
     assert.doesNotMatch(JSON.stringify(baseline), /old-private-project|new-private-project/)
   })
 
+  test('reports package metadata that disappears after validated top-level enumeration', () => {
+    const root = createRoot()
+    const packagePath = join(root, 'package.json')
+    const movedPath = join(root, 'moved-package.json')
+    writeFileSync(packagePath, JSON.stringify({ name: 'private-project' }))
+
+    const baseline = scanBaselineWithHooks(root, {
+      beforePackageMetadataRead: () => {
+        renameSync(packagePath, movedPath)
+      },
+    })
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
+    const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
+
+    assert.deepEqual(overview.scanTruncationReasons, ['package-metadata-error', 'unreadable-directory'])
+    assert.equal('packageName' in tooling, false)
+    assert.deepEqual(overview.sources, [])
+    assert.deepEqual(tooling.sources, [])
+    assert.deepEqual(workflow.sources, [])
+    assert.doesNotMatch(JSON.stringify(baseline), /private-project|moved-package/)
+  })
+
   test('reports an operational package metadata read failure without source attribution', () => {
     const root = createRoot()
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'private-project' }))
 
-    const baseline = scanBaseline(root, {
+    const baseline = scanBaselineWithHooks(root, {
       afterPackageMetadataLstat: () => {
         throw Object.assign(new Error('private path'), { code: 'EIO' })
       },
@@ -1149,7 +1199,9 @@ describe('initialisation', () => {
     assert.doesNotMatch(JSON.stringify(baseline), /private-project|private path/)
   })
 
-  test('preserves the exact enumerated package source spelling without aliases', () => {
+  test('preserves the exact enumerated package source spelling on case-insensitive file systems', {
+    skip: caseInsensitiveSkip,
+  }, () => {
     const root = createRoot()
     writeFileSync(join(root, 'Package.json'), JSON.stringify({ name: 'sample-project', scripts: { test: 'private' } }))
 
@@ -1165,6 +1217,46 @@ describe('initialisation', () => {
     assert.doesNotMatch(JSON.stringify(baseline), /"package\.json"/)
   })
 
+  test('reads the exact package.json when differently-cased aliases coexist', { skip: caseSensitiveSkip }, () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'Package.json'), JSON.stringify({ name: 'alias-project', scripts: { alias: 'private' } }))
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'canonical-project', scripts: { test: 'private' } }),
+    )
+
+    const baseline = scanBaseline(root)
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
+    const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
+
+    assert.equal(tooling.packageName, 'canonical-project')
+    assert.deepEqual(overview.sources, ['Package.json', 'package.json'])
+    assert.deepEqual(tooling.sources, ['Package.json', 'package.json'])
+    assert.deepEqual(workflow.sources, ['package.json'])
+    assert.deepEqual(workflow.scriptKeys, ['test'])
+    assert.doesNotMatch(JSON.stringify(baseline), /alias-project|"alias"/)
+  })
+
+  test('does not treat an uppercase-only alias as package metadata on a case-sensitive file system', {
+    skip: caseSensitiveSkip,
+  }, () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'Package.json'), JSON.stringify({ name: 'alias-project', scripts: { alias: 'private' } }))
+
+    const baseline = scanBaseline(root)
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
+    const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
+
+    assert.equal('packageName' in tooling, false)
+    assert.deepEqual(overview.sources, ['Package.json'])
+    assert.deepEqual(tooling.sources, ['Package.json'])
+    assert.deepEqual(workflow.sources, [])
+    assert.deepEqual(workflow.scriptKeys, [])
+    assert.doesNotMatch(JSON.stringify(baseline), /alias-project|"alias"/)
+  })
+
   test('reports replaced workflow ancestry without retaining workflow facts', () => {
     const root = createRoot()
     const githubPath = join(root, '.github')
@@ -1175,7 +1267,7 @@ describe('initialisation', () => {
     writeFileSync(join(githubPath, 'workflows', 'old-private.yml'), 'name: old\n')
     writeFileSync(join(replacementPath, 'workflows', 'new-private.yml'), 'name: new\n')
 
-    const baseline = scanBaseline(root, {
+    const baseline = scanBaselineWithHooks(root, {
       afterWorkflowEnumeration: () => {
         renameSync(githubPath, movedPath)
         renameSync(replacementPath, githubPath)
@@ -1197,11 +1289,32 @@ describe('initialisation', () => {
     ensureParent(join(githubPath, 'workflows', 'private.yml'))
     writeFileSync(join(githubPath, 'workflows', 'private.yml'), 'name: private\n')
 
-    const baseline = scanBaseline(root, {
+    const baseline = scanBaselineWithHooks(root, {
       afterOptionalDirectoryLstat: path => {
         if (path === githubPath) {
           renameSync(githubPath, movedPath)
         }
+      },
+    })
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
+
+    assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory', 'workflow-enumeration-error'])
+    assert.deepEqual(workflow.workflowFiles, [])
+    assert.deepEqual(workflow.sources, [])
+    assert.doesNotMatch(JSON.stringify(baseline), /private\.yml|moved-github/)
+  })
+
+  test('reports workflow ancestry that disappears before its preliminary metadata check', () => {
+    const root = createRoot()
+    const githubPath = join(root, '.github')
+    const movedPath = join(root, 'moved-github')
+    ensureParent(join(githubPath, 'workflows', 'private.yml'))
+    writeFileSync(join(githubPath, 'workflows', 'private.yml'), 'name: private\n')
+
+    const baseline = scanBaselineWithHooks(root, {
+      beforeWorkflowDirectoryCapture: () => {
+        renameSync(githubPath, movedPath)
       },
     })
     const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
