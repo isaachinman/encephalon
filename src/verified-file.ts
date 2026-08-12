@@ -1,7 +1,7 @@
 import type { BigIntStats } from 'node:fs'
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs'
 import { TextDecoder } from 'node:util'
-import { sameFileIdentity, sameStableFileMetadata } from './file-identity.ts'
+import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.ts'
 
 type VerifiedFileFault = 'after-fstat' | 'after-lstat' | 'before-final-path-lstat'
 
@@ -54,7 +54,7 @@ const readVerifiedDescriptor = (
   options: VerifiedFileOptions,
 ) => {
   const metadata = fstatSync(descriptor, { bigint: true })
-  if (!(metadata.isFile() && sameFileIdentity(pathMetadata, metadata)) || metadata.size > BigInt(maximumBytes)) {
+  if (!(metadata.isFile() && sameEntryIdentity(pathMetadata, metadata)) || metadata.size > BigInt(maximumBytes)) {
     return changed()
   }
   options.fault?.('after-fstat')
@@ -73,8 +73,8 @@ const readVerifiedDescriptor = (
   if (
     !finalPathMetadata.isFile() ||
     finalPathMetadata.isSymbolicLink() ||
-    !sameStableFileMetadata(finalPathMetadata, finalMetadata) ||
-    !sameStableFileMetadata(metadata, finalMetadata)
+    !sameStableEntryMetadata(finalPathMetadata, finalMetadata) ||
+    !sameStableEntryMetadata(metadata, finalMetadata)
   ) {
     return changed()
   }

@@ -64,7 +64,7 @@ test('reads only bounded regular files and decodes UTF-8 fatally', () => {
   }
 })
 
-test('rejects a path replaced between lstat and descriptor verification', () => {
+test('rejects a regular file replacement before descriptor verification without reading it', () => {
   const root = createRoot()
   const marker = join(root, 'marker')
   const captured = join(root, 'captured')
@@ -72,40 +72,27 @@ test('rejects a path replaced between lstat and descriptor verification', () => 
   writeFileSync(marker, 'gitdir: expected\n')
   writeFileSync(outside, 'gitdir: attacker-controlled\n')
 
-  let symlinksSupported = false
-  try {
-    symlinkSync(outside, join(root, 'symlink-check'), 'file')
-    rmSync(join(root, 'symlink-check'))
-    symlinksSupported = true
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EPERM') {
-      throw error
-    }
-  }
-
-  if (symlinksSupported) {
-    let descriptorReached = false
-    assert.throws(
-      () =>
-        readVerifiedRegularFile(marker, 64, {
-          fault: point => {
-            if (point === 'after-lstat') {
-              renameSync(marker, captured)
-              symlinkSync(outside, marker, 'file')
-            }
-            if (point === 'after-fstat') {
-              descriptorReached = true
-            }
-          },
-        }),
-      (error: unknown) => {
-        assert.equal(error instanceof VerifiedFileError, true)
-        assert.equal((error as Error).message.includes(root), false)
-        return true
-      },
-    )
-    assert.equal(descriptorReached, false)
-  }
+  let descriptorReached = false
+  assert.throws(
+    () =>
+      readVerifiedRegularFile(marker, 64, {
+        fault: point => {
+          if (point === 'after-lstat') {
+            renameSync(marker, captured)
+            renameSync(outside, marker)
+          }
+          if (point === 'after-fstat') {
+            descriptorReached = true
+          }
+        },
+      }),
+    (error: unknown) => {
+      assert.equal(error instanceof VerifiedFileError, true)
+      assert.equal((error as Error).message.includes(root), false)
+      return true
+    },
+  )
+  assert.equal(descriptorReached, false)
 })
 
 test('rejects a pathname replacement after the descriptor final metadata check', () => {

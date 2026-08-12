@@ -13,19 +13,21 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { discoverRepository, repositoryTestHooks } from '../src/repository.ts'
+import { discoverRepository, repositoryTestHooks, resolveRepository } from '../src/repository.ts'
+import { createTestRepository } from './helpers.ts'
 
 const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const temporaryRoots: string[] = []
 
-const createIsolatedPackage = () => {
+const createIsolatedPackage = (options: { packageManifest?: boolean } = {}) => {
   const testRoot = mkdtempSync(join(tmpdir(), 'encephalon-repository-test-'))
-  const executingRoot = join(testRoot, 'executing')
-  mkdirSync(join(executingRoot, 'src', 'generated'), { recursive: true })
+  const executingPath = join(testRoot, 'executing')
+  mkdirSync(join(executingPath, 'src', 'generated'), { recursive: true })
+  const executingRoot = realpathSync.native(executingPath)
   for (const file of [
     'directory-witness.ts',
     'errors.ts',
-    'file-identity.ts',
+    'filesystem-entry.ts',
     'repository.ts',
     'sqlite-error.ts',
     'verified-file.ts',
@@ -36,7 +38,9 @@ const createIsolatedPackage = () => {
     join(sourceRoot, 'src', 'generated', 'version.ts'),
     join(executingRoot, 'src', 'generated', 'version.ts'),
   )
-  writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","version":"0.2.0"}\n')
+  if (options.packageManifest !== false) {
+    writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","version":"0.2.0"}\n')
+  }
 
   const repositoryRoot = join(testRoot, 'repository')
   mkdirSync(join(repositoryRoot, 'node_modules'), { recursive: true })
@@ -52,10 +56,53 @@ const createIsolatedPackage = () => {
 afterEach(() => {
   repositoryTestHooks.afterGitDirectoryLstat = undefined
   repositoryTestHooks.afterExecutingManifestRead = undefined
+  repositoryTestHooks.afterExecutingParentCapture = undefined
   repositoryTestHooks.afterInstalledManifestRead = undefined
+  repositoryTestHooks.afterRepositoryParentCapture = undefined
+  repositoryTestHooks.afterRootInstallation = undefined
   for (const root of temporaryRoots.splice(0)) {
     rmSync(root, { force: true, recursive: true })
   }
+})
+
+test('classifies an explicit regular-file root as an invalid repository', () => {
+  const root = mkdtempSync(join(tmpdir(), 'encephalon-regular-root-test-'))
+  temporaryRoots.push(root)
+  const file = join(root, 'root-file')
+  writeFileSync(file, 'not a directory')
+
+  assert.throws(
+    () => discoverRepository({ root: file }),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'INVALID_REPOSITORY')
+      return true
+    },
+  )
+})
+
+test('rejects a child generation change while ascending to a repository parent', () => {
+  const root = createTestRepository()
+  temporaryRoots.push(root)
+  const child = join(root, 'packages', 'app')
+  const captured = join(root, 'packages', 'captured-app')
+  mkdirSync(child, { recursive: true })
+  let replaced = false
+  repositoryTestHooks.afterRepositoryParentCapture = (path: string) => {
+    if (!replaced && path === child) {
+      replaced = true
+      renameSync(child, captured)
+      mkdirSync(child)
+    }
+  }
+
+  assert.throws(
+    () => discoverRepository({ start: child }),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'INVALID_REPOSITORY')
+      return true
+    },
+  )
+  assert.equal(replaced, true)
 })
 
 test('rejects a worktree target replaced after inspection', () => {
@@ -200,9 +247,10 @@ test('does not memoize executing identity across a package-directory generation 
     `${pathToFileURL(join(executingRoot, 'src', 'repository.ts')).href}?executing-generation=${Date.now()}`
   )
   const capturedRoot = `${executingRoot}-captured`
+  const expectedManifest = join(executingRoot, 'package.json')
   let replaced = false
   repositoryModule.repositoryTestHooks.afterExecutingManifestRead = (path: string) => {
-    if (!replaced && path.endsWith('/executing/package.json')) {
+    if (!replaced && path === expectedManifest) {
       replaced = true
       renameSync(executingRoot, capturedRoot)
       mkdirSync(executingRoot)
@@ -218,6 +266,78 @@ test('does not memoize executing identity across a package-directory generation 
     },
   )
   assert.equal(replaced, true)
+  repositoryModule.repositoryTestHooks.afterExecutingManifestRead = undefined
+  assert.throws(
+    () => repositoryModule.assertRootInstallation(repositoryRoot),
+    (error: unknown) => {
+      assert.notEqual((error as { code?: unknown }).code, undefined)
+      return true
+    },
+  )
+})
+
+test('rejects an executing child generation change while accepting its package parent', async () => {
+  const { executingRoot, repositoryRoot } = createIsolatedPackage()
+  const sourceDirectory = join(executingRoot, 'src')
+  const capturedSource = join(executingRoot, 'captured-src')
+  writeFileSync(join(sourceDirectory, 'package.json'), '{"name":"unrelated","type":"module"}\n')
+  const repositoryModule = await import(
+    `${pathToFileURL(join(sourceDirectory, 'repository.ts')).href}?executing-transition=${Date.now()}`
+  )
+  let replaced = false
+  repositoryModule.repositoryTestHooks.afterExecutingParentCapture = (path: string) => {
+    if (!replaced && path === sourceDirectory) {
+      replaced = true
+      renameSync(sourceDirectory, capturedSource)
+      mkdirSync(sourceDirectory)
+    }
+  }
+
+  assert.throws(
+    () => repositoryModule.assertRootInstallation(repositoryRoot),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+      return true
+    },
+  )
+  assert.equal(replaced, true)
+})
+
+test('preserves root-install-required when no executing package can be found', async () => {
+  const { executingRoot, repositoryRoot } = createIsolatedPackage({ packageManifest: false })
+  const repositoryModule = await import(
+    `${pathToFileURL(join(executingRoot, 'src', 'repository.ts')).href}?missing-executing=${Date.now()}`
+  )
+
+  assert.throws(
+    () => repositoryModule.assertRootInstallation(repositoryRoot),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'ROOT_INSTALL_REQUIRED')
+      return true
+    },
+  )
+})
+
+test('requires the installed root to retain the memoized executing generation between calls', async () => {
+  const { executingRoot, repositoryRoot } = createIsolatedPackage()
+  writeFileSync(join(executingRoot, 'src', 'package.json'), '{"name":"unrelated","type":"module"}\n')
+  const repositoryModule = await import(
+    `${pathToFileURL(join(executingRoot, 'src', 'repository.ts')).href}?memo-generation=${Date.now()}`
+  )
+  assert.equal(repositoryModule.assertRootInstallation(repositoryRoot), executingRoot)
+
+  const capturedRoot = `${executingRoot}-captured`
+  renameSync(executingRoot, capturedRoot)
+  mkdirSync(executingRoot)
+  writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","version":"0.2.0"}\n')
+
+  assert.throws(
+    () => repositoryModule.assertRootInstallation(repositoryRoot),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'ROOT_INSTALL_REQUIRED')
+      return true
+    },
+  )
 })
 
 test('rejects an installed package-directory generation change after its manifest read', async () => {
@@ -246,6 +366,44 @@ test('rejects an installed package-directory generation change after its manifes
     },
   )
   assert.equal(replaced, true)
+})
+
+test('preserves operational installed-manifest failures as I/O errors', async () => {
+  const { executingRoot, repositoryRoot } = createIsolatedPackage()
+  writeFileSync(join(executingRoot, 'src', 'package.json'), '{"name":"unrelated","type":"module"}\n')
+  const repositoryModule = await import(
+    `${pathToFileURL(join(executingRoot, 'src', 'repository.ts')).href}?installed-io=${Date.now()}`
+  )
+  repositoryModule.repositoryTestHooks.afterInstalledManifestRead = () => {
+    throw Object.assign(new Error('simulated input/output failure'), { code: 'EIO' })
+  }
+
+  assert.throws(
+    () => repositoryModule.assertRootInstallation(repositoryRoot),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+      return true
+    },
+  )
+})
+
+test('revalidates the discovered repository generation after installation succeeds', () => {
+  const root = createTestRepository()
+  temporaryRoots.push(root)
+  const captured = `${root}-captured`
+  temporaryRoots.push(captured)
+  repositoryTestHooks.afterRootInstallation = () => {
+    renameSync(root, captured)
+    mkdirSync(root)
+  }
+
+  assert.throws(
+    () => resolveRepository({ root }),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'INVALID_REPOSITORY')
+      return true
+    },
+  )
 })
 
 test('rejects unsafe executing package manifests with a stable internal error', async () => {

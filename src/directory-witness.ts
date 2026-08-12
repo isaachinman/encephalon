@@ -1,13 +1,18 @@
 import type { BigIntStats } from 'node:fs'
 import { lstatSync, realpathSync } from 'node:fs'
-import { sameStableFileMetadata } from './file-identity.ts'
+import { sameStableEntryMetadata } from './filesystem-entry.ts'
 
 type CaptureDirectoryOptions = {
   afterCanonicalisation?: (() => void) | undefined
   allowLink: boolean
 }
 
+type RevalidateDirectoryOptions = {
+  afterCanonicalisation?: (() => void) | undefined
+}
+
 export type DirectoryWitness = {
+  allowLink: boolean
   canonicalMetadata: BigIntStats
   canonicalPath: string
   path: string
@@ -28,6 +33,12 @@ const changed = (): never => {
   throw new DirectoryWitnessError()
 }
 
+const witnessMatches = (expected: DirectoryWitness, current: DirectoryWitness) =>
+  expected.allowLink === current.allowLink &&
+  expected.canonicalPath === current.canonicalPath &&
+  sameStableEntryMetadata(expected.pathMetadata, current.pathMetadata) &&
+  sameStableEntryMetadata(expected.canonicalMetadata, current.canonicalMetadata)
+
 export const captureDirectoryWitness = (path: string, options: CaptureDirectoryOptions): DirectoryWitness => {
   const pathMetadata = lstatSync(path, { bigint: true })
   if (!validPathEntry(pathMetadata, options.allowLink)) {
@@ -44,27 +55,25 @@ export const captureDirectoryWitness = (path: string, options: CaptureDirectoryO
   const finalCanonicalMetadata = lstatSync(canonicalPath, { bigint: true })
   if (
     !(
-      validPathEntry(finalPathMetadata, options.allowLink) && sameStableFileMetadata(pathMetadata, finalPathMetadata)
+      validPathEntry(finalPathMetadata, options.allowLink) && sameStableEntryMetadata(pathMetadata, finalPathMetadata)
     ) ||
     finalCanonicalPath !== canonicalPath ||
     !finalCanonicalMetadata.isDirectory() ||
     finalCanonicalMetadata.isSymbolicLink() ||
-    !sameStableFileMetadata(canonicalMetadata, finalCanonicalMetadata)
+    !sameStableEntryMetadata(canonicalMetadata, finalCanonicalMetadata)
   ) {
     return changed()
   }
-  return { canonicalMetadata, canonicalPath, path, pathMetadata }
+  return { allowLink: options.allowLink, canonicalMetadata, canonicalPath, path, pathMetadata }
 }
 
-export const directoryWitnessIsCurrent = (witness: DirectoryWitness) => {
-  const pathMetadata = lstatSync(witness.path, { bigint: true })
-  const canonicalPath = realpathSync.native(witness.path)
-  const canonicalMetadata = lstatSync(witness.canonicalPath, { bigint: true })
-  return (
-    sameStableFileMetadata(witness.pathMetadata, pathMetadata) &&
-    canonicalPath === witness.canonicalPath &&
-    canonicalMetadata.isDirectory() &&
-    !canonicalMetadata.isSymbolicLink() &&
-    sameStableFileMetadata(witness.canonicalMetadata, canonicalMetadata)
-  )
+export const revalidateDirectoryWitness = (witness: DirectoryWitness, options: RevalidateDirectoryOptions = {}) => {
+  const current = captureDirectoryWitness(witness.path, {
+    afterCanonicalisation: options.afterCanonicalisation,
+    allowLink: witness.allowLink,
+  })
+  if (witnessMatches(witness, current)) {
+    return current
+  }
+  return changed()
 }

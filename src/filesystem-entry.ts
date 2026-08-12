@@ -1,10 +1,10 @@
 import type { BigIntStats } from 'node:fs'
 
-export const sameFileIdentity = (first: BigIntStats, second: BigIntStats) =>
+export const sameEntryIdentity = (first: BigIntStats, second: BigIntStats) =>
   first.dev === second.dev && first.ino === second.ino
 
-export const sameStableFileMetadata = (first: BigIntStats, second: BigIntStats) =>
-  sameFileIdentity(first, second) &&
+export const sameStableEntryMetadata = (first: BigIntStats, second: BigIntStats) =>
+  sameEntryIdentity(first, second) &&
   first.size === second.size &&
   first.mode === second.mode &&
   first.birthtimeNs === second.birthtimeNs &&

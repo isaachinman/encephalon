@@ -4,9 +4,10 @@ import {
   captureDirectoryWitness,
   type DirectoryWitness,
   DirectoryWitnessError,
-  directoryWitnessIsCurrent,
+  revalidateDirectoryWitness,
 } from './directory-witness.ts'
 import { fail, wrapIo } from './errors.ts'
+import { sameStableEntryMetadata } from './filesystem-entry.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import { decodeVerifiedUtf8, readVerifiedRegularFile, VerifiedFileError } from './verified-file.ts'
 
@@ -16,6 +17,7 @@ export type DiscoverRepositoryInput = {
 }
 
 type PackageIdentity = {
+  directory: DirectoryWitness
   name: string
   root: string
   version: string
@@ -28,8 +30,11 @@ type PackageManifest = {
 
 type RepositoryTestHooks = {
   afterExecutingManifestRead?: ((path: string) => void) | undefined
+  afterExecutingParentCapture?: ((path: string) => void) | undefined
   afterGitDirectoryLstat?: ((path: string) => void) | undefined
   afterInstalledManifestRead?: ((path: string) => void) | undefined
+  afterRepositoryParentCapture?: ((path: string) => void) | undefined
+  afterRootInstallation?: (() => void) | undefined
 }
 
 export const repositoryTestHooks: RepositoryTestHooks = {}
@@ -40,17 +45,23 @@ const installRequiredMessage = 'Install Encephalon at the Git repository root be
 let executingPackageIdentity: PackageIdentity | undefined
 
 const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
+const isMissingOrNotDirectory = (error: unknown) => {
+  const { code } = error as NodeJS.ErrnoException
+  return code === 'ENOENT' || code === 'ENOTDIR'
+}
 
-const captureCanonicalDirectory = (path: string, allowLink: boolean, afterCanonicalisation?: () => void) =>
-  captureDirectoryWitness(path, { afterCanonicalisation, allowLink })
+const captureLinkedDirectory = (path: string) => captureDirectoryWitness(path, { allowLink: true })
+const captureRealDirectory = (path: string, afterCanonicalisation?: () => void) =>
+  captureDirectoryWitness(path, { afterCanonicalisation, allowLink: false })
 
 const validGitMarker = (directory: DirectoryWitness) => {
   const marker = resolve(directory.canonicalPath, '.git')
   try {
     let markerValid = false
     try {
-      const markerDirectory = captureCanonicalDirectory(marker, false)
-      markerValid = directoryWitnessIsCurrent(markerDirectory)
+      const markerDirectory = captureRealDirectory(marker)
+      revalidateDirectoryWitness(markerDirectory)
+      markerValid = true
     } catch (error) {
       if (!(error instanceof DirectoryWitnessError || isMissing(error))) {
         throw error
@@ -61,14 +72,16 @@ const validGitMarker = (directory: DirectoryWitness) => {
         if (match?.[1] !== undefined) {
           const target = match[1].trim()
           const gitDirectory = isAbsolute(target) ? target : resolve(directory.canonicalPath, target)
-          const administrationDirectory = captureCanonicalDirectory(gitDirectory, false, () =>
+          const administrationDirectory = captureRealDirectory(gitDirectory, () =>
             repositoryTestHooks.afterGitDirectoryLstat?.(gitDirectory),
           )
-          markerValid = directoryWitnessIsCurrent(administrationDirectory)
+          revalidateDirectoryWitness(administrationDirectory)
+          markerValid = true
         }
       }
     }
-    return directoryWitnessIsCurrent(directory) && markerValid
+    revalidateDirectoryWitness(directory)
+    return markerValid
   } catch (error) {
     if (error instanceof DirectoryWitnessError || error instanceof VerifiedFileError || isMissing(error)) {
       return false
@@ -77,35 +90,48 @@ const validGitMarker = (directory: DirectoryWitness) => {
   }
 }
 
-const canonicalDirectory = (path: string) => {
+const captureRepositoryDirectory = (path: string, explicit: boolean) => {
   try {
-    return captureCanonicalDirectory(resolve(path), true)
+    return captureLinkedDirectory(resolve(path))
   } catch (error) {
+    if (explicit && error instanceof DirectoryWitnessError) {
+      return fail('INVALID_REPOSITORY', 'The explicit root is not a Git repository.')
+    }
     return wrapIo('Unable to resolve the repository path.', error)
   }
 }
 
-export const discoverRepository = (input: DiscoverRepositoryInput = {}) => {
+const discoverRepositoryWitness = (input: DiscoverRepositoryInput = {}) => {
   if (input.root !== undefined) {
-    const explicitRoot = canonicalDirectory(input.root)
+    const explicitRoot = captureRepositoryDirectory(input.root, true)
     if (validGitMarker(explicitRoot)) {
-      return explicitRoot.canonicalPath
+      return explicitRoot
     }
     return fail('INVALID_REPOSITORY', 'The explicit root is not a Git repository.')
   }
 
-  let current = canonicalDirectory(input.start ?? process.cwd())
+  let current = captureRepositoryDirectory(input.start ?? process.cwd(), false)
   for (;;) {
     if (validGitMarker(current)) {
-      return current.canonicalPath
+      return current
     }
-    const parent = dirname(current.canonicalPath)
-    if (parent === current.canonicalPath) {
+    const parentPath = dirname(current.canonicalPath)
+    if (parentPath === current.canonicalPath) {
       return fail('REPOSITORY_NOT_FOUND', 'No Git repository was found.')
     }
-    current = canonicalDirectory(parent)
+    const parent = captureRepositoryDirectory(parentPath, false)
+    repositoryTestHooks.afterRepositoryParentCapture?.(current.path)
+    try {
+      revalidateDirectoryWitness(current)
+    } catch {
+      return fail('INVALID_REPOSITORY', 'The repository path changed during discovery.')
+    }
+    current = parent
   }
 }
+
+export const discoverRepository = (input: DiscoverRepositoryInput = {}) =>
+  discoverRepositoryWitness(input).canonicalPath
 
 const parsePackageManifest = (bytes: Buffer): PackageManifest => {
   const parsed = JSON.parse(decodeVerifiedUtf8(bytes)) as unknown
@@ -115,45 +141,49 @@ const parsePackageManifest = (bytes: Buffer): PackageManifest => {
   throw new VerifiedFileError('The package manifest must contain a JSON object.')
 }
 
-const packageRootFromModule = (): PackageIdentity => {
+const findExecutingPackage = (): PackageIdentity => {
   if (executingPackageIdentity !== undefined) {
     return executingPackageIdentity
   }
-  let current = dirname(fileURLToPath(import.meta.url))
+  let current = captureLinkedDirectory(dirname(fileURLToPath(import.meta.url)))
   for (;;) {
-    let parent: string
+    let packageJson: PackageManifest | undefined
     try {
-      const directory = captureCanonicalDirectory(current, true)
-      const packagePath = resolve(directory.canonicalPath, 'package.json')
+      const packagePath = resolve(current.canonicalPath, 'package.json')
       const bytes = readVerifiedRegularFile(packagePath, MAX_PACKAGE_MANIFEST_BYTES)
-      let packageJson: PackageManifest | undefined
       if (bytes !== undefined) {
         packageJson = parsePackageManifest(bytes)
         repositoryTestHooks.afterExecutingManifestRead?.(packagePath)
       }
-      if (!directoryWitnessIsCurrent(directory)) {
-        throw new DirectoryWitnessError()
-      }
-      if (packageJson?.name === 'encephalon') {
-        if (typeof packageJson.version === 'string') {
-          const identity = {
-            name: packageJson.name,
-            root: directory.canonicalPath,
-            version: packageJson.version,
-          }
-          executingPackageIdentity = identity
-          return identity
-        }
-        throw new VerifiedFileError('The executing package version is invalid.')
-      }
-      parent = dirname(directory.canonicalPath)
-      if (parent === directory.canonicalPath) {
-        return fail('ROOT_INSTALL_REQUIRED', 'Unable to locate the executing Encephalon package.')
-      }
+      revalidateDirectoryWitness(current)
     } catch (error) {
       return wrapIo('Unable to inspect the executing package.', error)
     }
-    current = parent
+    if (packageJson?.name === 'encephalon') {
+      if (typeof packageJson.version === 'string') {
+        const identity = {
+          directory: current,
+          name: packageJson.name,
+          root: current.canonicalPath,
+          version: packageJson.version,
+        }
+        executingPackageIdentity = identity
+        return identity
+      }
+      return wrapIo('Unable to inspect the executing package.', new VerifiedFileError())
+    }
+    const parentPath = dirname(current.canonicalPath)
+    if (parentPath === current.canonicalPath) {
+      return fail('ROOT_INSTALL_REQUIRED', 'Unable to locate the executing Encephalon package.')
+    }
+    try {
+      const parent = captureLinkedDirectory(parentPath)
+      repositoryTestHooks.afterExecutingParentCapture?.(current.path)
+      revalidateDirectoryWitness(current)
+      current = parent
+    } catch (error) {
+      return wrapIo('Unable to inspect the executing package.', error)
+    }
   }
 }
 
@@ -164,17 +194,32 @@ const comparablePath = (path: string) => {
 
 const rootInstallationRequired = (): never => fail('ROOT_INSTALL_REQUIRED', installRequiredMessage)
 
-export const assertRootInstallation = (root: string) => {
-  const installedPath = resolve(root, 'node_modules', 'encephalon')
-  let installedDirectory: DirectoryWitness
-  try {
-    installedDirectory = captureCanonicalDirectory(installedPath, true)
-  } catch {
+const installedVerificationError = (error: unknown): never => {
+  if (
+    error instanceof DirectoryWitnessError ||
+    error instanceof VerifiedFileError ||
+    error instanceof SyntaxError ||
+    isMissingOrNotDirectory(error)
+  ) {
     return rootInstallationRequired()
   }
+  return wrapIo('Unable to verify the root Encephalon installation.', error)
+}
 
-  const executingPackage = packageRootFromModule()
-  if (comparablePath(installedDirectory.canonicalPath) === comparablePath(executingPackage.root)) {
+const assertRootInstallationWitness = (root: DirectoryWitness) => {
+  const installedPath = resolve(root.canonicalPath, 'node_modules', 'encephalon')
+  let installedDirectory: DirectoryWitness
+  try {
+    installedDirectory = captureLinkedDirectory(installedPath)
+  } catch (error) {
+    return installedVerificationError(error)
+  }
+
+  const executingPackage = findExecutingPackage()
+  if (
+    comparablePath(installedDirectory.canonicalPath) === comparablePath(executingPackage.root) &&
+    sameStableEntryMetadata(installedDirectory.canonicalMetadata, executingPackage.directory.canonicalMetadata)
+  ) {
     let packageJson: PackageManifest
     try {
       const packagePath = resolve(installedDirectory.canonicalPath, 'package.json')
@@ -184,11 +229,9 @@ export const assertRootInstallation = (root: string) => {
       }
       packageJson = parsePackageManifest(bytes)
       repositoryTestHooks.afterInstalledManifestRead?.(packagePath)
-      if (!directoryWitnessIsCurrent(installedDirectory)) {
-        return rootInstallationRequired()
-      }
-    } catch {
-      return rootInstallationRequired()
+      revalidateDirectoryWitness(installedDirectory)
+    } catch (error) {
+      return installedVerificationError(error)
     }
     if (
       packageJson.name === executingPackage.name &&
@@ -208,8 +251,16 @@ export const assertRootInstallation = (root: string) => {
   return rootInstallationRequired()
 }
 
+export const assertRootInstallation = (root: string) => assertRootInstallationWitness(captureLinkedDirectory(root))
+
 export const resolveRepository = (input: { root?: string } = {}) => {
-  const root = discoverRepository(input)
-  assertRootInstallation(root)
-  return root
+  const root = discoverRepositoryWitness(input)
+  assertRootInstallationWitness(root)
+  repositoryTestHooks.afterRootInstallation?.()
+  try {
+    revalidateDirectoryWitness(root)
+  } catch {
+    return fail('INVALID_REPOSITORY', 'The repository path changed while its installation was verified.')
+  }
+  return root.canonicalPath
 }

@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { afterEach, before, describe, test } from 'node:test'
+import { afterEach, describe, test } from 'node:test'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import { createTestRepository, removeTestRepository } from '../test/helpers.ts'
 
@@ -19,14 +19,6 @@ const createRoot = () => {
 
 afterEach(() => {
   roots.splice(0).forEach(removeTestRepository)
-})
-
-before(() => {
-  const result = spawnSync('bun', ['run', 'build'], {
-    cwd: projectRoot,
-    encoding: 'utf8',
-  })
-  assert.equal(result.status, 0, result.stderr)
 })
 
 const run = (root: string, arguments_: string[]) =>
