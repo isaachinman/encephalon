@@ -42,6 +42,31 @@ type StagingEntry = {
   writerName: string
 }
 
+const sameRegularEntryApartFromCtime = (expected: BigIntStats, current: BigIntStats) =>
+  expected.isFile() &&
+  current.isFile() &&
+  sameEntryIdentity(expected, current) &&
+  expected.size === current.size &&
+  expected.mode === current.mode &&
+  expected.birthtimeNs === current.birthtimeNs &&
+  expected.mtimeNs === current.mtimeNs
+
+/** @internal */
+export const advanceRegularStagingIncarnation = (
+  expected: BigIntStats,
+  deletedDescriptor: BigIntStats,
+  survivingPath: BigIntStats,
+  survivingDescriptor: BigIntStats,
+) => {
+  if (
+    sameRegularEntryApartFromCtime(expected, deletedDescriptor) &&
+    sameRegularEntryApartFromCtime(expected, survivingDescriptor) &&
+    sameStableEntryMetadata(survivingPath, survivingDescriptor)
+  ) {
+    return survivingDescriptor
+  }
+}
+
 /** @internal */
 export const parseOwnedStagingName = (name: string): { pid: number; uuid: string } | undefined => {
   const match = name.match(OWNED_STAGING_NAME)
@@ -230,6 +255,47 @@ const quarantineStagingEntry = (
   return result as { metadata?: BigIntStats; witness: DirectoryWitness }
 }
 
+const captureSurvivingRegularIncarnation = (
+  stagingDirectory: string,
+  entry: StagingEntry,
+  expected: BigIntStats,
+  deletedDescriptor: BigIntStats,
+  witness: DirectoryWitness,
+) => {
+  const path = resolve(stagingDirectory, entry.name)
+  let descriptor: number | undefined
+  let result: BigIntStats | undefined
+  let primaryError: unknown
+  try {
+    mapReplacement(() => revalidateDirectoryWitness(witness))
+    const pathMetadata = mapReplacement(() => lstatSync(path, { bigint: true }))
+    descriptor = mapReplacement(() => openSync(path, constants.O_RDONLY | noFollowFlag))
+    const descriptorMetadata = fstatSync(descriptor, { bigint: true })
+    result = advanceRegularStagingIncarnation(expected, deletedDescriptor, pathMetadata, descriptorMetadata)
+    if (result === undefined) {
+      return repositoryChanged()
+    }
+    mapReplacement(() => revalidateDirectoryWitness(witness))
+  } catch (error) {
+    primaryError = error
+  }
+  let closeError: unknown
+  if (descriptor !== undefined) {
+    try {
+      closeSync(descriptor)
+    } catch (error) {
+      closeError = error
+    }
+  }
+  if (primaryError !== undefined) {
+    throw primaryError
+  }
+  if (closeError !== undefined) {
+    throw closeError
+  }
+  return result as BigIntStats
+}
+
 /** @internal */
 export const inspectCurrentStagingFile = (stagingDirectory: string, name: string, descriptorMetadata: BigIntStats) => {
   const snapshot = mapReplacement(() => captureCanonicalDirectory(stagingDirectory, 1))
@@ -329,6 +395,7 @@ export const cleanupStaleStagingEntries = (stagingDirectory: string, hooks: Stag
   mapReplacement(() => revalidateDirectoryWitness(initialWitness))
   hooks.afterPreflight?.()
   const regularIncarnations = new Map<string, BigIntStats>()
+  const regularAliases = new Map<string, StagingEntry[]>()
   for (const entry of entries) {
     if (entry.metadata.isFile()) {
       const key = `${entry.metadata.dev}:${entry.metadata.ino}`
@@ -337,8 +404,15 @@ export const cleanupStaleStagingEntries = (stagingDirectory: string, hooks: Stag
         return repositoryChanged()
       }
       regularIncarnations.set(key, entry.metadata)
+      const aliases = regularAliases.get(key)
+      if (aliases === undefined) {
+        regularAliases.set(key, [entry])
+      } else {
+        aliases.push(entry)
+      }
     }
   }
+  const regularAliasPositions = new Map<string, number>()
   let witness = initialWitness
   for (const entry of entries) {
     const key = `${entry.metadata.dev}:${entry.metadata.ino}`
@@ -351,7 +425,17 @@ export const cleanupStaleStagingEntries = (stagingDirectory: string, hooks: Stag
     )
     witness = nextWitness
     if (metadata !== undefined) {
-      regularIncarnations.set(key, metadata)
+      const position = (regularAliasPositions.get(key) ?? 0) + 1
+      regularAliasPositions.set(key, position)
+      const nextAlias = regularAliases.get(key)?.[position]
+      if (nextAlias === undefined) {
+        regularIncarnations.set(key, metadata)
+      } else {
+        regularIncarnations.set(
+          key,
+          captureSurvivingRegularIncarnation(stagingDirectory, nextAlias, expected, metadata, witness),
+        )
+      }
     }
   }
   assertStagingEmpty(witness, hooks)

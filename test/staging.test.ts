@@ -1,13 +1,48 @@
 import assert from 'node:assert/strict'
+import type { BigIntStats } from 'node:fs'
 import { describe, test } from 'node:test'
 import {
+  advanceRegularStagingIncarnation,
   createOwnedStagingName,
   MAX_STAGING_DIRECTORY_ENTRIES,
   parseOwnedStagingName,
   parseOwnedStagingQuarantineName,
 } from '../src/staging.ts'
 
+const metadata = (ctimeNs: bigint, overrides: Partial<BigIntStats> = {}) =>
+  ({
+    birthtimeNs: 10n,
+    ctimeNs,
+    dev: 20n,
+    ino: 30n,
+    isFile: () => true,
+    mode: 0o100644n,
+    mtimeNs: 40n,
+    size: 50n,
+    ...overrides,
+  }) as BigIntStats
+
 describe('owned staging names', () => {
+  test('advances a hard-link group to a verified surviving alias incarnation', () => {
+    const expected = metadata(1n)
+    const staleDeletedDescriptor = metadata(1n)
+    const survivingPath = metadata(2n)
+    const survivingDescriptor = metadata(2n)
+
+    assert.equal(
+      advanceRegularStagingIncarnation(expected, staleDeletedDescriptor, survivingPath, survivingDescriptor),
+      survivingDescriptor,
+    )
+    assert.equal(
+      advanceRegularStagingIncarnation(expected, staleDeletedDescriptor, survivingPath, metadata(3n)),
+      undefined,
+    )
+    assert.equal(
+      advanceRegularStagingIncarnation(expected, staleDeletedDescriptor, survivingPath, metadata(2n, { size: 51n })),
+      undefined,
+    )
+  })
+
   test('accepts only the exact writer filename grammar and fixes the recovery bound', () => {
     assert.equal(MAX_STAGING_DIRECTORY_ENTRIES, 1000)
     assert.deepEqual(parseOwnedStagingName('record-123-550e8400-e29b-41d4-a716-446655440000.tmp'), {
