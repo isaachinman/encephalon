@@ -169,7 +169,9 @@ describe('initialisation', () => {
   test('rejects baseline kind-directory overflow before publishing any batch state', () => {
     const root = createRoot()
     for (const index of Array.from({ length: 999 }, (_, value) => value)) {
-      mkdirSync(join(root, 'encephalon', `kind-${String(index).padStart(4, '0')}`), { recursive: true })
+      mkdirSync(join(root, 'encephalon', `kind-${String(index).padStart(4, '0')}`), {
+        recursive: true,
+      })
     }
 
     assertErrorCode(() => api.initEncephalon({ root }), 'VALIDATION_FAILED')
@@ -379,7 +381,11 @@ describe('initialisation', () => {
         scriptKeys: ['test'],
       },
       {
-        evidence: { lockfiles: [{ file: 'bun.lock', manager: 'bun' }], manager: 'bun', status: 'lockfile-derived' },
+        evidence: {
+          lockfiles: [{ file: 'bun.lock', manager: 'bun' }],
+          manager: 'bun',
+          status: 'lockfile-derived',
+        },
         files: { 'bun.lock': '', 'package.json': JSON.stringify(packageJson) },
         manager: 'bun',
         name: 'bun text lockfile',
@@ -387,7 +393,11 @@ describe('initialisation', () => {
         scriptKeys: ['test'],
       },
       {
-        evidence: { lockfiles: [{ file: 'bun.lockb', manager: 'bun' }], manager: 'bun', status: 'lockfile-derived' },
+        evidence: {
+          lockfiles: [{ file: 'bun.lockb', manager: 'bun' }],
+          manager: 'bun',
+          status: 'lockfile-derived',
+        },
         files: { 'bun.lockb': '', 'package.json': JSON.stringify(packageJson) },
         manager: 'bun',
         name: 'bun binary lockfile',
@@ -419,7 +429,11 @@ describe('initialisation', () => {
         scriptKeys: ['test'],
       },
       {
-        evidence: { lockfiles: [{ file: 'yarn.lock', manager: 'yarn' }], manager: 'yarn', status: 'lockfile-derived' },
+        evidence: {
+          lockfiles: [{ file: 'yarn.lock', manager: 'yarn' }],
+          manager: 'yarn',
+          status: 'lockfile-derived',
+        },
         files: { 'package.json': JSON.stringify(packageJson), 'yarn.lock': '' },
         manager: 'yarn',
         name: 'yarn lockfile',
@@ -457,7 +471,10 @@ describe('initialisation', () => {
           lockfiles: [{ file: 'yarn.lock', manager: 'yarn' }],
           status: 'conflicted',
         },
-        files: { 'package.json': JSON.stringify({ ...packageJson, packageManager: 'npm@11.0.0' }), 'yarn.lock': '' },
+        files: {
+          'package.json': JSON.stringify({ ...packageJson, packageManager: 'npm@11.0.0' }),
+          'yarn.lock': '',
+        },
         manager: undefined,
         name: 'conflicting declaration and lockfile',
         scriptInvocations: [],
@@ -472,7 +489,11 @@ describe('initialisation', () => {
           ],
           status: 'conflicted',
         },
-        files: { 'package-lock.json': '{}', 'package.json': JSON.stringify(packageJson), 'pnpm-lock.yaml': '' },
+        files: {
+          'package-lock.json': '{}',
+          'package.json': JSON.stringify(packageJson),
+          'pnpm-lock.yaml': '',
+        },
         manager: undefined,
         name: 'multiple package-manager lockfiles',
         scriptInvocations: [],
@@ -634,6 +655,44 @@ describe('initialisation', () => {
     const records = api.listRecords({ includeSuperseded: true, limit: 20, root })
     assert.equal(records.length, 3)
     assert.deepEqual(new Set(records.map(record => record.subject)).size, 3)
+  })
+
+  test('stops a baseline batch after a post-link canonical generation replacement', () => {
+    const root = createRoot()
+    const kindDirectory = join(root, 'encephalon', 'context')
+    const displaced = join(root, 'displaced-context-after-publication')
+    let publicationAttempts = 0
+
+    assert.throws(
+      () =>
+        initWithCounts({ root }, point => {
+          if (point === 'after-publication') {
+            publicationAttempts += 1
+            if (publicationAttempts === 1) {
+              renameSync(kindDirectory, displaced)
+              mkdirSync(kindDirectory)
+            }
+          }
+        }),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: Record<string, unknown> }
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(actual.details?.canonicalCommitted, true)
+        assert.equal(actual.details?.postCommitPhase, 'publicationVerification')
+        assert.equal(typeof actual.details?.path, 'string')
+        assert.equal(typeof actual.details?.recordId, 'string')
+        assert.equal(typeof actual.details?.recoveryAction, 'string')
+        return true
+      },
+    )
+    assert.equal(publicationAttempts, 1)
+    assert.equal(readdirSync(displaced).filter(name => name.endsWith('.json')).length, 1)
+    assert.deepEqual(readdirSync(kindDirectory), [])
+    assert.equal(existsSync(join(root, 'encephalon', 'architecture')), false)
+    assert.equal(existsSync(join(root, 'encephalon', 'workflow')), false)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
 
   test('records package scripts as structured argv data instead of shell strings', () => {
@@ -876,8 +935,12 @@ describe('initialisation', () => {
 
   test('selects directory entry caps from sorted names regardless of input order', () => {
     const reverseGroupOrder = [
-      ...Array.from({ length: 300 }, (_, index) => ({ name: `z-${String(index).padStart(3, '0')}.py` })),
-      ...Array.from({ length: 300 }, (_, index) => ({ name: `a-${String(index).padStart(3, '0')}.ts` })),
+      ...Array.from({ length: 300 }, (_, index) => ({
+        name: `z-${String(index).padStart(3, '0')}.py`,
+      })),
+      ...Array.from({ length: 300 }, (_, index) => ({
+        name: `a-${String(index).padStart(3, '0')}.ts`,
+      })),
     ]
     const { entries, truncated } = selectBoundedDirectoryEntries(reverseGroupOrder, () => true)
 

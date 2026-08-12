@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { type BigIntStats, lstatSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { resolve } from 'node:path'
+import { basename, dirname, resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import {
   parseGatherInput,
@@ -29,6 +29,12 @@ import {
   MAX_CANONICAL_KIND_ENTRIES,
   revalidateCanonicalDirectory,
 } from './canonical-layout.ts'
+import {
+  captureDirectoryWitness,
+  type DirectoryWitness,
+  DirectoryWitnessError,
+  revalidateDirectoryWitness,
+} from './directory-witness.ts'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import { withOperationLock } from './lock.ts'
@@ -118,6 +124,7 @@ type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind
 
 type CacheReadTestHooks = {
   afterCanonicalValidation?: (() => void) | undefined
+  afterManifestEntryLstat?: ((path: string) => void) | undefined
   afterManifestKindEnumeration?: ((path: string) => void) | undefined
   afterManifestRootEnumeration?: ((path: string) => void) | undefined
   afterCompactSearchRead?: ((query: string) => void) | undefined
@@ -171,7 +178,9 @@ const isRecoverableCacheFailure = (error: unknown) => {
 }
 
 const assertTableColumns = (database: DatabaseSync, table: string, expected: string[]) => {
-  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name?: unknown
+  }>
   const names = columns.map(column => column.name)
   if (JSON.stringify(names) !== JSON.stringify(expected)) {
     throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
@@ -311,6 +320,7 @@ const statEntry = (root: string, path: string, missingAllowed = false): Manifest
   try {
     cacheReadTestHooks.beforeManifestEntryLstat?.(path)
     metadata = lstatSync(path, { bigint: true })
+    cacheReadTestHooks.afterManifestEntryLstat?.(path)
   } catch (error) {
     const { code } = error as NodeJS.ErrnoException
     if (code === 'ENOENT' || code === 'ENOTDIR') {
@@ -340,6 +350,68 @@ const statEntry = (root: string, path: string, missingAllowed = false): Manifest
   }
 }
 
+const captureManifestDirectory = (path: string) => {
+  try {
+    return captureDirectoryWitness(path, { allowLink: false })
+  } catch (error) {
+    if (
+      error instanceof DirectoryWitnessError ||
+      ['ELOOP', 'ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
+    ) {
+      throw new CanonicalDirectoryChangedError(path, { cause: error })
+    }
+    throw error
+  }
+}
+
+const revalidateManifestDirectories = (directories: readonly DirectoryWitness[]) => {
+  try {
+    for (const directory of directories) {
+      revalidateDirectoryWitness(directory)
+    }
+  } catch (error) {
+    if (
+      error instanceof DirectoryWitnessError ||
+      ['ELOOP', 'ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
+    ) {
+      throw new CanonicalDirectoryChangedError(directories[0]?.path ?? 'encephalon', {
+        cause: error,
+      })
+    }
+    throw error
+  }
+}
+
+const artifactManifestEntry = (root: string, artifactPath: string) => {
+  const brainDirectory = resolve(root, 'encephalon')
+  const segments = artifactPath.split('/')
+  const directorySegments = segments.slice(0, -1)
+  const brainWitness = captureManifestDirectory(brainDirectory)
+  const directories = directorySegments.reduce<DirectoryWitness[]>(
+    (witnesses, segment, index) => {
+      const path = resolve(brainDirectory, ...directorySegments.slice(0, index + 1))
+      const witness = captureManifestDirectory(path)
+      const parent = witnesses.at(-1)
+      if (parent === undefined) {
+        throw new CanonicalDirectoryChangedError(path)
+      }
+      const expectedCanonicalPath = resolve(parent.canonicalPath, segment)
+      if (witness.canonicalPath !== expectedCanonicalPath) {
+        throw new CanonicalDirectoryChangedError(path)
+      }
+      return [...witnesses, witness]
+    },
+    [brainWitness],
+  )
+  const parent = directories.at(-1)
+  if (parent === undefined) {
+    throw new CanonicalDirectoryChangedError(dirname(resolve(brainDirectory, ...segments)))
+  }
+  const entry = statEntry(root, resolve(parent.canonicalPath, basename(artifactPath)))
+  revalidateManifestDirectories(directories)
+  return entry
+}
+
 const recordManifestEntries = (root: string) => {
   const brainDirectory = resolve(root, 'encephalon')
   const brainEntry = statEntry(root, brainDirectory, true)
@@ -363,6 +435,7 @@ const recordManifestEntries = (root: string) => {
     .flatMap(entry => {
       const kindPath = resolve(brainDirectory, entry.name)
       const kindEntry = statEntry(root, kindPath)
+      revalidateCanonicalDirectory(rootEntries)
       if (!isCanonicalKindDirectoryEntry(entry) || kindEntry.type !== 'directory') {
         return [kindEntry]
       }
@@ -379,6 +452,7 @@ const recordManifestEntries = (root: string) => {
         ...recordEntries.entries.map(recordEntry => statEntry(root, resolve(kindPath, recordEntry.name))),
       ]
       revalidateCanonicalDirectory(recordEntries)
+      revalidateCanonicalDirectory(rootEntries)
       return entries
     })
   revalidateCanonicalDirectory(rootEntries)
@@ -388,9 +462,7 @@ const recordManifestEntries = (root: string) => {
 const repositoryManifest = (root: string, artifactPaths: string[]) => {
   const entries = [
     ...recordManifestEntries(root),
-    ...[...artifactPaths]
-      .sort(ordinalStringCompare)
-      .map(path => statEntry(root, resolve(root, 'encephalon', ...path.split('/')))),
+    ...[...artifactPaths].sort(ordinalStringCompare).map(path => artifactManifestEntry(root, path)),
   ]
   return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
 }
@@ -447,7 +519,9 @@ const validateCachedArtifactPath = (value: unknown) => {
   try {
     return validateArtifactPath(value, kind, id)
   } catch (error) {
-    throw new CacheSchemaMismatch('Cached artifact metadata contains an invalid path.', { cause: error })
+    throw new CacheSchemaMismatch('Cached artifact metadata contains an invalid path.', {
+      cause: error,
+    })
   }
 }
 

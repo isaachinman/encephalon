@@ -19,7 +19,7 @@ import { createTestRepository } from './helpers.ts'
 const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const temporaryRoots: string[] = []
 
-const createIsolatedPackage = (options: { packageManifest?: boolean } = {}) => {
+const createIsolatedPackage = () => {
   const testRoot = mkdtempSync(join(tmpdir(), 'encephalon-repository-test-'))
   const executingPath = join(testRoot, 'executing')
   mkdirSync(join(executingPath, 'src', 'generated'), { recursive: true })
@@ -38,9 +38,7 @@ const createIsolatedPackage = (options: { packageManifest?: boolean } = {}) => {
     join(sourceRoot, 'src', 'generated', 'version.ts'),
     join(executingRoot, 'src', 'generated', 'version.ts'),
   )
-  if (options.packageManifest !== false) {
-    writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","type":"module","version":"0.2.0"}\n')
-  }
+  writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","type":"module","version":"0.2.0"}\n')
 
   const repositoryRoot = join(testRoot, 'repository')
   mkdirSync(join(repositoryRoot, 'node_modules'), { recursive: true })
@@ -50,7 +48,7 @@ const createIsolatedPackage = (options: { packageManifest?: boolean } = {}) => {
     process.platform === 'win32' ? 'junction' : 'dir',
   )
   temporaryRoots.push(testRoot)
-  return { executingRoot, repositoryRoot, testRoot }
+  return { executingRoot, repositoryRoot }
 }
 
 afterEach(() => {
@@ -61,7 +59,6 @@ afterEach(() => {
   repositoryTestHooks.afterInstalledManifestRead = undefined
   repositoryTestHooks.afterRepositoryParentCapture = undefined
   repositoryTestHooks.afterRootInstallation = undefined
-  repositoryTestHooks.executingSearchBoundary = undefined
   for (const root of temporaryRoots.splice(0)) {
     rmSync(root, { force: true, recursive: true })
   }
@@ -350,21 +347,14 @@ test('rejects an executing child generation change while accepting its package p
   assert.equal(replaced, true)
 })
 
-test('preserves root-install-required when no executing package can be found', async () => {
-  const { executingRoot, repositoryRoot, testRoot } = createIsolatedPackage({ packageManifest: false })
-  const repositoryModule = await import(
-    `${pathToFileURL(join(executingRoot, 'src', 'repository.ts')).href}?missing-executing=${Date.now()}`
-  )
-  repositoryModule.repositoryTestHooks.executingSearchBoundary = testRoot
-
+test('preserves root-install-required when no executing package can be found', () => {
   assert.throws(
-    () => repositoryModule.assertRootInstallation(repositoryRoot),
+    () => repositoryTestHooks.executingPackageNotFound(),
     (error: unknown) => {
       assert.equal((error as { code?: unknown }).code, 'ROOT_INSTALL_REQUIRED')
       return true
     },
   )
-  repositoryModule.repositoryTestHooks.executingSearchBoundary = undefined
 })
 
 test('normalises an initial executing-directory failure', async () => {
@@ -532,7 +522,14 @@ test('rejects unsafe executing package manifests with a stable internal error', 
     {
       name: 'oversized',
       write: (path: string) =>
-        writeFileSync(path, JSON.stringify({ name: 'encephalon', padding: 'x'.repeat(1024 * 1024), version: '0.2.0' })),
+        writeFileSync(
+          path,
+          JSON.stringify({
+            name: 'encephalon',
+            padding: 'x'.repeat(1024 * 1024),
+            version: '0.2.0',
+          }),
+        ),
     },
     {
       name: 'symlink',

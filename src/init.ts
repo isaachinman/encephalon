@@ -163,6 +163,7 @@ export const initEncephalon = (input: InitEncephalonInput = {}): InitEncephalonR
   }
 }
 
+/** @internal */
 export const initEncephalonWithHooks = (
   input: InitEncephalonInput = {},
   hooks: InitHooks = {},

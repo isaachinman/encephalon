@@ -60,6 +60,7 @@ afterEach(() => {
   cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.afterManifestKindEnumeration = undefined
+  cacheReadTestHooks.afterManifestEntryLstat = undefined
   cacheReadTestHooks.afterManifestRootEnumeration = undefined
   cacheReadTestHooks.beforeManifestEntryLstat = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
@@ -753,13 +754,19 @@ describe('SQLite cache and reads', () => {
       [
         'list limit',
         root => {
-          functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ limit: 0, root })
+          functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({
+            limit: 0,
+            root,
+          })
         },
       ],
       [
         'show id',
         root => {
-          functionFromApi<(input: Record<string, unknown>) => unknown>('showRecord')({ id: '../bad', root })
+          functionFromApi<(input: Record<string, unknown>) => unknown>('showRecord')({
+            id: '../bad',
+            root,
+          })
         },
       ],
       [
@@ -775,7 +782,10 @@ describe('SQLite cache and reads', () => {
       [
         'search query',
         root => {
-          functionFromApi<(input: Record<string, unknown>) => unknown>('searchRecords')({ query: 42, root })
+          functionFromApi<(input: Record<string, unknown>) => unknown>('searchRecords')({
+            query: 42,
+            root,
+          })
         },
       ],
       [
@@ -863,14 +873,19 @@ describe('SQLite cache and reads', () => {
       [
         'gather',
         (root: string) =>
-          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ root, searches: [] }),
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({
+            root,
+            searches: [],
+          }),
       ],
     ] as const
 
     for (const [name, operation] of cases) {
       const root = createRoot()
       cacheLocationTestHooks.beforeLocationInspection = () => {
-        throw Object.assign(new Error('Injected cache location inspection failure.'), { code: 'EACCES' })
+        throw Object.assign(new Error('Injected cache location inspection failure.'), {
+          code: 'EACCES',
+        })
       }
       try {
         assert.throws(
@@ -903,13 +918,18 @@ describe('SQLite cache and reads', () => {
   test('does not create a cache when canonical root enumeration overflows', () => {
     const root = createRoot()
     for (const index of Array.from({ length: 1003 }, (_, value) => value)) {
-      mkdirSync(join(root, 'encephalon', `kind-${String(index).padStart(4, '0')}`), { recursive: true })
+      mkdirSync(join(root, 'encephalon', `kind-${String(index).padStart(4, '0')}`), {
+        recursive: true,
+      })
     }
 
     assert.throws(
       () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
       (error: unknown) => {
-        const actual = error as { code?: unknown; details?: { errors?: Array<{ code?: unknown }> } }
+        const actual = error as {
+          code?: unknown
+          details?: { errors?: Array<{ code?: unknown }> }
+        }
         assert.equal(actual.code, 'VALIDATION_FAILED')
         assert.equal(actual.details?.errors?.[0]?.code, 'CORPUS_DIRECTORY_ENTRY_LIMIT')
         return true
@@ -1005,9 +1025,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(removed, true)
   })
 
-  test('does not follow a symlink replacement at the manifest lstat boundary', {
-    skip: process.platform === 'win32' ? 'Windows runners may not permit symlink creation.' : false,
-  }, () => {
+  test('does not follow a missing-target link replacement at the manifest lstat boundary', () => {
     const root = createRoot()
     const recordPath = join(realpathSync.native(root), 'encephalon', 'context', 'manifest-symlink.json')
     ensureParent(recordPath)
@@ -1022,15 +1040,13 @@ describe('SQLite cache and reads', () => {
         subject: 'cache.manifest-symlink',
       })}\n`,
     )
-    const outside = createOutsideDirectory()
-    const sentinel = join(outside, 'outside-record')
-    writeFileSync(sentinel, 'outside')
+    const missingTarget = join(root, 'missing-manifest-target')
     let replaced = false
     cacheReadTestHooks.beforeManifestEntryLstat = path => {
       if (path === recordPath && !replaced) {
         replaced = true
         rmSync(recordPath)
-        symlinkSync(sentinel, recordPath)
+        symlinkSync(missingTarget, recordPath, process.platform === 'win32' ? 'junction' : 'file')
       }
     }
 
@@ -1038,12 +1054,111 @@ describe('SQLite cache and reads', () => {
       () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
       (error: unknown) => {
         assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
-        assert.equal(JSON.stringify(error).includes(outside), false)
+        assert.equal(JSON.stringify(error).includes(missingTarget), false)
         return true
       },
     )
     assert.equal(replaced, true)
-    assert.equal(readFileSync(sentinel, 'utf8'), 'outside')
+  })
+
+  test('classifies a kind ancestor replacement after manifest entry lstat as repository change', () => {
+    const root = createRoot()
+    const canonicalRoot = realpathSync.native(root)
+    const kindDirectory = join(canonicalRoot, 'encephalon', 'decision')
+    const preservedKindDirectory = join(canonicalRoot, 'preserved-decision-kind')
+    const outside = createOutsideDirectory()
+    const sentinel = join(outside, 'outside-sentinel.txt')
+    mkdirSync(kindDirectory, { recursive: true })
+    writeFileSync(sentinel, 'outside kind sentinel')
+    utimesSync(kindDirectory, new Date('2025-01-02T03:04:05.000Z'), new Date('2025-01-02T03:04:05.000Z'))
+    utimesSync(outside, new Date('2024-02-03T04:05:06.000Z'), new Date('2024-02-03T04:05:06.000Z'))
+    assert.equal(api.validateRecords({ root }).valid, true)
+
+    let replaced = false
+    let replacements = 0
+    cacheReadTestHooks.beforeManifestEntryLstat = path => {
+      if (path === kindDirectory && replaced) {
+        rmSync(kindDirectory)
+        renameSync(preservedKindDirectory, kindDirectory)
+        replaced = false
+      }
+    }
+    cacheReadTestHooks.afterManifestEntryLstat = path => {
+      if (path === kindDirectory && !replaced) {
+        renameSync(kindDirectory, preservedKindDirectory)
+        symlinkSync(outside, kindDirectory, process.platform === 'win32' ? 'junction' : 'dir')
+        replaced = true
+        replacements += 1
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(replacements > 0, true)
+    assert.equal(readFileSync(sentinel, 'utf8'), 'outside kind sentinel')
+  })
+
+  test('classifies an artifact ancestor replacement after manifest entry lstat as repository change', () => {
+    const root = createRoot()
+    const canonicalRoot = realpathSync.native(root)
+    const id = 'manifest-artifact-ancestor'
+    const artifact = `_artifacts/architecture/${id}/diagram.svg`
+    const artifactDirectory = join(canonicalRoot, 'encephalon', '_artifacts', 'architecture', id)
+    const artifactPath = join(artifactDirectory, 'diagram.svg')
+    const preservedArtifactDirectory = join(canonicalRoot, 'preserved-artifact-directory')
+    const outside = createOutsideDirectory()
+    const sentinel = join(outside, 'diagram.svg')
+    mkdirSync(artifactDirectory, { recursive: true })
+    writeFileSync(artifactPath, '<svg>a</svg>')
+    writeFileSync(sentinel, '<svg>outside artifact sentinel with deliberately different metadata</svg>')
+    utimesSync(artifactPath, new Date('2025-01-02T03:04:05.000Z'), new Date('2025-01-02T03:04:05.000Z'))
+    utimesSync(sentinel, new Date('2024-02-03T04:05:06.000Z'), new Date('2024-02-03T04:05:06.000Z'))
+    api.addRecord({
+      artifacts: [artifact],
+      id,
+      kind: 'architecture',
+      payload: {},
+      root,
+      source: 'test',
+      subject: 'cache.manifest-artifact-ancestor',
+    })
+    assert.equal(api.validateRecords({ root }).valid, true)
+
+    let replaced = false
+    let replacements = 0
+    cacheReadTestHooks.afterManifestRootEnumeration = () => {
+      if (replaced) {
+        rmSync(artifactDirectory)
+        renameSync(preservedArtifactDirectory, artifactDirectory)
+        replaced = false
+      }
+    }
+    cacheReadTestHooks.afterManifestEntryLstat = path => {
+      if (path === artifactPath && !replaced) {
+        renameSync(artifactDirectory, preservedArtifactDirectory)
+        symlinkSync(outside, artifactDirectory, process.platform === 'win32' ? 'junction' : 'dir')
+        replaced = true
+        replacements += 1
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(replacements > 0, true)
+    assert.equal(
+      readFileSync(sentinel, 'utf8'),
+      '<svg>outside artifact sentinel with deliberately different metadata</svg>',
+    )
   })
 
   test('retries a kind disappearance during manifest collection without an I/O failure', () => {
@@ -1083,7 +1198,10 @@ describe('SQLite cache and reads', () => {
       rmSync(persistentKind, { recursive: true })
     }
     assert.throws(
-      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root: persistentRoot }),
+      () =>
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({
+          root: persistentRoot,
+        }),
       (error: unknown) => {
         assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
         return true
@@ -1115,7 +1233,9 @@ describe('SQLite cache and reads', () => {
     const releasePath = join(root, 'release-first-prepare')
     const fixture = join(import.meta.dirname, 'fixtures', 'prepare-cache.ts')
     const before = statSync(join(root, 'node_modules'), { bigint: true })
-    const first = spawn(process.execPath, [fixture, root, firstResult, firstReady, releasePath], { stdio: 'inherit' })
+    const first = spawn(process.execPath, [fixture, root, firstResult, firstReady, releasePath], {
+      stdio: 'inherit',
+    })
     const second = spawn(process.execPath, [fixture, root, secondResult, secondReady, releasePath], {
       stdio: 'inherit',
     })
@@ -1342,7 +1462,11 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(listRecords({ limit: 50, root: validRoot }), [])
     assert.deepEqual(searchRecords({ limit: 50, query: 'x'.repeat(1024), root: validRoot }), [])
     assert.deepEqual(
-      searchRecords({ limit: 50, query: Array.from({ length: 32 }, () => 'x').join(' '), root: validRoot }),
+      searchRecords({
+        limit: 50,
+        query: Array.from({ length: 32 }, () => 'x').join(' '),
+        root: validRoot,
+      }),
       [],
     )
     assert.deepEqual(searchCompactRecords({ limit: 100, query: 'x', root: validRoot }), [])
@@ -1367,9 +1491,18 @@ describe('SQLite cache and reads', () => {
     const invalidCases: Array<{ budget: string; run: (root: string) => void }> = [
       { budget: 'fullResultLimit', run: root => listRecords({ limit: 51, root }) },
       { budget: 'fullResultLimit', run: root => searchRecords({ limit: 51, query: 'x', root }) },
-      { budget: 'compactResultLimit', run: root => searchCompactRecords({ limit: 101, query: 'x', root }) },
-      { budget: 'queryBytes', run: root => searchRecords({ query: `${'x'.repeat(1024)}y`, root }) },
-      { budget: 'queryBytes', run: root => searchCompactRecords({ query: `${'x'.repeat(1024)}y`, root }) },
+      {
+        budget: 'compactResultLimit',
+        run: root => searchCompactRecords({ limit: 101, query: 'x', root }),
+      },
+      {
+        budget: 'queryBytes',
+        run: root => searchRecords({ query: `${'x'.repeat(1024)}y`, root }),
+      },
+      {
+        budget: 'queryBytes',
+        run: root => searchCompactRecords({ query: `${'x'.repeat(1024)}y`, root }),
+      },
       {
         budget: 'queryTerms',
         run: root => searchRecords({ query: Array.from({ length: 33 }, () => 'x').join(' '), root }),
@@ -1386,7 +1519,10 @@ describe('SQLite cache and reads', () => {
         budget: 'gatherShows',
         run: root => gatherRecords({ root, shows: Array.from({ length: 65 }, () => 'missing') }),
       },
-      { budget: 'compactResultLimit', run: root => gatherRecords({ limit: 101, root, searches: ['x'] }) },
+      {
+        budget: 'compactResultLimit',
+        run: root => gatherRecords({ limit: 101, root, searches: ['x'] }),
+      },
       {
         budget: 'queryTerms',
         run: root => gatherRecords({ root, searches: [Array.from({ length: 33 }, () => 'x').join(' ')] }),
@@ -2881,7 +3017,9 @@ describe('SQLite cache and reads', () => {
     const verifiedCacheDirectory = inspectCacheLocation(root).directory
     const database = new DatabaseSync(gatePath)
     try {
-      const mode = database.prepare('PRAGMA journal_mode = WAL').get() as { journal_mode?: unknown }
+      const mode = database.prepare('PRAGMA journal_mode = WAL').get() as {
+        journal_mode?: unknown
+      }
       assert.equal(mode.journal_mode, 'wal')
     } finally {
       database.close()

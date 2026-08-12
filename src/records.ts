@@ -10,7 +10,6 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readdirSync,
   readSync,
   rmSync,
   writeFileSync,
@@ -33,7 +32,14 @@ import {
   revalidateCanonicalDirectory,
   STAGING_DIRECTORY_NAME,
 } from './canonical-layout.ts'
+import {
+  captureDirectoryWitness,
+  type DirectoryWitness,
+  DirectoryWitnessError,
+  revalidateDirectoryWitness,
+} from './directory-witness.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
+import { sameEntryIdentity } from './filesystem-entry.ts'
 import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import { resolveRepository } from './repository.ts'
@@ -68,10 +74,18 @@ type CanonicalLayoutWitness = {
 
 type CanonicalPublicationAuthority = {
   assertCurrent: () => void
-  kindCount: number
-  rootExists: boolean
-  rootNames: Set<string>
-  update: (kind: string) => void
+  acceptPreparation: (
+    kind: string,
+    rootSnapshot: CanonicalDirectorySnapshot,
+    kindSnapshot: CanonicalDirectorySnapshot,
+  ) => void
+  acceptPublication: (
+    kind: string,
+    recordName: string,
+    rootSnapshot: CanonicalDirectorySnapshot,
+    kindSnapshot: CanonicalDirectorySnapshot,
+  ) => void
+  projection: () => { kindCount: number; rootExists: boolean; rootNames: ReadonlySet<string> }
 }
 
 type FileIdentity = {
@@ -89,14 +103,17 @@ type RecordWriteFault =
   | 'during-publication-flush'
   | 'during-staging-write'
 
+/** @internal */
 export type RecordWriteHooks = {
   fault?: ((point: RecordWriteFault) => void) | undefined
 }
 
+/** @internal */
 export const recordWriteTestHooks: RecordWriteHooks = {}
 
 type RecordReadFault = 'after-record-fstat' | 'after-record-lstat' | 'after-record-open'
 
+/** @internal */
 export type RecordReadHooks = {
   afterBrainRootEnumeration?: (() => void) | undefined
   afterKindEnumeration?: ((path: string) => void) | undefined
@@ -130,18 +147,21 @@ type AllowedMultiHead = {
   subject: string
 }
 
-type PostCommitPhase = 'cacheHydration' | 'publicationFlush' | 'stagingCleanup'
+type PostCommitPhase = 'cacheHydration' | 'publicationFlush' | 'publicationVerification' | 'stagingCleanup'
 
 const postCommitRecoveryAction = {
   cacheHydration: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
   publicationFlush:
     'Confirm the canonical record file is present; prepare does not re-fsync the kind directory, so treat durability as unverified until that sync succeeds.',
-  stagingCleanup: 'Retry this add; leftovers under encephalon/_staging are cleared by the next add.',
+  publicationVerification:
+    'Inspect the canonical directory generation before retrying; the linked record may have been displaced by a concurrent replacement.',
+  stagingCleanup: 'Inspect encephalon/_staging and remove only a confirmed leftover from this operation.',
 } as const satisfies Record<PostCommitPhase, string>
 
 const postCommitPriority: Record<PostCommitPhase, number> = {
   cacheHydration: 2,
   publicationFlush: 3,
+  publicationVerification: 4,
   stagingCleanup: 1,
 }
 
@@ -162,6 +182,20 @@ const postCommitError = (record: BrainRecord, phase: PostCommitPhase, cause: unk
     { cause },
   )
 
+const publicationVerificationError = (record: BrainRecord, cause: unknown) =>
+  new EncephalonError(
+    'REPOSITORY_CHANGED',
+    `Record ${record.id} was linked, but its canonical directory generation changed before verification. ${postCommitRecoveryAction.publicationVerification}`,
+    {
+      canonicalCommitted: true,
+      path: record.path,
+      postCommitPhase: 'publicationVerification',
+      recordId: record.id,
+      recoveryAction: postCommitRecoveryAction.publicationVerification,
+    },
+    { cause },
+  )
+
 const canonicalRecordBytes = (record: BrainRecord) => {
   const { path: _path, ...recordFile } = record
   return Buffer.byteLength(formatRecordFile(recordFile), 'utf8')
@@ -169,10 +203,15 @@ const canonicalRecordBytes = (record: BrainRecord) => {
 
 const directoryFlag = constants.O_DIRECTORY ?? 0
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
+/** @internal */
 export const MAX_CANONICAL_RECORDS = 1000
+/** @internal */
 export const MAX_CANONICAL_RECORD_BYTES = 8 * 1024 * 1024
+/** @internal */
 export const MAX_SUPERSESSION_EDGES = 1000
+/** @internal */
 export const MAX_ARTIFACT_REFERENCES = 1000
+/** @internal */
 export const MAX_VALIDATION_ISSUES = 100
 const decoder = new TextDecoder('utf-8', { fatal: true })
 
@@ -248,18 +287,6 @@ const fsyncDirectory = (path: string) => {
         closeSync(descriptor)
       }
     }
-  }
-}
-
-const cleanupStagingDirectory = (root: string, hooks?: RecordWriteHooks) => {
-  const stagingDirectory = resolve(root, 'encephalon', STAGING_DIRECTORY_NAME)
-  if (existsSync(stagingDirectory)) {
-    assertRealDirectory(root, stagingDirectory)
-    for (const entry of readdirSync(stagingDirectory, { withFileTypes: true })) {
-      fault(hooks, 'during-cleanup')
-      rmSync(resolve(stagingDirectory, entry.name), { force: true, recursive: true })
-    }
-    fsyncDirectory(stagingDirectory)
   }
 }
 
@@ -372,8 +399,15 @@ const kindDirectoryIssue = (name: string, path: string) => {
 
 const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}): RecordScan => {
   const brainDirectory = resolve(root, 'encephalon')
-  if (existsSync(brainDirectory)) {
-    const rootMetadata = lstatSync(brainDirectory)
+  let rootMetadata: Stats | undefined
+  try {
+    rootMetadata = lstatSync(brainDirectory)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error
+    }
+  }
+  if (rootMetadata !== undefined) {
     if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
       return {
         bytes: 0,
@@ -871,6 +905,7 @@ const allowedMultiHeadRecordIds = (records: BrainRecord[], allowed: AllowedMulti
   return ids
 }
 
+/** @internal */
 export const validateRecordsResolved = (root: string, options: ValidateRecordsOptions = {}): ValidateResult => {
   try {
     return validateScanned(root, scanCanonicalRecords(root, options))
@@ -923,31 +958,82 @@ const canonicalPublicationAuthority = (
   initialLayout: CanonicalLayoutWitness,
 ): CanonicalPublicationAuthority => {
   let layout = initialLayout
-  const rootEntries = layout.root === null ? [] : layout.root.entries
+  const projection = () => {
+    const rootEntries = layout.root === null ? [] : layout.root.entries
+    return {
+      kindCount: rootEntries.filter(isCanonicalKindDirectoryEntry).length,
+      rootExists: layout.root !== null,
+      rootNames: new Set(rootEntries.map(entry => entry.name)),
+    }
+  }
+  const sameDirectoryGeneration = (expected: CanonicalDirectorySnapshot, current: CanonicalDirectorySnapshot) =>
+    expected.witness.path === current.witness.path &&
+    expected.witness.canonicalPath === current.witness.canonicalPath &&
+    sameEntryIdentity(expected.witness.pathMetadata, current.witness.pathMetadata) &&
+    sameEntryIdentity(expected.witness.canonicalMetadata, current.witness.canonicalMetadata)
+  const sameEntryNames = (first: readonly { name: string }[], second: readonly { name: string }[]) =>
+    first.length === second.length && first.every((entry, index) => entry.name === second[index]?.name)
   const authority: CanonicalPublicationAuthority = {
-    assertCurrent: () => assertLayoutWitnessCurrent(root, layout),
-    kindCount: rootEntries.filter(isCanonicalKindDirectoryEntry).length,
-    rootExists: layout.root !== null,
-    rootNames: new Set(rootEntries.map(entry => entry.name)),
-    update: kind => {
-      const brainDirectory = resolve(root, 'encephalon')
-      const rootSnapshot = captureCanonicalDirectory(brainDirectory, MAX_CANONICAL_BRAIN_ROOT_ENTRIES)
-      const kindSnapshot = captureCanonicalDirectory(resolve(brainDirectory, kind), MAX_CANONICAL_KIND_ENTRIES)
+    acceptPreparation: (kind, rootSnapshot, kindSnapshot) => {
+      const currentProjection = projection()
+      const expectedRootNames = new Set([...currentProjection.rootNames, STAGING_DIRECTORY_NAME, kind])
+      const actualRootNames = new Set(rootSnapshot.entries.map(entry => entry.name))
+      const rootGenerationAccepted =
+        layout.root === null || (layout.root !== null && sameDirectoryGeneration(layout.root, rootSnapshot))
+      const rootEntriesAccepted =
+        expectedRootNames.size === actualRootNames.size &&
+        [...expectedRootNames].every(name => actualRootNames.has(name))
+      const previousKind = layout.kinds.get(kind)
+      const kindGenerationAccepted =
+        previousKind === undefined
+          ? kindSnapshot.entries.length === 0
+          : sameDirectoryGeneration(previousKind, kindSnapshot) &&
+            sameEntryNames(previousKind.entries, kindSnapshot.entries)
+      if (!(rootGenerationAccepted && rootEntriesAccepted && kindGenerationAccepted)) {
+        return repositoryChangedBeforePublication()
+      }
+      for (const snapshot of layout.kinds.values()) {
+        revalidateCanonicalDirectory(snapshot)
+      }
       layout = {
         kinds: new Map(layout.kinds).set(kind, kindSnapshot),
         root: rootSnapshot,
       }
-      authority.rootExists = true
-      authority.rootNames.add(kind)
-      authority.rootNames.add(STAGING_DIRECTORY_NAME)
+      authority.assertCurrent()
     },
+    acceptPublication: (kind, recordName, rootSnapshot, kindSnapshot) => {
+      try {
+        if (layout.root !== rootSnapshot || layout.kinds.get(kind) !== kindSnapshot) {
+          return repositoryChangedBeforePublication()
+        }
+        revalidateCanonicalDirectory(rootSnapshot)
+        const nextKind = captureCanonicalDirectory(kindSnapshot.witness.path, MAX_CANONICAL_KIND_ENTRIES)
+        const expectedEntries = [...kindSnapshot.entries, { name: recordName }].sort((first, second) =>
+          ordinalStringCompare(first.name, second.name),
+        )
+        if (!(sameDirectoryGeneration(kindSnapshot, nextKind) && sameEntryNames(expectedEntries, nextKind.entries))) {
+          return repositoryChangedBeforePublication()
+        }
+        layout = { kinds: new Map(layout.kinds).set(kind, nextKind), root: rootSnapshot }
+        authority.assertCurrent()
+      } catch (error) {
+        if (isCanonicalDirectoryReplacementError(error)) {
+          return repositoryChangedBeforePublication()
+        }
+        throw error
+      }
+    },
+    assertCurrent: () => assertLayoutWitnessCurrent(root, layout),
+    projection,
   }
   return authority
 }
 
+/** @internal */
 export const readRecordsResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
   readRecordScanResolved(root, hooks, allowed).records
 
+/** @internal */
 export const readRecordSnapshotResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
   const scan = readRecordScanResolved(root, hooks, allowed)
   if (scan.layout === undefined) {
@@ -956,11 +1042,14 @@ export const readRecordSnapshotResolved = (root: string, hooks: RecordReadHooks 
   return { authority: canonicalPublicationAuthority(root, scan.layout), records: scan.records }
 }
 
+/** @internal */
 export const readRecords = (input: RootInput = {}) => readRecordsResolved(resolveRepository(input))
 
+/** @internal */
 export const readRecordsAllowingGeneratedMultiHeads = (input: RootInput, allowed: AllowedMultiHead[]) =>
   readRecordsResolved(resolveRepository(input), {}, allowed)
 
+/** @internal */
 export const planRecordAddition = (root: string, input: AddRecordInput): PlannedRecord => {
   const recordFile = createRecordFile(input)
   const relativePath = `encephalon/${recordFile.kind}/${recordFile.id}.json`
@@ -980,6 +1069,7 @@ export const planRecordAddition = (root: string, input: AddRecordInput): Planned
   }
 }
 
+/** @internal */
 export const assertRecordGraph = (
   root: string,
   records: BrainRecord[],
@@ -1014,8 +1104,16 @@ const assertLayoutWitnessCurrent = (root: string, layout: CanonicalLayoutWitness
   const brainDirectory = resolve(root, 'encephalon')
   try {
     if (layout.root === null) {
-      if (existsSync(brainDirectory)) {
+      try {
+        const metadata = lstatSync(brainDirectory)
+        if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+          return repositoryChangedBeforePublication()
+        }
         return repositoryChangedBeforePublication()
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw error
+        }
       }
     } else {
       for (const snapshot of layout.kinds.values()) {
@@ -1031,19 +1129,21 @@ const assertLayoutWitnessCurrent = (root: string, layout: CanonicalLayoutWitness
   }
 }
 
+/** @internal */
 export const assertCanonicalLayoutAdditions = (
   kinds: readonly string[],
   authority: CanonicalPublicationAuthority,
 ): CanonicalPublicationAuthority => {
   authority.assertCurrent()
-  const additions = new Set([STAGING_DIRECTORY_NAME, ...kinds].filter(name => !authority.rootNames.has(name)))
-  if (authority.rootNames.size + additions.size > MAX_CANONICAL_BRAIN_ROOT_ENTRIES) {
+  const current = authority.projection()
+  const additions = new Set([STAGING_DIRECTORY_NAME, ...kinds].filter(name => !current.rootNames.has(name)))
+  if (current.rootNames.size + additions.size > MAX_CANONICAL_BRAIN_ROOT_ENTRIES) {
     return fail('VALIDATION_FAILED', 'Canonical layout additions would exceed directory limits.', {
       errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_BRAIN_ROOT_ENTRIES)],
     })
   }
-  const addedKinds = [...new Set(kinds)].filter(kind => !authority.rootNames.has(kind)).length
-  if (authority.kindCount + addedKinds > MAX_CANONICAL_KIND_DIRECTORIES) {
+  const addedKinds = [...new Set(kinds)].filter(kind => !current.rootNames.has(kind)).length
+  if (current.kindCount + addedKinds > MAX_CANONICAL_KIND_DIRECTORIES) {
     return fail('VALIDATION_FAILED', 'Canonical layout additions would exceed directory limits.', {
       errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_KIND_DIRECTORIES, 'kind directories')],
     })
@@ -1058,45 +1158,63 @@ type PublishResult = {
   record: BrainRecord
 }
 
+const capturePublicationDirectory = (path: string) => {
+  try {
+    return captureDirectoryWitness(path, { allowLink: false })
+  } catch (error) {
+    if (error instanceof DirectoryWitnessError || isCanonicalDirectoryReplacementError(error)) {
+      return repositoryChangedBeforePublication()
+    }
+    throw error
+  }
+}
+
+const revalidatePublicationDirectories = (directories: readonly DirectoryWitness[]) => {
+  try {
+    for (const directory of directories) {
+      revalidateDirectoryWitness(directory)
+    }
+  } catch (error) {
+    if (error instanceof DirectoryWitnessError || isCanonicalDirectoryReplacementError(error)) {
+      return repositoryChangedBeforePublication()
+    }
+    throw error
+  }
+}
+
 const publishPlannedRecordInternal = (
   root: string,
   plan: PlannedRecord,
-  options: { authority?: CanonicalPublicationAuthority; hooks?: RecordWriteHooks } = {},
+  options: { authority: CanonicalPublicationAuthority; hooks?: RecordWriteHooks },
 ): PublishResult => {
-  if (options.authority !== undefined) {
-    options.authority.assertCurrent()
-  }
+  options.authority.assertCurrent()
   fault(options.hooks, 'before-directory-preparation')
-  cleanupStagingDirectory(root, options.hooks)
+  options.authority.assertCurrent()
   const { formatted, path, record, recordFile, relativePath } = plan
   const brainDirectory = resolve(root, 'encephalon')
-  ensurePublicationDirectory(
-    root,
-    brainDirectory,
-    options.authority === undefined ? existsSync(brainDirectory) : options.authority.rootExists,
-  )
+  const projection = options.authority.projection()
+  if (projection.rootNames.has(STAGING_DIRECTORY_NAME)) {
+    const existingStaging = capturePublicationDirectory(resolve(brainDirectory, STAGING_DIRECTORY_NAME))
+    fault(options.hooks, 'during-cleanup')
+    revalidatePublicationDirectories([existingStaging])
+    options.authority.assertCurrent()
+  }
+  options.authority.assertCurrent()
+  ensurePublicationDirectory(root, brainDirectory, projection.rootExists)
   const kindDirectory = resolve(brainDirectory, recordFile.kind)
-  ensurePublicationDirectory(
-    root,
-    kindDirectory,
-    options.authority === undefined ? existsSync(kindDirectory) : options.authority.rootNames.has(recordFile.kind),
-  )
+  ensurePublicationDirectory(root, kindDirectory, projection.rootNames.has(recordFile.kind))
   const stagingDirectory = resolve(brainDirectory, STAGING_DIRECTORY_NAME)
-  ensurePublicationDirectory(
-    root,
-    stagingDirectory,
-    options.authority === undefined
-      ? existsSync(stagingDirectory)
-      : options.authority.rootNames.has(STAGING_DIRECTORY_NAME),
-  )
+  ensurePublicationDirectory(root, stagingDirectory, projection.rootNames.has(STAGING_DIRECTORY_NAME))
   const publicationRoot = captureCanonicalDirectory(resolve(root, 'encephalon'), MAX_CANONICAL_BRAIN_ROOT_ENTRIES)
   const publicationKind = captureCanonicalDirectory(kindDirectory, MAX_CANONICAL_KIND_ENTRIES)
+  options.authority.acceptPreparation(recordFile.kind, publicationRoot, publicationKind)
   const stagingPath = resolve(stagingDirectory, `record-${process.pid}-${randomUUID()}.tmp`)
   let published = false
   let operationFailed = false
   let cleanupError: unknown
   let committedError: EncephalonError | undefined
   let committedErrorPhase: PostCommitPhase | undefined
+  let stagingWitness: DirectoryWitness | undefined
   const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
     if (committedErrorPhase === undefined || postCommitPriority[phase] > postCommitPriority[committedErrorPhase]) {
       committedError = postCommitError(record, phase, error)
@@ -1117,18 +1235,10 @@ const publishPlannedRecordInternal = (
     } finally {
       closeSync(descriptor)
     }
+    stagingWitness = capturePublicationDirectory(stagingDirectory)
     fault(options.hooks, 'before-publication')
-    if (options.authority !== undefined) {
-      try {
-        revalidateCanonicalDirectory(publicationKind)
-        revalidateCanonicalDirectory(publicationRoot)
-      } catch (error) {
-        if (isCanonicalDirectoryReplacementError(error)) {
-          return repositoryChangedBeforePublication()
-        }
-        throw error
-      }
-    }
+    options.authority.assertCurrent()
+    revalidatePublicationDirectories([stagingWitness])
     assertRealDirectory(root, kindDirectory)
     assertRealDirectory(root, stagingDirectory)
     try {
@@ -1136,7 +1246,9 @@ const publishPlannedRecordInternal = (
       published = true
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-        return fail('RECORD_EXISTS', `Record ${recordFile.id} already exists.`, { path: relativePath })
+        return fail('RECORD_EXISTS', `Record ${recordFile.id} already exists.`, {
+          path: relativePath,
+        })
       }
       throw error
     }
@@ -1151,23 +1263,55 @@ const publishPlannedRecordInternal = (
     operationFailed = true
     throw error
   } finally {
+    let stagingCleanupFault: unknown
     try {
       fault(options.hooks, 'during-cleanup')
-      rmSync(stagingPath, { force: true })
-      fsyncDirectory(stagingDirectory)
     } catch (error) {
-      if (published) {
-        capturePostCommitError('stagingCleanup', error)
-      } else if (!operationFailed) {
-        cleanupError = error
+      stagingCleanupFault = error
+    }
+    if (stagingCleanupFault === undefined) {
+      try {
+        revalidateCanonicalDirectory(publicationRoot)
+        if (stagingWitness !== undefined) {
+          revalidatePublicationDirectories([stagingWitness])
+        }
+      } catch (error) {
+        if (published) {
+          committedError = publicationVerificationError(record, error)
+          committedErrorPhase = 'publicationVerification'
+        } else if (!operationFailed) {
+          cleanupError = error
+        }
+      }
+    } else if (published) {
+      capturePostCommitError('stagingCleanup', stagingCleanupFault)
+    } else if (!operationFailed) {
+      cleanupError = stagingCleanupFault
+    }
+    if (
+      stagingCleanupFault === undefined &&
+      committedErrorPhase !== 'publicationVerification' &&
+      cleanupError === undefined
+    ) {
+      try {
+        rmSync(stagingPath, { force: true })
+        fsyncDirectory(stagingDirectory)
+      } catch (error) {
+        if (published) {
+          capturePostCommitError('stagingCleanup', error)
+        } else if (!operationFailed) {
+          cleanupError = error
+        }
       }
     }
   }
   if (cleanupError !== undefined) {
     throw cleanupError
   }
-  if (options.authority !== undefined) {
-    options.authority.update(recordFile.kind)
+  try {
+    options.authority.acceptPublication(recordFile.kind, `${recordFile.id}.json`, publicationRoot, publicationKind)
+  } catch (error) {
+    throw publicationVerificationError(record, error)
   }
   return {
     record,
@@ -1176,10 +1320,11 @@ const publishPlannedRecordInternal = (
   }
 }
 
+/** @internal */
 export const publishPlannedRecord = (
   root: string,
   plan: PlannedRecord,
-  options: { authority?: CanonicalPublicationAuthority; hooks?: RecordWriteHooks } = {},
+  options: { authority: CanonicalPublicationAuthority; hooks?: RecordWriteHooks },
 ): BrainRecord => {
   const published = publishPlannedRecordInternal(root, plan, options)
   if (published.committedError !== undefined) {
@@ -1226,7 +1371,10 @@ const addRecordFileResolved = (
   }
   const authority = assertCanonicalLayoutAdditions([plan.record.kind], canonicalPublicationAuthority(root, scan.layout))
 
-  const publishOptions = { authority, ...(options.hooks === undefined ? {} : { hooks: options.hooks }) }
+  const publishOptions = {
+    authority,
+    ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
+  }
   const published = publishPlannedRecordInternal(root, plan, publishOptions)
   let { committedError, committedErrorPhase } = published
   const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
@@ -1249,6 +1397,7 @@ const addRecordFileResolved = (
   return published.record
 }
 
+/** @internal */
 export const addRecordResolved = (root: string, input: AddRecordInput, options: AddRecordOptions = {}): BrainRecord =>
   addRecordFileResolved(root, createRecordFile(input), options)
 
@@ -1257,7 +1406,10 @@ export const addRecord = (input: AddRecordInput): BrainRecord => {
   const root = resolveRepository(parsed)
   try {
     return withOperationLock(root, cacheLocation =>
-      addRecordFileResolved(root, parsed.recordFile, { cacheLocation, hooks: recordWriteTestHooks }),
+      addRecordFileResolved(root, parsed.recordFile, {
+        cacheLocation,
+        hooks: recordWriteTestHooks,
+      }),
     )
   } catch (error) {
     if (error instanceof EncephalonError) {
@@ -1267,5 +1419,6 @@ export const addRecord = (input: AddRecordInput): BrainRecord => {
   }
 }
 
+/** @internal */
 export const canonicalRecordPath = (record: BrainRecordFile) =>
   join('encephalon', record.kind, `${basename(record.id)}.json`).replaceAll('\\', '/')
