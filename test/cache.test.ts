@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import {
   chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -21,6 +23,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
+import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
 import {
   cacheLocationTestHooks,
@@ -50,6 +53,8 @@ const createOutsideDirectory = () => {
 }
 
 afterEach(() => {
+  artifactInspectionTestHooks.close = undefined
+  artifactInspectionTestHooks.fault = undefined
   cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
   cacheLocationTestHooks.afterDatabaseOpen = undefined
   cacheLocationTestHooks.afterQuarantineRename = undefined
@@ -121,6 +126,155 @@ const addCacheRecord = (root: string) =>
     source: 'agent',
     subject: 'cache.validation',
   })
+
+test('uses verified artifact observations without a detached cache lstat', () => {
+  const root = createRoot()
+  const id = 'handed-artifact-observation'
+  const artifact = `_artifacts/architecture/${id}/diagram.svg`
+  const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+  ensureParent(artifactPath)
+  writeFileSync(artifactPath, '<svg>stable</svg>')
+  api.addRecord({
+    artifacts: [artifact],
+    id,
+    kind: 'architecture',
+    payload: { summary: 'Stable observation' },
+    root,
+    source: 'test',
+    subject: 'cache.handed-artifact-observation',
+  })
+
+  let detachedArtifactStats = 0
+  cacheReadTestHooks.beforeManifestEntryLstat = path => {
+    if (path === artifactPath) {
+      detachedArtifactStats += 1
+      throw Object.assign(new Error('detached artifact stat'), { code: 'EIO' })
+    }
+  }
+
+  assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+  assert.equal(detachedArtifactStats, 0)
+})
+
+test('preserves artifact manifest field ordering while converting verified observations', () => {
+  const root = createRoot()
+  const id = 'artifact-manifest-conversion'
+  const artifact = `_artifacts/architecture/${id}/diagram.svg`
+  const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+  ensureParent(artifactPath)
+  writeFileSync(artifactPath, '<svg>stable</svg>')
+  api.addRecord({
+    artifacts: [artifact],
+    id,
+    kind: 'architecture',
+    payload: { summary: 'Manifest conversion' },
+    root,
+    source: 'test',
+    subject: 'cache.artifact-manifest-conversion',
+  })
+
+  const manifestEntry = (path: string, type: 'directory' | 'file') => {
+    const metadata = lstatSync(join(root, ...path.split('/')), { bigint: true })
+    return {
+      ctimeNanoseconds: metadata.ctimeNs.toString(),
+      mtimeNanoseconds: metadata.mtimeNs.toString(),
+      path,
+      size: metadata.size.toString(),
+      type,
+    }
+  }
+  const expected = createHash('sha256')
+    .update(
+      JSON.stringify([
+        manifestEntry('encephalon', 'directory'),
+        manifestEntry('encephalon/architecture', 'directory'),
+        manifestEntry(`encephalon/architecture/${id}.json`, 'file'),
+        manifestEntry(`encephalon/${artifact}`, 'file'),
+      ]),
+    )
+    .digest('hex')
+  const database = new DatabaseSync(cacheDatabasePath(root), { readOnly: true })
+  const actual = database.prepare("SELECT value FROM metadata WHERE key = 'manifest'").get() as { value?: unknown }
+  database.close()
+
+  assert.equal(actual.value, expected)
+})
+
+test('retries transient artifact mutation and bounds persistent mutation as repository change', () => {
+  for (const persistent of [false, true]) {
+    const root = createRoot()
+    const id = persistent ? 'persistent-artifact-mutation' : 'transient-artifact-mutation'
+    const artifact = `_artifacts/architecture/${id}/diagram.svg`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, '<svg>initial</svg>')
+    api.addRecord({
+      artifacts: [artifact],
+      id,
+      kind: 'architecture',
+      payload: { summary: 'Artifact mutation retry' },
+      root,
+      source: 'test',
+      subject: `cache.${id}`,
+    })
+
+    let mutations = 0
+    artifactInspectionTestHooks.fault = (point, path) => {
+      if (point === 'after-artifact-fstat' && path === artifact && (persistent || mutations === 0)) {
+        mutations += 1
+        writeFileSync(artifactPath, `<svg>mutation-${mutations}</svg>`)
+      }
+    }
+
+    if (persistent) {
+      assert.throws(
+        () => api.hydrate({ root }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+      assert.equal(mutations, 3)
+    } else {
+      assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+      assert.equal(mutations, 1)
+      assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+    }
+    artifactInspectionTestHooks.fault = undefined
+  }
+})
+
+test('keeps operational artifact I/O errors classified as IO_ERROR', () => {
+  const root = createRoot()
+  const id = 'artifact-operational-io'
+  const artifact = `_artifacts/architecture/${id}/diagram.svg`
+  const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+  ensureParent(artifactPath)
+  writeFileSync(artifactPath, '<svg>stable</svg>')
+  api.addRecord({
+    artifacts: [artifact],
+    id,
+    kind: 'architecture',
+    payload: { summary: 'Operational artifact failure' },
+    root,
+    source: 'test',
+    subject: 'cache.artifact-operational-io',
+  })
+  artifactInspectionTestHooks.fault = (point, path) => {
+    if (point === 'after-artifact-fstat' && path === artifact) {
+      throw Object.assign(new Error('simulated artifact I/O failure'), { code: 'EIO' })
+    }
+  }
+
+  assert.throws(
+    () => api.hydrate({ root }),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+      assert.equal(JSON.stringify(error).includes(root), false)
+      return true
+    },
+  )
+})
 
 const mutateCache = (root: string, mutation: (database: DatabaseSync) => void) => {
   const database = new DatabaseSync(cacheDatabasePath(root))
@@ -1103,7 +1257,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(readFileSync(sentinel, 'utf8'), 'outside kind sentinel')
   })
 
-  test('classifies an artifact ancestor replacement after manifest entry lstat as repository change', () => {
+  test('classifies an artifact ancestor replacement after descriptor verification as repository change', () => {
     const root = createRoot()
     const canonicalRoot = realpathSync.native(root)
     const id = 'manifest-artifact-ancestor'
@@ -1138,8 +1292,8 @@ describe('SQLite cache and reads', () => {
         replaced = false
       }
     }
-    cacheReadTestHooks.afterManifestEntryLstat = path => {
-      if (path === artifactPath && !replaced) {
+    artifactInspectionTestHooks.fault = (point, path) => {
+      if (point === 'before-final-directory-revalidation' && path === artifact && !replaced) {
         renameSync(artifactDirectory, preservedArtifactDirectory)
         symlinkSync(outside, artifactDirectory, process.platform === 'win32' ? 'junction' : 'dir')
         replaced = true

@@ -24,6 +24,7 @@ import {
   MAX_CANONICAL_RECORDS,
   planRecordAddition,
   projectedKindDirectoryOverflow,
+  readValidatedRecordSnapshotResolved,
   recordWriteTestHooks,
   validateRecordsResolved,
 } from '../src/records.ts'
@@ -261,6 +262,10 @@ describe('canonical records', () => {
     assert.deepEqual(record.artifacts, [artifact])
     assert.deepEqual(readdirSync(join(root, 'encephalon', '_artifacts', 'architecture', id)), ['diagram.svg'])
     assert.equal(api.validateRecords({ root }).valid, true)
+    const validated = readValidatedRecordSnapshotResolved(root)
+    assert.equal(Object.isFrozen(validated), true)
+    assert.equal(Object.isFrozen(validated.artifacts), true)
+    assert.equal(Object.isFrozen(validated.artifacts[0]), true)
   })
 
   test('validates planned graph bytes without counting runtime paths', () => {

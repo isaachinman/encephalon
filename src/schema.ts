@@ -1,6 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { lstatSync, realpathSync } from 'node:fs'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { ARTIFACTS_DIRECTORY_NAME } from './canonical-layout.ts'
 import { fail } from './errors.ts'
 import type { AddRecordInput, BrainRecordFile, JsonValue } from './types.ts'
@@ -361,32 +359,6 @@ export const validateArtifactPath = (value: unknown, kind: string, id: string) =
   return fail('INVALID_ARGUMENT', 'artifact must remain beneath the matching record artifact directory.', {
     field: 'artifact',
   })
-}
-
-export const assertArtifactFile = (brainDirectory: string, artifact: string) => {
-  const root = realpathSync.native(brainDirectory)
-  const segments = artifact.split('/')
-  let current = root
-  for (const segment of segments) {
-    current = resolve(current, segment)
-    const metadata = lstatSync(current)
-    if (metadata.isSymbolicLink()) {
-      fail('VALIDATION_FAILED', 'Artifact paths may not contain symbolic links.')
-    }
-  }
-  const relativePath = relative(root, current)
-  const finalMetadata = lstatSync(current)
-  if (
-    relativePath.length > 0 &&
-    relativePath !== '..' &&
-    !relativePath.startsWith(`..${sep}`) &&
-    !isAbsolute(relativePath) &&
-    finalMetadata.isFile() &&
-    !finalMetadata.isSymbolicLink()
-  ) {
-    return current
-  }
-  return fail('VALIDATION_FAILED', 'Artifact must resolve to a regular file beneath the brain directory.')
 }
 
 const normalizeOptionalText = (value: unknown, field: string, maximumBytes: number) => {
