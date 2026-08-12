@@ -1,8 +1,9 @@
 import type { BigIntStats } from 'node:fs'
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs'
 import { TextDecoder } from 'node:util'
+import { sameFileIdentity, sameStableFileMetadata } from './file-identity.ts'
 
-type VerifiedFileFault = 'after-fstat' | 'after-lstat'
+type VerifiedFileFault = 'after-fstat' | 'after-lstat' | 'before-final-path-lstat'
 
 type VerifiedFileOptions = {
   fault?: (point: VerifiedFileFault) => void
@@ -10,16 +11,6 @@ type VerifiedFileOptions = {
 
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
 const decoder = new TextDecoder('utf-8', { fatal: true })
-
-const sameIdentity = (first: BigIntStats, second: BigIntStats) => first.dev === second.dev && first.ino === second.ino
-
-const sameStableMetadata = (first: BigIntStats, second: BigIntStats) =>
-  sameIdentity(first, second) &&
-  first.size === second.size &&
-  first.mode === second.mode &&
-  first.birthtimeNs === second.birthtimeNs &&
-  first.mtimeNs === second.mtimeNs &&
-  first.ctimeNs === second.ctimeNs
 
 const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
 
@@ -63,12 +54,13 @@ const readVerifiedDescriptor = (
   options: VerifiedFileOptions,
 ) => {
   const metadata = fstatSync(descriptor, { bigint: true })
-  if (!(metadata.isFile() && sameIdentity(pathMetadata, metadata)) || metadata.size > BigInt(maximumBytes)) {
+  if (!(metadata.isFile() && sameFileIdentity(pathMetadata, metadata)) || metadata.size > BigInt(maximumBytes)) {
     return changed()
   }
   options.fault?.('after-fstat')
   const bytes = readExactBytes(descriptor, Number(metadata.size))
   const finalMetadata = fstatSync(descriptor, { bigint: true })
+  options.fault?.('before-final-path-lstat')
   let finalPathMetadata: BigIntStats
   try {
     finalPathMetadata = lstatSync(path, { bigint: true })
@@ -81,8 +73,8 @@ const readVerifiedDescriptor = (
   if (
     !finalPathMetadata.isFile() ||
     finalPathMetadata.isSymbolicLink() ||
-    !sameIdentity(finalPathMetadata, finalMetadata) ||
-    !sameStableMetadata(metadata, finalMetadata)
+    !sameStableFileMetadata(finalPathMetadata, finalMetadata) ||
+    !sameStableFileMetadata(metadata, finalMetadata)
   ) {
     return changed()
   }

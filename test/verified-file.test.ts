@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { linkSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, test } from 'node:test'
@@ -30,7 +30,19 @@ test('reads only bounded regular files and decodes UTF-8 fatally', () => {
     assert.equal(decodeVerifiedUtf8(bytes), 'gitdir: admin\n')
   }
   assert.notEqual(bytes, undefined)
-  assert.throws(() => readVerifiedRegularFile(file, 4), VerifiedFileError)
+  let oversizedDescriptorReached = false
+  assert.throws(
+    () =>
+      readVerifiedRegularFile(file, 4, {
+        fault: point => {
+          if (point === 'after-fstat') {
+            oversizedDescriptorReached = true
+          }
+        },
+      }),
+    VerifiedFileError,
+  )
+  assert.equal(oversizedDescriptorReached, false)
 
   const directory = join(root, 'directory')
   mkdirSync(directory)
@@ -72,6 +84,7 @@ test('rejects a path replaced between lstat and descriptor verification', () => 
   }
 
   if (symlinksSupported) {
+    let descriptorReached = false
     assert.throws(
       () =>
         readVerifiedRegularFile(marker, 64, {
@@ -79,6 +92,9 @@ test('rejects a path replaced between lstat and descriptor verification', () => 
             if (point === 'after-lstat') {
               renameSync(marker, captured)
               symlinkSync(outside, marker, 'file')
+            }
+            if (point === 'after-fstat') {
+              descriptorReached = true
             }
           },
         }),
@@ -88,7 +104,28 @@ test('rejects a path replaced between lstat and descriptor verification', () => 
         return true
       },
     )
+    assert.equal(descriptorReached, false)
   }
+})
+
+test('rejects a pathname replacement after the descriptor final metadata check', () => {
+  const root = createRoot()
+  const manifest = join(root, 'package.json')
+  const captured = join(root, 'captured.json')
+  writeFileSync(manifest, '{"name":"encephalon"}')
+
+  assert.throws(
+    () =>
+      readVerifiedRegularFile(manifest, 1024, {
+        fault: point => {
+          if (point === 'before-final-path-lstat') {
+            renameSync(manifest, captured)
+            linkSync(captured, manifest)
+          }
+        },
+      }),
+    VerifiedFileError,
+  )
 })
 
 test('rejects a file whose descriptor changes after its initial metadata check', () => {

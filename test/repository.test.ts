@@ -22,7 +22,14 @@ const createIsolatedPackage = () => {
   const testRoot = mkdtempSync(join(tmpdir(), 'encephalon-repository-test-'))
   const executingRoot = join(testRoot, 'executing')
   mkdirSync(join(executingRoot, 'src', 'generated'), { recursive: true })
-  for (const file of ['errors.ts', 'repository.ts', 'sqlite-error.ts', 'verified-file.ts']) {
+  for (const file of [
+    'directory-witness.ts',
+    'errors.ts',
+    'file-identity.ts',
+    'repository.ts',
+    'sqlite-error.ts',
+    'verified-file.ts',
+  ]) {
     copyFileSync(join(sourceRoot, 'src', file), join(executingRoot, 'src', file))
   }
   copyFileSync(
@@ -44,6 +51,8 @@ const createIsolatedPackage = () => {
 
 afterEach(() => {
   repositoryTestHooks.afterGitDirectoryLstat = undefined
+  repositoryTestHooks.afterExecutingManifestRead = undefined
+  repositoryTestHooks.afterInstalledManifestRead = undefined
   for (const root of temporaryRoots.splice(0)) {
     rmSync(root, { force: true, recursive: true })
   }
@@ -52,12 +61,14 @@ afterEach(() => {
 test('rejects a worktree target replaced after inspection', () => {
   const root = mkdtempSync(join(tmpdir(), 'encephalon-worktree-test-'))
   temporaryRoots.push(root)
-  const administrationDirectory = join(root, 'administration')
+  const administrationRoot = mkdtempSync(join(tmpdir(), 'encephalon-worktree-administration-test-'))
+  temporaryRoots.push(administrationRoot)
+  const administrationDirectory = join(administrationRoot, 'administration')
   const capturedDirectory = join(root, 'captured-administration')
   const outsideDirectory = join(root, 'outside')
   mkdirSync(administrationDirectory)
   mkdirSync(outsideDirectory)
-  writeFileSync(join(root, '.git'), 'gitdir: administration\n')
+  writeFileSync(join(root, '.git'), `gitdir: ${administrationDirectory}\n`)
 
   assert.equal(discoverRepository({ root }), realpathSync.native(root))
   let symlinksSupported = false
@@ -74,7 +85,7 @@ test('rejects a worktree target replaced after inspection', () => {
   let replaced = false
   if (symlinksSupported) {
     repositoryTestHooks.afterGitDirectoryLstat = path => {
-      if (!replaced && path.endsWith('/administration')) {
+      if (!replaced && path === administrationDirectory) {
         replaced = true
         renameSync(administrationDirectory, capturedDirectory)
         symlinkSync(outsideDirectory, administrationDirectory, process.platform === 'win32' ? 'junction' : 'dir')
@@ -96,7 +107,8 @@ test('rejects unsafe Git marker inputs with the stable explicit-root error', () 
   const cases = [
     {
       name: 'oversized',
-      write: (root: string) => writeFileSync(join(root, '.git'), `gitdir: ${'a'.repeat(16_384)}\n`),
+      write: (root: string) =>
+        writeFileSync(join(root, '.git'), `gitdir: ${join(root, 'administration')}${' '.repeat(16_384)}\n`),
     },
     {
       name: 'invalid UTF-8',
@@ -154,10 +166,86 @@ test('memoizes verified executing package identity but reverifies the installed 
   assert.throws(
     () => repositoryModule.assertRootInstallation(repositoryRoot),
     (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'ROOT_INSTALL_REQUIRED')
+      return true
+    },
+  )
+})
+
+test('rejects an oversized installed manifest after executing identity is cached', async () => {
+  const { executingRoot, repositoryRoot } = createIsolatedPackage()
+  writeFileSync(join(executingRoot, 'src', 'package.json'), '{"name":"unrelated","type":"module"}\n')
+  const repositoryModule = await import(
+    `${pathToFileURL(join(executingRoot, 'src', 'repository.ts')).href}?installed-bound=${Date.now()}`
+  )
+  assert.equal(repositoryModule.assertRootInstallation(repositoryRoot), realpathSync.native(executingRoot))
+
+  writeFileSync(
+    join(executingRoot, 'package.json'),
+    JSON.stringify({ name: 'encephalon', padding: 'x'.repeat(1024 * 1024), version: '0.2.0' }),
+  )
+  assert.throws(
+    () => repositoryModule.assertRootInstallation(repositoryRoot),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'ROOT_INSTALL_REQUIRED')
+      return true
+    },
+  )
+})
+
+test('does not memoize executing identity across a package-directory generation change', async () => {
+  const { executingRoot, repositoryRoot } = createIsolatedPackage()
+  writeFileSync(join(executingRoot, 'src', 'package.json'), '{"name":"unrelated","type":"module"}\n')
+  const repositoryModule = await import(
+    `${pathToFileURL(join(executingRoot, 'src', 'repository.ts')).href}?executing-generation=${Date.now()}`
+  )
+  const capturedRoot = `${executingRoot}-captured`
+  let replaced = false
+  repositoryModule.repositoryTestHooks.afterExecutingManifestRead = (path: string) => {
+    if (!replaced && path.endsWith('/executing/package.json')) {
+      replaced = true
+      renameSync(executingRoot, capturedRoot)
+      mkdirSync(executingRoot)
+      writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","version":"0.2.0"}\n')
+    }
+  }
+
+  assert.throws(
+    () => repositoryModule.assertRootInstallation(repositoryRoot),
+    (error: unknown) => {
       assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
       return true
     },
   )
+  assert.equal(replaced, true)
+})
+
+test('rejects an installed package-directory generation change after its manifest read', async () => {
+  const { executingRoot, repositoryRoot } = createIsolatedPackage()
+  writeFileSync(join(executingRoot, 'src', 'package.json'), '{"name":"unrelated","type":"module"}\n')
+  const repositoryModule = await import(
+    `${pathToFileURL(join(executingRoot, 'src', 'repository.ts')).href}?installed-generation=${Date.now()}`
+  )
+  assert.equal(repositoryModule.assertRootInstallation(repositoryRoot), realpathSync.native(executingRoot))
+  const capturedRoot = `${executingRoot}-captured`
+  let replaced = false
+  repositoryModule.repositoryTestHooks.afterInstalledManifestRead = () => {
+    if (!replaced) {
+      replaced = true
+      renameSync(executingRoot, capturedRoot)
+      mkdirSync(executingRoot)
+      writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","version":"0.2.0"}\n')
+    }
+  }
+
+  assert.throws(
+    () => repositoryModule.assertRootInstallation(repositoryRoot),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'ROOT_INSTALL_REQUIRED')
+      return true
+    },
+  )
+  assert.equal(replaced, true)
 })
 
 test('rejects unsafe executing package manifests with a stable internal error', async () => {
