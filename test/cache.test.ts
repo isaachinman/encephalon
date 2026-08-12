@@ -262,7 +262,12 @@ describe('cache filesystem containment', () => {
     assert.equal(readFileSync(target, 'utf8'), 'outside wal bytes')
   })
 
-  test('aborts corrupt cleanup after the cache directory is replaced', () => {
+  test('aborts corrupt cleanup after the cache directory is replaced', {
+    skip:
+      process.platform === 'win32'
+        ? 'Windows does not permit renaming a directory containing the open operation gate.'
+        : false,
+  }, () => {
     const root = createRoot()
     const cachePath = cacheDirectoryPath(root)
     const displacedPath = `${cachePath}-displaced`
@@ -548,7 +553,9 @@ describe('cache filesystem containment', () => {
     }
   })
 
-  test('retries sidecar replacement immediately after the gate transaction begins', () => {
+  test('retries sidecar replacement immediately after the gate transaction begins', {
+    skip: process.platform === 'win32' ? 'Windows does not permit renaming an open SQLite rollback journal.' : false,
+  }, () => {
     for (const persistent of [false, true]) {
       const root = createRoot()
       withOperationLock(root, () => 'prepared')
@@ -590,7 +597,9 @@ describe('cache filesystem containment', () => {
     }
   })
 
-  test('rejects an unsafe sidecar introduced after the gate transaction begins', () => {
+  test('rejects an unsafe sidecar introduced after the gate transaction begins', {
+    skip: process.platform === 'win32' ? 'Windows does not permit renaming an open SQLite rollback journal.' : false,
+  }, () => {
     const root = createRoot()
     const outside = createOutsideDirectory()
     withOperationLock(root, () => 'prepared')
@@ -616,7 +625,12 @@ describe('cache filesystem containment', () => {
     assert.equal(readFileSync(targetPath, 'utf8'), 'outside gate journal')
   })
 
-  test('carries the locked cache location through add-record hydration', () => {
+  test('carries the locked cache location through add-record hydration', {
+    skip:
+      process.platform === 'win32'
+        ? 'Windows does not permit renaming a directory containing the open operation gate.'
+        : false,
+  }, () => {
     const root = createRoot()
     functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
     const cachePath = cacheDirectoryPath(root)

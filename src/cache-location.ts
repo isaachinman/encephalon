@@ -29,6 +29,14 @@ export type CacheEntryIdentity = {
   ino: bigint
 }
 
+type CacheEntryIncarnation = CacheEntryIdentity & {
+  birthtimeNs: bigint
+  ctimeNs: bigint
+  mode: bigint
+  mtimeNs: bigint
+  size: bigint
+}
+
 type CacheDirectoryEntry = CacheEntryIdentity & {
   path: string
   relativePath: string
@@ -131,6 +139,23 @@ const identityFrom = (metadata: BigIntStats): CacheEntryIdentity => ({
   ino: metadata.ino,
 })
 
+const incarnationFrom = (metadata: BigIntStats): CacheEntryIncarnation => ({
+  ...identityFrom(metadata),
+  birthtimeNs: metadata.birthtimeNs,
+  ctimeNs: metadata.ctimeNs,
+  mode: metadata.mode,
+  mtimeNs: metadata.mtimeNs,
+  size: metadata.size,
+})
+
+const sameCacheEntryIncarnation = (first: CacheEntryIncarnation, second: CacheEntryIncarnation) =>
+  sameCacheEntryIdentity(first, second) &&
+  first.birthtimeNs === second.birthtimeNs &&
+  first.ctimeNs === second.ctimeNs &&
+  first.mode === second.mode &&
+  first.mtimeNs === second.mtimeNs &&
+  first.size === second.size
+
 const missingPath = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
 
 const existingPath = (error: unknown) => (error as NodeJS.ErrnoException).code === 'EEXIST'
@@ -153,6 +178,17 @@ const changedLayout = (relativePath: string, invariant: string): never =>
     entry: relativePath,
     invariant,
   })
+
+const quarantineMetadata = (path: string, relativePath: string) => {
+  try {
+    return lstatSync(path, { bigint: true })
+  } catch (error) {
+    if (missingPath(error)) {
+      return changedLayout(relativePath, 'stable-quarantine-identity')
+    }
+    throw error
+  }
+}
 
 const inspectDirectory = (
   path: string,
@@ -579,10 +615,19 @@ const quarantineFile = (location: CacheLocation, expected: CacheFile, required: 
     const quarantinePath = resolve(location.directory, quarantineName)
     renameSync(expected.path, quarantinePath)
     assertCacheLocation(location)
+    const movedMetadata = quarantineMetadata(quarantinePath, expected.relativePath)
+    if (!(movedMetadata.isFile() && sameCacheEntryIdentity(expected, identityFrom(movedMetadata)))) {
+      return changedLayout(expected.relativePath, 'stable-quarantine-identity')
+    }
+    const movedIncarnation = incarnationFrom(movedMetadata)
     cacheLocationTestHooks.afterQuarantineRename?.(quarantinePath)
     assertCacheLocation(location)
-    const quarantined = inspectRegularFile(quarantinePath, `node_modules/.cache/encephalon/${quarantineName}`)
-    if (quarantined === undefined || !sameCacheEntryIdentity(expected, quarantined)) {
+    const quarantinedMetadata = quarantineMetadata(quarantinePath, expected.relativePath)
+    if (
+      !quarantinedMetadata.isFile() ||
+      quarantinedMetadata.isSymbolicLink() ||
+      !sameCacheEntryIncarnation(movedIncarnation, incarnationFrom(quarantinedMetadata))
+    ) {
       return changedLayout(expected.relativePath, 'stable-quarantine-identity')
     }
     unlinkSync(quarantinePath)
@@ -800,10 +845,15 @@ export const quarantineCacheOwnedDirectory = (location: CacheLocation, directory
   const quarantinePath = resolve(location.directory, quarantineName)
   renameSync(directory.path, quarantinePath)
   assertCacheLocation(location)
+  const movedMetadata = quarantineMetadata(quarantinePath, ownedDirectoryRelativePath(directory.name))
+  if (!(movedMetadata.isDirectory() && sameCacheEntryIdentity(directory, identityFrom(movedMetadata)))) {
+    return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-quarantine-identity')
+  }
+  const movedIncarnation = incarnationFrom(movedMetadata)
   cacheLocationTestHooks.afterQuarantineRename?.(quarantinePath)
   assertCacheLocation(location)
-  const metadata = lstatSync(quarantinePath, { bigint: true })
-  if (!(metadata.isDirectory() && sameCacheEntryIdentity(directory, identityFrom(metadata)))) {
+  const metadata = quarantineMetadata(quarantinePath, ownedDirectoryRelativePath(directory.name))
+  if (!(metadata.isDirectory() && sameCacheEntryIncarnation(movedIncarnation, incarnationFrom(metadata)))) {
     return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-quarantine-identity')
   }
   const ownerPath = resolve(quarantinePath, 'owner.json')
