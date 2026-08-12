@@ -21,6 +21,7 @@ import {
 
 import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
+import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
 import { DirectoryWitnessError } from '../src/directory-witness.ts'
 import * as api from '../src/index.ts'
@@ -172,6 +173,9 @@ const cloneBaselineRecord = (
 }
 
 afterEach(() => {
+  artifactInspectionTestHooks.close = undefined
+  artifactInspectionTestHooks.fault = undefined
+  artifactInspectionTestHooks.open = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
 
@@ -235,6 +239,34 @@ describe('initialisation', () => {
     assert.equal(replaced, true)
     assert.deepEqual(readdirSync(join(brainDirectory, 'decision')), [])
     assert.equal(existsSync(join(brainDirectory, '_staging')), false)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('classifies existing artifact mutation during init validation before publication', () => {
+    const root = createRoot()
+    const artifact = '_artifacts/decision/existing-init-artifact/evidence.txt'
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, 'stable evidence')
+    writeRecordFile(root, {
+      artifacts: [artifact],
+      createdAt: '2026-08-13T00:00:00.000Z',
+      id: 'existing-init-artifact',
+      kind: 'decision',
+      payload: {},
+      source: 'test',
+      subject: 'validation.existing-init-artifact',
+    })
+    artifactInspectionTestHooks.fault = (point, path) => {
+      if (point === 'after-artifact-fstat' && path === artifact) {
+        writeFileSync(artifactPath, 'mutated evidence with different metadata')
+      }
+    }
+
+    assertErrorCode(() => api.initEncephalon({ root }), 'REPOSITORY_CHANGED')
+    assert.deepEqual(readdirSync(join(root, 'encephalon', 'decision')), ['existing-init-artifact.json'])
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })

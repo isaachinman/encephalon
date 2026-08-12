@@ -726,7 +726,10 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
       const validated = readValidatedRecordSnapshotResolved(root)
       ;({ artifacts, records } = validated)
     } catch (error) {
-      if (error instanceof ArtifactChangedError) {
+      if (
+        error instanceof ArtifactChangedError ||
+        (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED')
+      ) {
         repositoryChangeObserved = true
         if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {
           return fail('REPOSITORY_CHANGED', 'The repository changed repeatedly while rebuilding the Encephalon cache.')

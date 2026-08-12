@@ -340,6 +340,39 @@ describe('canonical records', () => {
     }
   })
 
+  test('classifies existing artifact mutation during addRecord validation before publication', () => {
+    const root = createRoot()
+    const artifact = '_artifacts/decision/existing-artifact/evidence.txt'
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    const candidatePath = join(root, 'encephalon', 'decision', 'artifact-validation-candidate.json')
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, 'stable evidence')
+    writeCanonicalRecord(root, {
+      artifacts: [artifact],
+      id: 'existing-artifact',
+      subject: 'validation.existing-artifact',
+    })
+    artifactInspectionTestHooks.fault = (point, path) => {
+      if (point === 'after-artifact-fstat' && path === artifact) {
+        writeFileSync(artifactPath, 'mutated evidence with different metadata')
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'artifact-validation-candidate',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'validation.candidate',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(existsSync(candidatePath), false)
+  })
+
   test('validates planned graph bytes without counting runtime paths', () => {
     const root = createRoot()
     const plans = Array.from({ length: 8 }, (_, index) =>

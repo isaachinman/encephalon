@@ -911,9 +911,20 @@ const corpusBudgetIssues = (scan: RecordScan) => {
   ]
 }
 
+const validatedArtifactIssues = (root: string, records: BrainRecord[]) => {
+  try {
+    return artifactIssues(root, records)
+  } catch (error) {
+    if (error instanceof ArtifactChangedError) {
+      return fail('REPOSITORY_CHANGED', 'An artifact changed while canonical records were being validated.')
+    }
+    throw error
+  }
+}
+
 const validateScannedSnapshot = (root: string, scan: RecordScan, hooks: RecordReadHooks = {}): ValidatedRecordScan => {
   hooks.graphValidation?.()
-  const artifactValidation = artifactIssues(root, scan.records)
+  const artifactValidation = validatedArtifactIssues(root, scan.records)
   const collectedErrors = [
     ...scan.errors,
     ...corpusBudgetIssues(scan),
@@ -977,9 +988,6 @@ export const validateRecordsResolved = (root: string, options: ValidateRecordsOp
   try {
     return validateScanned(root, scanCanonicalRecords(root, options))
   } catch (error) {
-    if (error instanceof ArtifactChangedError) {
-      return fail('REPOSITORY_CHANGED', 'An artifact changed while canonical records were being validated.')
-    }
     if (error instanceof EncephalonError) {
       throw error
     }
