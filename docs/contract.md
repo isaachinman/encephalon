@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-12 for audited snapshot `34c8394af3a3f54729c56ebf5b3394e5bdf3e11c`.
+Last reviewed: 2026-08-12 for audited snapshot `dda18228c5eb026c39422b67e386ffb47e797cd2`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -23,6 +23,8 @@ This document is the concise contract maintainers should update when public beha
 - Supersession records must use the same kind and subject as their targets. Active records are records not listed in any other record’s `supersedes`.
 - Existing records are not rewritten or deleted by normal mutations; changed knowledge is represented by a new record that supersedes the active head.
 - Canonical layout validation reads at most 1,003 entries from `encephalon` and 1,001 entries from any kind directory to distinguish the inclusive limits from overflow. The root permits 1,002 total entries and 1,000 kind directories; `_artifacts` and `_staging` consume root-entry capacity but not kind-directory capacity. Each kind directory permits 1,000 entries. Overflow returns one deterministic `CORPUS_DIRECTORY_ENTRY_LIMIT` issue naming only the repository-relative containing directory and its maximum.
+- Canonical root and kind enumeration is bound to captured real-directory generations and revalidated before acceptance. A replacement, symlink substitution, or ancestor-generation change cannot produce a valid mixed-generation corpus.
+- Record addition and initialisation account for all candidate new kind directories and a newly introduced `_staging` root entry before any staging or canonical publication. A candidate that would cross either root bound fails validation with the same deterministic directory-entry-limit issue.
 
 ## Initialisation and Privacy
 
@@ -43,8 +45,8 @@ This document is the concise contract maintainers should update when public beha
 - SQLite result classification normalises extended numeric codes to their primary result, gives structured numeric and symbolic codes precedence over messages, and uses bounded message fallback only for generic SQLite runtime errors.
 - Disposable cache recovery is limited to corrupt, not-a-database, schema, read-only, and cannot-open failures. Busy, locked, general I/O, and unknown failures are terminal for that rebuild attempt; the operation gate separately reports busy or locked contention and recovers only corrupt or not-a-database state.
 - Public I/O wrapping recognises busy, locked, corrupt, not-a-database, read-only, cannot-open, and general I/O categories as environmental failures. Schema and unknown SQLite failures remain internal errors after any cache recovery is exhausted.
-- Freshness is determined from explicit cache metadata and a manifest of canonical records plus referenced artifacts.
-- Cache manifests use the same bounded canonical directory enumeration as validation. A bound crossed after canonical validation is treated as a repository change and retried rather than cached.
+- Freshness is determined from explicit cache metadata and a manifest of canonical records plus referenced artifacts. Transient `_staging` and `_artifacts` directories are excluded from the record manifest, including their directory metadata and contents.
+- Cache manifests use the same bounded, generation-stable canonical directory enumeration as validation. A bound crossed or directory generation changed after canonical validation is treated as a repository change and retried; a persistent change reports `REPOSITORY_CHANGED`, while genuine operational filesystem failures retain their I/O classification.
 - Node's pathname-only SQLite API leaves a narrow replacement race inside SQLite's open after the surrounding identity checks. Defending against arbitrary same-user mutation between those boundaries is not a supported security boundary.
 
 ## Package and Release Gates
@@ -78,4 +80,4 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2556 canonical directory bounds and behavioural coverage: `7576b5452a11d068fd290621e074d1415ed5c19e`.
+- MAR-2556 bounded, generation-stable canonical layout handling and behavioural coverage: `dda18228c5eb026c39422b67e386ffb47e797cd2`.
