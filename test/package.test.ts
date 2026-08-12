@@ -82,43 +82,72 @@ describe('package contract', () => {
     const workflowConfiguration = workflow.slice(0, jobsStart)
     const verificationJob = workflow.slice(jobsStart, releaseStart)
     const releaseJob = workflow.slice(releaseStart)
+    const uploadStart = releaseJob.indexOf('      - name: Upload release-equivalent package artifact\n')
+    const uploadStep = releaseJob.slice(uploadStart)
 
-    assert.match(workflowConfiguration, /push:\n\s+branches:\n\s+- main\n\s+- release\/\*\*/)
-    assert.match(
-      workflowConfiguration,
-      /pull_request:\n\s+branches:\n\s+- main\n\s+types: \[opened, reopened, synchronize, edited\]/,
-    )
-    assert.match(workflowConfiguration, /permissions:\n\s+contents: read/)
-    assert.match(
-      workflowConfiguration,
-      /group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.head\.repo\.full_name \|\| github\.repository \}\}-\$\{\{ github\.head_ref \|\| github\.ref_name \}\}/,
-    )
-    assert.equal(workflowConfiguration.includes('cancel-in-progress: true'), true)
-
-    assert.match(verificationJob, /name: verify \(\$\{\{ matrix\.context \}\}\)/)
-    assert.equal(verificationJob.match(/\n\s+- context:/g)?.length, 4)
-    assert.match(verificationJob, /context: ubuntu-latest\n\s+os: ubuntu-latest\n\s+node: 24\.15\.0/)
-    assert.match(verificationJob, /context: macos-latest\n\s+os: macos-latest\n\s+node: 24\.15\.0/)
-    assert.match(verificationJob, /context: windows-latest\n\s+os: windows-latest\n\s+node: 24\.15\.0/)
-    assert.match(verificationJob, /context: ubuntu-current\n\s+os: ubuntu-latest\n\s+node: 26/)
-    assert.match(verificationJob, /runs-on: \$\{\{ matrix\.os \}\}/)
-    assert.match(verificationJob, /node-version: \$\{\{ matrix\.node \}\}/)
-    assert.match(verificationJob, /uses: actions\/checkout@v7\n\s+with:\n\s+persist-credentials: false/)
-    const verificationCommands = [
-      'bun install --frozen-lockfile',
-      'bun run typecheck',
-      'bun run test',
-      'bun run lint',
-      'bun run benchmark:check',
-      'bun run build',
-      'bun run check:package',
-    ]
     assert.equal(
-      verificationCommands.every(command => verificationJob.includes(`- run: ${command}`)),
-      true,
+      workflowConfiguration,
+      `name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: \${{ github.workflow }}-\${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+`,
     )
-    assert.equal(verificationJob.includes('actions/upload-artifact'), false)
-    assert.equal(verificationJob.includes('bun run check:publish'), false)
+    assert.equal(
+      verificationJob,
+      `
+jobs:
+  verify:
+    name: verify (\${{ matrix.context }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - context: ubuntu-latest
+            os: ubuntu-latest
+            node: 24.15.0
+          - context: macos-latest
+            os: macos-latest
+            node: 24.15.0
+          - context: windows-latest
+            os: windows-latest
+            node: 24.15.0
+          - context: ubuntu-current
+            os: ubuntu-latest
+            node: 26
+    runs-on: \${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: \${{ matrix.node }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.1
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test
+      - run: bun run lint
+      - run: bun run benchmark:check
+      - run: bun run build
+      - run: bun run check:package
+`,
+    )
 
     assert.match(
       releaseJob,
@@ -135,9 +164,16 @@ describe('package contract', () => {
     assert.match(releaseJob, /- name: Check npm publish dry run\n\s+run: bun run check:publish/)
     assert.equal(releaseJob.match(/bun run check:publish/g)?.length, 1)
     assert.equal(releaseJob.match(/actions\/upload-artifact/g)?.length, 1)
-    assert.match(
-      releaseJob,
-      /uses: actions\/upload-artifact@v4\n\s+with:\n\s+name: encephalon-npm-package\n\s+path: package-artifacts\/\*\n\s+if-no-files-found: error\n\s+retention-days: 7/,
+    assert.equal(
+      uploadStep,
+      `      - name: Upload release-equivalent package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: encephalon-npm-package
+          path: package-artifacts/*
+          if-no-files-found: error
+          retention-days: 7
+`,
     )
     assert.equal(
       releaseJob.indexOf('npm pack') < releaseJob.indexOf('bun run check:publish') &&
