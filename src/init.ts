@@ -93,7 +93,7 @@ const initResolved = (input: InitEncephalonInput, hooks: InitHooks = {}): InitEn
     }))
   }
 
-  return withOperationLock(root, () => {
+  return withOperationLock(root, location => {
     const instructionPlans = planInstructionChanges(root, false)
     hooks.baselineScan?.()
     const baseline = scanBaseline(root)
@@ -122,7 +122,9 @@ const initResolved = (input: InitEncephalonInput, hooks: InitHooks = {}): InitEn
     const recordWriteOptions = hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }
     const recordsCreated = plans.map(plan => publishPlannedRecord(root, plan, recordWriteOptions))
     const cacheResult =
-      recordsCreated.length === 0 ? prepareResolvedRepository(root, false) : hydrateResolvedRepository(root, false)
+      recordsCreated.length === 0
+        ? prepareResolvedRepository(root, false, location)
+        : hydrateResolvedRepository(root, false, location)
     hooks.hydration?.(cacheResult)
     const instructionFiles = applyInstructionChanges(root, instructionPlans)
     return {
