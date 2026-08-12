@@ -19,6 +19,7 @@ import { basename, join, relative, resolve } from 'node:path'
 import { TextDecoder } from 'node:util'
 import { parseAddRecordInput, parseRootInput } from './api-input.ts'
 import { hydrateResolvedRepository } from './cache.ts'
+import type { CacheLocation } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
@@ -60,8 +61,10 @@ type RecordWriteFault =
   | 'during-staging-write'
 
 export type RecordWriteHooks = {
-  fault?: (point: RecordWriteFault) => void
+  fault?: ((point: RecordWriteFault) => void) | undefined
 }
+
+export const recordWriteTestHooks: RecordWriteHooks = {}
 
 type RecordReadFault = 'after-record-fstat' | 'after-record-lstat' | 'after-record-open'
 
@@ -72,6 +75,7 @@ export type RecordReadHooks = {
 }
 
 type AddRecordOptions = {
+  cacheLocation?: CacheLocation
   hooks?: RecordWriteHooks
   hydrate?: boolean
 }
@@ -988,7 +992,7 @@ const addRecordFileResolved = (
   if (committedErrorPhase !== 'publicationFlush' && options.hydrate !== false) {
     try {
       fault(options.hooks, 'during-hydration')
-      hydrateResolvedRepository(root, false)
+      hydrateResolvedRepository(root, false, options.cacheLocation)
     } catch (error) {
       capturePostCommitError('cacheHydration', error)
     }
@@ -1006,7 +1010,9 @@ export const addRecord = (input: AddRecordInput): BrainRecord => {
   const parsed = parseAddRecordInput(input)
   const root = resolveRepository(parsed)
   try {
-    return withOperationLock(root, () => addRecordFileResolved(root, parsed.recordFile))
+    return withOperationLock(root, cacheLocation =>
+      addRecordFileResolved(root, parsed.recordFile, { cacheLocation, hooks: recordWriteTestHooks }),
+    )
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error

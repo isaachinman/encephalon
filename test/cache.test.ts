@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -25,6 +26,7 @@ import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
+import { recordWriteTestHooks } from '../src/records.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -43,7 +45,9 @@ const createOutsideDirectory = () => {
 
 afterEach(() => {
   cacheLocationTestHooks.afterQuarantineRename = undefined
+  cacheLocationTestHooks.beforeDatabaseOpen = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
+  recordWriteTestHooks.fault = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
 
@@ -113,6 +117,13 @@ describe('cache filesystem containment', () => {
       ),
       false,
     )
+    assert.equal(
+      sameCacheEntryIdentity(
+        { dev: beyondSafeInteger, ino: beyondSafeInteger + 1n },
+        { dev: beyondSafeInteger + 1n, ino: beyondSafeInteger + 1n },
+      ),
+      false,
+    )
   })
 
   test('rejects cache ancestor redirects without changing the redirect target', () => {
@@ -124,12 +135,14 @@ describe('cache filesystem containment', () => {
           symlinkSync(installedPackage, join(outside, 'encephalon'), process.platform === 'win32' ? 'junction' : 'dir')
           symlinkSync(outside, join(root, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir')
         },
+        entry: 'node_modules',
         name: 'node_modules',
       },
       {
         arrange: (root: string, outside: string) => {
           symlinkSync(outside, join(root, 'node_modules', '.cache'), process.platform === 'win32' ? 'junction' : 'dir')
         },
+        entry: 'node_modules/.cache',
         name: '.cache',
       },
       {
@@ -141,6 +154,7 @@ describe('cache filesystem containment', () => {
             process.platform === 'win32' ? 'junction' : 'dir',
           )
         },
+        entry: 'node_modules/.cache/encephalon',
         name: 'encephalon',
       },
     ] as const
@@ -152,7 +166,18 @@ describe('cache filesystem containment', () => {
       entry.arrange(root, outside)
       const before = readdirSync(outside).sort(ordinalStringCompare)
 
-      assertCacheLayoutRejected(() => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }))
+      assert.throws(
+        () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+          assert.deepEqual((error as { details?: unknown }).details, {
+            entry: entry.entry,
+            invariant: 'real-directory',
+          })
+          assert.equal(JSON.stringify(error).includes(outside), false)
+          return true
+        },
+      )
       assert.deepEqual(readdirSync(outside).sort(ordinalStringCompare), before)
       assert.equal(readFileSync(join(outside, 'sentinel'), 'utf8'), entry.name)
     }
@@ -166,7 +191,18 @@ describe('cache filesystem containment', () => {
     writeFileSync(target, 'outside database bytes')
     symlinkSync(target, cacheDatabasePath(root))
 
-    assertCacheLayoutRejected(() => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }))
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          invariant: 'regular-non-symlink-file',
+        })
+        assert.equal(JSON.stringify(error).includes(outside), false)
+        return true
+      },
+    )
     assert.equal(readFileSync(target, 'utf8'), 'outside database bytes')
     assert.equal(readFileSync(cacheDatabasePath(root), 'utf8'), 'outside database bytes')
   })
@@ -240,6 +276,134 @@ describe('cache filesystem containment', () => {
     )
     assert.ok(quarantinePath !== undefined)
     assert.equal(readFileSync(quarantinePath, 'utf8'), 'replacement quarantine')
+  })
+
+  test('never quarantines a replacement at the corrupt primary source path', () => {
+    const root = createRoot()
+    const displacedPath = join(root, 'displaced-corrupt-brain.sqlite')
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    writeFileSync(cacheDatabasePath(root), 'not a sqlite database')
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (path.endsWith('/brain.sqlite')) {
+        renameSync(path, displacedPath)
+        writeFileSync(path, 'replacement primary')
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(readFileSync(cacheDatabasePath(root), 'utf8'), 'replacement primary')
+  })
+
+  test('rejects valid primary replacements between inspection and SQLite open', () => {
+    const cases = [
+      {
+        databaseName: 'brain.sqlite',
+        operation: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }),
+        prepare: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      },
+      {
+        databaseName: 'brain.sqlite',
+        operation: (root: string) =>
+          functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+        prepare: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      },
+      {
+        databaseName: 'operation-lock.sqlite',
+        operation: (root: string) => withOperationLock(root, () => 'entered'),
+        prepare: (root: string) => withOperationLock(root, () => 'prepared'),
+      },
+    ] as const
+
+    for (const [index, entry] of cases.entries()) {
+      const root = createRoot()
+      entry.prepare(root)
+      const databasePath = join(cacheDirectoryPath(root), entry.databaseName)
+      const replacementPath = join(root, `valid-replacement-${index}.sqlite`)
+      const displacedPath = join(root, `displaced-${index}.sqlite`)
+      copyFileSync(databasePath, replacementPath)
+      const replacement = statSync(replacementPath, { bigint: true })
+      cacheLocationTestHooks.beforeDatabaseOpen = database => {
+        if (database.name === entry.databaseName) {
+          cacheLocationTestHooks.beforeDatabaseOpen = undefined
+          renameSync(databasePath, displacedPath)
+          renameSync(replacementPath, databasePath)
+        }
+      }
+
+      assert.throws(
+        () => entry.operation(root),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+      const preserved = statSync(databasePath, { bigint: true })
+      assert.equal(sameCacheEntryIdentity(replacement, preserved), true)
+    }
+  })
+
+  test('rejects a sidecar identity change across SQLite open', () => {
+    const root = createRoot()
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const journalPath = `${cacheDatabasePath(root)}-journal`
+    const replacementPath = join(root, 'replacement-journal')
+    writeFileSync(journalPath, 'original journal')
+    writeFileSync(replacementPath, 'replacement journal')
+    cacheLocationTestHooks.beforeDatabaseOpen = database => {
+      if (database.name === 'brain.sqlite') {
+        cacheLocationTestHooks.beforeDatabaseOpen = undefined
+        rmSync(journalPath)
+        renameSync(replacementPath, journalPath)
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(readFileSync(journalPath, 'utf8'), 'replacement journal')
+  })
+
+  test('carries the locked cache location through add-record hydration', () => {
+    const root = createRoot()
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const cachePath = cacheDirectoryPath(root)
+    const displacedPath = `${cachePath}-before-add-hydration`
+    recordWriteTestHooks.fault = point => {
+      if (point === 'during-hydration') {
+        recordWriteTestHooks.fault = undefined
+        renameSync(cachePath, displacedPath)
+        mkdirSync(cachePath)
+        writeFileSync(join(cachePath, 'replacement-sentinel'), 'replacement cache')
+      }
+    }
+
+    assert.throws(
+      () =>
+        functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')({
+          id: 'locked-location-hydration',
+          kind: 'context',
+          payload: null,
+          root,
+          source: 'agent',
+          subject: 'cache.location',
+        }),
+      (error: unknown) => {
+        assert.equal((error as { details?: { postCommitPhase?: unknown } }).details?.postCommitPhase, 'cacheHydration')
+        assert.equal(((error as Error).cause as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.deepEqual(readdirSync(cachePath), ['replacement-sentinel'])
   })
 
   test('rejects an operation gate database symlink without changing its target', () => {
@@ -431,6 +595,34 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('wraps cache-location filesystem failures from prepared reads and gathers', () => {
+    const cases = [
+      ['list', (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root })],
+      [
+        'gather',
+        (root: string) =>
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ root, searches: [] }),
+      ],
+    ] as const
+
+    for (const [name, operation] of cases) {
+      const root = createRoot()
+      chmodSync(join(root, 'node_modules'), 0o500)
+      try {
+        assert.throws(
+          () => operation(root),
+          (error: unknown) => {
+            assert.equal((error as { code?: unknown }).code, 'IO_ERROR', name)
+            assert.equal(JSON.stringify(error).includes(root), false, name)
+            return true
+          },
+        )
+      } finally {
+        chmodSync(join(root, 'node_modules'), 0o700)
+      }
+    }
+  })
+
   test('prepares an empty repository before a cache directory exists', () => {
     const root = createRoot()
     const prepare =
@@ -448,16 +640,36 @@ describe('SQLite cache and reads', () => {
     const root = createRoot()
     const firstResult = join(root, 'first-prepare-result')
     const secondResult = join(root, 'second-prepare-result')
+    const firstReady = join(root, 'first-prepare-ready')
+    const secondReady = join(root, 'second-prepare-ready')
+    const releasePath = join(root, 'release-first-prepare')
     const fixture = join(import.meta.dirname, 'fixtures', 'prepare-cache.ts')
     const before = statSync(join(root, 'node_modules'), { bigint: true })
-    const first = spawn(process.execPath, [fixture, root, firstResult], { stdio: 'inherit' })
-    const second = spawn(process.execPath, [fixture, root, secondResult], { stdio: 'inherit' })
+    const first = spawn(process.execPath, [fixture, root, firstResult, firstReady, releasePath], { stdio: 'inherit' })
+    const second = spawn(process.execPath, [fixture, root, secondResult, secondReady, releasePath], {
+      stdio: 'inherit',
+    })
+    const exits = [once(first, 'exit'), once(second, 'exit')]
 
-    await Promise.all([once(first, 'exit'), once(second, 'exit')])
-    assert.equal(first.exitCode, 0)
-    assert.equal(second.exitCode, 0)
-    assert.equal(JSON.parse(readFileSync(firstResult, 'utf8')).recordsIndexed, 0)
-    assert.equal(JSON.parse(readFileSync(secondResult, 'utf8')).recordsIndexed, 0)
+    waitForPath(firstReady, first)
+    waitForPath(secondReady, second)
+    writeFileSync(releasePath, 'release')
+    const exitResults = await Promise.all(exits)
+    assert.equal(exitResults[0]?.[0], 0)
+    assert.equal(exitResults[1]?.[0], 0)
+    const firstOutput = JSON.parse(readFileSync(firstResult, 'utf8')) as {
+      cacheIdentity: { dev: string; ino: string }
+      result: { recordsIndexed: number }
+    }
+    const secondOutput = JSON.parse(readFileSync(secondResult, 'utf8')) as typeof firstOutput
+    assert.equal(firstOutput.result.recordsIndexed, 0)
+    assert.equal(secondOutput.result.recordsIndexed, 0)
+    assert.deepEqual(firstOutput.cacheIdentity, secondOutput.cacheIdentity)
+    const finalIdentity = statSync(cacheDirectoryPath(root), { bigint: true })
+    assert.deepEqual(firstOutput.cacheIdentity, {
+      dev: finalIdentity.dev.toString(),
+      ino: finalIdentity.ino.toString(),
+    })
     assert.equal(
       realpathSync(cacheDirectoryPath(root)),
       join(realpathSync(root), 'node_modules', '.cache', 'encephalon'),
@@ -1441,6 +1653,99 @@ describe('SQLite cache and reads', () => {
       'entered',
     )
     assert.equal(existsSync(recoveryPath), false)
+  })
+
+  test('reobserves a replacement recovery marker before reclaiming it', async () => {
+    const root = createRoot()
+    const recoveryPath = join(root, 'node_modules', '.cache', 'encephalon', 'operation-lock.recovery')
+    const displacedPath = join(root, 'displaced-recovery-predecessor')
+    const removalResult = join(root, 'recovery-successor-removal')
+    const fixture = join(import.meta.dirname, 'fixtures', 'remove-path-after-delay.ts')
+    mkdirSync(recoveryPath, { recursive: true })
+    writeFileSync(
+      join(recoveryPath, 'owner.json'),
+      `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: 2_147_483_647, token: 'predecessor' })}\n`,
+    )
+    let remover: ReturnType<typeof spawn> | undefined
+
+    assert.equal(
+      withOperationLock(root, () => 'entered', {
+        afterRecoveryStaleObservation: () => {
+          renameSync(recoveryPath, displacedPath)
+          mkdirSync(recoveryPath)
+          writeFileSync(
+            join(recoveryPath, 'owner.json'),
+            `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: process.pid, token: 'successor' })}\n`,
+          )
+          remover = spawn(process.execPath, [fixture, recoveryPath, removalResult, '100'], { stdio: 'inherit' })
+        },
+      }),
+      'entered',
+    )
+    assert.ok(remover !== undefined)
+    if (remover.exitCode === null) {
+      await once(remover, 'exit')
+    }
+    assert.equal(readFileSync(removalResult, 'utf8'), 'removed')
+  })
+
+  test('cleans only the captured recovery directory identity', () => {
+    const root = createRoot()
+    const cachePath = cacheDirectoryPath(root)
+    const recoveryPath = join(cachePath, 'operation-lock.recovery')
+    const displacedPath = join(root, 'displaced-owned-recovery')
+    mkdirSync(cachePath, { recursive: true })
+    writeFileSync(join(cachePath, 'operation-lock.sqlite'), 'not a sqlite database')
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => 'entered', {
+          afterRecoveryCreation: () => {
+            renameSync(recoveryPath, displacedPath)
+            mkdirSync(recoveryPath)
+            writeFileSync(join(recoveryPath, 'owner.json'), readFileSync(join(displacedPath, 'owner.json')))
+            writeFileSync(join(recoveryPath, 'successor-sentinel'), 'successor recovery')
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(readFileSync(join(recoveryPath, 'successor-sentinel'), 'utf8'), 'successor recovery')
+  })
+
+  test('preserves directory replacements at lock and recovery quarantine paths', () => {
+    const cases = ['operation.lock', 'operation-lock.recovery'] as const
+    for (const name of cases) {
+      const root = createRoot()
+      const path = join(cacheDirectoryPath(root), name)
+      mkdirSync(path, { recursive: true })
+      writeFileSync(
+        join(path, 'owner.json'),
+        `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: 2_147_483_647, token: name })}\n`,
+      )
+      let quarantinePath: string | undefined
+      cacheLocationTestHooks.afterQuarantineRename = candidate => {
+        if (candidate.includes(`.${name}.`)) {
+          quarantinePath = candidate
+          rmSync(candidate, { recursive: true })
+          mkdirSync(candidate)
+          writeFileSync(join(candidate, 'replacement-sentinel'), name)
+        }
+      }
+
+      assert.throws(
+        () => withOperationLock(root, () => 'entered'),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+      assert.ok(quarantinePath !== undefined)
+      assert.equal(readFileSync(join(quarantinePath, 'replacement-sentinel'), 'utf8'), name)
+      cacheLocationTestHooks.afterQuarantineRename = undefined
+    }
   })
 
   test('serialises two contenders recovering the same malformed operation gate', async () => {

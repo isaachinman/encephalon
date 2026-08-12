@@ -12,11 +12,15 @@ import {
 } from './api-input.ts'
 import {
   assertCacheDatabase,
+  CacheDatabaseFailure,
   type CacheLocation,
+  cacheDatabaseWillOpen,
+  failCacheDatabase,
   inspectCacheDatabase,
   inspectCacheLocation,
   prepareCacheDatabase,
   quarantineCacheDatabase,
+  refreshCacheDatabase,
 } from './cache-location.ts'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
@@ -141,9 +145,10 @@ const loadSQLite = () => {
 }
 
 const isRecoverableCacheFailure = (error: unknown) => {
-  const sqlite = error as { errcode?: unknown; message?: unknown }
+  const failure = error instanceof CacheDatabaseFailure ? error.failure : error
+  const sqlite = failure as { errcode?: unknown; message?: unknown }
   return (
-    error instanceof CacheSchemaMismatch ||
+    failure instanceof CacheSchemaMismatch ||
     sqlite.errcode === 8 ||
     sqlite.errcode === 14 ||
     sqlite.errcode === 11 ||
@@ -163,7 +168,12 @@ const assertTableColumns = (database: DatabaseSync, table: string, expected: str
   }
 }
 
-const removeCorruptCache = (location: CacheLocation) => quarantineCacheDatabase(location, 'brain.sqlite')
+const removeCorruptCache = (location: CacheLocation, error: unknown) => {
+  if (error instanceof CacheDatabaseFailure) {
+    return quarantineCacheDatabase(location, error.database)
+  }
+  throw error
+}
 
 const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync']) => {
   if (sqliteFeaturesVerified) {
@@ -240,45 +250,86 @@ const createCacheSchema = (database: DatabaseSync) => {
   `)
 }
 
-const openWriterDatabase = (root: string, location: CacheLocation = inspectCacheLocation(root)) => {
+const openWriterDatabase = (location: CacheLocation) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  const cacheDatabase = prepareCacheDatabase(location, 'brain.sqlite')
-  const database = new DatabaseConstructor(cacheDatabase.path, {
-    timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
-  })
+  let cacheDatabase = prepareCacheDatabase(location, 'brain.sqlite')
+  cacheDatabaseWillOpen(cacheDatabase)
+  cacheDatabase = assertCacheDatabase(location, cacheDatabase)
+  let database: DatabaseSync
+  try {
+    database = new DatabaseConstructor(cacheDatabase.path, {
+      timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
+    })
+  } catch (error) {
+    return failCacheDatabase(error, cacheDatabase)
+  }
   try {
     // Node's SQLite API accepts only pathnames, leaving a narrow replacement race
     // between this identity check and SQLite's internal open.
-    assertCacheDatabase(location, cacheDatabase)
+    cacheDatabase = assertCacheDatabase(location, cacheDatabase)
     database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
+    cacheDatabase = refreshCacheDatabase(location, cacheDatabase)
     createCacheSchema(database)
     assertCacheSchema(database)
+    cacheDatabase = assertCacheDatabase(location, cacheDatabase)
     return database
   } catch (error) {
+    let validationError: unknown
+    try {
+      cacheDatabase = assertCacheDatabase(location, cacheDatabase)
+    } catch (candidate) {
+      validationError = candidate
+    }
     database.close()
-    throw error
+    if (validationError !== undefined) {
+      throw validationError
+    }
+    if (error instanceof EncephalonError) {
+      throw error
+    }
+    return failCacheDatabase(error, cacheDatabase)
   }
 }
 
-const openReaderDatabase = (root: string, location: CacheLocation = inspectCacheLocation(root)) => {
+const openReaderDatabase = (location: CacheLocation) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  const cacheDatabase = inspectCacheDatabase(location, 'brain.sqlite')
+  let cacheDatabase = inspectCacheDatabase(location, 'brain.sqlite')
   if (cacheDatabase === undefined) {
     throw new CacheSchemaMismatch('The cache database disappeared before it was opened.')
   }
-  const database = new DatabaseConstructor(cacheDatabase.path, {
-    readOnly: true,
-    timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
-  })
+  cacheDatabaseWillOpen(cacheDatabase)
+  cacheDatabase = assertCacheDatabase(location, cacheDatabase)
+  let database: DatabaseSync
   try {
-    assertCacheDatabase(location, cacheDatabase)
+    database = new DatabaseConstructor(cacheDatabase.path, {
+      readOnly: true,
+      timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
+    })
+  } catch (error) {
+    return failCacheDatabase(error, cacheDatabase)
+  }
+  try {
+    cacheDatabase = assertCacheDatabase(location, cacheDatabase)
     assertCacheSchema(database)
+    cacheDatabase = assertCacheDatabase(location, cacheDatabase)
     return database
   } catch (error) {
+    let validationError: unknown
+    try {
+      cacheDatabase = assertCacheDatabase(location, cacheDatabase)
+    } catch (candidate) {
+      validationError = candidate
+    }
     database.close()
-    throw error
+    if (validationError !== undefined) {
+      throw validationError
+    }
+    if (error instanceof EncephalonError) {
+      throw error
+    }
+    return failCacheDatabase(error, cacheDatabase)
   }
 }
 
@@ -589,7 +640,7 @@ const writeMetadata = (database: DatabaseSync, metadata: Metadata) => {
 }
 
 const readFreshMetadata = (root: string, location: CacheLocation): Metadata | undefined => {
-  const database = openReaderDatabase(root, location)
+  const database = openReaderDatabase(location)
   try {
     const metadata = readMetadata(database)
     return metadataIsFresh(root, database, metadata) ? metadata : undefined
@@ -627,13 +678,13 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
     let database: DatabaseSync
     try {
-      database = openWriterDatabase(root, location)
+      database = openWriterDatabase(location)
     } catch (error) {
       if (!isRecoverableCacheFailure(error)) {
         throw error
       }
-      removeCorruptCache(location)
-      database = openWriterDatabase(root, location)
+      removeCorruptCache(location, error)
+      database = openWriterDatabase(location)
     }
     try {
       let existingMetadata: Metadata | undefined
@@ -813,7 +864,7 @@ const fullResultLimit = (value: unknown) => positiveLimit(value, MAX_FULL_RESULT
 const compactResultLimit = (value: unknown) => positiveLimit(value, MAX_COMPACT_RESULT_LIMIT, 'compactResultLimit')
 
 const readFreshDatabase = <Result>(root: string, location: CacheLocation, read: (database: DatabaseSync) => Result) => {
-  const database = openReaderDatabase(root, location)
+  const database = openReaderDatabase(location)
   try {
     const metadata = readMetadata(database)
     if (!metadataIsFresh(root, database, metadata)) {
@@ -827,15 +878,16 @@ const readFreshDatabase = <Result>(root: string, location: CacheLocation, read: 
 
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
   const root = resolveRepository(input)
-  const location = inspectCacheLocation(root)
+  let location: CacheLocation | undefined
   try {
+    location = inspectCacheLocation(root)
     prepareResolved(root, true, location)
     return readFreshDatabase(root, location, read)
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
     }
-    if (isRecoverableCacheFailure(error)) {
+    if (isRecoverableCacheFailure(error) && location !== undefined) {
       withOperationLock(root, captured => rebuildCache(root, captured), {}, location)
       try {
         return readFreshDatabase(root, location, read)
@@ -1101,7 +1153,7 @@ const readFreshTransaction = <Result>(
   location: CacheLocation,
   read: (database: DatabaseSync) => Result,
 ) => {
-  const database = openReaderDatabase(root, location)
+  const database = openReaderDatabase(location)
   try {
     database.exec('BEGIN')
     const metadata = readMetadata(database)
@@ -1148,8 +1200,9 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
   assertGatherBudgets(parsed)
   compactResultLimit(parsed.limit)
   const root = resolveRepository(parsed)
-  const location = inspectCacheLocation(root)
+  let location: CacheLocation | undefined
   try {
+    location = inspectCacheLocation(root)
     let hydrated: HydrateResult | null = null
     if (parsed.hydrate === true) {
       hydrated = {
@@ -1163,7 +1216,7 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
     if (error instanceof EncephalonError) {
       throw error
     }
-    if (isRecoverableCacheFailure(error)) {
+    if (isRecoverableCacheFailure(error) && location !== undefined) {
       const recovered = withOperationLock(root, captured => rebuildCache(root, captured), {}, location)
       try {
         return readFreshTransaction(root, location, database =>

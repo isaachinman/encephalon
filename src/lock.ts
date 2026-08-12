@@ -1,17 +1,21 @@
 import { randomUUID } from 'node:crypto'
-import { renameSync, statSync } from 'node:fs'
-import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import {
   assertCacheDatabase,
-  assertCacheOwnedEntries,
+  assertCacheLockCandidates,
   type CacheDatabase,
+  CacheDatabaseFailure,
   type CacheLocation,
   type CacheOwnedDirectory,
+  cacheDatabaseWillOpen,
+  cacheOwnedDirectoryIsCurrent,
+  cacheOwnedDirectoryMtimeMilliseconds,
   createCacheOwnedDirectory,
+  failCacheDatabase,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
   prepareCacheDatabase,
+  promoteCacheOwnedDirectory,
   quarantineCacheDatabase,
   quarantineCacheOwnedDirectory,
   readCacheOwner,
@@ -30,7 +34,9 @@ type LockOwner = {
 }
 
 type LockTestHooks = {
-  afterStaleObservation?: () => void
+  afterRecoveryCreation?: (() => void) | undefined
+  afterRecoveryStaleObservation?: (() => void) | undefined
+  afterStaleObservation?: (() => void) | undefined
 }
 
 const MAX_OWNER_BYTES = 4096
@@ -71,7 +77,10 @@ const processIsRunning = (pid: number) => {
 }
 
 const sqliteBusy = (error: unknown) => {
-  const candidate = error as { errcode?: unknown; message?: unknown }
+  const candidate = (error instanceof CacheDatabaseFailure ? error.failure : error) as {
+    errcode?: unknown
+    message?: unknown
+  }
   return (
     candidate.errcode === 5 ||
     candidate.errcode === 6 ||
@@ -81,7 +90,10 @@ const sqliteBusy = (error: unknown) => {
 }
 
 const sqliteCorrupt = (error: unknown) => {
-  const candidate = error as { errcode?: unknown; message?: unknown }
+  const candidate = (error instanceof CacheDatabaseFailure ? error.failure : error) as {
+    errcode?: unknown
+    message?: unknown
+  }
   return (
     candidate.errcode === 11 ||
     candidate.errcode === 26 ||
@@ -90,8 +102,6 @@ const sqliteCorrupt = (error: unknown) => {
   )
 }
 
-export const cacheDirectory = (root: string) => resolve(root, 'node_modules', '.cache', 'encephalon')
-
 export const withOperationLock = <Result>(
   root: string,
   operation: (location: CacheLocation) => Result,
@@ -99,13 +109,11 @@ export const withOperationLock = <Result>(
   capturedLocation?: CacheLocation,
 ): Result => {
   const location = capturedLocation ?? inspectCacheLocation(root)
-  assertCacheOwnedEntries(location)
-  const { directory } = location
+  assertCacheLockCandidates(location)
   const lockName = 'operation.lock'
-  const lockPath = resolve(directory, lockName)
   const recoveryName = 'operation-lock.recovery'
   const token = randomUUID()
-  const candidatePath = resolve(directory, `operation.lock.${token}`)
+  const candidateName = `operation.lock.${token}`
   const startedAt = Date.now()
   let gate: DatabaseSync | undefined
   let gateDatabase: CacheDatabase | undefined
@@ -119,52 +127,55 @@ export const withOperationLock = <Result>(
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds)
   }
 
-  const missingPath = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
-
-  const recoveryMarkerIsStale = () => {
+  const recoveryMarkerObservation = () => {
     const recoveryDirectory = inspectCacheOwnedDirectory(location, recoveryName)
     if (recoveryDirectory === undefined) {
-      return false
+      return
     }
     const owner = readOwner(location, recoveryDirectory)
     if (owner !== undefined) {
       const acquiredAt = Date.parse(owner.acquiredAt)
       const age = Number.isFinite(acquiredAt) ? Date.now() - acquiredAt : RECOVERY_STALE_MILLISECONDS + 1
-      return !processIsRunning(owner.pid) || age > RECOVERY_STALE_MILLISECONDS
-    }
-    try {
-      return Date.now() - statSync(recoveryDirectory.path).mtimeMs > RECOVERY_STALE_MILLISECONDS
-    } catch (error) {
-      if (missingPath(error)) {
-        return false
+      return {
+        directory: recoveryDirectory,
+        stale: !processIsRunning(owner.pid) || age > RECOVERY_STALE_MILLISECONDS,
       }
-      throw error
+    }
+    return {
+      directory: recoveryDirectory,
+      stale:
+        Date.now() - cacheOwnedDirectoryMtimeMilliseconds(location, recoveryDirectory) > RECOVERY_STALE_MILLISECONDS,
     }
   }
 
-  const reclaimRecoveryMarker = () => {
-    const recoveryDirectory = inspectCacheOwnedDirectory(location, recoveryName)
-    if (recoveryDirectory !== undefined) {
+  const reclaimRecoveryMarker = (recoveryDirectory: CacheOwnedDirectory) => {
+    testHooks.afterRecoveryStaleObservation?.()
+    if (cacheOwnedDirectoryIsCurrent(location, recoveryDirectory)) {
       quarantineCacheOwnedDirectory(location, recoveryDirectory)
     }
   }
 
   const waitForGateRecovery = () => {
-    while (inspectCacheOwnedDirectory(location, recoveryName) !== undefined) {
+    let observation = recoveryMarkerObservation()
+    while (observation !== undefined) {
       if (remainingMilliseconds() === 0) {
         return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
           timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
         })
       }
-      if (recoveryMarkerIsStale()) {
-        reclaimRecoveryMarker()
+      if (observation.stale) {
+        reclaimRecoveryMarker(observation.directory)
       }
       wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))
+      observation = recoveryMarkerObservation()
     }
   }
 
-  const quarantineCorruptGate = () => {
-    quarantineCacheDatabase(location, 'operation-lock.sqlite')
+  const quarantineCorruptGate = (error: unknown) => {
+    if (error instanceof CacheDatabaseFailure) {
+      return quarantineCacheDatabase(location, error.database)
+    }
+    throw error
   }
 
   const beginGateTransaction = (recoveryLockHeld = false) => {
@@ -172,26 +183,46 @@ export const withOperationLock = <Result>(
       waitForGateRecovery()
     }
     gateDatabase = prepareCacheDatabase(location, 'operation-lock.sqlite')
-    gate = new DatabaseSync(gateDatabase.path, { timeout: remainingMilliseconds() })
+    cacheDatabaseWillOpen(gateDatabase)
+    gateDatabase = assertCacheDatabase(location, gateDatabase)
+    try {
+      gate = new DatabaseSync(gateDatabase.path, { timeout: remainingMilliseconds() })
+    } catch (error) {
+      return failCacheDatabase(error, gateDatabase)
+    }
     try {
       // Node's SQLite API accepts only pathnames, leaving a narrow replacement race
       // between this identity check and SQLite's internal open.
-      assertCacheDatabase(location, gateDatabase)
+      gateDatabase = assertCacheDatabase(location, gateDatabase)
       gate.exec('BEGIN IMMEDIATE')
       gateTransaction = true
     } catch (error) {
+      let validationError: unknown
+      try {
+        gateDatabase = assertCacheDatabase(location, gateDatabase)
+      } catch (candidate) {
+        validationError = candidate
+      }
       gate.close()
       gate = undefined
-      throw error
+      if (validationError !== undefined) {
+        throw validationError
+      }
+      if (error instanceof EncephalonError) {
+        throw error
+      }
+      return failCacheDatabase(error, gateDatabase)
     }
   }
 
   const recoverCorruptGate = () => {
     let recoveryLockHeld = false
+    let ownedRecoveryDirectory: CacheOwnedDirectory | undefined
     let recoveryError: unknown
     while (!recoveryLockHeld) {
       try {
         const recoveryDirectory = createCacheOwnedDirectory(location, recoveryName)
+        ownedRecoveryDirectory = recoveryDirectory
         writeCacheOwner(
           location,
           recoveryDirectory,
@@ -201,6 +232,7 @@ export const withOperationLock = <Result>(
             token,
           })}\n`,
         )
+        testHooks.afterRecoveryCreation?.()
         recoveryLockHeld = true
       } catch (error) {
         const existingRecovery = (error as NodeJS.ErrnoException).code === 'EEXIST'
@@ -212,8 +244,9 @@ export const withOperationLock = <Result>(
             timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
           })
         }
-        if (recoveryMarkerIsStale()) {
-          reclaimRecoveryMarker()
+        const observation = recoveryMarkerObservation()
+        if (observation?.stale === true) {
+          reclaimRecoveryMarker(observation.directory)
         }
         wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))
       }
@@ -230,7 +263,7 @@ export const withOperationLock = <Result>(
         if (!sqliteCorrupt(error)) {
           throw error
         }
-        quarantineCorruptGate()
+        quarantineCorruptGate(error)
         beginGateTransaction(true)
       }
     } catch (error) {
@@ -238,9 +271,8 @@ export const withOperationLock = <Result>(
     }
     let cleanupError: unknown
     try {
-      const recoveryDirectory = inspectCacheOwnedDirectory(location, recoveryName)
-      if (recoveryDirectory !== undefined && readOwner(location, recoveryDirectory)?.token === token) {
-        quarantineCacheOwnedDirectory(location, recoveryDirectory)
+      if (ownedRecoveryDirectory !== undefined) {
+        quarantineCacheOwnedDirectory(location, ownedRecoveryDirectory)
       }
     } catch (error) {
       cleanupError = error
@@ -254,7 +286,7 @@ export const withOperationLock = <Result>(
   }
 
   try {
-    candidateDirectory = createCacheOwnedDirectory(location, `operation.lock.${token}`)
+    candidateDirectory = createCacheOwnedDirectory(location, candidateName)
     const candidateOwner: LockOwner = {
       acquiredAt: new Date().toISOString(),
       pid: process.pid,
@@ -288,8 +320,7 @@ export const withOperationLock = <Result>(
       quarantineCacheOwnedDirectory(location, staleLock)
     }
 
-    renameSync(candidatePath, lockPath)
-    ownedLockDirectory = { ...candidateDirectory, name: lockName, path: lockPath }
+    ownedLockDirectory = promoteCacheOwnedDirectory(location, candidateDirectory, lockName)
     candidateDirectory = undefined
     try {
       return operation(location)
@@ -315,7 +346,7 @@ export const withOperationLock = <Result>(
     }
     gate?.close()
     try {
-      const remainingCandidate = candidateDirectory ?? inspectCacheOwnedDirectory(location, `operation.lock.${token}`)
+      const remainingCandidate = candidateDirectory ?? inspectCacheOwnedDirectory(location, candidateName)
       if (remainingCandidate !== undefined) {
         quarantineCacheOwnedDirectory(location, remainingCandidate)
       }

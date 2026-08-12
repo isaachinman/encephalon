@@ -20,6 +20,7 @@ import { fail } from './errors.ts'
 
 const CACHE_COMPONENTS = ['node_modules', '.cache', 'encephalon'] as const
 const DATABASE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'] as const
+const OPTIONAL_FILE_OBSERVATION_ATTEMPTS = 3
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0
 
 export type CacheEntryIdentity = {
@@ -38,9 +39,16 @@ export type CacheLocation = {
   repository: string
 }
 
-export type CacheDatabase = CacheEntryIdentity & {
-  name: CacheDatabaseName
+type CacheFile = CacheEntryIdentity & {
   path: string
+  relativePath: string
+}
+
+type CacheDatabaseSidecarSuffix = (typeof DATABASE_SIDECAR_SUFFIXES)[number]
+
+export type CacheDatabase = CacheFile & {
+  name: CacheDatabaseName
+  sidecars: Partial<Record<CacheDatabaseSidecarSuffix, CacheFile>>
 }
 
 export type CacheDatabaseName = 'brain.sqlite' | 'operation-lock.sqlite'
@@ -50,8 +58,25 @@ export type CacheOwnedDirectory = CacheEntryIdentity & {
   path: string
 }
 
+export class CacheDatabaseFailure extends Error {
+  readonly database: CacheDatabase
+  readonly failure: unknown
+
+  constructor(failure: unknown, database: CacheDatabase, options: ErrorOptions) {
+    super(failure instanceof Error ? failure.message : 'The SQLite cache operation failed.', options)
+    this.name = 'CacheDatabaseFailure'
+    this.database = database
+    this.failure = failure
+  }
+}
+
+export const failCacheDatabase = (failure: unknown, database: CacheDatabase): never => {
+  throw new CacheDatabaseFailure(failure, database, { cause: failure })
+}
+
 type CacheLocationTestHooks = {
   afterQuarantineRename?: ((path: string) => void) | undefined
+  beforeDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
   beforeQuarantineRename?: ((path: string) => void) | undefined
 }
 
@@ -186,13 +211,15 @@ export const assertCacheLocation = (location: CacheLocation) => {
 
 const databaseRelativePath = (name: CacheDatabaseName) => `node_modules/.cache/encephalon/${name}`
 
-const inspectRegularFile = (path: string, relativePath: string): CacheEntryIdentity | undefined => {
+type RegularFileInspection = { kind: 'changed' } | { kind: 'missing' } | { file: CacheFile; kind: 'stable' }
+
+const inspectRegularFileOnce = (path: string, relativePath: string): RegularFileInspection => {
   let metadata: BigIntStats
   try {
     metadata = lstatSync(path, { bigint: true })
   } catch (error) {
     if (missingPath(error)) {
-      return
+      return { kind: 'missing' }
     }
     throw error
   }
@@ -200,25 +227,74 @@ const inspectRegularFile = (path: string, relativePath: string): CacheEntryIdent
     return invalidLayout(relativePath, 'regular-non-symlink-file')
   }
   const captured = identityFrom(metadata)
+  let actualRealpath: string
+  try {
+    actualRealpath = realpathSync.native(path)
+  } catch (error) {
+    if (missingPath(error)) {
+      return { kind: 'changed' }
+    }
+    throw error
+  }
+  if (!samePath(actualRealpath, path)) {
+    return invalidLayout(relativePath, 'expected-realpath')
+  }
   let descriptor: number | undefined
   try {
-    descriptor = openSync(path, constants.O_RDONLY | NO_FOLLOW)
+    try {
+      descriptor = openSync(path, constants.O_RDONLY | NO_FOLLOW)
+    } catch (error) {
+      if (missingPath(error)) {
+        return { kind: 'changed' }
+      }
+      throw error
+    }
     const opened = fstatSync(descriptor, { bigint: true })
     if (!(opened.isFile() && sameCacheEntryIdentity(captured, identityFrom(opened)))) {
-      return changedLayout(relativePath, 'stable-open-identity')
+      return { kind: 'changed' }
     }
   } finally {
     if (descriptor !== undefined) {
       closeSync(descriptor)
     }
   }
-  return captured
+  return { file: { ...captured, path, relativePath }, kind: 'stable' }
 }
 
-const inspectSidecars = (location: CacheLocation, name: CacheDatabaseName) => {
-  for (const suffix of DATABASE_SIDECAR_SUFFIXES) {
-    inspectRegularFile(resolve(location.directory, `${name}${suffix}`), `${databaseRelativePath(name)}${suffix}`)
+const inspectRegularFile = (path: string, relativePath: string, optional = false): CacheFile | undefined => {
+  const attempts = optional ? OPTIONAL_FILE_OBSERVATION_ATTEMPTS : 1
+  for (const attempt of Array.from({ length: attempts }, (_, index) => index)) {
+    const inspection = inspectRegularFileOnce(path, relativePath)
+    if (inspection.kind === 'stable') {
+      return inspection.file
+    }
+    if (inspection.kind === 'missing' && (!optional || attempt === attempts - 1)) {
+      return
+    }
   }
+  return changedLayout(relativePath, 'stable-open-identity')
+}
+
+const inspectSidecars = (location: CacheLocation, name: CacheDatabaseName) =>
+  DATABASE_SIDECAR_SUFFIXES.reduce<Partial<Record<CacheDatabaseSidecarSuffix, CacheFile>>>((sidecars, suffix) => {
+    const file = inspectRegularFile(
+      resolve(location.directory, `${name}${suffix}`),
+      `${databaseRelativePath(name)}${suffix}`,
+      true,
+    )
+    return file === undefined ? sidecars : { ...sidecars, [suffix]: file }
+  }, {})
+
+const assertSidecars = (location: CacheLocation, database: CacheDatabase) => {
+  const observed = inspectSidecars(location, database.name)
+  for (const suffix of DATABASE_SIDECAR_SUFFIXES) {
+    const expected = database.sidecars[suffix]
+    const current = observed[suffix]
+    if (expected !== undefined && (current === undefined || !sameCacheEntryIdentity(expected, current))) {
+      return changedLayout(`${databaseRelativePath(database.name)}${suffix}`, 'stable-identity')
+    }
+  }
+  return observed
 }
 
 const bootstrapPrimary = (location: CacheLocation, name: CacheDatabaseName) => {
@@ -243,21 +319,20 @@ const bootstrapPrimary = (location: CacheLocation, name: CacheDatabaseName) => {
 
 export const prepareCacheDatabase = (location: CacheLocation, name: CacheDatabaseName): CacheDatabase => {
   assertCacheLocation(location)
-  inspectSidecars(location, name)
+  const sidecars = inspectSidecars(location, name)
   const path = resolve(location.directory, name)
   const existing = inspectRegularFile(path, databaseRelativePath(name))
   const identity = existing ?? bootstrapPrimary(location, name)
   assertCacheLocation(location)
-  inspectSidecars(location, name)
-  return { ...identity, name, path }
+  return { ...identity, name, sidecars: { ...sidecars, ...inspectSidecars(location, name) } }
 }
 
 export const inspectCacheDatabase = (location: CacheLocation, name: CacheDatabaseName): CacheDatabase | undefined => {
   assertCacheLocation(location)
-  inspectSidecars(location, name)
+  const sidecars = inspectSidecars(location, name)
   const path = resolve(location.directory, name)
   const identity = inspectRegularFile(path, databaseRelativePath(name))
-  return identity === undefined ? undefined : { ...identity, name, path }
+  return identity === undefined ? undefined : { ...identity, name, sidecars }
 }
 
 export const assertCacheDatabase = (location: CacheLocation, database: CacheDatabase) => {
@@ -266,44 +341,66 @@ export const assertCacheDatabase = (location: CacheLocation, database: CacheData
   if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
     return changedLayout(databaseRelativePath(database.name), 'stable-identity')
   }
-  inspectSidecars(location, database.name)
+  return { ...database, sidecars: { ...database.sidecars, ...assertSidecars(location, database) } }
 }
 
-const quarantineFile = (location: CacheLocation, path: string, relativePath: string) => {
-  const captured = inspectRegularFile(path, relativePath)
-  if (captured !== undefined) {
-    assertCacheLocation(location)
-    cacheLocationTestHooks.beforeQuarantineRename?.(path)
-    assertCacheLocation(location)
-    const current = inspectRegularFile(path, relativePath)
-    if (current === undefined || !sameCacheEntryIdentity(captured, current)) {
-      return changedLayout(relativePath, 'stable-quarantine-source')
+export const refreshCacheDatabase = (location: CacheLocation, database: CacheDatabase) => {
+  assertCacheLocation(location)
+  const identity = inspectRegularFile(database.path, database.relativePath)
+  if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
+    return changedLayout(database.relativePath, 'stable-identity')
+  }
+  return { ...database, sidecars: inspectSidecars(location, database.name) }
+}
+
+export const cacheDatabaseWillOpen = (database: CacheDatabase) => {
+  cacheLocationTestHooks.beforeDatabaseOpen?.(database)
+}
+
+const quarantineFile = (location: CacheLocation, expected: CacheFile, required: boolean) => {
+  const current = inspectRegularFile(expected.path, expected.relativePath, !required)
+  if (current === undefined) {
+    if (required) {
+      return changedLayout(expected.relativePath, 'stable-quarantine-source')
     }
-    const quarantineName = `.${relativePath.split('/').at(-1)}.${randomUUID()}.quarantine`
+  } else {
+    if (!sameCacheEntryIdentity(expected, current)) {
+      return changedLayout(expected.relativePath, 'stable-quarantine-source')
+    }
+    assertCacheLocation(location)
+    cacheLocationTestHooks.beforeQuarantineRename?.(expected.path)
+    assertCacheLocation(location)
+    const verified = inspectRegularFile(expected.path, expected.relativePath, !required)
+    if (verified === undefined) {
+      return changedLayout(expected.relativePath, 'stable-quarantine-source')
+    }
+    if (!sameCacheEntryIdentity(expected, verified)) {
+      return changedLayout(expected.relativePath, 'stable-quarantine-source')
+    }
+    const quarantineName = `.${expected.relativePath.split('/').at(-1)}.${randomUUID()}.quarantine`
     const quarantinePath = resolve(location.directory, quarantineName)
-    renameSync(path, quarantinePath)
+    renameSync(expected.path, quarantinePath)
     assertCacheLocation(location)
     cacheLocationTestHooks.afterQuarantineRename?.(quarantinePath)
     assertCacheLocation(location)
     const quarantined = inspectRegularFile(quarantinePath, `node_modules/.cache/encephalon/${quarantineName}`)
-    if (quarantined === undefined || !sameCacheEntryIdentity(captured, quarantined)) {
-      return changedLayout(relativePath, 'stable-quarantine-identity')
+    if (quarantined === undefined || !sameCacheEntryIdentity(expected, quarantined)) {
+      return changedLayout(expected.relativePath, 'stable-quarantine-identity')
     }
     unlinkSync(quarantinePath)
     assertCacheLocation(location)
   }
 }
 
-export const quarantineCacheDatabase = (location: CacheLocation, name: CacheDatabaseName) => {
+export const quarantineCacheDatabase = (location: CacheLocation, database: CacheDatabase) => {
   assertCacheLocation(location)
-  for (const suffix of [...DATABASE_SIDECAR_SUFFIXES, ''] as const) {
-    const candidateName = `${name}${suffix}`
-    quarantineFile(
-      location,
-      resolve(location.directory, candidateName),
-      `node_modules/.cache/encephalon/${candidateName}`,
-    )
+  for (const suffix of DATABASE_SIDECAR_SUFFIXES) {
+    const sidecar = database.sidecars[suffix]
+    if (sidecar !== undefined) {
+      quarantineFile(location, sidecar, false)
+    }
   }
+  quarantineFile(location, database, true)
 }
 
 const safeOwnedDirectoryName = (name: string) =>
@@ -336,11 +433,13 @@ export const inspectCacheOwnedDirectory = (location: CacheLocation, name: string
   return inspectOwnedDirectoryPath(location, name)
 }
 
-export const assertCacheOwnedEntries = (location: CacheLocation) => {
+export const assertCacheLockCandidates = (location: CacheLocation) => {
   assertCacheLocation(location)
-  readdirSync(location.directory)
-    .filter(name => /^operation\.lock\.[0-9a-f-]{36}$/u.test(name))
-    .map(name => inspectOwnedDirectoryPath(location, name))
+  const candidates = readdirSync(location.directory).filter(name => /^operation\.lock\.[0-9a-f-]{36}$/u.test(name))
+  // biome-ignore lint/complexity/noForEach: validation intentionally visits every candidate entry.
+  candidates.forEach(name => {
+    inspectOwnedDirectoryPath(location, name)
+  })
 }
 
 export const createCacheOwnedDirectory = (location: CacheLocation, name: string) => {
@@ -362,6 +461,41 @@ const assertOwnedDirectory = (location: CacheLocation, directory: CacheOwnedDire
   if (current === undefined || !sameCacheEntryIdentity(directory, current)) {
     return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-identity')
   }
+}
+
+export const cacheOwnedDirectoryIsCurrent = (location: CacheLocation, directory: CacheOwnedDirectory) => {
+  assertCacheLocation(location)
+  const current = inspectOwnedDirectoryPath(location, directory.name)
+  return current !== undefined && sameCacheEntryIdentity(directory, current)
+}
+
+export const cacheOwnedDirectoryMtimeMilliseconds = (location: CacheLocation, directory: CacheOwnedDirectory) => {
+  assertOwnedDirectory(location, directory)
+  const metadata = lstatSync(directory.path, { bigint: true })
+  if (!sameCacheEntryIdentity(directory, identityFrom(metadata))) {
+    return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-metadata-identity')
+  }
+  return Number(metadata.mtimeMs)
+}
+
+export const promoteCacheOwnedDirectory = (
+  location: CacheLocation,
+  directory: CacheOwnedDirectory,
+  targetName: 'operation.lock',
+) => {
+  assertOwnedDirectory(location, directory)
+  const existingTarget = inspectOwnedDirectoryPath(location, targetName)
+  if (existingTarget !== undefined) {
+    return changedLayout(ownedDirectoryRelativePath(targetName), 'promotion-target-missing')
+  }
+  const targetPath = resolve(location.directory, targetName)
+  renameSync(directory.path, targetPath)
+  assertCacheLocation(location)
+  const promoted = inspectOwnedDirectoryPath(location, targetName)
+  if (promoted === undefined || !sameCacheEntryIdentity(directory, promoted)) {
+    return changedLayout(ownedDirectoryRelativePath(targetName), 'stable-promoted-identity')
+  }
+  return promoted
 }
 
 export const writeCacheOwner = (location: CacheLocation, directory: CacheOwnedDirectory, contents: string) => {
