@@ -53,8 +53,10 @@ afterEach(() => {
   cacheLocationTestHooks.afterQuarantineRename = undefined
   cacheLocationTestHooks.beforeDatabaseOpen = undefined
   cacheLocationTestHooks.beforeLocationInspection = undefined
+  cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
   cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
+  cacheReadTestHooks.duringDatabaseInitialisation = undefined
   recordWriteTestHooks.fault = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
@@ -493,6 +495,55 @@ describe('cache filesystem containment', () => {
         },
       )
       assert.equal(opens, 3, entry.name)
+    }
+  })
+
+  test('retries sidecar replacement during complete writer and reader initialisation', () => {
+    for (const entry of databaseOpenCases.filter(({ name }) => name !== 'gate')) {
+      for (const persistent of [false, true]) {
+        const root = createRoot()
+        entry.prepare(root)
+        const sidecarPath = join(cacheDirectoryPath(root), 'brain.sqlite-journal')
+        writeFileSync(sidecarPath, '')
+        let initialisations = 0
+        let opens = 0
+        cacheLocationTestHooks.afterDatabaseOpen = database => {
+          if (database.name === 'brain.sqlite') {
+            opens += 1
+          }
+        }
+        cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+          if (mode === entry.name) {
+            initialisations += 1
+            if (persistent || initialisations === 1) {
+              renameSync(sidecarPath, join(root, `${entry.name}-initialisation-sidecar-generation-${initialisations}`))
+              writeFileSync(sidecarPath, '')
+            }
+          }
+        }
+
+        if (persistent) {
+          assert.throws(
+            () => entry.operation(root),
+            (error: unknown) => {
+              assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED', entry.name)
+              return true
+            },
+          )
+        } else {
+          entry.operation(root)
+        }
+        const expectedAttempts = persistent ? 3 : 2
+        assert.equal(initialisations, expectedAttempts, entry.name)
+        assert.equal(opens, expectedAttempts, entry.name)
+        assert.equal(
+          statSync(join(root, `${entry.name}-initialisation-sidecar-generation-1`)).isFile(),
+          true,
+          entry.name,
+        )
+        cacheLocationTestHooks.afterDatabaseOpen = undefined
+        cacheReadTestHooks.duringDatabaseInitialisation = undefined
+      }
     }
   })
 
@@ -1801,7 +1852,36 @@ describe('SQLite cache and reads', () => {
     )
   })
 
-  test('does not return a predecessor identity after an owned-directory successor replaces it', () => {
+  test('reports a recovery marker missing only after a stable absent observation', () => {
+    const root = createRoot()
+    const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
+    let inspections = 0
+    cacheLocationTestHooks.duringOwnedDirectoryInspection = path => {
+      if (basename(path) === 'operation-lock.recovery') {
+        inspections += 1
+        if (inspections === 1) {
+          mkdirSync(path)
+          writeFileSync(
+            join(path, 'owner.json'),
+            `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: process.pid, token: 'appearing' })}\n`,
+          )
+        } else if (inspections === 2) {
+          rmSync(path, { recursive: true })
+        }
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => {
+        assert.equal(existsSync(recoveryPath), false)
+        return 'entered'
+      }),
+      'entered',
+    )
+    assert.equal(inspections, 3)
+  })
+
+  test('rejects an ambiguous owned-directory observation after a successor replaces it', () => {
     const root = createRoot()
     const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
     const displacedPath = join(root, 'owned-directory-realpath-predecessor')
@@ -1816,10 +1896,59 @@ describe('SQLite cache and reads', () => {
       }
     }
 
-    assert.equal(inspectCacheOwnedDirectory(location, 'operation-lock.recovery'), undefined)
+    assert.throws(
+      () => inspectCacheOwnedDirectory(location, 'operation-lock.recovery'),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
     const successor = statSync(recoveryPath, { bigint: true })
     assert.equal(sameCacheEntryIdentity(predecessor, successor), false)
     assert.equal(sameCacheEntryIdentity(predecessor, statSync(displacedPath, { bigint: true })), true)
+  })
+
+  test('reobserves a recovery successor replaced at the final directory identity boundary', () => {
+    const root = createRoot()
+    const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
+    const displacedPath = join(root, 'final-identity-recovery-predecessor')
+    mkdirSync(recoveryPath, { recursive: true })
+    writeFileSync(
+      join(recoveryPath, 'owner.json'),
+      `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: process.pid, token: 'final-predecessor' })}\n`,
+    )
+    cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = path => {
+      if (basename(path) === 'operation-lock.recovery') {
+        cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = undefined
+        renameSync(path, displacedPath)
+        mkdirSync(path)
+        writeFileSync(
+          join(path, 'owner.json'),
+          `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: process.pid, token: 'final-successor' })}\n`,
+        )
+      }
+    }
+    let successorObservations = 0
+
+    assert.equal(
+      withOperationLock(
+        root,
+        () => {
+          assert.equal(existsSync(recoveryPath), false)
+          return 'entered'
+        },
+        {
+          duringRecoveryObservation: () => {
+            successorObservations += 1
+            assert.match(readFileSync(join(recoveryPath, 'owner.json'), 'utf8'), /final-successor/u)
+            rmSync(recoveryPath, { recursive: true })
+          },
+        },
+      ),
+      'entered',
+    )
+    assert.equal(successorObservations, 1)
+    assert.match(readFileSync(join(displacedPath, 'owner.json'), 'utf8'), /final-predecessor/u)
   })
 
   test('reobserves when a recovery predecessor completes during observation', () => {

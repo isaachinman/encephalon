@@ -11,10 +11,8 @@ import {
   parseShowRecordInput,
 } from './api-input.ts'
 import {
-  assertCacheDatabase,
   CacheDatabaseFailure,
   type CacheLocation,
-  failCacheDatabase,
   inspectCacheDatabase,
   inspectCacheLocation,
   openVerifiedCacheDatabase,
@@ -109,6 +107,7 @@ type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind
 type CacheReadTestHooks = {
   afterCompactSearchRead?: ((query: string) => void) | undefined
   afterShowRead?: ((id: string) => void) | undefined
+  duringDatabaseInitialisation?: ((mode: 'reader' | 'writer') => void) | undefined
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
 }
@@ -254,6 +253,9 @@ const openWriterDatabase = (location: CacheLocation) => {
   const opened = openVerifiedCacheDatabase({
     afterVerifiedOpen: database => {
       database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
+      createCacheSchema(database)
+      assertCacheSchema(database)
+      cacheReadTestHooks.duringDatabaseInitialisation?.('writer')
     },
     create: true,
     DatabaseConstructor,
@@ -261,34 +263,17 @@ const openWriterDatabase = (location: CacheLocation) => {
     name: 'brain.sqlite',
     openOptions: { timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS },
   })
-  let cacheDatabase = opened.snapshot
-  try {
-    createCacheSchema(opened.database)
-    assertCacheSchema(opened.database)
-    cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-    return opened.database
-  } catch (error) {
-    let validationError: unknown
-    try {
-      cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-    } catch (candidate) {
-      validationError = candidate
-    }
-    opened.database.close()
-    if (validationError !== undefined) {
-      throw validationError
-    }
-    if (error instanceof EncephalonError) {
-      throw error
-    }
-    return failCacheDatabase(error, cacheDatabase)
-  }
+  return opened.database
 }
 
 const openReaderDatabase = (location: CacheLocation) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
   const opened = openVerifiedCacheDatabase({
+    afterVerifiedOpen: database => {
+      assertCacheSchema(database)
+      cacheReadTestHooks.duringDatabaseInitialisation?.('reader')
+    },
     create: false,
     DatabaseConstructor,
     location,
@@ -301,27 +286,7 @@ const openReaderDatabase = (location: CacheLocation) => {
       timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
     },
   })
-  let cacheDatabase = opened.snapshot
-  try {
-    assertCacheSchema(opened.database)
-    cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-    return opened.database
-  } catch (error) {
-    let validationError: unknown
-    try {
-      cacheDatabase = assertCacheDatabase(location, cacheDatabase)
-    } catch (candidate) {
-      validationError = candidate
-    }
-    opened.database.close()
-    if (validationError !== undefined) {
-      throw validationError
-    }
-    if (error instanceof EncephalonError) {
-      throw error
-    }
-    return failCacheDatabase(error, cacheDatabase)
-  }
+  return opened.database
 }
 
 const posixRelative = (root: string, path: string) =>

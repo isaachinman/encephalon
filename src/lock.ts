@@ -1,18 +1,16 @@
 import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import {
-  assertCacheDatabase,
   assertCacheLockCandidates,
-  type CacheDatabase,
   CacheDatabaseFailure,
   type CacheLocation,
   type CacheOwnedDirectory,
   cacheOwnedDirectoryIsCurrent,
   cacheOwnedDirectoryMtimeMilliseconds,
   createCacheOwnedDirectory,
-  failCacheDatabase,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
+  observeCacheOwnedDirectory,
   openVerifiedCacheDatabase,
   promoteCacheOwnedDirectory,
   quarantineCacheDatabase,
@@ -121,7 +119,6 @@ export const withOperationLock = <Result>(
   const candidateName = `operation.lock.${token}`
   const startedAt = Date.now()
   let gate: DatabaseSync | undefined
-  let gateDatabase: CacheDatabase | undefined
   let gateTransaction = false
   let candidateDirectory: CacheOwnedDirectory | undefined
   let ownedLockDirectory: CacheOwnedDirectory | undefined
@@ -133,10 +130,14 @@ export const withOperationLock = <Result>(
   }
 
   const recoveryMarkerObservation = (): RecoveryMarkerObservation => {
-    const recoveryDirectory = inspectCacheOwnedDirectory(location, recoveryName)
-    if (recoveryDirectory === undefined) {
+    const directoryObservation = observeCacheOwnedDirectory(location, recoveryName)
+    if (directoryObservation.kind === 'missing') {
       return { kind: 'absent' }
     }
+    if (directoryObservation.kind === 'changed') {
+      return { kind: 'retry' }
+    }
+    const recoveryDirectory = directoryObservation.directory
     testHooks.duringRecoveryObservation?.()
     try {
       const owner = readOwner(location, recoveryDirectory)
@@ -200,34 +201,18 @@ export const withOperationLock = <Result>(
       waitForGateRecovery()
     }
     const opened = openVerifiedCacheDatabase({
+      afterVerifiedOpen: database => {
+        database.exec('BEGIN IMMEDIATE')
+      },
       create: true,
       DatabaseConstructor: DatabaseSync,
       location,
       name: 'operation-lock.sqlite',
       openOptions: { timeout: remainingMilliseconds() },
+      preserveDatabaseLocksAfterInitialisation: true,
     })
     gate = opened.database
-    gateDatabase = opened.snapshot
-    try {
-      gate.exec('BEGIN IMMEDIATE')
-      gateTransaction = true
-    } catch (error) {
-      let validationError: unknown
-      try {
-        gateDatabase = assertCacheDatabase(location, gateDatabase)
-      } catch (candidate) {
-        validationError = candidate
-      }
-      gate.close()
-      gate = undefined
-      if (validationError !== undefined) {
-        throw validationError
-      }
-      if (error instanceof EncephalonError) {
-        throw error
-      }
-      return failCacheDatabase(error, gateDatabase)
-    }
+    gateTransaction = true
   }
 
   const recoverCorruptGate = () => {

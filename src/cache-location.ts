@@ -73,6 +73,7 @@ type VerifiedCacheDatabaseOptions<Database> = {
     readOnly?: boolean
     timeout?: number
   }
+  preserveDatabaseLocksAfterInitialisation?: boolean
 }
 
 export type CacheOwnedDirectory = CacheEntryIdentity & {
@@ -114,6 +115,7 @@ type CacheLocationTestHooks = {
   afterQuarantineRename?: ((path: string) => void) | undefined
   beforeDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
   beforeLocationInspection?: (() => void) | undefined
+  beforeOwnedDirectoryFinalIdentity?: ((path: string) => void) | undefined
   beforeQuarantineRename?: ((path: string) => void) | undefined
   duringOwnedDirectoryInspection?: ((path: string) => void) | undefined
 }
@@ -386,6 +388,56 @@ export const assertCacheDatabase = (location: CacheLocation, database: CacheData
   return { ...database, sidecars: reconcileSidecars(location, database) }
 }
 
+const assertCacheDatabaseMetadata = (location: CacheLocation, database: CacheDatabase) => {
+  // Closing another descriptor for this file can release process-scoped POSIX
+  // locks, so the operation gate uses metadata continuity after BEGIN.
+  assertCacheLocation(location)
+  let initialMetadata: BigIntStats
+  try {
+    initialMetadata = lstatSync(database.path, { bigint: true })
+  } catch (error) {
+    if (missingPath(error)) {
+      return changedLayout(databaseRelativePath(database.name), 'stable-identity')
+    }
+    throw error
+  }
+  if (!initialMetadata.isFile() || initialMetadata.isSymbolicLink()) {
+    return invalidLayout(databaseRelativePath(database.name), 'regular-non-symlink-file')
+  }
+  const captured = identityFrom(initialMetadata)
+  let actualRealpath: string
+  try {
+    actualRealpath = realpathSync.native(database.path)
+  } catch (error) {
+    if (missingPath(error)) {
+      return changedLayout(databaseRelativePath(database.name), 'stable-identity')
+    }
+    throw error
+  }
+  if (!samePath(actualRealpath, database.path)) {
+    return invalidLayout(databaseRelativePath(database.name), 'expected-realpath')
+  }
+  let finalMetadata: BigIntStats
+  try {
+    finalMetadata = lstatSync(database.path, { bigint: true })
+  } catch (error) {
+    if (missingPath(error)) {
+      return changedLayout(databaseRelativePath(database.name), 'stable-identity')
+    }
+    throw error
+  }
+  if (
+    !finalMetadata.isFile() ||
+    finalMetadata.isSymbolicLink() ||
+    !sameCacheEntryIdentity(database, captured) ||
+    !sameCacheEntryIdentity(captured, identityFrom(finalMetadata))
+  ) {
+    return changedLayout(databaseRelativePath(database.name), 'stable-identity')
+  }
+  assertCacheLocation(location)
+  return { ...database, sidecars: reconcileSidecars(location, database) }
+}
+
 export const openVerifiedCacheDatabase = <Database extends { close: () => void }>(
   options: VerifiedCacheDatabaseOptions<Database>,
 ) => {
@@ -424,7 +476,9 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
       cacheLocationTestHooks.afterDatabaseOpen?.(snapshot)
       snapshot = assertCacheDatabase(options.location, snapshot)
       options.afterVerifiedOpen?.(database)
-      snapshot = assertCacheDatabase(options.location, snapshot)
+      snapshot = options.preserveDatabaseLocksAfterInitialisation
+        ? assertCacheDatabaseMetadata(options.location, snapshot)
+        : assertCacheDatabase(options.location, snapshot)
       return { database, snapshot }
     } catch (error) {
       if (error instanceof CacheDatabaseSidecarChanged) {
@@ -505,7 +559,12 @@ const safeOwnedDirectoryName = (name: string) =>
 
 const ownedDirectoryRelativePath = (name: string) => `node_modules/.cache/encephalon/${name}`
 
-const inspectOwnedDirectoryPath = (location: CacheLocation, name: string): CacheOwnedDirectory | undefined => {
+type CacheOwnedDirectoryObservation =
+  | { kind: 'changed' }
+  | { kind: 'missing' }
+  | { directory: CacheOwnedDirectory; kind: 'stable' }
+
+const observeOwnedDirectoryPath = (location: CacheLocation, name: string): CacheOwnedDirectoryObservation => {
   if (!safeOwnedDirectoryName(name)) {
     return fail('INTERNAL_ERROR', 'An unsupported cache directory name was requested.')
   }
@@ -515,7 +574,19 @@ const inspectOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
     initialMetadata = lstatSync(path, { bigint: true })
   } catch (error) {
     if (missingPath(error)) {
-      return
+      cacheLocationTestHooks.duringOwnedDirectoryInspection?.(path)
+      try {
+        const replacement = lstatSync(path, { bigint: true })
+        if (!replacement.isDirectory() || replacement.isSymbolicLink()) {
+          return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
+        }
+        return { kind: 'changed' }
+      } catch (candidate) {
+        if (missingPath(candidate)) {
+          return { kind: 'missing' }
+        }
+        throw candidate
+      }
     }
     throw error
   }
@@ -529,19 +600,20 @@ const inspectOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
     actualRealpath = realpathSync.native(path)
   } catch (error) {
     if (missingPath(error)) {
-      return
+      return { kind: 'changed' }
     }
     throw error
   }
   if (!samePath(actualRealpath, path)) {
     return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
   }
+  cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity?.(path)
   let finalMetadata: BigIntStats
   try {
     finalMetadata = lstatSync(path, { bigint: true })
   } catch (error) {
     if (missingPath(error)) {
-      return
+      return { kind: 'changed' }
     }
     throw error
   }
@@ -549,14 +621,24 @@ const inspectOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
     return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
   }
   if (!sameCacheEntryIdentity(captured, identityFrom(finalMetadata))) {
-    return
+    return { kind: 'changed' }
   }
-  return { ...captured, name, path }
+  return { directory: { ...captured, name, path }, kind: 'stable' }
+}
+
+export const observeCacheOwnedDirectory = (location: CacheLocation, name: string) => {
+  assertCacheLocation(location)
+  const observation = observeOwnedDirectoryPath(location, name)
+  assertCacheLocation(location)
+  return observation
 }
 
 export const inspectCacheOwnedDirectory = (location: CacheLocation, name: string) => {
-  assertCacheLocation(location)
-  return inspectOwnedDirectoryPath(location, name)
+  const observation = observeCacheOwnedDirectory(location, name)
+  if (observation.kind === 'changed') {
+    return changedLayout(ownedDirectoryRelativePath(name), 'stable-identity')
+  }
+  return observation.kind === 'stable' ? observation.directory : undefined
 }
 
 export const assertCacheLockCandidates = (location: CacheLocation) => {
@@ -564,7 +646,7 @@ export const assertCacheLockCandidates = (location: CacheLocation) => {
   const candidates = readdirSync(location.directory).filter(name => /^operation\.lock\.[0-9a-f-]{36}$/u.test(name))
   // biome-ignore lint/complexity/noForEach: validation intentionally visits every candidate entry.
   candidates.forEach(name => {
-    inspectOwnedDirectoryPath(location, name)
+    observeCacheOwnedDirectory(location, name)
   })
 }
 
@@ -574,25 +656,23 @@ export const createCacheOwnedDirectory = (location: CacheLocation, name: string)
     return fail('INTERNAL_ERROR', 'An unsupported cache directory name was requested.')
   }
   mkdirSync(resolve(location.directory, name))
-  const directory = inspectOwnedDirectoryPath(location, name)
-  if (directory === undefined) {
+  const observation = observeCacheOwnedDirectory(location, name)
+  if (observation.kind !== 'stable') {
     return changedLayout(ownedDirectoryRelativePath(name), 'created-directory-present')
   }
-  return directory
+  return observation.directory
 }
 
 const assertOwnedDirectory = (location: CacheLocation, directory: CacheOwnedDirectory) => {
-  assertCacheLocation(location)
-  const current = inspectOwnedDirectoryPath(location, directory.name)
-  if (current === undefined || !sameCacheEntryIdentity(directory, current)) {
+  const observation = observeCacheOwnedDirectory(location, directory.name)
+  if (observation.kind !== 'stable' || !sameCacheEntryIdentity(directory, observation.directory)) {
     return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-identity')
   }
 }
 
 export const cacheOwnedDirectoryIsCurrent = (location: CacheLocation, directory: CacheOwnedDirectory) => {
-  assertCacheLocation(location)
-  const current = inspectOwnedDirectoryPath(location, directory.name)
-  return current !== undefined && sameCacheEntryIdentity(directory, current)
+  const observation = observeCacheOwnedDirectory(location, directory.name)
+  return observation.kind === 'stable' && sameCacheEntryIdentity(directory, observation.directory)
 }
 
 export const cacheOwnedDirectoryMtimeMilliseconds = (location: CacheLocation, directory: CacheOwnedDirectory) => {
@@ -610,18 +690,18 @@ export const promoteCacheOwnedDirectory = (
   targetName: 'operation.lock',
 ) => {
   assertOwnedDirectory(location, directory)
-  const existingTarget = inspectOwnedDirectoryPath(location, targetName)
-  if (existingTarget !== undefined) {
+  const targetObservation = observeCacheOwnedDirectory(location, targetName)
+  if (targetObservation.kind !== 'missing') {
     return changedLayout(ownedDirectoryRelativePath(targetName), 'promotion-target-missing')
   }
   const targetPath = resolve(location.directory, targetName)
   renameSync(directory.path, targetPath)
   assertCacheLocation(location)
-  const promoted = inspectOwnedDirectoryPath(location, targetName)
-  if (promoted === undefined || !sameCacheEntryIdentity(directory, promoted)) {
+  const promoted = observeCacheOwnedDirectory(location, targetName)
+  if (promoted.kind !== 'stable' || !sameCacheEntryIdentity(directory, promoted.directory)) {
     return changedLayout(ownedDirectoryRelativePath(targetName), 'stable-promoted-identity')
   }
-  return promoted
+  return promoted.directory
 }
 
 export const writeCacheOwner = (location: CacheLocation, directory: CacheOwnedDirectory, contents: string) => {
