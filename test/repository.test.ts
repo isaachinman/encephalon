@@ -159,3 +159,62 @@ test('memoizes verified executing package identity but reverifies the installed 
     },
   )
 })
+
+test('rejects unsafe executing package manifests with a stable internal error', async () => {
+  const cases = [
+    {
+      name: 'invalid JSON',
+      write: (path: string) => writeFileSync(path, '{not-json'),
+    },
+    {
+      name: 'invalid UTF-8',
+      write: (path: string) => writeFileSync(path, Buffer.from([0x7b, 0xc3, 0x28, 0x7d])),
+    },
+    {
+      name: 'oversized',
+      write: (path: string) =>
+        writeFileSync(path, JSON.stringify({ name: 'encephalon', padding: 'x'.repeat(1024 * 1024), version: '0.2.0' })),
+    },
+    {
+      name: 'symlink',
+      write: (path: string) => {
+        const target = `${path}.target`
+        writeFileSync(target, '{"name":"encephalon","version":"0.2.0"}\n')
+        rmSync(path)
+        symlinkSync(target, path, 'file')
+      },
+    },
+  ]
+
+  await Promise.all(
+    cases.map(async manifestCase => {
+      const { executingRoot, repositoryRoot } = createIsolatedPackage()
+      writeFileSync(
+        join(executingRoot, 'src', 'package.json'),
+        '{"name":"unrelated","type":"module","version":"1.0.0"}\n',
+      )
+      let manifestWritten = false
+      try {
+        manifestCase.write(join(executingRoot, 'package.json'))
+        manifestWritten = true
+      } catch (error) {
+        if (!(manifestCase.name === 'symlink' && (error as NodeJS.ErrnoException).code === 'EPERM')) {
+          throw error
+        }
+      }
+      if (manifestWritten) {
+        const repositoryModule = await import(
+          `${pathToFileURL(join(executingRoot, 'src', 'repository.ts')).href}?unsafe=${manifestCase.name}`
+        )
+        assert.throws(
+          () => repositoryModule.assertRootInstallation(repositoryRoot),
+          (error: unknown) => {
+            assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+            assert.equal((error as Error).message.includes(executingRoot), false)
+            return true
+          },
+        )
+      }
+    }),
+  )
+})
