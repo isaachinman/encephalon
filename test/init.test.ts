@@ -21,7 +21,7 @@ import {
 
 import { dirname, join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
-import { selectBoundedDirectoryEntries } from '../src/baseline.ts'
+import { scanBaseline } from '../src/baseline.ts'
 import * as api from '../src/index.ts'
 import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
@@ -33,7 +33,7 @@ import { createTestRepository, ensureParent, removeTestRepository } from '../tes
 
 const roots: string[] = []
 
-const generatedPayload = (records: api.BrainRecord[], subject: string) => {
+const generatedPayload = (records: readonly { payload: unknown; subject: string }[], subject: string) => {
   const payload = records.find(record => record.subject === subject)?.payload
   assert.equal(payload !== null && typeof payload === 'object' && !Array.isArray(payload), true)
   return payload as Record<string, unknown>
@@ -934,32 +934,135 @@ describe('initialisation', () => {
     api.initEncephalon({ root })
     const overview = generatedRecord(root, 'encephalon:init/repository-overview')
 
-    assert.equal((overview.payload as { scannedRegularFiles?: unknown }).scannedRegularFiles, 512)
+    assert.equal((overview.payload as { scannedRegularFiles?: unknown }).scannedRegularFiles, 0)
+    assert.deepEqual((overview.payload as { recognisedTopLevelFiles?: unknown }).recognisedTopLevelFiles, [])
+    assert.deepEqual((overview.payload as { topLevelDirectories?: unknown }).topLevelDirectories, [])
     assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, [
       'directory-entry-limit',
+      'top-level-entry-limit',
     ])
   })
 
-  test('selects directory entry caps from sorted names regardless of input order', () => {
-    const reverseGroupOrder = [
-      ...Array.from({ length: 300 }, (_, index) => ({
-        name: `z-${String(index).padStart(3, '0')}.py`,
-      })),
-      ...Array.from({ length: 300 }, (_, index) => ({
-        name: `a-${String(index).padStart(3, '0')}.ts`,
-      })),
-    ]
-    const { entries, truncated } = selectBoundedDirectoryEntries(reverseGroupOrder, () => true)
+  test('omits an overflowing nested language directory without dropping sibling facts', () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'keep.ts'), 'export {}\n')
+    for (let index = 0; index < 513; index += 1) {
+      const source = join(root, 'large', `customer-${String(index).padStart(3, '0')}.py`)
+      ensureParent(source)
+      writeFileSync(source, 'pass\n')
+    }
 
-    assert.equal(truncated, true)
-    assert.equal(entries.length, 512)
-    assert.deepEqual(
-      entries.map(entry => entry.name),
-      [
-        ...Array.from({ length: 300 }, (_, index) => `a-${String(index).padStart(3, '0')}.ts`),
-        ...Array.from({ length: 212 }, (_, index) => `z-${String(index).padStart(3, '0')}.py`),
-      ],
-    )
+    const baseline = scanBaseline(root)
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+
+    assert.deepEqual(overview.languageCounts, [{ files: 1, language: 'TypeScript' }])
+    assert.equal(overview.scannedRegularFiles, 1)
+    assert.deepEqual(overview.scanTruncationReasons, ['directory-entry-limit'])
+    assert.doesNotMatch(JSON.stringify(overview), /customer-/)
+  })
+
+  test('omits workflow facts when raw workflow enumeration overflows', () => {
+    const root = createRoot()
+    for (let index = 0; index < 513; index += 1) {
+      const workflow = join(root, '.github', 'workflows', `customer-${String(index).padStart(3, '0')}.yml`)
+      ensureParent(workflow)
+      writeFileSync(workflow, 'name: check\n')
+    }
+
+    const baseline = scanBaseline(root)
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
+
+    assert.deepEqual(workflow.workflowFiles, [])
+    assert.deepEqual(workflow.sources, [])
+    assert.equal(overview.scanTruncated, true)
+    assert.deepEqual(overview.scanTruncationReasons, ['directory-entry-limit', 'workflow-entry-limit'])
+    assert.doesNotMatch(JSON.stringify(baseline), /customer-/)
+  })
+
+  test('reports malformed package metadata without retaining partial package facts', () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'package.json'), '{"name":"private-project","scripts":')
+
+    const baseline = scanBaseline(root)
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
+    const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
+
+    assert.equal(overview.scanTruncated, true)
+    assert.deepEqual(overview.scanTruncationReasons, ['package-metadata-error'])
+    assert.equal('packageName' in tooling, false)
+    assert.deepEqual(tooling.workspacePatterns, [])
+    assert.deepEqual(workflow.scriptKeys, [])
+    assert.doesNotMatch(JSON.stringify(baseline), /private-project/)
+  })
+
+  test('reports replaced package metadata without retaining the old or new facts', () => {
+    const root = createRoot()
+    const packagePath = join(root, 'package.json')
+    const movedPath = join(root, 'moved-package.json')
+    const replacementPath = join(root, 'replacement.json')
+    writeFileSync(packagePath, JSON.stringify({ name: 'old-private-project' }))
+    writeFileSync(replacementPath, JSON.stringify({ name: 'new-private-project' }))
+
+    const baseline = scanBaseline(root, {
+      afterPackageMetadataLstat: () => {
+        renameSync(packagePath, movedPath)
+        renameSync(replacementPath, packagePath)
+      },
+    })
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
+
+    assert.deepEqual(overview.scanTruncationReasons, ['package-metadata-error'])
+    assert.equal('packageName' in tooling, false)
+    assert.doesNotMatch(JSON.stringify(baseline), /old-private-project|new-private-project/)
+  })
+
+  test('reports replaced workflow ancestry without retaining workflow facts', () => {
+    const root = createRoot()
+    const githubPath = join(root, '.github')
+    const movedPath = join(root, 'moved-github')
+    const replacementPath = join(root, 'replacement-github')
+    ensureParent(join(githubPath, 'workflows', 'old-private.yml'))
+    ensureParent(join(replacementPath, 'workflows', 'new-private.yml'))
+    writeFileSync(join(githubPath, 'workflows', 'old-private.yml'), 'name: old\n')
+    writeFileSync(join(replacementPath, 'workflows', 'new-private.yml'), 'name: new\n')
+
+    const baseline = scanBaseline(root, {
+      afterWorkflowEnumeration: () => {
+        renameSync(githubPath, movedPath)
+        renameSync(replacementPath, githubPath)
+      },
+    })
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
+
+    assert.deepEqual(overview.scanTruncationReasons, ['workflow-enumeration-error'])
+    assert.deepEqual(workflow.workflowFiles, [])
+    assert.deepEqual(workflow.sources, [])
+    assert.doesNotMatch(JSON.stringify(workflow), /old-private|new-private|moved-github|replacement-github/)
+  })
+
+  test('reports an unreadable language directory without retaining its names', {
+    skip: process.platform === 'win32' ? 'Windows permission handling differs from POSIX.' : false,
+  }, () => {
+    const root = createRoot()
+    const directory = join(root, 'customer-project')
+    ensureParent(join(directory, 'private-source.ts'))
+    writeFileSync(join(directory, 'private-source.ts'), 'export {}\n')
+    chmodSync(directory, 0o000)
+    try {
+      const baseline = scanBaseline(root)
+      const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+
+      assert.equal(overview.scanTruncated, true)
+      assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory'])
+      assert.deepEqual(overview.languageCounts, [])
+      assert.doesNotMatch(JSON.stringify(overview), /private-source/)
+    } finally {
+      chmodSync(directory, 0o700)
+    }
   })
 
   test('bounds baseline scanner depth without following deep chains forever', () => {
@@ -987,9 +1090,16 @@ describe('initialisation', () => {
     symlinkSync(join(outside, '.github'), join(root, '.github'))
 
     api.initEncephalon({ root })
+    const overview = generatedRecord(root, 'encephalon:init/repository-overview')
     const workflow = generatedRecord(root, 'encephalon:init/commands-ci')
 
     assert.deepEqual((workflow.payload as { workflowFiles?: unknown }).workflowFiles, [])
+    assert.deepEqual((workflow.payload as { sources?: unknown }).sources, [])
+    assert.equal((overview.payload as { scanTruncated?: unknown }).scanTruncated, true)
+    assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, [
+      'workflow-enumeration-error',
+    ])
+    assert.doesNotMatch(JSON.stringify([overview, workflow]), /leaked\.yml/)
   })
 
   test('preflights both instruction files before writing anything', () => {
