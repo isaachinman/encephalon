@@ -8,36 +8,39 @@ on:
   pull_request:
     branches:
       - main
+    types: [opened, reopened, synchronize, edited]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
   verify:
-    name: Verify (${{ matrix.label }})
+    name: verify (${{ matrix.context }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - label: Ubuntu / Node 24.15.0
+          - context: ubuntu-latest
             os: ubuntu-latest
             node: 24.15.0
-          - label: macOS / Node 24.15.0
+          - context: macos-latest
             os: macos-latest
             node: 24.15.0
-          - label: Windows / Node 24.15.0
+          - context: windows-latest
             os: windows-latest
             node: 24.15.0
-          - label: Ubuntu / Node 26
+          - context: ubuntu-current
             os: ubuntu-latest
             node: 26
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
@@ -59,6 +62,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: 24.15.0
@@ -73,6 +78,8 @@ jobs:
         run: |
           mkdir -p package-artifacts
           npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts > package-artifacts/npm-pack.json
+      - name: Check npm publish dry run
+        run: bun run check:publish
       - name: Upload release-equivalent package artifact
         uses: actions/upload-artifact@v4
         with:
@@ -80,5 +87,3 @@ jobs:
           path: package-artifacts/*
           if-no-files-found: error
           retention-days: 7
-      - name: Check npm publish dry run
-        run: bun run check:publish

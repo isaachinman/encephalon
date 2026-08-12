@@ -71,42 +71,82 @@ describe('package contract', () => {
 
   test('runs pull-request and current-Node package checks with a trusted release gate', () => {
     const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
+    const readme = readFileSync(resolve(root, 'README.md'), 'utf8')
     const publishCheck = readFileSync(resolve(root, 'scripts', 'check-publish.ts'), 'utf8')
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       scripts?: Record<string, unknown>
     }
     const publishScript = String(packageJson.scripts?.['check:publish'])
-    const [verificationJob = ''] = workflow.split('\n  release:\n', 1)
+    const jobsStart = workflow.indexOf('\njobs:\n')
+    const releaseStart = workflow.indexOf('\n  release:\n', jobsStart)
+    const workflowConfiguration = workflow.slice(0, jobsStart)
+    const verificationJob = workflow.slice(jobsStart, releaseStart)
+    const releaseJob = workflow.slice(releaseStart)
 
-    assert.match(workflow, /push:\n\s+branches:\n\s+- main\n\s+- release\/\*\*/)
-    assert.match(workflow, /pull_request:\n\s+branches:\n\s+- main/)
-    assert.match(workflow, /permissions:\n\s+contents: read/)
+    assert.match(workflowConfiguration, /push:\n\s+branches:\n\s+- main\n\s+- release\/\*\*/)
     assert.match(
-      workflow,
-      /group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/,
+      workflowConfiguration,
+      /pull_request:\n\s+branches:\n\s+- main\n\s+types: \[opened, reopened, synchronize, edited\]/,
     )
-    assert.equal(workflow.includes('cancel-in-progress: true'), true)
-    assert.match(verificationJob, /label: Ubuntu \/ Node 24\.15\.0\n\s+os: ubuntu-latest\n\s+node: 24\.15\.0/)
-    assert.match(verificationJob, /label: macOS \/ Node 24\.15\.0\n\s+os: macos-latest\n\s+node: 24\.15\.0/)
-    assert.match(verificationJob, /label: Windows \/ Node 24\.15\.0\n\s+os: windows-latest\n\s+node: 24\.15\.0/)
-    assert.match(verificationJob, /label: Ubuntu \/ Node 26\n\s+os: ubuntu-latest\n\s+node: 26/)
+    assert.match(workflowConfiguration, /permissions:\n\s+contents: read/)
+    assert.match(
+      workflowConfiguration,
+      /group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.head\.repo\.full_name \|\| github\.repository \}\}-\$\{\{ github\.head_ref \|\| github\.ref_name \}\}/,
+    )
+    assert.equal(workflowConfiguration.includes('cancel-in-progress: true'), true)
+
+    assert.match(verificationJob, /name: verify \(\$\{\{ matrix\.context \}\}\)/)
+    assert.equal(verificationJob.match(/\n\s+- context:/g)?.length, 4)
+    assert.match(verificationJob, /context: ubuntu-latest\n\s+os: ubuntu-latest\n\s+node: 24\.15\.0/)
+    assert.match(verificationJob, /context: macos-latest\n\s+os: macos-latest\n\s+node: 24\.15\.0/)
+    assert.match(verificationJob, /context: windows-latest\n\s+os: windows-latest\n\s+node: 24\.15\.0/)
+    assert.match(verificationJob, /context: ubuntu-current\n\s+os: ubuntu-latest\n\s+node: 26/)
+    assert.match(verificationJob, /runs-on: \$\{\{ matrix\.os \}\}/)
+    assert.match(verificationJob, /node-version: \$\{\{ matrix\.node \}\}/)
+    assert.match(verificationJob, /uses: actions\/checkout@v7\n\s+with:\n\s+persist-credentials: false/)
+    const verificationCommands = [
+      'bun install --frozen-lockfile',
+      'bun run typecheck',
+      'bun run test',
+      'bun run lint',
+      'bun run benchmark:check',
+      'bun run build',
+      'bun run check:package',
+    ]
     assert.equal(
-      [
-        'bun install --frozen-lockfile',
-        'bun run typecheck',
-        'bun run test',
-        'bun run lint',
-        'bun run benchmark:check',
-        'bun run build',
-        'bun run check:package',
-      ].every(command => verificationJob.includes(command)),
+      verificationCommands.every(command => verificationJob.includes(`- run: ${command}`)),
       true,
     )
-    assert.equal(workflow.match(/bun run check:package/g)?.length, 2)
-    assert.equal(workflow.match(/bun run check:publish/g)?.length, 1)
-    assert.equal(workflow.match(/actions\/upload-artifact/g)?.length, 1)
-    assert.match(workflow, /if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/)
-    assert.match(workflow, /retention-days: 7/)
+    assert.equal(verificationJob.includes('actions/upload-artifact'), false)
+    assert.equal(verificationJob.includes('bun run check:publish'), false)
+
+    assert.match(
+      releaseJob,
+      /release:\n\s+name: Release-equivalent package gate\n\s+if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'\n\s+needs: verify/,
+    )
+    assert.match(releaseJob, /uses: actions\/checkout@v7\n\s+with:\n\s+persist-credentials: false/)
+    assert.equal(
+      ['bun install --frozen-lockfile', 'bun run build', 'bun run check:package'].every(command =>
+        releaseJob.includes(`- run: ${command}`),
+      ),
+      true,
+    )
+    assert.match(releaseJob, /npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts/)
+    assert.match(releaseJob, /- name: Check npm publish dry run\n\s+run: bun run check:publish/)
+    assert.equal(releaseJob.match(/bun run check:publish/g)?.length, 1)
+    assert.equal(releaseJob.match(/actions\/upload-artifact/g)?.length, 1)
+    assert.match(
+      releaseJob,
+      /uses: actions\/upload-artifact@v4\n\s+with:\n\s+name: encephalon-npm-package\n\s+path: package-artifacts\/\*\n\s+if-no-files-found: error\n\s+retention-days: 7/,
+    )
+    assert.equal(
+      releaseJob.indexOf('npm pack') < releaseJob.indexOf('bun run check:publish') &&
+        releaseJob.indexOf('bun run check:publish') < releaseJob.indexOf('actions/upload-artifact'),
+      true,
+    )
+    assert.match(readme, /four verification lanes/)
+    assert.match(readme, /trusted pushes to `main`/)
+    assert.match(readme, /release-equivalent package gate/)
     assert.equal(publishScript, 'bun run scripts/check-publish.ts')
     assert.equal(publishCheck.includes("'--dry-run'"), true)
     assert.equal(publishCheck.includes("'--ignore-scripts'"), true)
