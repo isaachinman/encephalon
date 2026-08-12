@@ -49,6 +49,8 @@ type OwnedRecoveryMarker = {
 }
 
 const MAX_OWNER_BYTES = 4096
+const MAX_OWNER_TIMESTAMP_LENGTH = 64
+const MAX_OWNER_TOKEN_LENGTH = 128
 
 const readOwner = (location: CacheLocation, directory: CacheOwnedDirectory): LockOwner | undefined => {
   try {
@@ -56,9 +58,13 @@ const readOwner = (location: CacheLocation, directory: CacheOwnedDirectory): Loc
     const value = JSON.parse(contents ?? '') as Partial<LockOwner>
     if (
       typeof value.token === 'string' &&
-      Number.isInteger(value.pid) &&
+      value.token.length > 0 &&
+      value.token.length <= MAX_OWNER_TOKEN_LENGTH &&
+      Number.isSafeInteger(value.pid) &&
       (value.pid ?? 0) > 0 &&
-      typeof value.acquiredAt === 'string'
+      typeof value.acquiredAt === 'string' &&
+      value.acquiredAt.length > 0 &&
+      value.acquiredAt.length <= MAX_OWNER_TIMESTAMP_LENGTH
     ) {
       return value as LockOwner
     }

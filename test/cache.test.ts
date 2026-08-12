@@ -14,6 +14,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -1914,28 +1915,48 @@ describe('SQLite cache and reads', () => {
     assert.equal(existsSync(recoveryPath), false)
   })
 
-  test('waits for an old recovery marker while its owner process remains live', () => {
-    const root = createRoot()
-    const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
-    mkdirSync(recoveryPath, { recursive: true })
-    writeFileSync(
-      join(recoveryPath, 'owner.json'),
-      `${JSON.stringify({ acquiredAt: '2026-08-06T10:00:00.000Z', pid: process.pid, token: 'live-owner' })}\n`,
-    )
-    let observations = 0
+  test('waits for bounded live recovery owners and reclaims stale malformed metadata', () => {
+    const ownerCases = [
+      { acquiredAt: '2026-08-06T10:00:00.000Z', expectedObservations: 2, token: 'old-live-owner' },
+      { acquiredAt: 'not-a-date', expectedObservations: 2, token: 'unparseable-date-live-owner' },
+      { acquiredAt: '2026-08-06T10:00:00.000Z', expectedObservations: 1, token: 'x'.repeat(129) },
+      {
+        acquiredAt: '2026-08-06T10:00:00.000Z',
+        expectedObservations: 1,
+        pid: Number.MAX_SAFE_INTEGER + 1,
+        token: 'unsafe-pid',
+      },
+    ] as const
 
-    assert.equal(
-      withOperationLock(root, () => 'entered', {
-        duringRecoveryObservation: () => {
-          observations += 1
-          if (observations === 2) {
-            rmSync(recoveryPath, { recursive: true })
-          }
-        },
-      }),
-      'entered',
-    )
-    assert.equal(observations, 2)
+    for (const ownerCase of ownerCases) {
+      const root = createRoot()
+      const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
+      mkdirSync(recoveryPath, { recursive: true })
+      writeFileSync(
+        join(recoveryPath, 'owner.json'),
+        `${JSON.stringify({
+          acquiredAt: ownerCase.acquiredAt,
+          pid: 'pid' in ownerCase ? ownerCase.pid : process.pid,
+          token: ownerCase.token,
+        })}\n`,
+      )
+      const oldTimestamp = new Date('2026-08-06T10:00:00.000Z')
+      utimesSync(recoveryPath, oldTimestamp, oldTimestamp)
+      let observations = 0
+
+      assert.equal(
+        withOperationLock(root, () => 'entered', {
+          duringRecoveryObservation: () => {
+            observations += 1
+            if (observations === 2) {
+              rmSync(recoveryPath, { recursive: true })
+            }
+          },
+        }),
+        'entered',
+      )
+      assert.equal(observations, ownerCase.expectedObservations)
+    }
   })
 
   test('reacquires recovery ownership when its owner token is replaced before gate recovery', () => {
