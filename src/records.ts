@@ -21,10 +21,16 @@ import { parseAddRecordInput, parseRootInput } from './api-input.ts'
 import { hydrateResolvedRepository } from './cache.ts'
 import type { CacheLocation } from './cache-location.ts'
 import {
-  collectBoundedDirectoryEntries,
+  CanonicalDirectoryChangedError,
+  type CanonicalDirectorySnapshot,
+  captureCanonicalDirectory,
+  isCanonicalDirectoryReplacementError,
+  isCanonicalKindDirectoryEntry,
+  isCanonicalReservedDirectory,
   MAX_CANONICAL_BRAIN_ROOT_ENTRIES,
   MAX_CANONICAL_KIND_DIRECTORIES,
   MAX_CANONICAL_KIND_ENTRIES,
+  revalidateCanonicalDirectory,
 } from './canonical-layout.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { withOperationLock } from './lock.ts'
@@ -75,6 +81,8 @@ export const recordWriteTestHooks: RecordWriteHooks = {}
 type RecordReadFault = 'after-record-fstat' | 'after-record-lstat' | 'after-record-open'
 
 export type RecordReadHooks = {
+  afterBrainRootEnumeration?: (() => void) | undefined
+  afterKindEnumeration?: ((path: string) => void) | undefined
   canonicalScan?: () => void
   fault?: (point: RecordReadFault, path: string) => void
   graphValidation?: () => void
@@ -142,7 +150,6 @@ const canonicalRecordBytes = (record: BrainRecord) => {
 }
 
 const STAGING_DIRECTORY = '_staging'
-const RESERVED_DIRECTORIES = new Set(['_artifacts', STAGING_DIRECTORY])
 const directoryFlag = constants.O_DIRECTORY ?? 0
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
 export const MAX_CANONICAL_RECORDS = 1000
@@ -357,7 +364,21 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       }
     }
 
-    const rootEntries = collectBoundedDirectoryEntries(brainDirectory, MAX_CANONICAL_BRAIN_ROOT_ENTRIES)
+    let rootEntries: CanonicalDirectorySnapshot
+    try {
+      rootEntries = captureCanonicalDirectory(brainDirectory, MAX_CANONICAL_BRAIN_ROOT_ENTRIES, () =>
+        options.hooks?.afterBrainRootEnumeration?.(),
+      )
+    } catch (error) {
+      if (error instanceof CanonicalDirectoryChangedError) {
+        return {
+          bytes: 0,
+          errors: [issue('INVALID_RECORD_LAYOUT', 'encephalon changed while it was being validated.', 'encephalon')],
+          records: [],
+        }
+      }
+      throw error
+    }
     if (rootEntries.overflow) {
       return {
         bytes: 0,
@@ -365,9 +386,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
         records: [],
       }
     }
-    const kindEntries = rootEntries.entries.filter(
-      entry => !entry.name.startsWith('_') && entry.isDirectory() && !entry.isSymbolicLink(),
-    )
+    const kindEntries = rootEntries.entries.filter(isCanonicalKindDirectoryEntry)
     if (kindEntries.length > MAX_CANONICAL_KIND_DIRECTORIES) {
       return {
         bytes: 0,
@@ -375,15 +394,37 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
         records: [],
       }
     }
+    const kindSnapshots = new Map<string, CanonicalDirectorySnapshot>()
     for (const kindEntry of kindEntries) {
       const relativeKindPath = `encephalon/${kindEntry.name}`
-      if (collectBoundedDirectoryEntries(join(brainDirectory, kindEntry.name), MAX_CANONICAL_KIND_ENTRIES).overflow) {
+      const kindPath = join(brainDirectory, kindEntry.name)
+      let snapshot: CanonicalDirectorySnapshot
+      try {
+        snapshot = captureCanonicalDirectory(kindPath, MAX_CANONICAL_KIND_ENTRIES, options.hooks?.afterKindEnumeration)
+      } catch (error) {
+        if (error instanceof CanonicalDirectoryChangedError) {
+          return {
+            bytes: 0,
+            errors: [
+              issue(
+                'INVALID_RECORD_LAYOUT',
+                `${relativeKindPath} changed while it was being validated.`,
+                relativeKindPath,
+              ),
+            ],
+            records: [],
+          }
+        }
+        throw error
+      }
+      if (snapshot.overflow) {
         return {
           bytes: 0,
           errors: [directoryEntryLimitIssue(relativeKindPath, MAX_CANONICAL_KIND_ENTRIES)],
           records: [],
         }
       }
+      kindSnapshots.set(kindEntry.name, snapshot)
     }
 
     const kindDirectoryNames = new Map<string, string>()
@@ -400,7 +441,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       if (stopScanning) {
         break
       }
-      if (RESERVED_DIRECTORIES.has(kindEntry.name)) {
+      if (isCanonicalReservedDirectory(kindEntry.name)) {
         if (!(kindEntry.isDirectory() && !kindEntry.isSymbolicLink())) {
           addScanError(
             issue(
@@ -443,13 +484,9 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
             )
           }
           const kindIdentity = identityFor(kindMetadata)
-          const recordEntries = collectBoundedDirectoryEntries(kindPath, MAX_CANONICAL_KIND_ENTRIES)
-          if (recordEntries.overflow) {
-            return {
-              bytes: 0,
-              errors: [directoryEntryLimitIssue(relativeKindPath, MAX_CANONICAL_KIND_ENTRIES)],
-              records: [],
-            }
+          const recordEntries = kindSnapshots.get(kindEntry.name)
+          if (recordEntries === undefined) {
+            throw new Error('Canonical kind snapshot is missing.')
           }
           for (const recordEntry of recordEntries.entries) {
             if (stopScanning) {
@@ -519,6 +556,27 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
             ),
           )
         }
+      }
+    }
+    try {
+      for (const snapshot of kindSnapshots.values()) {
+        revalidateCanonicalDirectory(snapshot)
+      }
+      revalidateCanonicalDirectory(rootEntries)
+    } catch (error) {
+      if (error instanceof CanonicalDirectoryChangedError) {
+        if (scanned.errors.length === 0) {
+          const relativePath = posixRelative(root, error.path)
+          return {
+            bytes: 0,
+            errors: [
+              issue('INVALID_RECORD_LAYOUT', `${relativePath} changed while it was being validated.`, relativePath),
+            ],
+            records: [],
+          }
+        }
+      } else {
+        throw error
       }
     }
     return {
@@ -811,7 +869,7 @@ export const validateRecords = (input: RootInput = {}): ValidateResult => {
 
 export const readRecordsResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
   hooks.canonicalScan?.()
-  const scan = scanCanonicalRecords(root)
+  const scan = scanCanonicalRecords(root, { hooks })
   const result = validateScanned(root, scan, hooks)
   if (allowed === undefined) {
     if (result.valid) {
@@ -889,6 +947,55 @@ export const assertRecordGraph = (
       message: error.message,
     })),
   })
+}
+
+export const assertCanonicalLayoutAdditions = (root: string, kinds: readonly string[]) => {
+  const brainDirectory = resolve(root, 'encephalon')
+  let rootEntries: CanonicalDirectorySnapshot | undefined
+  try {
+    rootEntries = existsSync(brainDirectory)
+      ? captureCanonicalDirectory(brainDirectory, MAX_CANONICAL_BRAIN_ROOT_ENTRIES)
+      : undefined
+  } catch (error) {
+    if (isCanonicalDirectoryReplacementError(error)) {
+      return fail('VALIDATION_FAILED', 'Canonical layout changed before publication.', {
+        errors: [issue('INVALID_RECORD_LAYOUT', 'encephalon changed before publication.', 'encephalon')],
+      })
+    }
+    throw error
+  }
+  if (rootEntries?.overflow === true) {
+    return fail('VALIDATION_FAILED', 'Canonical layout additions would exceed directory limits.', {
+      errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_BRAIN_ROOT_ENTRIES)],
+    })
+  }
+  const entries = rootEntries === undefined ? [] : rootEntries.entries
+  const names = new Set(entries.map(entry => entry.name))
+  const additions = new Set([STAGING_DIRECTORY, ...kinds].filter(name => !names.has(name)))
+  if (names.size + additions.size > MAX_CANONICAL_BRAIN_ROOT_ENTRIES) {
+    return fail('VALIDATION_FAILED', 'Canonical layout additions would exceed directory limits.', {
+      errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_BRAIN_ROOT_ENTRIES)],
+    })
+  }
+  const existingKinds = entries.filter(isCanonicalKindDirectoryEntry).length
+  const addedKinds = [...new Set(kinds)].filter(kind => !names.has(kind)).length
+  if (existingKinds + addedKinds > MAX_CANONICAL_KIND_DIRECTORIES) {
+    return fail('VALIDATION_FAILED', 'Canonical layout additions would exceed directory limits.', {
+      errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_KIND_DIRECTORIES, 'kind directories')],
+    })
+  }
+  if (rootEntries !== undefined) {
+    try {
+      revalidateCanonicalDirectory(rootEntries)
+    } catch (error) {
+      if (isCanonicalDirectoryReplacementError(error)) {
+        return fail('VALIDATION_FAILED', 'Canonical layout changed before publication.', {
+          errors: [issue('INVALID_RECORD_LAYOUT', 'encephalon changed before publication.', 'encephalon')],
+        })
+      }
+      throw error
+    }
+  }
 }
 
 type PublishResult = {
@@ -1021,6 +1128,7 @@ const addRecordFileResolved = (
     {},
     scan.bytes + Buffer.byteLength(plan.formatted, 'utf8'),
   )
+  assertCanonicalLayoutAdditions(root, [plan.record.kind])
 
   const publishOptions = options.hooks === undefined ? {} : { hooks: options.hooks }
   const published = publishPlannedRecordInternal(root, plan, publishOptions)

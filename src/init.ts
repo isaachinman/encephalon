@@ -6,6 +6,7 @@ import { applyInstructionChanges, planInstructionChanges } from './instructions.
 import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import {
+  assertCanonicalLayoutAdditions,
   assertRecordGraph,
   planRecordAddition,
   publishPlannedRecord,
@@ -117,6 +118,10 @@ const initResolved = (input: InitEncephalonInput, hooks: InitHooks = {}): InitEn
         [...records, ...plans.map(plan => plan.record)],
         'The generated baseline would make canonical records invalid.',
         hooks,
+      )
+      assertCanonicalLayoutAdditions(
+        root,
+        plans.map(plan => plan.record.kind),
       )
     }
     const recordWriteOptions = hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }

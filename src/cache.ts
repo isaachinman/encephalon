@@ -19,11 +19,15 @@ import {
   quarantineCacheDatabase,
 } from './cache-location.ts'
 import {
+  CanonicalDirectoryChangedError,
   CanonicalDirectoryEntryLimitError,
-  collectBoundedDirectoryEntries,
+  captureCanonicalDirectory,
+  isCanonicalKindDirectoryEntry,
+  isCanonicalReservedDirectory,
   MAX_CANONICAL_BRAIN_ROOT_ENTRIES,
   MAX_CANONICAL_KIND_DIRECTORIES,
   MAX_CANONICAL_KIND_ENTRIES,
+  revalidateCanonicalDirectory,
 } from './canonical-layout.ts'
 import { EncephalonError, fail, failWithCause, wrapIo } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
@@ -114,6 +118,8 @@ type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind
 
 type CacheReadTestHooks = {
   afterCanonicalValidation?: (() => void) | undefined
+  afterManifestKindEnumeration?: ((path: string) => void) | undefined
+  afterManifestRootEnumeration?: ((path: string) => void) | undefined
   afterCompactSearchRead?: ((query: string) => void) | undefined
   afterShowRead?: ((id: string) => void) | undefined
   duringDatabaseInitialisation?: ((mode: 'reader' | 'writer') => void) | undefined
@@ -334,33 +340,42 @@ const recordManifestEntries = (root: string) => {
   if (brainEntry.type !== 'directory') {
     return [brainEntry]
   }
-  const rootEntries = collectBoundedDirectoryEntries(brainDirectory, MAX_CANONICAL_BRAIN_ROOT_ENTRIES)
+  const rootEntries = captureCanonicalDirectory(
+    brainDirectory,
+    MAX_CANONICAL_BRAIN_ROOT_ENTRIES,
+    cacheReadTestHooks.afterManifestRootEnumeration,
+  )
   if (rootEntries.overflow) {
     throw new CanonicalDirectoryEntryLimitError()
   }
-  const kindDirectoryCount = rootEntries.entries.filter(
-    entry => !entry.name.startsWith('_') && entry.isDirectory() && !entry.isSymbolicLink(),
-  ).length
+  const kindDirectoryCount = rootEntries.entries.filter(isCanonicalKindDirectoryEntry).length
   if (kindDirectoryCount > MAX_CANONICAL_KIND_DIRECTORIES) {
     throw new CanonicalDirectoryEntryLimitError()
   }
   const children = rootEntries.entries
-    .filter(entry => entry.name !== '_artifacts')
+    .filter(entry => !isCanonicalReservedDirectory(entry.name))
     .flatMap(entry => {
       const kindPath = resolve(brainDirectory, entry.name)
       const kindEntry = statEntry(root, kindPath)
-      if (!entry.isDirectory() || entry.isSymbolicLink() || kindEntry.type !== 'directory') {
+      if (!isCanonicalKindDirectoryEntry(entry) || kindEntry.type !== 'directory') {
         return [kindEntry]
       }
-      const recordEntries = collectBoundedDirectoryEntries(kindPath, MAX_CANONICAL_KIND_ENTRIES)
+      const recordEntries = captureCanonicalDirectory(
+        kindPath,
+        MAX_CANONICAL_KIND_ENTRIES,
+        cacheReadTestHooks.afterManifestKindEnumeration,
+      )
       if (recordEntries.overflow) {
         throw new CanonicalDirectoryEntryLimitError()
       }
-      return [
+      const entries = [
         kindEntry,
         ...recordEntries.entries.map(recordEntry => statEntry(root, resolve(kindPath, recordEntry.name))),
       ]
+      revalidateCanonicalDirectory(recordEntries)
+      return entries
     })
+  revalidateCanonicalDirectory(rootEntries)
   return [brainEntry, ...children]
 }
 
@@ -374,12 +389,22 @@ const repositoryManifest = (root: string, artifactPaths: string[]) => {
   return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
 }
 
-const boundedRepositoryManifest = (root: string, artifactPaths: string[]) => {
+type RepositoryManifestResult =
+  | { kind: 'changed' | 'overflow' }
+  | {
+      kind: 'stable'
+      value: string
+    }
+
+const boundedRepositoryManifest = (root: string, artifactPaths: string[]): RepositoryManifestResult => {
   try {
-    return repositoryManifest(root, artifactPaths)
+    return { kind: 'stable', value: repositoryManifest(root, artifactPaths) }
   } catch (error) {
+    if (error instanceof CanonicalDirectoryChangedError) {
+      return { kind: 'changed' }
+    }
     if (error instanceof CanonicalDirectoryEntryLimitError) {
-      return
+      return { kind: 'overflow' }
     }
     throw error
   }
@@ -589,7 +614,10 @@ const metadataIsFresh = (
   const fresh =
     metadata !== undefined &&
     metadata.schemaVersion === SCHEMA_VERSION &&
-    metadata.manifest === boundedRepositoryManifest(root, metadata.artifactPaths)
+    (() => {
+      const manifest = boundedRepositoryManifest(root, metadata.artifactPaths)
+      return manifest.kind === 'stable' && metadata.manifest === manifest.value
+    })()
   if (fresh) {
     assertCacheContentConsistent(database, metadata)
   }
@@ -638,8 +666,8 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
   let repositoryChangeObserved = false
   for (const attempt of attempts) {
     const recordManifestBefore = boundedRepositoryManifest(root, [])
-    if (recordManifestBefore === undefined) {
-      if (!repositoryChangeObserved) {
+    if (recordManifestBefore.kind !== 'stable') {
+      if (recordManifestBefore.kind === 'overflow' && !repositoryChangeObserved) {
         readRecords({ root })
       }
       repositoryChangeObserved = true
@@ -652,7 +680,8 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
     try {
       records = readRecords({ root })
     } catch (error) {
-      if (boundedRepositoryManifest(root, []) !== recordManifestBefore) {
+      const recordManifestAfter = boundedRepositoryManifest(root, [])
+      if (recordManifestAfter.kind !== 'stable' || recordManifestAfter.value !== recordManifestBefore.value) {
         repositoryChangeObserved = true
         if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {
           return fail('REPOSITORY_CHANGED', 'The repository changed repeatedly while rebuilding the Encephalon cache.')
@@ -666,7 +695,12 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
       ordinalStringCompare(first, second),
     )
     const manifestBefore = boundedRepositoryManifest(root, artifactPaths)
-    if (manifestBefore === undefined || boundedRepositoryManifest(root, []) !== recordManifestBefore) {
+    const recordsAfterValidation = boundedRepositoryManifest(root, [])
+    if (
+      manifestBefore.kind !== 'stable' ||
+      recordsAfterValidation.kind !== 'stable' ||
+      recordsAfterValidation.value !== recordManifestBefore.value
+    ) {
       repositoryChangeObserved = true
       if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {
         return fail('REPOSITORY_CHANGED', 'The repository changed repeatedly while rebuilding the Encephalon cache.')
@@ -718,14 +752,14 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
         }
         writeMetadata(database, {
           artifactPaths,
-          manifest: manifestBefore,
+          manifest: manifestBefore.value,
           packageVersion: PACKAGE_VERSION,
           recordsIndexed: records.length,
           repositoryRealpath: realpathSync.native(root),
           schemaVersion: SCHEMA_VERSION,
         })
         const manifestAfter = boundedRepositoryManifest(root, artifactPaths)
-        if (manifestAfter === manifestBefore) {
+        if (manifestAfter.kind === 'stable' && manifestAfter.value === manifestBefore.value) {
           database.exec('COMMIT')
           return { hydrated: true, recordsIndexed: records.length }
         }

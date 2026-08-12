@@ -7,6 +7,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -786,6 +787,40 @@ describe('canonical records', () => {
     assert.equal(overflow.recordsChecked, 0)
   })
 
+  test('rejects a candidate new kind before creating canonical or cache state', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 1000 }, (_, value) => value)) {
+      mkdirSync(join(root, 'encephalon', `kind-${String(index).padStart(4, '0')}`), { recursive: true })
+    }
+
+    assertValidationFailureCode(
+      () =>
+        api.addRecord({
+          id: 'new-kind-overflow',
+          kind: 'new-kind',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'validation.new-kind-overflow',
+        }),
+      'CORPUS_DIRECTORY_ENTRY_LIMIT',
+    )
+    assert.equal(existsSync(join(root, 'encephalon', 'new-kind')), false)
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+
+    assert.doesNotThrow(() =>
+      api.addRecord({
+        id: 'existing-kind-boundary',
+        kind: 'kind-0000',
+        payload: {},
+        root,
+        source: 'test',
+        subject: 'validation.existing-kind-boundary',
+      }),
+    )
+  })
+
   test('rejects addRecord when the candidate would exceed corpus count or byte budgets', () => {
     const countRoot = createRoot()
     for (const index of Array.from({ length: MAX_CANONICAL_RECORDS }, (_, value) => value)) {
@@ -1312,6 +1347,56 @@ describe('canonical records', () => {
     })
 
     assertInvalidRecord(result, record.path)
+  })
+
+  test('rejects a brain-root generation replaced after bounded enumeration', () => {
+    const root = createRoot()
+    const brainDirectory = join(root, 'encephalon')
+    const displaced = join(root, 'displaced-encephalon')
+    const replacement = join(root, 'replacement-encephalon')
+    mkdirSync(brainDirectory)
+    mkdirSync(replacement)
+    writeFileSync(join(replacement, 'outside-sentinel'), 'outside')
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        afterBrainRootEnumeration: () => {
+          renameSync(brainDirectory, displaced)
+          renameSync(replacement, brainDirectory)
+        },
+      },
+    })
+
+    assert.equal(result.valid, false)
+    assert.deepEqual(
+      result.errors.map(error => [error.code, error.path]),
+      [['INVALID_RECORD_LAYOUT', 'encephalon']],
+    )
+    assert.equal(readFileSync(join(brainDirectory, 'outside-sentinel'), 'utf8'), 'outside')
+  })
+
+  test('rejects an empty kind generation replaced after bounded enumeration', () => {
+    const root = createRoot()
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    const displaced = join(root, 'displaced-decision')
+    mkdirSync(kindDirectory, { recursive: true })
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        afterKindEnumeration: path => {
+          if (path === kindDirectory) {
+            renameSync(kindDirectory, displaced)
+            mkdirSync(kindDirectory)
+          }
+        },
+      },
+    })
+
+    assert.equal(result.valid, false)
+    assert.deepEqual(
+      result.errors.map(error => [error.code, error.path]),
+      [['INVALID_RECORD_LAYOUT', 'encephalon/decision']],
+    )
   })
 
   test('rejects a record when its parent kind directory is replaced during read', () => {

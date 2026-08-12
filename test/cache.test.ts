@@ -59,6 +59,8 @@ afterEach(() => {
   cacheLocationTestHooks.beforeQuarantineRename = undefined
   cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
+  cacheReadTestHooks.afterManifestKindEnumeration = undefined
+  cacheReadTestHooks.afterManifestRootEnumeration = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   recordWriteTestHooks.fault = undefined
   roots.splice(0).forEach(removeTestRepository)
@@ -948,6 +950,84 @@ describe('SQLite cache and reads', () => {
       },
     )
     assert.equal(existsSync(cacheDatabasePath(root)), false)
+  })
+
+  test('ignores transient staging contents in canonical validation and cache freshness', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    mkdirSync(stagingDirectory, { recursive: true })
+    for (const index of Array.from({ length: 1001 }, (_, value) => value)) {
+      writeFileSync(join(stagingDirectory, `temporary-${String(index).padStart(4, '0')}`), '')
+    }
+
+    assert.equal(api.validateRecords({ root }).valid, true)
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 0,
+    })
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: false,
+      recordsIndexed: 0,
+    })
+  })
+
+  test('retries a kind disappearance during manifest collection without an I/O failure', () => {
+    const root = createRoot()
+    const kindDirectory = join(root, 'encephalon', 'decision')
+    mkdirSync(kindDirectory, { recursive: true })
+    writeFileSync(
+      join(kindDirectory, 'transient.json'),
+      `${JSON.stringify({
+        createdAt: '2026-08-06T10:00:00.000Z',
+        id: 'transient',
+        kind: 'decision',
+        payload: {},
+        source: 'test',
+        subject: 'cache.transient-manifest',
+      })}\n`,
+    )
+    cacheReadTestHooks.afterManifestKindEnumeration = () => {
+      cacheReadTestHooks.afterManifestKindEnumeration = undefined
+      rmSync(kindDirectory, { recursive: true })
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 0,
+    })
+  })
+
+  test('bounds persistent manifest replacement as repository change and preserves operational I/O errors', () => {
+    const persistentRoot = createRoot()
+    const persistentKind = join(persistentRoot, 'encephalon', 'decision')
+    mkdirSync(persistentKind, { recursive: true })
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      mkdirSync(persistentKind, { recursive: true })
+    }
+    cacheReadTestHooks.afterManifestRootEnumeration = () => {
+      rmSync(persistentKind, { recursive: true })
+    }
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root: persistentRoot }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+
+    cacheReadTestHooks.afterCanonicalValidation = undefined
+    cacheReadTestHooks.afterManifestRootEnumeration = () => {
+      throw Object.assign(new Error('injected I/O failure'), { code: 'EIO' })
+    }
+    const ioRoot = createRoot()
+    mkdirSync(join(ioRoot, 'encephalon'))
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root: ioRoot }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        return true
+      },
+    )
   })
 
   test('keeps one stable real cache directory during concurrent first use', async () => {

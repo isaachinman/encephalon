@@ -163,6 +163,22 @@ afterEach(() => {
 })
 
 describe('initialisation', () => {
+  test('rejects baseline kind-directory overflow before publishing any batch state', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 999 }, (_, value) => value)) {
+      mkdirSync(join(root, 'encephalon', `kind-${String(index).padStart(4, '0')}`), { recursive: true })
+    }
+
+    assertErrorCode(() => api.initEncephalon({ root }), 'VALIDATION_FAILED')
+    for (const kind of ['architecture', 'context', 'workflow']) {
+      assert.equal(existsSync(join(root, 'encephalon', kind)), false)
+    }
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
   test('creates a safe deterministic baseline and exactly reversible instruction blocks', () => {
     const root = createRoot()
     const originalAgents = '# Existing agent guidance'

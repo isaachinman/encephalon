@@ -40,6 +40,22 @@ describe('bounded canonical directory collection', () => {
     assert.deepEqual(second.state(), { closed: 1, entriesRead: 3 })
   })
 
+  test('does not inspect entry names after detecting overflow', () => {
+    const entries = [
+      { name: 'first' },
+      { name: 'second' },
+      {
+        get name(): string {
+          throw new Error('overflow name accessed')
+        },
+      },
+    ]
+    const reader = readerFor(entries)
+
+    assert.deepEqual(collectBoundedDirectoryEntries('ignored', 2, reader.open), { entries: [], overflow: true })
+    assert.deepEqual(reader.state(), { closed: 1, entriesRead: 3 })
+  })
+
   test('sorts only bounded results and closes readers after success and failure', () => {
     const success = readerFor([{ name: 'z' }, { name: 'a' }])
     assert.deepEqual(collectBoundedDirectoryEntries('ignored', 2, success.open), {
