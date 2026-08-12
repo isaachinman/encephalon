@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { Stats } from 'node:fs'
+import type { BigIntStats, Stats } from 'node:fs'
 import {
   closeSync,
   constants,
@@ -11,7 +11,6 @@ import {
   mkdirSync,
   openSync,
   readSync,
-  rmSync,
   writeFileSync,
 } from 'node:fs'
 import { basename, join, relative, resolve } from 'node:path'
@@ -32,14 +31,9 @@ import {
   revalidateCanonicalDirectory,
   STAGING_DIRECTORY_NAME,
 } from './canonical-layout.ts'
-import {
-  captureDirectoryWitness,
-  type DirectoryWitness,
-  DirectoryWitnessError,
-  revalidateDirectoryWitness,
-} from './directory-witness.ts'
+import { type DirectoryWitness, DirectoryWitnessError, revalidateDirectoryWitness } from './directory-witness.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
-import { sameEntryIdentity } from './filesystem-entry.ts'
+import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.ts'
 import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import { resolveRepository } from './repository.ts'
@@ -51,7 +45,12 @@ import {
   parseRecordFile,
   validateKind,
 } from './schema.ts'
-import { cleanupStaleStagingEntries } from './staging.ts'
+import {
+  cleanupOwnedStagingEntry,
+  cleanupStaleStagingEntries,
+  createOwnedStagingName,
+  inspectCurrentStagingFile,
+} from './staging.ts'
 import type {
   AddRecordInput,
   BrainRecord,
@@ -102,9 +101,13 @@ type FileIdentity = {
 type RecordWriteFault =
   | 'after-scan-validation'
   | 'after-publication'
+  | 'after-canonical-link'
+  | 'after-staging-cleanup-quarantine'
+  | 'after-staging-cleanup-preflight'
   | 'before-directory-preparation'
   | 'before-publication'
   | 'before-staging-cleanup-entry-lstat'
+  | 'before-staging-cleanup-quarantine'
   | 'during-cleanup'
   | 'during-hydration'
   | 'during-publication-flush'
@@ -1191,17 +1194,6 @@ type PublishResult = {
   record: BrainRecord
 }
 
-const capturePublicationDirectory = (path: string) => {
-  try {
-    return captureDirectoryWitness(path, { allowLink: false })
-  } catch (error) {
-    if (error instanceof DirectoryWitnessError || isCanonicalDirectoryReplacementError(error)) {
-      return repositoryChangedBeforePublication()
-    }
-    throw error
-  }
-}
-
 const revalidatePublicationDirectories = (directories: readonly DirectoryWitness[]) => {
   try {
     for (const directory of directories) {
@@ -1228,9 +1220,11 @@ const publishPlannedRecordInternal = (
   const projection = options.authority.projection()
   if (projection.rootNames.has(STAGING_DIRECTORY_NAME)) {
     cleanupStaleStagingEntries(resolve(brainDirectory, STAGING_DIRECTORY_NAME), {
-      afterPreflight: () => fault(options.hooks, 'during-cleanup'),
+      afterPreflight: () => fault(options.hooks, 'after-staging-cleanup-preflight'),
+      afterQuarantine: () => fault(options.hooks, 'after-staging-cleanup-quarantine'),
       beforeEntryLstat: () => fault(options.hooks, 'before-staging-cleanup-entry-lstat'),
       beforeFlush: () => fault(options.hooks, 'during-staging-cleanup-flush'),
+      beforeQuarantine: () => fault(options.hooks, 'before-staging-cleanup-quarantine'),
     })
     options.authority.assertCurrent()
   }
@@ -1243,12 +1237,15 @@ const publishPlannedRecordInternal = (
   const publicationRoot = captureCanonicalDirectory(resolve(root, 'encephalon'), MAX_CANONICAL_BRAIN_ROOT_ENTRIES)
   const publicationKind = captureCanonicalDirectory(kindDirectory, MAX_CANONICAL_KIND_ENTRIES)
   options.authority.acceptPreparation(recordFile.kind, publicationRoot, publicationKind)
-  const stagingPath = resolve(stagingDirectory, `record-${process.pid}-${randomUUID()}.tmp`)
+  const stagingName = createOwnedStagingName(process.pid, randomUUID())
+  const stagingPath = resolve(stagingDirectory, stagingName)
   let published = false
   let operationFailed = false
   let cleanupError: unknown
   let committedError: EncephalonError | undefined
   let committedErrorPhase: PostCommitPhase | undefined
+  let descriptor: number | undefined
+  let descriptorMetadata: BigIntStats | undefined
   let stagingWitness: DirectoryWitness | undefined
   const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
     if (committedErrorPhase === undefined || postCommitPriority[phase] > postCommitPriority[committedErrorPhase]) {
@@ -1258,19 +1255,15 @@ const publishPlannedRecordInternal = (
   }
   try {
     assertRealDirectory(root, stagingDirectory)
-    const descriptor = openSync(
-      stagingPath,
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | noFollowFlag,
-      0o644,
-    )
-    try {
-      fault(options.hooks, 'during-staging-write')
-      writeFileSync(descriptor, formatted, 'utf8')
-      fsyncSync(descriptor)
-    } finally {
-      closeSync(descriptor)
+    descriptor = openSync(stagingPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | noFollowFlag, 0o644)
+    fault(options.hooks, 'during-staging-write')
+    writeFileSync(descriptor, formatted, 'utf8')
+    fsyncSync(descriptor)
+    descriptorMetadata = fstatSync(descriptor, { bigint: true })
+    if (!descriptorMetadata.isFile()) {
+      return repositoryChangedBeforePublication()
     }
-    stagingWitness = capturePublicationDirectory(stagingDirectory)
+    stagingWitness = inspectCurrentStagingFile(stagingDirectory, stagingName, descriptorMetadata)
     fault(options.hooks, 'before-publication')
     options.authority.assertCurrent()
     revalidatePublicationDirectories([stagingWitness])
@@ -1279,6 +1272,22 @@ const publishPlannedRecordInternal = (
     try {
       linkSync(stagingPath, path)
       published = true
+      try {
+        fault(options.hooks, 'after-canonical-link')
+        const linkedDescriptorMetadata = fstatSync(descriptor, { bigint: true })
+        const linkedStagingMetadata = lstatSync(stagingPath, { bigint: true })
+        const linkedCanonicalMetadata = lstatSync(path, { bigint: true })
+        if (
+          !(
+            sameStableEntryMetadata(linkedDescriptorMetadata, linkedStagingMetadata) &&
+            sameStableEntryMetadata(linkedDescriptorMetadata, linkedCanonicalMetadata)
+          )
+        ) {
+          throw new Error('The canonical link does not match the staged descriptor.')
+        }
+      } catch (error) {
+        throw publicationVerificationError(record, error)
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
         return fail('RECORD_EXISTS', `Record ${recordFile.id} already exists.`, {
@@ -1298,13 +1307,27 @@ const publishPlannedRecordInternal = (
     operationFailed = true
     throw error
   } finally {
+    let descriptorCloseError: unknown
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor)
+      } catch (error) {
+        descriptorCloseError = error
+      }
+      descriptor = undefined
+    }
     let stagingCleanupFault: unknown
     try {
       fault(options.hooks, 'during-cleanup')
     } catch (error) {
       stagingCleanupFault = error
     }
-    if (stagingCleanupFault === undefined) {
+    if (descriptorCloseError !== undefined && published && !operationFailed) {
+      capturePostCommitError('publicationVerification', descriptorCloseError)
+    } else if (descriptorCloseError !== undefined && !operationFailed) {
+      cleanupError = descriptorCloseError
+    }
+    if (stagingCleanupFault === undefined && descriptorCloseError === undefined) {
       try {
         revalidateCanonicalDirectory(publicationRoot)
         if (stagingWitness !== undefined) {
@@ -1329,8 +1352,14 @@ const publishPlannedRecordInternal = (
       cleanupError === undefined
     ) {
       try {
-        rmSync(stagingPath, { force: true })
-        fsyncDirectory(stagingDirectory)
+        if (descriptorMetadata !== undefined) {
+          cleanupOwnedStagingEntry(stagingDirectory, stagingName, descriptorMetadata, {
+            afterQuarantine: () => fault(options.hooks, 'after-staging-cleanup-quarantine'),
+            beforeEntryLstat: () => fault(options.hooks, 'before-staging-cleanup-entry-lstat'),
+            beforeFlush: () => fault(options.hooks, 'during-staging-cleanup-flush'),
+            beforeQuarantine: () => fault(options.hooks, 'before-staging-cleanup-quarantine'),
+          })
+        }
       } catch (error) {
         if (published) {
           capturePostCommitError('stagingCleanup', error)

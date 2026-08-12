@@ -159,6 +159,19 @@ afterEach(() => {
 })
 
 describe('initialisation', () => {
+  test('recovers a recognised stale staging entry before baseline publication', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    mkdirSync(stagingDirectory, { recursive: true })
+    writeFileSync(join(stagingDirectory, 'record-123-550e8400-e29b-41d4-a716-446655440000.tmp'), 'stale')
+
+    const result = api.initEncephalon({ root })
+
+    assert.equal(result.recordsCreated.length > 0, true)
+    assert.deepEqual(readdirSync(stagingDirectory), [])
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
   test('rejects baseline kind-directory overflow before publishing any batch state', () => {
     const root = createRoot()
     for (const index of Array.from({ length: 999 }, (_, value) => value)) {
