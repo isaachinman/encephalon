@@ -31,9 +31,12 @@ This document is the concise contract maintainers should update when public beha
 ## Cache Compatibility
 
 - SQLite is disposable derived state under `node_modules/.cache/encephalon`.
+- The repository, cache ancestors, SQLite databases and sidecars, operation-lock metadata, recovery entries, and quarantine entries must be real contained filesystem entries verified by type, native realpath, and stable identity. Static symlinks, junction redirects, unexpected types, and replacements at validation boundaries fail closed.
+- Missing cache ancestors are created individually. New primary databases use exclusive no-follow descriptor creation before SQLite opens the verified pathname, and destructive recovery removes only the exact identity moved to a verified sibling quarantine.
 - Every `list`, `show`, `search`, and `gather` operation prepares the cache before reading.
 - Cache rebuilds are transactional and repository-scoped. Corrupt or incompatible cache state is removed and rebuilt rather than treated as canonical data.
 - Freshness is determined from explicit cache metadata and a manifest of canonical records plus referenced artifacts.
+- Node's pathname-only SQLite API leaves a narrow replacement race inside SQLite's open after the surrounding identity checks. Defending against arbitrary same-user mutation between those boundaries is not a supported security boundary.
 
 ## Package and Release Gates
 
