@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-12 for audited snapshot `640d71f828484c77b980bb78319da8840ca5e3d7`.
+Last reviewed: 2026-08-12 for audited snapshot `f9de212a72e5214ba746c616de4e2562006ad10e`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -33,7 +33,7 @@ This document is the concise contract maintainers should update when public beha
 ## Initialisation and Privacy
 
 - `init` creates a bounded, deterministic, non-semantic baseline from package metadata, safe filesystem enumeration, language-count extensions, and workflow filenames.
-- Every baseline directory source reads at most 513 raw entries before filtering and is bound to a stable real-directory generation. Recursive traversal schedules at most 10,000 directories, binds each child capture to its enumerated parent, and accepts all baseline source passes only while the repository-root generation remains stable. Overflow, unreadable directories, workflow enumeration failures, and invalid, oversized, unreadable, or replaced package metadata omit the affected facts and set `scanTruncated` with bounded, ordinal-sorted reason codes in the repository overview.
+- Every baseline directory source reads at most 513 raw entries before filtering and is bound to a stable real-directory generation. Recursive traversal schedules at most 10,000 directories, binds each child capture to its enumerated parent, and accepts all baseline source passes only while the repository-root generation remains stable. The package pass always opens the literal root `package.json`; exact casing wins when case-distinct aliases coexist, while an enumerated alias supplies attribution only when that literal open succeeds on a case-insensitive filesystem. Validated top-level presence distinguishes a package or `.github` source that disappears before its preliminary metadata check from ordinary absence. Overflow, unreadable directories, workflow enumeration failures, and invalid, oversized, unreadable, or replaced package metadata omit the affected facts and set `scanTruncated` with bounded, ordinal-sorted reason codes in the repository overview.
 - The complete baseline reason vocabulary is `directory-entry-limit`, `directory-limit`, `max-depth`, `package-metadata-error`, `regular-file-limit`, `top-level-entry-limit`, `unreadable-directory`, `workflow-entry-limit`, and `workflow-enumeration-error`.
 - `init` may read root `AGENTS.md` and `CLAUDE.md` byte-for-byte only to manage the Encephalon block while preserving unrelated bytes.
 - Unrelated instruction text, source bodies, README content, environment files, registry configuration, Git history, Git remotes, and CI workflow contents must not enter generated records, cache search text, stdout, or structured error details.
