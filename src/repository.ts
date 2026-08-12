@@ -19,7 +19,6 @@ export type DiscoverRepositoryInput = {
 type PackageIdentity = {
   directory: DirectoryWitness
   name: string
-  root: string
   version: string
 }
 
@@ -32,6 +31,7 @@ type RepositoryTestHooks = {
   afterExecutingManifestRead?: ((path: string) => void) | undefined
   afterExecutingParentCapture?: ((path: string) => void) | undefined
   afterGitDirectoryLstat?: ((path: string) => void) | undefined
+  afterGitMarkerDecision?: (() => void) | undefined
   afterInstalledManifestRead?: ((path: string) => void) | undefined
   afterRepositoryParentCapture?: ((path: string) => void) | undefined
   afterRootInstallation?: (() => void) | undefined
@@ -49,6 +49,10 @@ const isMissingOrNotDirectory = (error: unknown) => {
   const { code } = error as NodeJS.ErrnoException
   return code === 'ENOENT' || code === 'ENOTDIR'
 }
+const isPathReplacement = (error: unknown) =>
+  error instanceof DirectoryWitnessError ||
+  isMissingOrNotDirectory(error) ||
+  (error as NodeJS.ErrnoException).code === 'ELOOP'
 
 const captureLinkedDirectory = (path: string) => captureDirectoryWitness(path, { allowLink: true })
 const captureRealDirectory = (path: string, afterCanonicalisation?: () => void) =>
@@ -71,15 +75,18 @@ const validGitMarker = (directory: DirectoryWitness) => {
         const match = /^gitdir:\s*(.+)$/i.exec(decodeVerifiedUtf8(bytes).trim())
         if (match?.[1] !== undefined) {
           const target = match[1].trim()
-          const gitDirectory = isAbsolute(target) ? target : resolve(directory.canonicalPath, target)
-          const administrationDirectory = captureRealDirectory(gitDirectory, () =>
-            repositoryTestHooks.afterGitDirectoryLstat?.(gitDirectory),
-          )
-          revalidateDirectoryWitness(administrationDirectory)
-          markerValid = true
+          if (target.length > 0 && !target.includes('\0')) {
+            const gitDirectory = isAbsolute(target) ? target : resolve(directory.canonicalPath, target)
+            const administrationDirectory = captureRealDirectory(gitDirectory, () =>
+              repositoryTestHooks.afterGitDirectoryLstat?.(gitDirectory),
+            )
+            revalidateDirectoryWitness(administrationDirectory)
+            markerValid = true
+          }
         }
       }
     }
+    repositoryTestHooks.afterGitMarkerDecision?.()
     revalidateDirectoryWitness(directory)
     return markerValid
   } catch (error) {
@@ -90,11 +97,11 @@ const validGitMarker = (directory: DirectoryWitness) => {
   }
 }
 
-const captureRepositoryDirectory = (path: string, explicit: boolean) => {
+const captureRepositoryDirectory = (path: string, options: { explicit: boolean }) => {
   try {
     return captureLinkedDirectory(resolve(path))
   } catch (error) {
-    if (explicit && error instanceof DirectoryWitnessError) {
+    if (options.explicit && error instanceof DirectoryWitnessError) {
       return fail('INVALID_REPOSITORY', 'The explicit root is not a Git repository.')
     }
     return wrapIo('Unable to resolve the repository path.', error)
@@ -103,14 +110,14 @@ const captureRepositoryDirectory = (path: string, explicit: boolean) => {
 
 const discoverRepositoryWitness = (input: DiscoverRepositoryInput = {}) => {
   if (input.root !== undefined) {
-    const explicitRoot = captureRepositoryDirectory(input.root, true)
+    const explicitRoot = captureRepositoryDirectory(input.root, { explicit: true })
     if (validGitMarker(explicitRoot)) {
       return explicitRoot
     }
     return fail('INVALID_REPOSITORY', 'The explicit root is not a Git repository.')
   }
 
-  let current = captureRepositoryDirectory(input.start ?? process.cwd(), false)
+  let current = captureRepositoryDirectory(input.start ?? process.cwd(), { explicit: false })
   for (;;) {
     if (validGitMarker(current)) {
       return current
@@ -119,12 +126,15 @@ const discoverRepositoryWitness = (input: DiscoverRepositoryInput = {}) => {
     if (parentPath === current.canonicalPath) {
       return fail('REPOSITORY_NOT_FOUND', 'No Git repository was found.')
     }
-    const parent = captureRepositoryDirectory(parentPath, false)
-    repositoryTestHooks.afterRepositoryParentCapture?.(current.path)
+    const parent = captureRepositoryDirectory(parentPath, { explicit: false })
     try {
+      repositoryTestHooks.afterRepositoryParentCapture?.(current.path)
       revalidateDirectoryWitness(current)
-    } catch {
-      return fail('INVALID_REPOSITORY', 'The repository path changed during discovery.')
+    } catch (error) {
+      if (isPathReplacement(error)) {
+        return fail('INVALID_REPOSITORY', 'The repository path changed during discovery.')
+      }
+      return wrapIo('Unable to verify the repository path during discovery.', error)
     }
     current = parent
   }
@@ -145,7 +155,12 @@ const findExecutingPackage = (): PackageIdentity => {
   if (executingPackageIdentity !== undefined) {
     return executingPackageIdentity
   }
-  let current = captureLinkedDirectory(dirname(fileURLToPath(import.meta.url)))
+  let current: DirectoryWitness
+  try {
+    current = captureLinkedDirectory(dirname(fileURLToPath(import.meta.url)))
+  } catch (error) {
+    return wrapIo('Unable to inspect the executing package.', error)
+  }
   for (;;) {
     let packageJson: PackageManifest | undefined
     try {
@@ -164,7 +179,6 @@ const findExecutingPackage = (): PackageIdentity => {
         const identity = {
           directory: current,
           name: packageJson.name,
-          root: current.canonicalPath,
           version: packageJson.version,
         }
         executingPackageIdentity = identity
@@ -199,7 +213,8 @@ const installedVerificationError = (error: unknown): never => {
     error instanceof DirectoryWitnessError ||
     error instanceof VerifiedFileError ||
     error instanceof SyntaxError ||
-    isMissingOrNotDirectory(error)
+    isMissingOrNotDirectory(error) ||
+    (error as NodeJS.ErrnoException).code === 'ELOOP'
   ) {
     return rootInstallationRequired()
   }
@@ -217,7 +232,7 @@ const assertRootInstallationWitness = (root: DirectoryWitness) => {
 
   const executingPackage = findExecutingPackage()
   if (
-    comparablePath(installedDirectory.canonicalPath) === comparablePath(executingPackage.root) &&
+    comparablePath(installedDirectory.canonicalPath) === comparablePath(executingPackage.directory.canonicalPath) &&
     sameStableEntryMetadata(installedDirectory.canonicalMetadata, executingPackage.directory.canonicalMetadata)
   ) {
     let packageJson: PackageManifest
@@ -256,11 +271,14 @@ export const assertRootInstallation = (root: string) => assertRootInstallationWi
 export const resolveRepository = (input: { root?: string } = {}) => {
   const root = discoverRepositoryWitness(input)
   assertRootInstallationWitness(root)
-  repositoryTestHooks.afterRootInstallation?.()
   try {
+    repositoryTestHooks.afterRootInstallation?.()
     revalidateDirectoryWitness(root)
-  } catch {
-    return fail('INVALID_REPOSITORY', 'The repository path changed while its installation was verified.')
+  } catch (error) {
+    if (isPathReplacement(error)) {
+      return fail('INVALID_REPOSITORY', 'The repository path changed while its installation was verified.')
+    }
+    return wrapIo('Unable to verify the repository path after installation.', error)
   }
   return root.canonicalPath
 }

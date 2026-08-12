@@ -73,7 +73,7 @@ export const revalidateDirectoryWitness = (witness: DirectoryWitness, options: R
     allowLink: witness.allowLink,
   })
   if (witnessMatches(witness, current)) {
-    return current
+    return
   }
   return changed()
 }

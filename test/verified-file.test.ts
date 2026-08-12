@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { linkSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, test } from 'node:test'
@@ -25,12 +25,21 @@ test('reads only bounded regular files and decodes UTF-8 fatally', () => {
   writeFileSync(file, 'gitdir: admin\n')
 
   assert.equal(readVerifiedRegularFile(join(root, 'missing'), 64), undefined)
-  const bytes = readVerifiedRegularFile(file, 64)
+  let allocationReached = false
+  const bytes = readVerifiedRegularFile(file, 64, {
+    fault: point => {
+      if (point === 'before-allocation') {
+        allocationReached = true
+      }
+    },
+  })
   if (bytes !== undefined) {
     assert.equal(decodeVerifiedUtf8(bytes), 'gitdir: admin\n')
   }
   assert.notEqual(bytes, undefined)
+  assert.equal(allocationReached, true)
   let oversizedDescriptorReached = false
+  allocationReached = false
   assert.throws(
     () =>
       readVerifiedRegularFile(file, 4, {
@@ -38,11 +47,15 @@ test('reads only bounded regular files and decodes UTF-8 fatally', () => {
           if (point === 'after-fstat') {
             oversizedDescriptorReached = true
           }
+          if (point === 'before-allocation') {
+            allocationReached = true
+          }
         },
       }),
     VerifiedFileError,
   )
   assert.equal(oversizedDescriptorReached, false)
+  assert.equal(allocationReached, false)
 
   const directory = join(root, 'directory')
   mkdirSync(directory)
@@ -99,7 +112,9 @@ test('rejects a pathname replacement after the descriptor final metadata check',
   const root = createRoot()
   const manifest = join(root, 'package.json')
   const captured = join(root, 'captured.json')
+  const successor = join(root, 'successor.json')
   writeFileSync(manifest, '{"name":"encephalon"}')
+  writeFileSync(successor, '{"name":"successor"}')
 
   assert.throws(
     () =>
@@ -107,12 +122,14 @@ test('rejects a pathname replacement after the descriptor final metadata check',
         fault: point => {
           if (point === 'before-final-path-lstat') {
             renameSync(manifest, captured)
-            linkSync(captured, manifest)
+            renameSync(successor, manifest)
           }
         },
       }),
     VerifiedFileError,
   )
+  assert.equal(readFileSync(captured, 'utf8'), '{"name":"encephalon"}')
+  assert.equal(readFileSync(manifest, 'utf8'), '{"name":"successor"}')
 })
 
 test('rejects a file whose descriptor changes after its initial metadata check', () => {

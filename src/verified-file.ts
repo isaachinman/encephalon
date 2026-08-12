@@ -3,7 +3,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from '
 import { TextDecoder } from 'node:util'
 import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.ts'
 
-type VerifiedFileFault = 'after-fstat' | 'after-lstat' | 'before-final-path-lstat'
+type VerifiedFileFault = 'after-fstat' | 'after-lstat' | 'before-allocation' | 'before-final-path-lstat'
 
 type VerifiedFileOptions = {
   fault?: (point: VerifiedFileFault) => void
@@ -58,6 +58,7 @@ const readVerifiedDescriptor = (
     return changed()
   }
   options.fault?.('after-fstat')
+  options.fault?.('before-allocation')
   const bytes = readExactBytes(descriptor, Number(metadata.size))
   const finalMetadata = fstatSync(descriptor, { bigint: true })
   options.fault?.('before-final-path-lstat')
