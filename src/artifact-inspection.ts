@@ -312,23 +312,17 @@ export const inspectArtifactFiles = (
   }
   const results = artifacts.map(inspectArtifact)
   results.reduce<undefined>((verified, result) => {
-    if (result.kind === 'stable') {
-      let verification: StableArtifactInspection
-      try {
-        verification = inspectFinalFile(
-          captureAncestors(brain, result.observation.path, effectiveHooks),
-          result.observation.path,
-          effectiveHooks,
-        )
-      } catch (error) {
-        if (error instanceof ArtifactInvalidError) {
-          changed()
-        }
-        throw error
-      }
-      if (!sameStableEntryMetadata(result.observation.metadata, verification.observation.metadata)) {
-        changed()
-      }
+    const path = result.kind === 'stable' ? result.observation.path : result.path
+    const verification = inspectArtifact(path)
+    if (result.kind !== verification.kind) {
+      changed()
+    }
+    if (
+      result.kind === 'stable' &&
+      verification.kind === 'stable' &&
+      !sameStableEntryMetadata(result.observation.metadata, verification.observation.metadata)
+    ) {
+      changed()
     }
     return verified
   }, undefined)

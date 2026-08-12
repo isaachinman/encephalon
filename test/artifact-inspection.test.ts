@@ -415,6 +415,28 @@ test('rejects an earlier artifact changed while a later artifact is inspected', 
   )
 })
 
+test('rejects an initially invalid artifact that becomes stable during batch inspection', () => {
+  const { artifact, brainDirectory, path } = createArtifact()
+  const laterArtifact = '_artifacts/decision/later-artifact/evidence.txt'
+  mkdirSync(dirname(join(brainDirectory, ...laterArtifact.split('/'))), { recursive: true })
+  writeFileSync(join(brainDirectory, ...laterArtifact.split('/')), 'later evidence')
+  rmSync(path)
+  let created = false
+
+  assert.throws(
+    () =>
+      inspectArtifactFiles(brainDirectory, [artifact, laterArtifact], {
+        fault: (point, currentArtifact) => {
+          if (!created && point === 'after-artifact-lstat' && currentArtifact === laterArtifact) {
+            created = true
+            writeFileSync(path, 'newly created evidence')
+          }
+        },
+      }),
+    ArtifactChangedError,
+  )
+})
+
 test('classifies a stable case-canonicalisation mismatch as invalid', {
   skip: !filesystemCapabilities.caseInsensitiveCanonicalPath,
 }, () => {
