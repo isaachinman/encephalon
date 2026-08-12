@@ -837,10 +837,17 @@ export const readCacheOwner = (location: CacheLocation, directory: CacheOwnedDir
   }
 }
 
-export const quarantineCacheOwnedDirectory = (location: CacheLocation, directory: CacheOwnedDirectory) => {
+export const quarantineCacheOwnedDirectory = (
+  location: CacheLocation,
+  directory: CacheOwnedDirectory,
+  ownershipIsCurrent?: () => boolean,
+) => {
   assertOwnedDirectory(location, directory)
   cacheLocationTestHooks.beforeQuarantineRename?.(directory.path)
   assertOwnedDirectory(location, directory)
+  if (!(ownershipIsCurrent?.() ?? true)) {
+    return false
+  }
   const quarantineName = `.${directory.name}.${randomUUID()}.quarantine`
   const quarantinePath = resolve(location.directory, quarantineName)
   renameSync(directory.path, quarantinePath)
@@ -863,4 +870,5 @@ export const quarantineCacheOwnedDirectory = (location: CacheLocation, directory
   }
   rmdirSync(quarantinePath)
   assertCacheLocation(location)
+  return true
 }
