@@ -69,18 +69,44 @@ describe('package contract', () => {
     assert.doesNotMatch(skill, /node \.\/node_modules\/encephalon\/dist\/cli\.mjs/)
   })
 
-  test('runs package and publish-contract checks in CI without publishing', () => {
+  test('runs pull-request and current-Node package checks with a trusted release gate', () => {
     const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
     const publishCheck = readFileSync(resolve(root, 'scripts', 'check-publish.ts'), 'utf8')
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       scripts?: Record<string, unknown>
     }
     const publishScript = String(packageJson.scripts?.['check:publish'])
+    const [verificationJob = ''] = workflow.split('\n  release:\n', 1)
 
-    assert.equal(workflow.includes('bun run check:package'), true)
-    assert.equal(workflow.includes('bun run check:publish'), true)
-    assert.equal(workflow.includes("matrix.os == 'ubuntu-latest'"), true)
-    assert.equal(workflow.includes('actions/upload-artifact'), true)
+    assert.match(workflow, /push:\n\s+branches:\n\s+- main\n\s+- release\/\*\*/)
+    assert.match(workflow, /pull_request:\n\s+branches:\n\s+- main/)
+    assert.match(workflow, /permissions:\n\s+contents: read/)
+    assert.match(
+      workflow,
+      /group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/,
+    )
+    assert.equal(workflow.includes('cancel-in-progress: true'), true)
+    assert.match(verificationJob, /label: Ubuntu \/ Node 24\.15\.0\n\s+os: ubuntu-latest\n\s+node: 24\.15\.0/)
+    assert.match(verificationJob, /label: macOS \/ Node 24\.15\.0\n\s+os: macos-latest\n\s+node: 24\.15\.0/)
+    assert.match(verificationJob, /label: Windows \/ Node 24\.15\.0\n\s+os: windows-latest\n\s+node: 24\.15\.0/)
+    assert.match(verificationJob, /label: Ubuntu \/ Node 26\n\s+os: ubuntu-latest\n\s+node: 26/)
+    assert.equal(
+      [
+        'bun install --frozen-lockfile',
+        'bun run typecheck',
+        'bun run test',
+        'bun run lint',
+        'bun run benchmark:check',
+        'bun run build',
+        'bun run check:package',
+      ].every(command => verificationJob.includes(command)),
+      true,
+    )
+    assert.equal(workflow.match(/bun run check:package/g)?.length, 2)
+    assert.equal(workflow.match(/bun run check:publish/g)?.length, 1)
+    assert.equal(workflow.match(/actions\/upload-artifact/g)?.length, 1)
+    assert.match(workflow, /if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/)
+    assert.match(workflow, /retention-days: 7/)
     assert.equal(publishScript, 'bun run scripts/check-publish.ts')
     assert.equal(publishCheck.includes("'--dry-run'"), true)
     assert.equal(publishCheck.includes("'--ignore-scripts'"), true)
