@@ -952,7 +952,8 @@ Directory traversal:
 
 - Walk regular files recursively without following symlinks.
 - Stream at most 513 raw entries from each language-scan directory, the repository root, and `.github/workflows`, then sort accepted bounded entries to ensure deterministic output.
-- Omit an entire directory source on overflow instead of retaining a filesystem-order-dependent prefix. Bind successful enumeration to a stable real-directory generation, including both `.github` and its `workflows` child.
+- Omit an entire directory source on overflow instead of retaining a filesystem-order-dependent prefix. Bind successful enumeration to a stable real-directory generation, including each queued child and its enumerated parent, both `.github` and its `workflows` child, and one repository-root generation shared by all baseline source passes.
+- Reserve the 10,000-directory traversal budget while scheduling children so queued paths and attempted directory reads cannot exceed the bound.
 - Report skipped work in the repository overview through the finite, ordinal-sorted reason vocabulary: `directory-entry-limit`, `directory-limit`, `max-depth`, `package-metadata-error`, `regular-file-limit`, `top-level-entry-limit`, `unreadable-directory`, `workflow-entry-limit`, and `workflow-enumeration-error`. Any reason makes `scanTruncated` true.
 - Exclude `.git`, `encephalon`, `node_modules`, common dependency/vendor directories, caches, coverage, build output, generated output, temporary directories, and package-manager stores.
 - Do not read hidden environment or registry files.
