@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-12 for audited snapshot `925ca345bd3bdf1e9c3b30d4364ebd09ef0ab90e`.
+Last reviewed: 2026-08-12 for audited snapshot `34c8394af3a3f54729c56ebf5b3394e5bdf3e11c`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -12,8 +12,8 @@ This document is the concise contract maintainers should update when public beha
 - API failures that users can reasonably handle throw `EncephalonError` with a stable code from `src/types.ts`.
 - CLI success writes one JSON value to stdout for JSON commands and exits `0`. Expected user errors write one structured JSON error to stderr and exit `2`. Validation failures print the validation result to stdout and exit `2`.
 - User and agent command examples use the installed package manager binary form, `npx --no-install encephalon ...`, after the package has been installed at the repository root. Runtime execution still verifies that the executing package is the root `node_modules/encephalon` installation.
-- Git marker files and package manifests used for repository or executing-package identity are read through bounded, no-follow regular-file descriptors with stable identity and fatal UTF-8 decoding. Their input and canonical directory generations must remain stable around the dependent read. Worktree administration targets are accepted only when their real-directory identity remains stable across native realpath resolution. Repository and executing-package ascent also revalidate each child generation after capturing its parent.
-- Executing package identity is cached only after its manifest and exact canonical directory generation have been verified successfully. Each repository root still reverifies its installed Encephalon manifest and directory generation on every resolution, and the installed generation must match the cached executing generation. The discovered repository generation remains verified through root-installation acceptance. Unsafe or malformed installed manifests use the generic root-install-required failure; operational filesystem failures retain the stable I/O error classification.
+- Git marker files and package manifests used for repository or executing-package identity are read through bounded, no-follow regular-file descriptors with stable identity and fatal UTF-8 decoding. Worktree targets must be non-empty and NUL-free, and are accepted only when their real-directory identity remains stable across native realpath resolution. Repository and executing-package ascent also revalidate each child generation after capturing its parent.
+- Executing package identity is cached only after its manifest and exact canonical directory generation have been verified successfully. Each repository root still reverifies its installed Encephalon manifest and directory generation on every resolution, and the installed generation must match the cached executing generation. The discovered repository generation remains verified through root-installation acceptance. Unsafe or malformed installed manifests use the generic root-install-required failure; path-generation changes use the stable repository classification while operational filesystem failures retain the stable I/O error classification.
 
 ## Canonical Storage
 
