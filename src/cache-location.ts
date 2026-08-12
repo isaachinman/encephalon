@@ -845,30 +845,30 @@ export const quarantineCacheOwnedDirectory = (
   assertOwnedDirectory(location, directory)
   cacheLocationTestHooks.beforeQuarantineRename?.(directory.path)
   assertOwnedDirectory(location, directory)
-  if (!(ownershipIsCurrent?.() ?? true)) {
-    return false
+  if (ownershipIsCurrent?.() ?? true) {
+    const quarantineName = `.${directory.name}.${randomUUID()}.quarantine`
+    const quarantinePath = resolve(location.directory, quarantineName)
+    renameSync(directory.path, quarantinePath)
+    assertCacheLocation(location)
+    const movedMetadata = quarantineMetadata(quarantinePath, ownedDirectoryRelativePath(directory.name))
+    if (!(movedMetadata.isDirectory() && sameCacheEntryIdentity(directory, identityFrom(movedMetadata)))) {
+      return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-quarantine-identity')
+    }
+    const movedIncarnation = incarnationFrom(movedMetadata)
+    cacheLocationTestHooks.afterQuarantineRename?.(quarantinePath)
+    assertCacheLocation(location)
+    const metadata = quarantineMetadata(quarantinePath, ownedDirectoryRelativePath(directory.name))
+    if (!(metadata.isDirectory() && sameCacheEntryIncarnation(movedIncarnation, incarnationFrom(metadata)))) {
+      return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-quarantine-identity')
+    }
+    const ownerPath = resolve(quarantinePath, 'owner.json')
+    const owner = inspectRegularFile(ownerPath, `${ownedDirectoryRelativePath(directory.name)}/owner.json`)
+    if (owner !== undefined) {
+      unlinkSync(ownerPath)
+    }
+    rmdirSync(quarantinePath)
+    assertCacheLocation(location)
+    return true
   }
-  const quarantineName = `.${directory.name}.${randomUUID()}.quarantine`
-  const quarantinePath = resolve(location.directory, quarantineName)
-  renameSync(directory.path, quarantinePath)
-  assertCacheLocation(location)
-  const movedMetadata = quarantineMetadata(quarantinePath, ownedDirectoryRelativePath(directory.name))
-  if (!(movedMetadata.isDirectory() && sameCacheEntryIdentity(directory, identityFrom(movedMetadata)))) {
-    return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-quarantine-identity')
-  }
-  const movedIncarnation = incarnationFrom(movedMetadata)
-  cacheLocationTestHooks.afterQuarantineRename?.(quarantinePath)
-  assertCacheLocation(location)
-  const metadata = quarantineMetadata(quarantinePath, ownedDirectoryRelativePath(directory.name))
-  if (!(metadata.isDirectory() && sameCacheEntryIncarnation(movedIncarnation, incarnationFrom(metadata)))) {
-    return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-quarantine-identity')
-  }
-  const ownerPath = resolve(quarantinePath, 'owner.json')
-  const owner = inspectRegularFile(ownerPath, `${ownedDirectoryRelativePath(directory.name)}/owner.json`)
-  if (owner !== undefined) {
-    unlinkSync(ownerPath)
-  }
-  rmdirSync(quarantinePath)
-  assertCacheLocation(location)
-  return true
+  return false
 }

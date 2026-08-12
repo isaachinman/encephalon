@@ -36,11 +36,17 @@ type LockTestHooks = {
   afterRecoveryStaleObservation?: (() => void) | undefined
   afterStaleObservation?: (() => void) | undefined
   duringRecoveryObservation?: (() => void) | undefined
+  now?: (() => number) | undefined
 }
 
 type RecoveryMarkerObservation =
   | { kind: 'absent' }
-  | { kind: 'observed'; directory: CacheOwnedDirectory; stale: boolean }
+  | {
+      kind: 'observed'
+      directory: CacheOwnedDirectory
+      owner: Pick<LockOwner, 'pid' | 'token'> | undefined
+      stale: boolean
+    }
   | { kind: 'retry' }
 
 type OwnedRecoveryMarker = {
@@ -49,6 +55,7 @@ type OwnedRecoveryMarker = {
 }
 
 const MAX_OWNER_BYTES = 4096
+const MAX_OWNER_PID = 2_147_483_647
 const MAX_OWNER_TIMESTAMP_LENGTH = 64
 const MAX_OWNER_TOKEN_LENGTH = 128
 
@@ -62,6 +69,7 @@ const readOwner = (location: CacheLocation, directory: CacheOwnedDirectory): Loc
       value.token.length <= MAX_OWNER_TOKEN_LENGTH &&
       Number.isSafeInteger(value.pid) &&
       (value.pid ?? 0) > 0 &&
+      (value.pid ?? 0) <= MAX_OWNER_PID &&
       typeof value.acquiredAt === 'string' &&
       value.acquiredAt.length > 0 &&
       value.acquiredAt.length <= MAX_OWNER_TIMESTAMP_LENGTH
@@ -106,13 +114,14 @@ export const withOperationLock = <Result>(
   const recoveryName = 'operation-lock.recovery'
   const token = randomUUID()
   const candidateName = `operation.lock.${token}`
-  const startedAt = Date.now()
+  const now = testHooks.now ?? Date.now
+  const startedAt = now()
   let gate: DatabaseSync | undefined
   let gateTransaction = false
   let candidateDirectory: CacheOwnedDirectory | undefined
   let ownedLockDirectory: CacheOwnedDirectory | undefined
 
-  const remainingMilliseconds = () => Math.max(0, LOCK_WAIT_MILLISECONDS - (Date.now() - startedAt))
+  const remainingMilliseconds = () => Math.max(0, LOCK_WAIT_MILLISECONDS - (now() - startedAt))
 
   const wait = (milliseconds: number) => {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds)
@@ -134,14 +143,15 @@ export const withOperationLock = <Result>(
         return {
           directory: recoveryDirectory,
           kind: 'observed',
+          owner: { pid: owner.pid, token: owner.token },
           stale: !processIsRunning(owner.pid),
         }
       }
       return {
         directory: recoveryDirectory,
         kind: 'observed',
-        stale:
-          Date.now() - cacheOwnedDirectoryMtimeMilliseconds(location, recoveryDirectory) > RECOVERY_STALE_MILLISECONDS,
+        owner: undefined,
+        stale: now() - cacheOwnedDirectoryMtimeMilliseconds(location, recoveryDirectory) > RECOVERY_STALE_MILLISECONDS,
       }
     } catch (error) {
       if (cacheOwnedDirectoryIsCurrent(location, recoveryDirectory)) {
@@ -151,10 +161,25 @@ export const withOperationLock = <Result>(
     }
   }
 
-  const reclaimRecoveryMarker = (recoveryDirectory: CacheOwnedDirectory) => {
+  const recoveryMarkerRemainsStale = (observation: Extract<RecoveryMarkerObservation, { kind: 'observed' }>) => {
+    const currentOwner = readOwner(location, observation.directory)
+    if (observation.owner !== undefined) {
+      return (
+        currentOwner?.token === observation.owner.token &&
+        currentOwner.pid === observation.owner.pid &&
+        !processIsRunning(currentOwner.pid)
+      )
+    }
+    return (
+      currentOwner === undefined &&
+      now() - cacheOwnedDirectoryMtimeMilliseconds(location, observation.directory) > RECOVERY_STALE_MILLISECONDS
+    )
+  }
+
+  const reclaimRecoveryMarker = (observation: Extract<RecoveryMarkerObservation, { kind: 'observed' }>) => {
     testHooks.afterRecoveryStaleObservation?.()
-    if (cacheOwnedDirectoryIsCurrent(location, recoveryDirectory)) {
-      quarantineCacheOwnedDirectory(location, recoveryDirectory)
+    if (cacheOwnedDirectoryIsCurrent(location, observation.directory)) {
+      quarantineCacheOwnedDirectory(location, observation.directory, () => recoveryMarkerRemainsStale(observation))
     }
   }
 
@@ -181,7 +206,7 @@ export const withOperationLock = <Result>(
         })
       }
       if (observation.kind === 'observed' && observation.stale) {
-        reclaimRecoveryMarker(observation.directory)
+        reclaimRecoveryMarker(observation)
       }
       if (observation.kind === 'observed') {
         wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))
@@ -218,6 +243,11 @@ export const withOperationLock = <Result>(
   const acquireRecoveryMarker = (): OwnedRecoveryMarker => {
     let ownedMarker: OwnedRecoveryMarker | undefined
     while (ownedMarker === undefined) {
+      if (remainingMilliseconds() === 0) {
+        return fail('CACHE_BUSY', 'Timed out waiting for the Encephalon operation lock.', {
+          timeoutMilliseconds: LOCK_WAIT_MILLISECONDS,
+        })
+      }
       try {
         const recoveryDirectory = createCacheOwnedDirectory(location, recoveryName)
         writeCacheOwner(
@@ -233,6 +263,8 @@ export const withOperationLock = <Result>(
         const candidate = { directory: recoveryDirectory, token }
         if (recoveryMarkerIsOwned(candidate)) {
           ownedMarker = candidate
+        } else {
+          wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))
         }
       } catch (error) {
         const existingRecovery = (error as NodeJS.ErrnoException).code === 'EEXIST'
@@ -246,7 +278,7 @@ export const withOperationLock = <Result>(
         }
         const observation = recoveryMarkerObservation()
         if (observation.kind === 'observed' && observation.stale) {
-          reclaimRecoveryMarker(observation.directory)
+          reclaimRecoveryMarker(observation)
         }
         wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))
       }
@@ -287,14 +319,23 @@ export const withOperationLock = <Result>(
     let recovered = false
     while (!recovered) {
       const ownedMarker = acquireRecoveryMarker()
+      let recoveryError: unknown
       try {
         recovered = recoverGateWhileOwned(ownedMarker)
-      } finally {
-        try {
-          releaseOwnedLock(location, ownedMarker.directory, ownedMarker.token)
-        } catch {
-          // Recovery-marker cleanup cannot replace the gate recovery result.
-        }
+      } catch (error) {
+        recoveryError = error
+      }
+      let cleanupError: unknown
+      try {
+        releaseOwnedLock(location, ownedMarker.directory, ownedMarker.token)
+      } catch (error) {
+        cleanupError = error
+      }
+      if (recoveryError !== undefined) {
+        throw recoveryError
+      }
+      if (cleanupError !== undefined) {
+        throw cleanupError
       }
     }
   }
