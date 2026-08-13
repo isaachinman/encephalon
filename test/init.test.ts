@@ -1691,17 +1691,350 @@ describe('initialisation', () => {
     chmodSync(path, 0o744)
 
     const [agentsPlan] = planInstructionChanges(root, false)
-    assert.ok(agentsPlan)
+    assert.ok(agentsPlan?.contentBytes)
     applyInstructionChanges(root, [agentsPlan])
 
-    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
+    assert.deepEqual(readFileSync(path), agentsPlan.contentBytes)
     if (process.platform !== 'win32') {
       assert.equal(statSync(path).mode & 0o777, 0o744)
     }
     assert.deepEqual(
-      readdirSync(root).filter(filename => filename.includes('.AGENTS.md.') && filename.endsWith('.tmp')),
+      readdirSync(root).filter(
+        filename =>
+          filename.startsWith('.AGENTS.md.') &&
+          (filename.endsWith('.backup') || filename.endsWith('.delete') || filename.endsWith('.tmp')),
+      ),
       [],
     )
+  })
+
+  test('instruction replacements preserve historical generated-looking aliases', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const historicalNames = [
+      '.AGENTS.md.123.550e8400-e29b-41d4-a716-446655440000.backup',
+      '.AGENTS.md.123.550e8400-e29b-41d4-a716-446655440001.delete',
+      '.AGENTS.md.123.550e8400-e29b-41d4-a716-446655440002.tmp',
+    ] as const
+    writeFileSync(path, '# Existing guidance\n')
+    const historical = historicalNames.map((name, index) => {
+      const aliasPath = join(root, name)
+      const bytes = Buffer.from(`historical-${index}`)
+      writeFileSync(aliasPath, bytes)
+      const metadata = statSync(aliasPath, { bigint: true })
+      return { bytes, dev: metadata.dev, ino: metadata.ino, name }
+    })
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan?.contentBytes)
+
+    applyInstructionChanges(root, [agentsPlan])
+
+    assert.deepEqual(readFileSync(path), agentsPlan.contentBytes)
+    assert.deepEqual(
+      historical.map(entry => {
+        const metadata = statSync(join(root, entry.name), { bigint: true })
+        return {
+          bytes: readFileSync(join(root, entry.name)),
+          dev: metadata.dev,
+          ino: metadata.ino,
+          name: entry.name,
+        }
+      }),
+      historical,
+    )
+    assert.deepEqual(
+      readdirSync(root).filter(
+        filename =>
+          filename.startsWith('.AGENTS.md.') &&
+          (filename.endsWith('.backup') || filename.endsWith('.delete') || filename.endsWith('.tmp')),
+      ),
+      [...historicalNames],
+    )
+  })
+
+  const instructionRecoveryAction = {
+    backupCleanup:
+      'Inspect the repository root and remove only a confirmed backup left by this operation before retrying.',
+    publicationFlush:
+      'Confirm the canonical instruction file is present; init does not re-fsync an unchanged instruction file, so treat durability as unverified until the repository directory sync succeeds.',
+    publicationVerification:
+      'Inspect the canonical instruction file before retrying; the linked replacement may have been displaced by a concurrent change.',
+    temporaryCleanup:
+      'Inspect the repository root and remove only a confirmed temporary file left by this operation before retrying.',
+  } as const
+
+  const assertCommittedInstructionError = (
+    error: unknown,
+    code: 'INTERNAL_ERROR' | 'IO_ERROR' | 'REPOSITORY_CHANGED',
+    postCommitPhase: keyof typeof instructionRecoveryAction,
+  ) => {
+    const actual = error as { code?: unknown; details?: Record<string, unknown> }
+    assert.equal(actual.code, code)
+    assert.deepEqual(actual.details, {
+      filename: 'AGENTS.md',
+      instructionCommitted: true,
+      postCommitPhase,
+      recoveryAction: instructionRecoveryAction[postCommitPhase],
+    })
+    return true
+  }
+
+  const committedFailureCases = [
+    {
+      expectedAliasSuffix: '.backup',
+      faultPoint: 'during-backup-cleanup',
+      name: 'backup cleanup',
+      postCommitPhase: 'backupCleanup',
+    },
+    {
+      expectedAliasSuffix: undefined,
+      faultPoint: 'during-publication-flush',
+      name: 'publication flush',
+      postCommitPhase: 'publicationFlush',
+    },
+    {
+      expectedAliasSuffix: '.tmp',
+      faultPoint: 'during-temp-cleanup',
+      name: 'temporary cleanup',
+      postCommitPhase: 'temporaryCleanup',
+    },
+  ] as const
+
+  for (const failureCase of committedFailureCases) {
+    test(`reports structured committed instruction ${failureCase.name} failures`, () => {
+      const root = createRoot()
+      const path = join(root, 'AGENTS.md')
+      writeFileSync(path, '# Existing guidance\n')
+      const [agentsPlan] = planInstructionChanges(root, false)
+      assert.ok(agentsPlan?.contentBytes)
+
+      assert.throws(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === failureCase.faultPoint) {
+                throw Object.assign(new Error(`Injected ${point}`), { code: 'EIO' })
+              }
+            },
+          }),
+        (error: unknown) => assertCommittedInstructionError(error, 'IO_ERROR', failureCase.postCommitPhase),
+      )
+
+      assert.deepEqual(readFileSync(path), agentsPlan.contentBytes)
+      const aliases = readdirSync(root).filter(filename => filename.startsWith('.AGENTS.md.'))
+      if (failureCase.expectedAliasSuffix === undefined) {
+        assert.deepEqual(aliases, [])
+      } else {
+        assert.equal(
+          aliases.some(filename => filename.endsWith(failureCase.expectedAliasSuffix)),
+          true,
+        )
+      }
+    })
+  }
+
+  test('reports instruction publication verification ahead of independent lower-priority failures', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan?.contentBytes)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (
+              point === 'after-publication' ||
+              point === 'during-backup-cleanup' ||
+              point === 'during-publication-flush' ||
+              point === 'during-temp-cleanup'
+            ) {
+              throw Object.assign(new Error(`Injected ${point}`), { code: 'EIO' })
+            }
+          },
+        }),
+      (error: unknown) => assertCommittedInstructionError(error, 'IO_ERROR', 'publicationVerification'),
+    )
+
+    assert.deepEqual(readFileSync(path), agentsPlan.contentBytes)
+  })
+
+  test('keeps unexpected committed instruction temporary cleanup faults internal', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan?.contentBytes)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'during-temp-cleanup') {
+              throw new Error('Injected unexpected cleanup fault')
+            }
+          },
+        }),
+      (error: unknown) => assertCommittedInstructionError(error, 'INTERNAL_ERROR', 'temporaryCleanup'),
+    )
+
+    assert.deepEqual(readFileSync(path), agentsPlan.contentBytes)
+  })
+
+  test('reports a committed instruction publication replacement without restoring predecessor bytes', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const replacement = '# Concurrent post-commit guidance\n'
+    writeFileSync(path, '# Existing guidance\n')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-publication') {
+              rmSync(path)
+              writeFileSync(path, replacement)
+            }
+          },
+        }),
+      (error: unknown) => assertCommittedInstructionError(error, 'REPOSITORY_CHANGED', 'publicationVerification'),
+    )
+
+    assert.equal(readFileSync(path, 'utf8'), replacement)
+  })
+
+  test('reports and preserves a replacement installed at the instruction backup pathname after quarantine', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const replacement = Buffer.from('concurrent backup successor')
+    let backupPath: string | undefined
+    let replacementIdentity: { dev: bigint; ino: bigint } | undefined
+    writeFileSync(path, '# Existing guidance\n')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-backup-validation') {
+              const [backupName] = readdirSync(root).filter(name => name.endsWith('.backup'))
+              assert.ok(backupName)
+              backupPath = join(root, backupName)
+            }
+            if (point === 'after-final-backup-validation') {
+              assert.ok(backupPath)
+              rmSync(backupPath, { force: true })
+              writeFileSync(backupPath, replacement)
+              const metadata = statSync(backupPath, { bigint: true })
+              replacementIdentity = { dev: metadata.dev, ino: metadata.ino }
+            }
+          },
+        }),
+      (error: unknown) => assertCommittedInstructionError(error, 'REPOSITORY_CHANGED', 'backupCleanup'),
+    )
+
+    assert.ok(backupPath)
+    assert.deepEqual(readFileSync(backupPath), replacement)
+    const finalMetadata = statSync(backupPath, { bigint: true })
+    assert.deepEqual({ dev: finalMetadata.dev, ino: finalMetadata.ino }, replacementIdentity)
+  })
+
+  test('reports old-descriptor mutation during instruction backup cleanup', {
+    skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const changed = '# Descriptor edit after commit\n'
+    writeFileSync(path, '# Existing guidance\n')
+    const descriptor = openSync(path, 'r+')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan?.contentBytes)
+
+    try {
+      assert.throws(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'after-final-backup-validation') {
+                ftruncateSync(descriptor, 0)
+                writeSync(descriptor, changed, 0, 'utf8')
+              }
+            },
+          }),
+        (error: unknown) => assertCommittedInstructionError(error, 'REPOSITORY_CHANGED', 'backupCleanup'),
+      )
+    } finally {
+      closeSync(descriptor)
+    }
+
+    assert.deepEqual(readFileSync(path), agentsPlan.contentBytes)
+    const [recoveryName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.'))
+    assert.ok(recoveryName)
+    assert.equal(readFileSync(join(root, recoveryName), 'utf8'), changed)
+  })
+
+  test('restores exact bytes and mode before instruction publication commits', {
+    skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = Buffer.from('# Exact predecessor bytes\r\n')
+    writeFileSync(path, original)
+    chmodSync(path, 0o741)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-backup-validation') {
+              throw Object.assign(new Error('Injected pre-publication failure'), { code: 'EIO' })
+            }
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        assert.deepEqual((error as { details?: unknown }).details, {})
+        return true
+      },
+    )
+
+    assert.deepEqual(readFileSync(path), original)
+    assert.equal(statSync(path).mode & 0o777, 0o741)
+    assert.deepEqual(
+      readdirSync(root).filter(name => name.startsWith('.AGENTS.md.')),
+      [],
+    )
+  })
+
+  test('instruction backup cleanup failure retries deterministically with one managed block', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'during-backup-cleanup') {
+              throw Object.assign(new Error('Injected backup cleanup failure'), { code: 'EIO' })
+            }
+          },
+        }),
+      (error: unknown) => assertCommittedInstructionError(error, 'IO_ERROR', 'backupCleanup'),
+    )
+
+    const [retryPlan] = planInstructionChanges(root, false)
+    assert.ok(retryPlan)
+    assert.deepEqual(applyInstructionChanges(root, [retryPlan]), [])
+    assert.equal(readFileSync(path, 'utf8').match(/encephalon:managed-instructions:start/g)?.length, 1)
   })
 
   test('preserves instruction-file mode changes made after planning', {
@@ -2022,7 +2355,7 @@ describe('initialisation', () => {
     writeFileSync(path, original)
     const descriptor = openSync(path, 'r+')
     const [agentsPlan] = planInstructionChanges(root, false)
-    assert.ok(agentsPlan)
+    assert.ok(agentsPlan?.contentBytes)
 
     try {
       assert.throws(
@@ -2044,9 +2377,11 @@ describe('initialisation', () => {
       closeSync(descriptor)
     }
 
-    const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
-    assert.ok(backupName)
-    assert.equal(readFileSync(join(root, backupName), 'utf8'), changed)
+    assert.equal(readFileSync(path, 'utf8'), changed)
+    assert.deepEqual(
+      readdirSync(root).filter(name => name.startsWith('.AGENTS.md.')),
+      [],
+    )
   })
 
   test('does not overwrite files created while restoring a backup', () => {
@@ -2142,10 +2477,12 @@ describe('initialisation', () => {
       closeSync(descriptor)
     }
 
-    const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
-    assert.ok(backupName)
-    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
-    assert.equal(statSync(join(root, backupName)).mode & 0o777, 0o744)
+    assert.equal(readFileSync(path, 'utf8'), '# Existing guidance\n')
+    assert.equal(statSync(path).mode & 0o777, 0o744)
+    assert.deepEqual(
+      readdirSync(root).filter(name => name.startsWith('.AGENTS.md.')),
+      [],
+    )
   })
 
   test('does not overwrite mode changes after final backup validation', {
@@ -2157,23 +2494,27 @@ describe('initialisation', () => {
     chmodSync(path, 0o600)
     const descriptor = openSync(path, 'r+')
     const [agentsPlan] = planInstructionChanges(root, false)
-    assert.ok(agentsPlan)
+    assert.ok(agentsPlan?.contentBytes)
 
     try {
-      applyInstructionChanges(root, [agentsPlan], {
-        fault: point => {
-          if (point === 'after-final-backup-validation') {
-            fchmodSync(descriptor, 0o744)
-          }
-        },
-      })
+      assert.throws(
+        () =>
+          applyInstructionChanges(root, [agentsPlan], {
+            fault: point => {
+              if (point === 'after-final-backup-validation') {
+                fchmodSync(descriptor, 0o744)
+              }
+            },
+          }),
+        (error: unknown) => assertCommittedInstructionError(error, 'REPOSITORY_CHANGED', 'backupCleanup'),
+      )
     } finally {
       closeSync(descriptor)
     }
 
     const [backupName] = readdirSync(root).filter(name => name.startsWith('.AGENTS.md.') && name.endsWith('.backup'))
     assert.ok(backupName)
-    assert.match(readFileSync(path, 'utf8'), /## Encephalon/)
+    assert.deepEqual(readFileSync(path), agentsPlan.contentBytes)
     assert.equal(statSync(path).mode & 0o777, 0o600)
     assert.equal(statSync(join(root, backupName)).mode & 0o777, 0o744)
   })

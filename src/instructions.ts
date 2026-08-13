@@ -1,17 +1,19 @@
 import { randomUUID } from 'node:crypto'
 import type { BigIntStats } from 'node:fs'
 import {
-  chmodSync,
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
   openSync,
   readFileSync,
+  readSync,
   renameSync,
   rmSync,
+  unlinkSync,
   writeSync,
 } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
@@ -373,6 +375,8 @@ type AtomicWriteFault =
   | 'after-plan-validation'
   | 'before-deletion'
   | 'during-delete-flush'
+  | 'during-backup-cleanup'
+  | 'during-publication-flush'
   | 'during-quarantine-restore'
   | 'before-temp-create'
   | 'during-backup-restore'
@@ -436,35 +440,186 @@ const fsyncDirectory = (path: string) => {
 const tempPathFor = (path: string, suffix = 'tmp') =>
   join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.${suffix}`)
 
-const fsyncFile = (path: string) => {
+type PostCommitPhase = 'backupCleanup' | 'publicationFlush' | 'publicationVerification' | 'temporaryCleanup'
+
+type DescriptorSnapshot = {
+  bytes: Buffer
+  identity: FileIdentity
+  mode: bigint
+}
+
+type HeldInstructionFile = DescriptorSnapshot & {
+  descriptor: number
+}
+
+type PostCommitFailure = {
+  cause: unknown
+  identityUncertain: boolean
+  phase: PostCommitPhase
+}
+
+const postCommitPhasePriority = [
+  'publicationVerification',
+  'publicationFlush',
+  'backupCleanup',
+  'temporaryCleanup',
+] as const satisfies readonly PostCommitPhase[]
+
+const postCommitRecoveryAction = {
+  backupCleanup:
+    'Inspect the repository root and remove only a confirmed backup left by this operation before retrying.',
+  publicationFlush:
+    'Confirm the canonical instruction file is present; init does not re-fsync an unchanged instruction file, so treat durability as unverified until the repository directory sync succeeds.',
+  publicationVerification:
+    'Inspect the canonical instruction file before retrying; the linked replacement may have been displaced by a concurrent change.',
+  temporaryCleanup:
+    'Inspect the repository root and remove only a confirmed temporary file left by this operation before retrying.',
+} as const satisfies Record<PostCommitPhase, string>
+
+class InstructionIdentityError extends Error {}
+
+const instructionIdentityChanged = (filename: (typeof FILENAMES)[number], options?: ErrorOptions): never => {
+  throw new InstructionIdentityError(`${filename} changed during publication.`, options)
+}
+
+const readDescriptorBytes = (descriptor: number, size: bigint) => {
+  if (size > BigInt(MAX_INSTRUCTION_FILE_BYTES)) {
+    throw new InstructionIdentityError('An instruction file exceeded its size limit during publication.')
+  }
+  const bytes = Buffer.alloc(Number(size))
+  let offset = 0
+  while (offset < bytes.length) {
+    const read = readSync(descriptor, bytes, offset, bytes.length - offset, offset)
+    if (read <= 0) {
+      throw Object.assign(new Error('Unable to read an instruction file descriptor.'), { code: 'EIO' })
+    }
+    offset += read
+  }
+  return bytes
+}
+
+const snapshotDescriptor = (descriptor: number, filename: (typeof FILENAMES)[number]): DescriptorSnapshot => {
+  const before = fstatSync(descriptor, { bigint: true })
+  if (!before.isFile()) {
+    return instructionIdentityChanged(filename)
+  }
+  const bytes = readDescriptorBytes(descriptor, before.size)
+  const after = fstatSync(descriptor, { bigint: true })
+  if (
+    !sameIdentity(identityFor(before), identityFor(after)) ||
+    (before.mode & BigInt(MODE_BITS)) !== (after.mode & BigInt(MODE_BITS))
+  ) {
+    return instructionIdentityChanged(filename)
+  }
+  return {
+    bytes,
+    identity: identityFor(after),
+    mode: after.mode & BigInt(MODE_BITS),
+  }
+}
+
+const holdInstructionFile = (path: string, filename: (typeof FILENAMES)[number]) => {
   const access = process.platform === 'win32' ? constants.O_RDWR : constants.O_RDONLY
   const descriptor = openSync(path, access | noFollowFlag)
   try {
-    fsyncSync(descriptor)
-  } finally {
-    closeSync(descriptor)
+    return { descriptor, ...snapshotDescriptor(descriptor, filename) }
+  } catch (error) {
+    closeAfterOperation(descriptor, true)
+    throw error
   }
 }
 
-const restoreBackupFile = (path: string, backupPath: string, hooks: AtomicWriteHooks | undefined) => {
+const assertPathIdentifiesDescriptor = (
+  path: string,
+  held: HeldInstructionFile,
+  filename: (typeof FILENAMES)[number],
+  requireHeldState: boolean,
+) => {
+  const descriptorSnapshot = snapshotDescriptor(held.descriptor, filename)
+  let pathnameMetadata: BigIntStats | undefined
+  try {
+    pathnameMetadata = lstatSync(path, { bigint: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return instructionIdentityChanged(filename, { cause: error })
+    }
+    throw error
+  }
+  if (pathnameMetadata.isSymbolicLink() || !pathnameMetadata.isFile()) {
+    return instructionIdentityChanged(filename)
+  }
+  if (!sameIdentity(descriptorSnapshot.identity, identityFor(pathnameMetadata))) {
+    return instructionIdentityChanged(filename)
+  }
+  if (
+    requireHeldState &&
+    (!sameIdentity(stableIdentity(held.identity), stableIdentity(descriptorSnapshot.identity)) ||
+      held.mode !== descriptorSnapshot.mode ||
+      !held.bytes.equals(descriptorSnapshot.bytes))
+  ) {
+    return instructionIdentityChanged(filename)
+  }
+  return descriptorSnapshot
+}
+
+const createDescriptorRecoveryCopy = (
+  path: string,
+  held: HeldInstructionFile,
+  filename: (typeof FILENAMES)[number],
+) => {
+  const snapshot = snapshotDescriptor(held.descriptor, filename)
+  const recoveryPath = tempPathFor(path, 'backup')
+  let recoveryDescriptor: number | undefined
+  try {
+    recoveryDescriptor = openSync(recoveryPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR, 0o666)
+    let offset = 0
+    while (offset < snapshot.bytes.length) {
+      const written = writeSync(recoveryDescriptor, snapshot.bytes, offset, snapshot.bytes.length - offset, offset)
+      if (written <= 0) {
+        throw Object.assign(new Error(`Unable to recover ${filename}.`), { code: 'EIO' })
+      }
+      offset += written
+    }
+    fchmodSync(recoveryDescriptor, Number(snapshot.mode))
+    fsyncSync(recoveryDescriptor)
+    const recovery = { descriptor: recoveryDescriptor, ...snapshotDescriptor(recoveryDescriptor, filename) }
+    if (lstatIfExists(path) === undefined) {
+      assertPathIdentifiesDescriptor(recoveryPath, recovery, filename, true)
+      linkSync(recoveryPath, path)
+      unlinkSync(recoveryPath)
+    }
+  } finally {
+    if (recoveryDescriptor !== undefined) {
+      closeAfterOperation(recoveryDescriptor, true)
+    }
+  }
+}
+
+const restoreHeldBackup = (
+  path: string,
+  backupPath: string,
+  held: HeldInstructionFile,
+  plan: FilePlan,
+  hooks: AtomicWriteHooks | undefined,
+) => {
   try {
     fault(hooks, 'during-backup-restore')
-    linkSync(backupPath, path)
-    rmSync(backupPath, { force: true })
+    if (lstatIfExists(path) === undefined) {
+      try {
+        assertPathIdentifiesDescriptor(backupPath, held, plan.filename, false)
+        linkSync(backupPath, path)
+        unlinkSync(backupPath)
+      } catch (error) {
+        if (error instanceof InstructionIdentityError) {
+          createDescriptorRecoveryCopy(path, held, plan.filename)
+        } else {
+          throw error
+        }
+      }
+    }
   } catch {
-    // Keep the backup file in place so the pre-publication bytes remain recoverable.
+    // Keep any exact backup or generated recovery copy for a later safe retry.
   }
-}
-
-const assertBackupUnchanged = (backupPath: string, plan: FilePlan) => {
-  const metadata = lstatIfExists(backupPath)
-  if (metadata === undefined || metadata.isSymbolicLink() || !metadata.isFile()) {
-    return fail('VALIDATION_FAILED', `${plan.filename} must remain a regular non-symlink file.`)
-  }
-  if (!readRegularFileBytes(backupPath, plan.filename).equals(plan.originalBytes)) {
-    return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
-  }
-  return metadata
 }
 
 const restoreQuarantinedFile = (path: string, quarantinePath: string, hooks: AtomicWriteHooks | undefined) => {
@@ -536,86 +691,224 @@ const deletePlan = (path: string, plan: FilePlan, hooks: AtomicWriteHooks | unde
   }
 }
 
-const publishTempFile = (path: string, tempPath: string, plan: FilePlan, hooks: AtomicWriteHooks | undefined) => {
-  if (!plan.originalFileExisted) {
+const isInstructionIdentityUncertainty = (error: unknown) =>
+  error instanceof InstructionIdentityError || (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED')
+
+const capturePostCommitFailure = (
+  failures: readonly PostCommitFailure[],
+  phase: PostCommitPhase,
+  operation: () => void,
+) => {
+  try {
+    operation()
+    return failures
+  } catch (error) {
+    return [
+      ...failures,
+      {
+        cause: error,
+        identityUncertain: isInstructionIdentityUncertainty(error),
+        phase,
+      },
+    ]
+  }
+}
+
+const finaliseHeldBackup = (
+  path: string,
+  backupPath: string,
+  held: HeldInstructionFile,
+  plan: FilePlan,
+  hooks: AtomicWriteHooks | undefined,
+) => {
+  fault(hooks, 'during-backup-cleanup')
+  const cleanupPath = tempPathFor(path, 'backup')
+  renameSync(backupPath, cleanupPath)
+  fault(hooks, 'after-final-backup-validation')
+  const backupPathReplaced = lstatIfExists(backupPath) !== undefined
+  assertPathIdentifiesDescriptor(cleanupPath, held, plan.filename, true)
+  unlinkSync(cleanupPath)
+  if (backupPathReplaced) {
+    return instructionIdentityChanged(plan.filename)
+  }
+}
+
+const committedFailureDetails = (plan: FilePlan, phase: PostCommitPhase) => ({
+  filename: plan.filename,
+  instructionCommitted: true,
+  postCommitPhase: phase,
+  recoveryAction: postCommitRecoveryAction[phase],
+})
+
+const throwHighestPriorityCommittedFailure = (plan: FilePlan, failures: readonly PostCommitFailure[]) => {
+  const phase = postCommitPhasePriority.find(candidate => failures.some(failure => failure.phase === candidate))
+  if (phase !== undefined) {
+    const samePhase = failures.filter(candidate => candidate.phase === phase)
+    const failure = samePhase.find(candidate => candidate.identityUncertain) ?? samePhase[0]
+    if (failure !== undefined) {
+      const recoveryAction = postCommitRecoveryAction[phase]
+      const message = `${plan.filename} was committed, but the ${phase} post-commit phase failed. ${recoveryAction}`
+      const details = committedFailureDetails(plan, phase)
+      if (failure.identityUncertain) {
+        throw new EncephalonError('REPOSITORY_CHANGED', message, details, { cause: failure.cause })
+      }
+      return wrapIo(message, failure.cause, details)
+    }
+  }
+}
+
+const cleanupHeldTempFile = (
+  path: string,
+  tempPath: string,
+  held: HeldInstructionFile,
+  plan: FilePlan,
+  hooks: AtomicWriteHooks | undefined,
+) => {
+  fault(hooks, 'during-temp-cleanup')
+  assertPathIdentifiesDescriptor(path, held, plan.filename, true)
+  assertPathIdentifiesDescriptor(tempPath, held, plan.filename, true)
+  unlinkSync(tempPath)
+}
+
+const writePlan = (root: string, path: string, plan: FilePlan, hooks?: AtomicWriteHooks) => {
+  const bytes = plan.contentBytes ?? Buffer.alloc(0)
+  const tempPath = tempPathFor(path)
+  const backupPath = tempPathFor(path, 'backup')
+  let staged: HeldInstructionFile | undefined
+  let backup: HeldInstructionFile | undefined
+  let descriptor: number | undefined
+  let committed = false
+  let preCommitError: unknown
+  try {
+    fault(hooks, 'before-temp-create')
+    descriptor = openSync(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR, 0o666)
+    writeAll(descriptor, bytes, plan, hooks)
+    fault(hooks, 'during-file-flush')
+    fsyncSync(descriptor)
+    assertPlanIsCurrent(root, plan)
+    if (plan.originalFileExisted) {
+      renameSync(path, backupPath)
+      backup = holdInstructionFile(backupPath, plan.filename)
+      if (!backup.bytes.equals(plan.originalBytes)) {
+        return instructionIdentityChanged(plan.filename)
+      }
+      fchmodSync(descriptor, Number(backup.mode))
+      fsyncSync(descriptor)
+      fault(hooks, 'after-backup-validation')
+      assertPathIdentifiesDescriptor(backupPath, backup, plan.filename, true)
+    }
+    staged = { descriptor, ...snapshotDescriptor(descriptor, plan.filename) }
+    fault(hooks, 'during-publication')
     try {
       linkSync(tempPath, path)
+      committed = true
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
         return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
       }
       throw error
     }
-    return
+  } catch (error) {
+    preCommitError = error
   }
 
-  const backupPath = tempPathFor(path, 'backup')
-  let backupCreated = false
-  let published = false
-  try {
-    renameSync(path, backupPath)
-    backupCreated = true
-    const backupMetadata = assertBackupUnchanged(backupPath, plan)
-    chmodSync(tempPath, backupMetadata.mode & MODE_BITS)
-    fsyncFile(tempPath)
-    fault(hooks, 'after-backup-validation')
-    linkSync(tempPath, path)
-    published = true
-    const finalBackupMetadata = assertBackupUnchanged(backupPath, plan)
-    fault(hooks, 'after-final-backup-validation')
-    if ((finalBackupMetadata.mode & MODE_BITS) !== (backupMetadata.mode & MODE_BITS)) {
-      return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+  if (!committed) {
+    if (backup !== undefined) {
+      restoreHeldBackup(path, backupPath, backup, plan, hooks)
     }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+    try {
+      fault(hooks, 'during-temp-cleanup')
+      if (descriptor !== undefined) {
+        const heldTemp = staged ?? { descriptor, ...snapshotDescriptor(descriptor, plan.filename) }
+        assertPathIdentifiesDescriptor(tempPath, heldTemp, plan.filename, true)
+        unlinkSync(tempPath)
+      }
+    } catch {
+      // Preserve the original pre-commit failure and any uncertain temporary path.
     }
-    throw error
-  } finally {
-    if (backupCreated && !published) {
-      restoreBackupFile(path, backupPath, hooks)
+    if (backup !== undefined) {
+      closeAfterOperation(backup.descriptor, true)
     }
-  }
-}
-
-const cleanupTempFile = (tempPath: string, hooks: AtomicWriteHooks | undefined, operationFailed: boolean) => {
-  try {
-    fault(hooks, 'during-temp-cleanup')
-    rmSync(tempPath, { force: true })
-  } catch (error) {
-    if (!operationFailed) {
-      throw error
-    }
-  }
-}
-
-const writePlan = (root: string, path: string, plan: FilePlan, hooks?: AtomicWriteHooks) => {
-  const bytes = plan.contentBytes ?? Buffer.alloc(0)
-  const tempPath = tempPathFor(path)
-  let descriptor: number | undefined
-  let operationFailed = false
-  try {
-    fault(hooks, 'before-temp-create')
-    descriptor = openSync(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o666)
-    writeAll(descriptor, bytes, plan, hooks)
-    fault(hooks, 'during-file-flush')
-    fsyncSync(descriptor)
-    closeSync(descriptor)
-    descriptor = undefined
-    assertPlanIsCurrent(root, plan)
-    fault(hooks, 'during-publication')
-    publishTempFile(path, tempPath, plan, hooks)
-    fault(hooks, 'after-publication')
-    fsyncDirectory(dirname(path))
-  } catch (error) {
-    operationFailed = true
-    throw error
-  } finally {
     if (descriptor !== undefined) {
-      closeAfterOperation(descriptor, operationFailed)
+      closeAfterOperation(descriptor, true)
     }
-    cleanupTempFile(tempPath, hooks, operationFailed)
+    if (isInstructionIdentityUncertainty(preCommitError)) {
+      return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+    }
+    if (preCommitError !== undefined) {
+      throw preCommitError
+    }
+    return fail('INTERNAL_ERROR', `${plan.filename} publication ended before its commit point.`)
   }
+
+  if (staged === undefined) {
+    return fail('INTERNAL_ERROR', `${plan.filename} publication lost its staged descriptor.`)
+  }
+
+  let failures: readonly PostCommitFailure[] = []
+  let canonicalVerified = true
+  failures = capturePostCommitFailure(failures, 'publicationVerification', () => {
+    fault(hooks, 'after-publication')
+  })
+  try {
+    assertPathIdentifiesDescriptor(path, staged, plan.filename, true)
+  } catch (error) {
+    canonicalVerified = false
+    failures = [
+      ...failures,
+      {
+        cause: error,
+        identityUncertain: isInstructionIdentityUncertainty(error),
+        phase: 'publicationVerification',
+      },
+    ]
+  }
+
+  if (canonicalVerified && backup !== undefined) {
+    failures = capturePostCommitFailure(failures, 'backupCleanup', () => {
+      finaliseHeldBackup(path, backupPath, backup as HeldInstructionFile, plan, hooks)
+    })
+  }
+
+  failures = capturePostCommitFailure(failures, 'publicationFlush', () => {
+    fault(hooks, 'during-publication-flush')
+    fsyncDirectory(dirname(path))
+  })
+
+  if (canonicalVerified) {
+    try {
+      assertPathIdentifiesDescriptor(path, staged, plan.filename, true)
+    } catch (error) {
+      canonicalVerified = false
+      failures = [
+        ...failures,
+        {
+          cause: error,
+          identityUncertain: isInstructionIdentityUncertainty(error),
+          phase: 'publicationVerification',
+        },
+      ]
+    }
+  }
+
+  if (canonicalVerified) {
+    const beforeTempCleanup = failures
+    failures = capturePostCommitFailure(failures, 'temporaryCleanup', () => {
+      cleanupHeldTempFile(path, tempPath, staged as HeldInstructionFile, plan, hooks)
+    })
+    const tempCleanupFailed = failures.length > beforeTempCleanup.length
+    if (!tempCleanupFailed) {
+      failures = capturePostCommitFailure(failures, 'publicationFlush', () => {
+        fsyncDirectory(dirname(path))
+      })
+    }
+  }
+
+  if (backup !== undefined) {
+    failures = capturePostCommitFailure(failures, 'backupCleanup', () => closeSync(backup.descriptor))
+  }
+  failures = capturePostCommitFailure(failures, 'temporaryCleanup', () => closeSync(staged.descriptor))
+  throwHighestPriorityCommittedFailure(plan, failures)
 }
 
 export const planInstructionChanges = (root: string, remove: boolean) => {
