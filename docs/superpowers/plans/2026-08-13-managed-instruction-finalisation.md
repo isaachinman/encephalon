@@ -1,10 +1,12 @@
 # Managed Instruction Finalisation Implementation Plan
 
+**Status:** Completed historical implementation record. `docs/contract.md` is the maintained normative contract.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Finalise successful managed instruction replacements without leaking operation-owned backup or temporary aliases, and report post-commit failures unambiguously.
 
-**Architecture:** Keep the instruction publication state machine in `src/instructions.ts`. Bind the staged file and renamed predecessor to held no-follow descriptors, define the successful canonical hard link as the commit point, quarantine and remove only the exact owned predecessor, and aggregate safe structured post-commit errors through the existing `EncephalonError` model.
+**Architecture:** Keep the instruction publication state machine in `src/instructions.ts`. Bind the repository root, staged file, and predecessor to held no-follow descriptors; move aliases with verified no-replace hard-link-and-unlink steps; define the successful canonical hard link as the commit point; flush recovery and publication boundaries before destructive cleanup where supported; and aggregate safe structured post-commit errors through the existing `EncephalonError` model.
 
 **Tech Stack:** TypeScript, Node.js synchronous filesystem APIs, Bun package scripts, Node test runner.
 
@@ -28,18 +30,20 @@
 - Modify: `README.md`
 - Modify: `CHANGELOG.md`
 - Modify: `docs/contract.md`
+- Modify: `docs/superpowers/specs/2026-08-13-managed-instruction-finalisation-design.md`
+- Modify: `docs/superpowers/plans/2026-08-13-managed-instruction-finalisation.md`
 
 **Interfaces:**
 - Consumes: existing `FilePlan`, `FileIdentity`, `AtomicWriteHooks`, `EncephalonError`, `wrapIo`, `planInstructionChanges(root, remove)`, and `applyInstructionChanges(root, plans, hooks)`.
 - Produces: internal post-commit phases, recovery actions, identity-bound cleanup, safe central I/O details, user-visible zero-alias success, and exact maintained documentation provenance. No public signature changes.
 
-- [ ] **Step 1: Strengthen successful replacement coverage**
+- [x] **Step 1: Strengthen successful replacement coverage**
 
 In `test/init.test.ts`, assert the canonical target equals the planned bytes, preserves the intended mode, and leaves no current-operation `.tmp`, `.backup`, or `.delete` alias. Seed historical aliases in a complementary case and assert their identities and bytes remain unchanged.
 
-- [ ] **Step 2: Add focused committed-failure coverage**
+- [x] **Step 2: Add focused committed-failure coverage**
 
-Add the narrow fault points `during-backup-cleanup` and `during-publication-flush`; reuse `after-final-backup-validation` and `during-temp-cleanup`. Assert literal details:
+Add the narrow fault points `during-backup-cleanup` and `during-publication-flush`; use `before-final-backup-validation` and `during-temp-cleanup`. Assert literal primary details plus the bounded safe list of every distinct failed or deferred recovery phase:
 
 ```ts
 {
@@ -51,12 +55,20 @@ Add the narrow fault points `during-backup-cleanup` and `during-publication-flus
     | 'backupCleanup'
     | 'temporaryCleanup',
   recoveryAction: '<phase-specific safe action>',
+  postCommitFailures: Array<{
+    postCommitPhase:
+      | 'publicationVerification'
+      | 'publicationFlush'
+      | 'backupCleanup'
+      | 'temporaryCleanup',
+    recoveryAction: '<phase-specific safe action>',
+  }>,
 }
 ```
 
 Cover backup cleanup failure, directory flush failure, temp cleanup failure, backup-path replacement, old-descriptor mutation, exact pre-publication restoration, and deterministic retry with one managed block.
 
-- [ ] **Step 3: Run the focused RED tests**
+- [x] **Step 3: Run the focused RED tests**
 
 Run:
 
@@ -66,27 +78,27 @@ node --test --test-name-pattern='instruction replacements|instruction backup|ins
 
 Expected: failures show leaked backups, absent fault seams, or generic post-commit errors while the canonical new bytes are already visible. Record the exact failures before changing production.
 
-- [ ] **Step 4: Extend central cause wrapping without changing classification**
+- [x] **Step 4: Extend central cause wrapping without changing classification**
 
 Allow `wrapIo(message, cause, details?)` in `src/errors.ts` to attach optional safe `Record<string, JsonValue>` details while continuing to choose only `IO_ERROR` or `INTERNAL_ERROR` from the cause.
 
-- [ ] **Step 5: Bind the staged and predecessor files to descriptors**
+- [x] **Step 5: Bind the staged and predecessor files to descriptors**
 
-Keep the flushed staged descriptor open until publication verification and cleanup finish. After renaming an existing target, open its backup no-follow, compare descriptor and pathname identities and original bytes, and retain that descriptor through finalisation.
+Keep the flushed staged descriptor open until publication verification and cleanup finish. Before moving an existing target, open it no-follow, compare the descriptor and pathname identities with the preflight original incarnation and bytes, and retain that descriptor through finalisation. Allow the existing deliberate post-plan mode-change behaviour.
 
-- [ ] **Step 6: Record the publication commit point**
+- [x] **Step 6: Record the publication commit point**
 
 Set committed state immediately after `linkSync(tempPath, targetPath)` returns. Verify that the canonical path identifies the staged descriptor before treating later work as cleanup. Never invoke predecessor restoration after this state.
 
-- [ ] **Step 7: Finalise the exact backup**
+- [x] **Step 7: Finalise the exact backup**
 
-Rename the generated backup to a fresh generated cleanup name, revalidate the moved pathname against the held backup descriptor, and unlink it without a hook or other fallible work between final verification and unlink. Preserve any replacement at the original backup pathname.
+Create the fresh cleanup name with an exclusive hard link from the generated backup, verify the destination against the held backup descriptor, revalidate the source immediately before source unlink, and then verify the cleanup alias immediately before its unlink. Preserve any source or destination successor and retain an exact recovery alias when identity cannot be proved.
 
-- [ ] **Step 8: Aggregate post-commit failures**
+- [x] **Step 8: Aggregate post-commit failures**
 
-Capture the highest-priority phase—publication verification, publication flush, backup cleanup, then temporary cleanup—while continuing independent safe cleanup. Throw one structured committed error after descriptors and safe cleanup complete. Use `REPOSITORY_CHANGED` for identity uncertainty and central cause classification for operational failures.
+Capture the highest-priority phase—publication verification, publication flush, backup cleanup, then temporary cleanup—while continuing independent safe cleanup. Include every distinct failed or deferred phase in the bounded safe list, and remove a transient publication-flush failure after a later cumulative directory flush succeeds. Throw one structured committed error after descriptors and safe cleanup complete. Use `REPOSITORY_CHANGED` for identity uncertainty and central cause classification for operational failures.
 
-- [ ] **Step 9: Run focused and affected GREEN checks**
+- [x] **Step 9: Run focused and affected GREEN checks**
 
 Run:
 
@@ -99,18 +111,18 @@ bun run typecheck
 
 Expected: all selected tests and all four TypeScript projects pass with no warnings.
 
-- [ ] **Step 10: Commit code and tests**
+- [x] **Step 10: Commit code and tests**
 
 ```bash
 git add src/errors.ts src/instructions.ts test/init.test.ts
 git commit -m "[MAR-2547] Finalise managed instruction replacements"
 ```
 
-- [ ] **Step 11: Update maintained documentation**
+- [x] **Step 11: Update maintained documentation**
 
-In `README.md`, `CHANGELOG.md`, and `docs/contract.md`, describe the hard-link commit point, zero-alias success, safe structured post-commit errors, retry behaviour, and the narrow Node final-syscall limitation. Add the exact code/test SHA to maintained contract provenance; do not edit the historical implementation plan.
+In `README.md`, `CHANGELOG.md`, `docs/contract.md`, and the design record, describe the exclusive hard-link-and-unlink moves, repository generation authority, durability ordering, hard-link commit point, zero-alias success, complete safe structured post-commit errors, retry behaviour, and the narrow Node final-syscall limitation. Add the exact code/test SHA to maintained contract provenance and mark this plan as a completed historical record.
 
-- [ ] **Step 12: Run all release gates**
+- [x] **Step 12: Run all release gates**
 
 Run:
 
@@ -129,13 +141,13 @@ git diff --check origin/main...HEAD
 
 Expected: every command exits zero; the publish contract may report the expected refusal to overwrite the existing package version; Bun files remain unchanged.
 
-- [ ] **Step 13: Commit documentation**
+- [x] **Step 13: Commit documentation**
 
 ```bash
 git add README.md CHANGELOG.md docs/contract.md
 git commit -m "[MAR-2547] Document instruction replacement finalisation"
 ```
 
-- [ ] **Step 14: Perform the final tidy audit**
+- [x] **Step 14: Perform the final tidy audit**
 
 Verify separation of concerns, understandable state transitions, no dead fault seam or leftover experiment, no stale filesystem assumption, no public declaration drift, exact documentation provenance, clean status, and exact branch/base.
