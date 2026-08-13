@@ -6,7 +6,7 @@
 
 **Goal:** Finalise successful managed instruction replacements without leaking operation-owned backup or temporary aliases, and report post-commit failures unambiguously.
 
-**Architecture:** Keep the instruction publication state machine in `src/instructions.ts`. Bind one fixed no-follow repository-root identity plus staged and predecessor files to held descriptors; move aliases with verified no-replace hard-link-and-unlink steps; define the successful canonical hard link as the commit point; flush recovery and publication boundaries before destructive cleanup where supported; and aggregate safe structured post-commit errors and exact repository-relative recovery paths through the existing `EncephalonError` model.
+**Architecture:** Keep the instruction publication state machine in `src/instructions.ts`. Bind all managed instruction mutations to one fixed no-follow repository-root identity plus staged and predecessor files to held descriptors; move aliases with verified no-replace hard-link-and-unlink steps; define the successful canonical hard link as the commit point; flush recovery and publication boundaries before destructive cleanup where supported; and aggregate safe structured post-commit errors and exact repository-relative recovery paths through the existing `EncephalonError` model.
 
 **Tech Stack:** TypeScript, Node.js synchronous filesystem APIs, Bun package scripts, Node test runner.
 
@@ -123,7 +123,7 @@ git commit -m "[MAR-2547] Finalise managed instruction replacements"
 
 - [x] **Step 11: Update maintained documentation**
 
-In `README.md`, `CHANGELOG.md`, `docs/contract.md`, and the design record, describe the exclusive hard-link-and-unlink moves, fixed root and descriptor authorities, private exact-byte verification, durability ordering, concurrent-successor guarantee, hard-link commit point, zero-alias success, exact safe recovery paths, complete structured post-commit errors, executable retry behaviour, and the narrow Node final-syscall limitation. Add the exact code/test SHA to maintained contract provenance and keep this plan marked as a completed historical record.
+In `README.md`, `CHANGELOG.md`, `docs/contract.md`, and the design record, describe the exclusive hard-link-and-unlink moves, fixed root and descriptor authorities for writes and removals, capability-aware private exact-byte verification, durability ordering, concurrent-successor guarantee, hard-link commit point and post-link failure aggregation, zero-alias success, exact safe recovery paths, complete structured post-commit errors, same-operation retry behaviour, and the narrow Node pathname-link/unlink syscall limitation. Add the exact code/test SHA to maintained contract provenance and keep this plan marked as a completed historical record.
 
 - [x] **Step 12: Run all release gates**
 
