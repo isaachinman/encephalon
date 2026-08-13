@@ -11,6 +11,7 @@ import type {
   ShowRecordInput,
 } from './types.ts'
 
+/** @internal */
 export type ParsedAddRecordInput = AddRecordInput & {
   recordDraft: ValidatedAddRecordInput
 }
@@ -178,6 +179,7 @@ export const parseInitInput = (value: unknown = {}): InitEncephalonInput => {
   }
 }
 
+/** @internal */
 export const parseAddRecordInput = (value: unknown): ParsedAddRecordInput => {
   const input = objectInput(value, 'addRecord') as AddRecordInput
   const root = rootProperties(input)

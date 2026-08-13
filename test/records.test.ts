@@ -18,6 +18,7 @@ import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import * as api from '../src/index.ts'
+import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import {
   addRecordResolved,
@@ -178,6 +179,7 @@ afterEach(() => {
   artifactInspectionTestHooks.fault = undefined
   artifactInspectionTestHooks.open = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
+  recordWriteTestHooks.afterOperationLock = undefined
   recordWriteTestHooks.beforeOperationLock = undefined
   recordWriteTestHooks.fault = undefined
   stagingInternals.stagingTestHooks.fsyncDirectory = undefined
@@ -205,53 +207,65 @@ describe('canonical records', () => {
     const baseline = api.initEncephalon({ root }).recordsCreated
     const timestamps = [future, added.createdAt, ...baseline.map(record => record.createdAt)]
 
-    assert.equal(added.createdAt, new Date(Date.parse(future) + 1).toISOString())
-    assert.deepEqual(timestamps, [...timestamps].sort(ordinalStringCompare))
+    assert.deepEqual(
+      timestamps,
+      Array.from({ length: timestamps.length }, (_, index) => new Date(Date.parse(future) + index).toISOString()),
+    )
   })
 
   test('orders cross-process timestamps by lock acquisition rather than input validation', async () => {
     const root = createRoot()
     const barrierRoot = createRoot()
     const validatedPath = join(barrierRoot, 'first-input-validated')
-    const releasePath = join(barrierRoot, 'release-first-input')
     const resultPath = join(barrierRoot, 'first-record-result.json')
-    const first = spawn(
-      process.execPath,
-      [
-        join(import.meta.dirname, 'fixtures', 'add-record-after-validation-release.ts'),
-        root,
-        validatedPath,
-        releasePath,
-        resultPath,
-      ],
-      { stdio: 'inherit' },
-    )
-    const deadline = Date.now() + 5000
-    while (!existsSync(validatedPath) && first.exitCode === null && Date.now() < deadline) {
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
-    }
-
+    let first: ReturnType<typeof spawn> | undefined
     let second: BrainRecord | undefined
     try {
-      assert.equal(existsSync(validatedPath), true)
-      second = api.addRecord({
-        id: 'second-process-first-publication',
-        kind: 'decision',
-        payload: {},
-        root,
-        source: 'agent',
-        subject: 'timestamp.second-process',
+      withOperationLock(root, cacheLocation => {
+        first = spawn(
+          process.execPath,
+          [
+            join(import.meta.dirname, 'fixtures', 'add-record-after-validation-release.ts'),
+            root,
+            validatedPath,
+            resultPath,
+          ],
+          { stdio: 'inherit' },
+        )
+        const validationDeadline = Date.now() + 10_000
+        while (!existsSync(validatedPath) && first.exitCode === null && Date.now() < validationDeadline) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
+        }
+        assert.equal(existsSync(validatedPath), true)
+        second = addRecordResolved(
+          root,
+          {
+            id: 'second-process-first-publication',
+            kind: 'decision',
+            payload: {},
+            root,
+            source: 'agent',
+            subject: 'timestamp.second-process',
+          },
+          { cacheLocation },
+        )
       })
+
+      const runningFirst = first
+      assert.ok(runningFirst)
+      if (runningFirst.exitCode === null) {
+        await once(runningFirst, 'exit', { signal: AbortSignal.timeout(10_000) })
+      }
+      assert.equal(runningFirst.exitCode, 0)
+      assert.ok(second)
+      const firstRecord = JSON.parse(readFileSync(resultPath, 'utf8')) as BrainRecord
+      assert.equal(Date.parse(firstRecord.createdAt) > Date.parse(second.createdAt), true)
     } finally {
-      writeFileSync(releasePath, 'release')
+      if (first?.exitCode === null) {
+        first.kill()
+        await once(first, 'exit')
+      }
     }
-    if (first.exitCode === null) {
-      await once(first, 'exit')
-    }
-    assert.equal(first.exitCode, 0)
-    assert.ok(second)
-    const firstRecord = JSON.parse(readFileSync(resultPath, 'utf8')) as BrainRecord
-    assert.equal(Date.parse(firstRecord.createdAt) > Date.parse(second.createdAt), true)
   })
 
   test('does not consume canonical timestamp order when publication fails before commit', () => {
@@ -295,6 +309,92 @@ describe('canonical records', () => {
       () => nextRecordCreatedAt([{ createdAt: '9999-12-31T23:59:59.999Z' }], Date.parse('2026-01-01')),
       'VALIDATION_FAILED',
     )
+  })
+
+  test('reports invalid canonical history before a timestamp ceiling', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, {
+      createdAt: '9999-12-31T23:59:59.999Z',
+      id: 'ceiling-invalid-history-a',
+      subject: 'timestamp.invalid-history',
+    })
+    writeCanonicalRecord(root, {
+      createdAt: '9999-12-31T23:59:59.998Z',
+      id: 'ceiling-invalid-history-b',
+      subject: 'timestamp.invalid-history',
+    })
+
+    assert.throws(
+      () =>
+        api.addRecord({
+          id: 'ceiling-invalid-history-candidate',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'timestamp.candidate',
+        }),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: { errors?: Array<{ code?: unknown }> } }
+        assert.equal(actual.code, 'VALIDATION_FAILED')
+        assert.equal(
+          actual.details?.errors?.some(issue => issue.code === 'MULTIPLE_ACTIVE_HEADS'),
+          true,
+        )
+        return true
+      },
+    )
+  })
+
+  test('does not publish into a repository root replaced after lock acquisition', () => {
+    const root = createRoot()
+    const replacement = createRoot()
+    const displaced = `${root}-locked-root`
+    roots.push(displaced)
+    recordWriteTestHooks.afterOperationLock = () => {
+      renameSync(root, displaced)
+      renameSync(replacement, root)
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'replacement-root-candidate',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'timestamp.replacement-root',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'replacement-root-candidate.json')), false)
+  })
+
+  test('does not publish after an observed canonical record changes in place', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'observed-record-before-publication' })
+    const existingPath = join(root, 'encephalon', 'decision', 'observed-record-before-publication.json')
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-scan-validation') {
+        const existing = JSON.parse(readFileSync(existingPath, 'utf8')) as Record<string, unknown>
+        writeFileSync(existingPath, `${JSON.stringify({ ...existing, payload: { changed: true } }, null, 2)}\n`)
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate-after-observed-mutation',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'timestamp.observed-mutation',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'candidate-after-observed-mutation.json')), false)
   })
 
   test('record publication outcome returns the canonical record with a post-link failure', () => {

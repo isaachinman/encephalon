@@ -1,6 +1,7 @@
 import { parseInitInput } from './api-input.ts'
 import { canonicalPayload, scanBaseline } from './baseline.ts'
 import { hydrateResolvedRepository, prepareResolvedRepository } from './cache.ts'
+import { assertCacheLocation } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { applyInstructionChangesOutcome, planInstructionChanges } from './instructions.ts'
 import { withOperationLock } from './lock.ts'
@@ -211,6 +212,7 @@ const initResolved = (
   return withOperationLock(
     root,
     location => {
+      assertCacheLocation(location)
       const instructionPlans = planInstructionChanges(root, false)
       hooks.baselineScan?.()
       const baseline = scanBaseline(root)
@@ -227,6 +229,7 @@ const initResolved = (
           : undefined,
       )
       const { records } = recordSnapshot
+      assertCacheLocation(location)
       const actions = baselineActions(records, baseline, refresh)
       const { plans } = actions.additions.reduce<{
         cursor: BrainRecord[]

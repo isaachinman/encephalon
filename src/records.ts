@@ -23,7 +23,7 @@ import {
   inspectArtifactFiles,
 } from './artifact-inspection.ts'
 import { hydrateResolvedRepository } from './cache.ts'
-import type { CacheLocation } from './cache-location.ts'
+import { assertCacheLocation, type CacheLocation } from './cache-location.ts'
 import {
   CanonicalDirectoryChangedError,
   type CanonicalDirectorySnapshot,
@@ -73,6 +73,7 @@ type RecordScan = {
   errors: ValidationIssue[]
   bytes: number
   layout?: CanonicalLayoutWitness
+  observations: Array<{ metadata: Stats; path: string }>
 }
 
 type ValidatedRecordScan = {
@@ -87,6 +88,7 @@ type CanonicalLayoutWitness = {
 
 type CanonicalPublicationAuthority = {
   assertCurrent: () => void
+  acceptStagingCleanup: () => void
   acceptPreparation: (
     kind: string,
     rootSnapshot: CanonicalDirectorySnapshot,
@@ -132,12 +134,16 @@ type RecordWriteFault =
 
 /** @internal */
 export type RecordWriteHooks = {
-  beforeOperationLock?: (() => void) | undefined
   fault?: ((point: RecordWriteFault) => void) | undefined
 }
 
+type AddRecordTestHooks = RecordWriteHooks & {
+  afterOperationLock?: (() => void) | undefined
+  beforeOperationLock?: (() => void) | undefined
+}
+
 /** @internal */
-export const recordWriteTestHooks: RecordWriteHooks = {}
+export const recordWriteTestHooks: AddRecordTestHooks = {}
 
 type RecordReadFault = 'after-record-fstat' | 'after-record-lstat' | 'after-record-open'
 
@@ -296,6 +302,13 @@ const sameStableMetadata = (first: Stats, second: Stats) =>
   first.mtimeMs === second.mtimeMs &&
   first.ctimeMs === second.ctimeMs
 
+const sameStableMetadataExceptCtime = (first: Stats, second: Stats) =>
+  sameIdentity(identityFor(first), identityFor(second)) &&
+  first.birthtimeMs === second.birthtimeMs &&
+  first.size === second.size &&
+  first.mode === second.mode &&
+  first.mtimeMs === second.mtimeMs
+
 const assertRealDirectory = (root: string, path: string) => {
   const metadata = lstatSync(path)
   if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
@@ -388,7 +401,7 @@ const readRecord = (
   kindPath: string,
   kindIdentity: FileIdentity,
   hooks?: RecordReadHooks,
-): BrainRecord => {
+): { metadata: Stats; record: BrainRecord } => {
   const relativePath = posixRelative(root, path)
   const pathMetadata = lstatSync(path)
   readFault(hooks, 'after-record-lstat', path)
@@ -423,7 +436,7 @@ const readRecord = (
     }
     const parsed = parseRecordJson(decodeRecordBytes(bytes))
     const record = parseRecordFile(parsed)
-    return { ...record, path: relativePath }
+    return { metadata: finalMetadata, record: { ...record, path: relativePath } }
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -462,6 +475,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       return {
         bytes: 0,
         errors: [issue('INVALID_RECORD_LAYOUT', 'encephalon must be a real directory.', 'encephalon')],
+        observations: [],
         records: [],
       }
     }
@@ -476,6 +490,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
         return {
           bytes: 0,
           errors: [issue('INVALID_RECORD_LAYOUT', 'encephalon changed while it was being validated.', 'encephalon')],
+          observations: [],
           records: [],
         }
       }
@@ -485,6 +500,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       return {
         bytes: 0,
         errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_BRAIN_ROOT_ENTRIES)],
+        observations: [],
         records: [],
       }
     }
@@ -493,6 +509,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       return {
         bytes: 0,
         errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_KIND_DIRECTORIES, 'kind directories')],
+        observations: [],
         records: [],
       }
     }
@@ -514,6 +531,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
                 relativeKindPath,
               ),
             ],
+            observations: [],
             records: [],
           }
         }
@@ -523,6 +541,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
         return {
           bytes: 0,
           errors: [directoryEntryLimitIssue(relativeKindPath, MAX_CANONICAL_KIND_ENTRIES)],
+          observations: [],
           records: [],
         }
       }
@@ -530,7 +549,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
     }
 
     const kindDirectoryNames = new Map<string, string>()
-    const scanned: RecordScan = { bytes: 0, errors: [], records: [] }
+    const scanned: RecordScan = { bytes: 0, errors: [], observations: [], records: [] }
     let recordBytes = 0
     let stopScanning = false
     const addScanError = (validationIssue: ValidationIssue) => {
@@ -622,7 +641,8 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
               }
               recordBytes += metadata.size
               try {
-                const record = readRecord(root, recordPath, kindPath, kindIdentity, options.hooks)
+                const observation = readRecord(root, recordPath, kindPath, kindIdentity, options.hooks)
+                const { record } = observation
                 const expectedName = `${record.id}.json`
                 if (!(recordEntry.name === expectedName && record.kind === kindEntry.name)) {
                   addScanError(
@@ -634,6 +654,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
                     ),
                   )
                 }
+                scanned.observations.push({ metadata: observation.metadata, path: recordPath })
                 scanned.records.push(record)
               } catch (error) {
                 const message = error instanceof Error ? error.message : 'Record could not be parsed.'
@@ -675,6 +696,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
             errors: [
               issue('INVALID_RECORD_LAYOUT', `${relativePath} changed while it was being validated.`, relativePath),
             ],
+            observations: [],
             records: [],
           }
         }
@@ -686,13 +708,14 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       bytes: recordBytes,
       errors: scanned.errors,
       layout: { kinds: kindSnapshots, root: rootEntries },
+      observations: scanned.observations,
       records: scanned.records.sort(
         (first, second) =>
           ordinalStringCompare(first.createdAt, second.createdAt) || ordinalStringCompare(first.id, second.id),
       ),
     }
   }
-  return { bytes: 0, errors: [], layout: { kinds: new Map(), root: null }, records: [] }
+  return { bytes: 0, errors: [], layout: { kinds: new Map(), root: null }, observations: [], records: [] }
 }
 
 const duplicateAndCaseIssues = (records: BrainRecord[]) => {
@@ -1044,8 +1067,28 @@ const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allow
 const canonicalPublicationAuthority = (
   root: string,
   initialLayout: CanonicalLayoutWitness,
+  initialObservations: readonly { metadata: Stats; path: string }[],
 ): CanonicalPublicationAuthority => {
   let layout = initialLayout
+  let observations = [...initialObservations]
+  const currentObservationMetadata = (path: string) => {
+    try {
+      return lstatSync(path)
+    } catch (error) {
+      const { code } = error as NodeJS.ErrnoException
+      if (code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR') {
+        return repositoryChangedBeforePublication()
+      }
+      throw error
+    }
+  }
+  const assertObservedRecordsCurrent = () => {
+    for (const observation of observations) {
+      if (!sameStableMetadata(observation.metadata, currentObservationMetadata(observation.path))) {
+        return repositoryChangedBeforePublication()
+      }
+    }
+  }
   const projection = () => {
     const rootEntries = layout.root === null ? [] : layout.root.entries
     return {
@@ -1103,6 +1146,8 @@ const canonicalPublicationAuthority = (
         if (!(sameDirectoryGeneration(kindSnapshot, nextKind) && sameEntryNames(expectedEntries, nextKind.entries))) {
           return repositoryChangedBeforePublication()
         }
+        const recordPath = resolve(root, 'encephalon', kind, recordName)
+        observations = [...observations, { metadata: lstatSync(recordPath), path: recordPath }]
         layout = { kinds: new Map(layout.kinds).set(kind, nextKind), root: rootSnapshot }
         authority.assertCurrent()
       } catch (error) {
@@ -1112,7 +1157,21 @@ const canonicalPublicationAuthority = (
         throw error
       }
     },
-    assertCurrent: () => assertLayoutWitnessCurrent(root, layout),
+    acceptStagingCleanup: () => {
+      observations = observations.map(observation => {
+        const metadata = currentObservationMetadata(observation.path)
+        if (!sameStableMetadataExceptCtime(observation.metadata, metadata)) {
+          return repositoryChangedBeforePublication()
+        }
+        return { metadata, path: observation.path }
+      })
+      authority.assertCurrent()
+    },
+    assertCurrent: () => {
+      assertObservedRecordsCurrent()
+      assertLayoutWitnessCurrent(root, layout)
+      assertObservedRecordsCurrent()
+    },
     projection,
   }
   return authority
@@ -1138,7 +1197,10 @@ export const readRecordSnapshotResolved = (root: string, hooks: RecordReadHooks 
   if (scan.layout === undefined) {
     return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')
   }
-  return { authority: canonicalPublicationAuthority(root, scan.layout), records: scan.records }
+  return {
+    authority: canonicalPublicationAuthority(root, scan.layout, scan.observations),
+    records: scan.records,
+  }
 }
 
 /** @internal */
@@ -1195,6 +1257,7 @@ export const assertRecordGraph = (
     {
       bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
       errors: [],
+      observations: [],
       records,
     },
     hooks,
@@ -1328,6 +1391,7 @@ const publishPlannedRecordInternal = (
       beforeFlush: () => fault(options.hooks, 'during-staging-cleanup-flush'),
       beforeQuarantine: () => fault(options.hooks, 'before-staging-cleanup-quarantine'),
     })
+    options.authority.acceptStagingCleanup()
     options.authority.assertCurrent()
   }
   options.authority.assertCurrent()
@@ -1573,6 +1637,9 @@ const addRecordFileResolved = (
   recordDraft: ValidatedAddRecordInput,
   options: AddRecordOptions = {},
 ): BrainRecord => {
+  if (options.cacheLocation !== undefined) {
+    assertCacheLocation(options.cacheLocation)
+  }
   const relativePath = `encephalon/${recordDraft.kind}/${recordDraft.id}.json`
   const path = resolve(root, ...relativePath.split('/'))
   if (existsSync(path)) {
@@ -1590,22 +1657,30 @@ const addRecordFileResolved = (
       })),
     })
   }
+  const validationRecordFile = createRecordFile(recordDraft, '2000-01-01T00:00:00.000Z')
+  const validationRecord: BrainRecord = { ...validationRecordFile, path: relativePath }
+  assertRecordGraph(
+    root,
+    [...scan.records, validationRecord],
+    'The new record would make canonical records invalid.',
+    {},
+    scan.bytes + Buffer.byteLength(formatRecordFile(validationRecordFile), 'utf8'),
+  )
+  if (options.cacheLocation !== undefined) {
+    assertCacheLocation(options.cacheLocation)
+  }
   const recordFile = createRecordFile(recordDraft, nextRecordCreatedAt(scan.records))
   const record: BrainRecord = { ...recordFile, path: relativePath }
   const formatted = formatRecordFile(recordFile)
   const plan: PlannedRecord = { formatted, path, record, recordFile, relativePath }
-  assertRecordGraph(
-    root,
-    [...scan.records, plan.record],
-    'The new record would make canonical records invalid.',
-    {},
-    scan.bytes + Buffer.byteLength(plan.formatted, 'utf8'),
-  )
   fault(options.hooks, 'after-scan-validation')
   if (scan.layout === undefined) {
     return repositoryChangedBeforePublication()
   }
-  const authority = assertCanonicalLayoutAdditions([plan.record.kind], canonicalPublicationAuthority(root, scan.layout))
+  const authority = assertCanonicalLayoutAdditions(
+    [plan.record.kind],
+    canonicalPublicationAuthority(root, scan.layout, scan.observations),
+  )
 
   const publishOptions = {
     authority,
@@ -1642,12 +1717,13 @@ export const addRecord = (input: AddRecordInput): BrainRecord => {
   const root = resolveRepository(parsed)
   try {
     recordWriteTestHooks.beforeOperationLock?.()
-    return withOperationLock(root, cacheLocation =>
-      addRecordFileResolved(root, parsed.recordDraft, {
+    return withOperationLock(root, cacheLocation => {
+      recordWriteTestHooks.afterOperationLock?.()
+      return addRecordFileResolved(root, parsed.recordDraft, {
         cacheLocation,
         hooks: recordWriteTestHooks,
-      }),
-    )
+      })
+    })
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
