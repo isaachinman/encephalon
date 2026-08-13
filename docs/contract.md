@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-13 for code and behavioural-test snapshot `2f8ea09c3dd96fc2184b8223e374ad1e4f70da12`.
+Last reviewed: 2026-08-13 for code and behavioural-test snapshot `2874874096bb7d327e084d7e17d5243564244c43`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -80,6 +80,7 @@ This document is the concise contract maintainers should update when public beha
 - SQLite is disposable derived state under `node_modules/.cache/encephalon`.
 - The repository, cache ancestors, SQLite databases and sidecars, operation-lock metadata, recovery entries, and quarantine entries must be real contained filesystem entries verified by type, native realpath, and stable identity. Static symlinks, junction redirects, unexpected types, and replacements at validation boundaries fail closed.
 - Missing cache ancestors are created individually. New primary databases use exclusive no-follow descriptor creation before SQLite opens the verified pathname, and destructive recovery removes only the exact identity moved to a verified sibling quarantine.
+- Operation-lock recovery retries only bounded sharing violations while exact directory identity and owner token remain current. Optional SQLite sidecar canonicalisation is likewise reobserved within the existing bound so normal WAL teardown cannot be confused with a persistent unsafe path.
 - Corrupt operation-gate recovery is serialised by a bounded owner marker and one total deadline. A well-formed live owner is never reclaimed because of age; oversized, non-record, otherwise malformed, dead, or ownerless markers remain reclaimable only while their observed state remains current at the destructive boundary. Recovery work, successful gate initialisation, and cleanup are conditional on the captured directory identity and random owner token. Cleanup failure prevents entry into the protected operation, and a later call may reclaim only that exact abandoned identity and token. Gate cleanup reports its own failure only when the protected operation succeeded; otherwise the operation failure remains authoritative.
 - Recovery-marker exclusion begins with atomic directory creation. An owner file that is briefly absent is age-reclaimed rather than published by candidate-directory rename because Node has no cross-platform no-replace directory rename, and replacement semantics could displace an empty live marker.
 - Every `list`, `show`, `search`, and `gather` operation prepares the cache before reading.
@@ -126,7 +127,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2f8ea09c3dd96fc2184b8223e374ad1e4f70da12`.
+- MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2874874096bb7d327e084d7e17d5243564244c43`.
 - MAR-2548 restart-safe partial initialisation progress and convergence: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`.
 - MAR-2547 fixed-root and descriptor-bound managed instruction finalisation, exact private bytes, collision and successor preservation, durability ordering, and complete safe recovery details: `bbb2182fe616ebd1264744647213cce4d9e9e429`.
 - MAR-2556 bounded, generation-stable canonical layout handling and behavioural coverage: `de05ccf06119a2ad2507accf18163be8243eafec`.
