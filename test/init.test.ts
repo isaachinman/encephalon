@@ -22,10 +22,13 @@ import {
 } from 'node:fs'
 
 import { dirname, join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
+import { cacheReadTestHooks } from '../src/cache.ts'
 import { DirectoryWitnessError } from '../src/directory-witness.ts'
+import { EncephalonError } from '../src/errors.ts'
 import * as api from '../src/index.ts'
 import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, applyInstructionChangesOutcome, planInstructionChanges } from '../src/instructions.ts'
@@ -214,10 +217,571 @@ afterEach(() => {
   artifactInspectionTestHooks.close = undefined
   artifactInspectionTestHooks.fault = undefined
   artifactInspectionTestHooks.open = undefined
+  cacheReadTestHooks.duringDatabaseInitialisation = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
 
 describe('initialisation', () => {
+  const baselineSubjects = [
+    ['context', 'encephalon:init/repository-overview'],
+    ['architecture', 'encephalon:init/tooling-layout'],
+    ['workflow', 'encephalon:init/commands-ci'],
+  ] as const
+
+  const committedBaselineIds = (root: string) =>
+    baselineSubjects.flatMap(([kind, subject]) => {
+      const directory = join(root, 'encephalon', kind)
+      if (!existsSync(directory)) {
+        return []
+      }
+      const record = readdirSync(directory)
+        .filter(name => name.endsWith('.json'))
+        .map(name => JSON.parse(readFileSync(join(directory, name), 'utf8')) as BrainRecordFile)
+        .find(candidate => candidate.subject === subject)
+      return record === undefined ? [] : [record.id]
+    })
+
+  const assertSafeInitError = (
+    error: unknown,
+    expected: {
+      cacheState: 'notAttempted' | 'disposable' | 'prepared'
+      code: string
+      committedInstructionFiles: Array<{ action: 'removed' | 'updated'; file: 'AGENTS.md' | 'CLAUDE.md' }>
+      committedRecordIds: string[]
+      message: string
+      phase: 'preflight' | 'recordPublication' | 'cachePreparation' | 'instructionApplication' | 'operationCleanup'
+      recoveryAction: string
+      recoveryMode: 'rerun' | 'inspectAndRerun'
+      root: string
+      sentinels?: readonly string[]
+    },
+  ) => {
+    assert.ok(error instanceof EncephalonError)
+    assert.equal(error.code, expected.code)
+    assert.equal(error.message, expected.message)
+    assert.deepEqual(error.details.initProgress, {
+      cacheState: expected.cacheState,
+      canonicalCommitted: expected.committedRecordIds.length > 0,
+      committedInstructionFiles: expected.committedInstructionFiles,
+      committedRecordIds: expected.committedRecordIds,
+      phase: expected.phase,
+      recoveryAction: expected.recoveryAction,
+      recoveryMode: expected.recoveryMode,
+    })
+    const serialised = JSON.stringify(error)
+    assert.equal(serialised.includes(expected.root), false)
+    for (const sentinel of expected.sentinels ?? []) {
+      assert.equal(serialised.includes(sentinel), false)
+    }
+    return true
+  }
+
+  test('init preflight progress reports no commits for a malformed second instruction file', () => {
+    const root = createRoot()
+    const secretInstructionBytes = Buffer.from([0x53, 0x45, 0x43, 0x52, 0x45, 0x54, 0xff])
+    writeFileSync(join(root, 'AGENTS.md'), '# Existing guidance\n')
+    writeFileSync(join(root, 'CLAUDE.md'), secretInstructionBytes)
+
+    assert.throws(
+      () => api.initEncephalon({ root }),
+      error =>
+        assertSafeInitError(error, {
+          cacheState: 'notAttempted',
+          code: 'VALIDATION_FAILED',
+          committedInstructionFiles: [],
+          committedRecordIds: [],
+          message: 'CLAUDE.md must contain valid UTF-8.',
+          phase: 'preflight',
+          recoveryAction:
+            'Resolve the reported preflight issue, then repeat the same init operation with the same options.',
+          recoveryMode: 'rerun',
+          root,
+          sentinels: ['SECRET'],
+        }),
+    )
+    assert.deepEqual(readFileSync(join(root, 'AGENTS.md')), Buffer.from('# Existing guidance\n'))
+    assert.deepEqual(readFileSync(join(root, 'CLAUDE.md')), secretInstructionBytes)
+    assert.equal(existsSync(join(root, 'encephalon')), false)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+  })
+
+  for (const failureAttempt of [2, 3] as const) {
+    test(`partial init progress retains the committed prefix before record attempt ${failureAttempt}`, () => {
+      const root = createRoot()
+      const privateSentinel = `PRIVATE_RECORD_PAYLOAD_${failureAttempt}`
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ privateSentinel }))
+      let publicationAttempts = 0
+      let capturedError: unknown
+
+      try {
+        initEncephalonWithHooks(
+          { root },
+          {
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'before-publication') {
+                  publicationAttempts += 1
+                  if (publicationAttempts === failureAttempt) {
+                    throw Object.assign(new Error(privateSentinel), { code: 'EIO' })
+                  }
+                }
+              },
+            },
+          },
+        )
+        assert.fail('Expected record publication to fail.')
+      } catch (error) {
+        capturedError = error
+      }
+
+      const expectedIds = committedBaselineIds(root)
+      assert.equal(expectedIds.length, failureAttempt - 1)
+      assertSafeInitError(capturedError, {
+        cacheState: 'disposable',
+        code: 'IO_ERROR',
+        committedInstructionFiles: [],
+        committedRecordIds: expectedIds,
+        message: 'Unable to coordinate Encephalon cache access.',
+        phase: 'recordPublication',
+        recoveryAction: 'Repeat the same init operation with the same options.',
+        recoveryMode: 'rerun',
+        root,
+        sentinels: [privateSentinel],
+      })
+      assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+      assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+      assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+    })
+  }
+
+  test('partial init progress includes the current record after post-link verification fails', () => {
+    const root = createRoot()
+    const privateSentinel = 'PRIVATE_POST_LINK_RECORD_BYTES'
+    let acceptedPublications = 0
+    let capturedError: unknown
+
+    try {
+      initEncephalonWithHooks(
+        { root },
+        {
+          recordWriteHooks: {
+            fault: point => {
+              if (point === 'after-publication-accept') {
+                acceptedPublications += 1
+                if (acceptedPublications === 2) {
+                  throw Object.assign(new Error(privateSentinel), { code: 'EIO' })
+                }
+              }
+            },
+          },
+        },
+      )
+      assert.fail('Expected post-link verification to fail.')
+    } catch (error) {
+      capturedError = error
+    }
+
+    const committedRecordIds = committedBaselineIds(root)
+    assert.equal(committedRecordIds.length, 2)
+    const [, currentRecordId] = committedRecordIds
+    assert.ok(currentRecordId)
+    assertSafeInitError(capturedError, {
+      cacheState: 'disposable',
+      code: 'IO_ERROR',
+      committedInstructionFiles: [],
+      committedRecordIds,
+      message: `Record ${currentRecordId} was committed, but the publicationVerification post-commit phase failed. Inspect the canonical directory generation before retrying; the linked record may have been displaced by a concurrent replacement.`,
+      phase: 'recordPublication',
+      recoveryAction:
+        'Inspect the reported canonical records, then repeat the same init operation with the same options.',
+      recoveryMode: 'inspectAndRerun',
+      root,
+      sentinels: [privateSentinel],
+    })
+    const { details } = capturedError as EncephalonError
+    assert.equal(details.canonicalCommitted, true)
+    assert.equal(details.postCommitPhase, 'publicationVerification')
+    assert.equal(details.recordId, currentRecordId)
+    assert.equal(
+      details.recoveryAction,
+      'Inspect the canonical directory generation before retrying; the linked record may have been displaced by a concurrent replacement.',
+    )
+  })
+
+  test('init cache progress reports all record commits and disposable cache state', () => {
+    const root = createRoot()
+    const privateSentinel = 'PRIVATE_CACHE_PAYLOAD'
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        throw Object.assign(new Error(privateSentinel), { code: 'EIO' })
+      }
+    }
+    let capturedError: unknown
+
+    try {
+      api.initEncephalon({ root })
+      assert.fail('Expected cache preparation to fail.')
+    } catch (error) {
+      capturedError = error
+    }
+
+    cacheReadTestHooks.duringDatabaseInitialisation = undefined
+    const committedRecordIds = committedBaselineIds(root)
+    assert.equal(committedRecordIds.length, 3)
+    assertSafeInitError(capturedError, {
+      cacheState: 'disposable',
+      code: 'IO_ERROR',
+      committedInstructionFiles: [],
+      committedRecordIds,
+      message: 'Unable to coordinate Encephalon cache access.',
+      phase: 'cachePreparation',
+      recoveryAction: 'Run prepare, run validate, then repeat the same init operation with the same options.',
+      recoveryMode: 'rerun',
+      root,
+      sentinels: [privateSentinel],
+    })
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('init instruction progress retains the first action when the second file fails before commit', () => {
+    const root = createRoot()
+    const privateSentinel = 'PRIVATE_SECOND_INSTRUCTION_BYTES'
+    let capturedError: unknown
+
+    try {
+      initEncephalonWithHooks(
+        { root },
+        {
+          instructionWriteHooks: {
+            fault: (point, generatedPath) => {
+              if (point === 'after-temp-create' && generatedPath?.includes('.CLAUDE.md.')) {
+                throw Object.assign(new Error(privateSentinel), { code: 'EIO' })
+              }
+            },
+          },
+        },
+      )
+      assert.fail('Expected the second instruction publication to fail.')
+    } catch (error) {
+      capturedError = error
+    }
+
+    const committedRecordIds = committedBaselineIds(root)
+    assert.equal(committedRecordIds.length, 3)
+    assertSafeInitError(capturedError, {
+      cacheState: 'prepared',
+      code: 'IO_ERROR',
+      committedInstructionFiles: [{ action: 'updated', file: 'AGENTS.md' }],
+      committedRecordIds,
+      message: 'Unable to update repository instruction files.',
+      phase: 'instructionApplication',
+      recoveryAction: 'Repeat the same init operation with the same options.',
+      recoveryMode: 'rerun',
+      root,
+      sentinels: [privateSentinel],
+    })
+    assert.equal(
+      readFileSync(join(root, 'AGENTS.md'), 'utf8').match(/encephalon:managed-instructions:start/gu)?.length,
+      1,
+    )
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('init instruction progress includes the current action and preserves post-commit recovery details', () => {
+    const root = createRoot()
+    const privateSentinel = 'PRIVATE_INSTRUCTION_RECOVERY_BYTES'
+    let capturedError: unknown
+
+    try {
+      initEncephalonWithHooks(
+        { root },
+        {
+          instructionWriteHooks: {
+            fault: point => {
+              if (point === 'after-publication' || point === 'during-temp-cleanup') {
+                throw Object.assign(new Error(privateSentinel), { code: 'EIO' })
+              }
+            },
+          },
+        },
+      )
+      assert.fail('Expected instruction finalisation to fail.')
+    } catch (error) {
+      capturedError = error
+    }
+
+    const committedRecordIds = committedBaselineIds(root)
+    assertSafeInitError(capturedError, {
+      cacheState: 'prepared',
+      code: 'IO_ERROR',
+      committedInstructionFiles: [{ action: 'updated', file: 'AGENTS.md' }],
+      committedRecordIds,
+      message:
+        'AGENTS.md was committed, but the publicationVerification post-commit phase failed. Inspect the canonical instruction file before retrying; the linked replacement may have been displaced by a concurrent change.',
+      phase: 'instructionApplication',
+      recoveryAction:
+        'Inspect the reported instruction files and recovery paths, then repeat the same init operation with the same options.',
+      recoveryMode: 'inspectAndRerun',
+      root,
+      sentinels: [privateSentinel],
+    })
+    const { details } = capturedError as EncephalonError
+    assert.deepEqual(details.postCommitFailures, [
+      {
+        postCommitPhase: 'publicationVerification',
+        recoveryAction:
+          'Inspect the canonical instruction file before retrying; the linked replacement may have been displaced by a concurrent change.',
+      },
+      {
+        postCommitPhase: 'temporaryCleanup',
+        recoveryAction:
+          'Inspect the repository root and remove only a confirmed temporary file left by this operation before retrying.',
+      },
+    ])
+    assert.ok(Array.isArray(details.recoveryPaths))
+    assert.equal(details.recoveryPaths.length, 1)
+    assert.equal(String(details.recoveryPaths[0]).includes(root), false)
+  })
+
+  test('partial init progress retains successful phases when operation cleanup fails', () => {
+    const root = createRoot()
+    const privateSentinel = 'PRIVATE_OPERATION_LOCK_OWNER'
+    let capturedError: unknown
+    let instructionPublications = 0
+    const originalClose = DatabaseSync.prototype.close
+
+    try {
+      initEncephalonWithHooks(
+        { root },
+        {
+          instructionWriteHooks: {
+            fault: point => {
+              if (point === 'after-publication') {
+                instructionPublications += 1
+                if (instructionPublications === 2) {
+                  DatabaseSync.prototype.close = function closeWithFailure() {
+                    originalClose.call(this)
+                    throw Object.assign(new Error(privateSentinel), { code: 'EIO' })
+                  }
+                }
+              }
+            },
+          },
+        },
+      )
+      assert.fail('Expected operation cleanup to fail.')
+    } catch (error) {
+      capturedError = error
+    } finally {
+      DatabaseSync.prototype.close = originalClose
+    }
+
+    assertSafeInitError(capturedError, {
+      cacheState: 'prepared',
+      code: 'IO_ERROR',
+      committedInstructionFiles: [
+        { action: 'updated', file: 'AGENTS.md' },
+        { action: 'updated', file: 'CLAUDE.md' },
+      ],
+      committedRecordIds: committedBaselineIds(root),
+      message: 'Unable to initialise Encephalon.',
+      phase: 'operationCleanup',
+      recoveryAction: 'Inspect operation cleanup state, then repeat the same init operation with the same options.',
+      recoveryMode: 'inspectAndRerun',
+      root,
+      sentinels: [privateSentinel],
+    })
+  })
+
+  test('partial init rerun creates only records missing after prefix and cache failures', () => {
+    for (const failure of ['record-prefix', 'cache'] as const) {
+      const root = createRoot()
+      let publicationAttempts = 0
+      if (failure === 'cache') {
+        cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+          if (mode === 'writer') {
+            throw Object.assign(new Error('Injected cache rerun failure'), { code: 'EIO' })
+          }
+        }
+      }
+
+      assert.throws(
+        () =>
+          initEncephalonWithHooks(
+            { root },
+            failure === 'record-prefix'
+              ? {
+                  recordWriteHooks: {
+                    fault: point => {
+                      if (point === 'before-publication') {
+                        publicationAttempts += 1
+                        if (publicationAttempts === 2) {
+                          throw Object.assign(new Error('Injected record-prefix rerun failure'), { code: 'EIO' })
+                        }
+                      }
+                    },
+                  },
+                }
+              : {},
+          ),
+        EncephalonError,
+      )
+      cacheReadTestHooks.duringDatabaseInitialisation = undefined
+      const committedBeforeRerun = committedBaselineIds(root)
+      const rerun = api.initEncephalon({ root })
+
+      assert.equal(rerun.recordsCreated.length, 3 - committedBeforeRerun.length, failure)
+      assert.deepEqual(committedBaselineIds(root).slice(0, committedBeforeRerun.length), committedBeforeRerun, failure)
+      assert.equal(new Set(committedBaselineIds(root)).size, 3, failure)
+      assert.equal(api.validateRecords({ root }).valid, true, failure)
+    }
+  })
+
+  test('partial refresh rerun repairs only the unresolved generated subject', () => {
+    const root = createRoot()
+    api.initEncephalon({ root })
+    const repairedSubject = 'encephalon:init/repository-overview'
+    const unresolvedSubject = 'encephalon:init/tooling-layout'
+    const originals = api.listRecords({ includeSuperseded: true, limit: 20, root })
+    const repairedOriginal = originals.find(record => record.subject === repairedSubject)
+    const unresolvedOriginal = originals.find(record => record.subject === unresolvedSubject)
+    assert.ok(repairedOriginal)
+    assert.ok(unresolvedOriginal)
+    writeRecordFile(root, { ...readRecordFile(root, repairedOriginal), id: 'parallel-overview' })
+    writeRecordFile(root, { ...readRecordFile(root, unresolvedOriginal), id: 'parallel-tooling' })
+    let publicationAttempts = 0
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { refreshBaseline: true, root },
+          {
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'before-publication') {
+                  publicationAttempts += 1
+                  if (publicationAttempts === 2) {
+                    throw Object.assign(new Error('Injected second resolver failure'), { code: 'EIO' })
+                  }
+                }
+              },
+            },
+          },
+        ),
+      EncephalonError,
+    )
+    const repairedBeforeRerun = rawRecordFilesForSubject(root, 'context', repairedSubject).find(
+      record => record.supersedes?.length === 2,
+    )
+    assert.ok(repairedBeforeRerun)
+
+    const rerun = api.initEncephalon({ refreshBaseline: true, root })
+
+    assert.deepEqual(
+      rerun.recordsCreated.map(record => record.subject),
+      [unresolvedSubject],
+    )
+    assert.deepEqual(
+      activeRecordsForSubject(root, repairedSubject).map(record => record.id),
+      [repairedBeforeRerun.id],
+    )
+    assert.equal(activeRecordsForSubject(root, unresolvedSubject).length, 1)
+    assert.equal(recordsForSubject(root, repairedSubject).length, 3)
+    assert.equal(recordsForSubject(root, unresolvedSubject).length, 3)
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('partial instruction rerun preserves concurrent bytes after a stale plan', () => {
+    const root = createRoot()
+    const concurrentClaude = '# Concurrent private guidance\n'
+    let changed = false
+    let capturedError: unknown
+
+    try {
+      initEncephalonWithHooks(
+        { root },
+        {
+          instructionWriteHooks: {
+            fault: point => {
+              if (point === 'before-plan-validation' && !changed) {
+                changed = true
+                writeFileSync(join(root, 'CLAUDE.md'), concurrentClaude)
+              }
+            },
+          },
+        },
+      )
+      assert.fail('Expected the stale instruction plan to fail.')
+    } catch (error) {
+      capturedError = error
+    }
+
+    const progress = (capturedError as EncephalonError).details.initProgress as {
+      committedInstructionFiles: unknown[]
+    }
+    assert.deepEqual(progress.committedInstructionFiles, [])
+    assert.equal(readFileSync(join(root, 'CLAUDE.md'), 'utf8'), concurrentClaude)
+
+    const rerun = api.initEncephalon({ root })
+
+    assert.deepEqual(rerun.recordsCreated, [])
+    assert.match(readFileSync(join(root, 'CLAUDE.md'), 'utf8'), /^# Concurrent private guidance\n/u)
+    for (const filename of ['AGENTS.md', 'CLAUDE.md']) {
+      assert.equal(
+        readFileSync(join(root, filename), 'utf8').match(/encephalon:managed-instructions:start/gu)?.length,
+        1,
+      )
+    }
+  })
+
+  test('partial instruction rerun completes remove mode without deleting baseline records', () => {
+    const root = createRoot()
+    api.initEncephalon({ root })
+    const baselineIds = committedBaselineIds(root)
+    let deletionAttempts = 0
+    let capturedError: unknown
+
+    try {
+      initEncephalonWithHooks(
+        { remove: true, root },
+        {
+          instructionWriteHooks: {
+            fault: point => {
+              if (point === 'before-delete-move') {
+                deletionAttempts += 1
+                if (deletionAttempts === 2) {
+                  throw Object.assign(new Error('Injected second removal failure'), { code: 'EIO' })
+                }
+              }
+            },
+          },
+        },
+      )
+      assert.fail('Expected the second instruction removal to fail.')
+    } catch (error) {
+      capturedError = error
+    }
+
+    assert.deepEqual((capturedError as EncephalonError).details.initProgress, {
+      cacheState: 'notAttempted',
+      canonicalCommitted: false,
+      committedInstructionFiles: [{ action: 'removed', file: 'AGENTS.md' }],
+      committedRecordIds: [],
+      phase: 'instructionApplication',
+      recoveryAction: 'Repeat the same init operation with the same options.',
+      recoveryMode: 'rerun',
+    })
+    assert.deepEqual(committedBaselineIds(root), baselineIds)
+
+    const rerun = api.initEncephalon({ remove: true, root })
+
+    assert.deepEqual(rerun.recordsCreated, [])
+    assert.deepEqual(committedBaselineIds(root), baselineIds)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
   test('instruction apply outcome retains an earlier action when a later file fails before commit', () => {
     const root = createRoot()
     const plans = planInstructionChanges(root, false)

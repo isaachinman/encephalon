@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
@@ -31,6 +31,83 @@ const outputJson = (result: ReturnType<typeof run>) => JSON.parse(result.stdout)
 const errorJson = (result: ReturnType<typeof run>) => JSON.parse(result.stderr) as { error: { message: string } }
 
 describe('command-line interface', () => {
+  test('projects safe partial init progress and reruns without duplicate state', () => {
+    const root = createRoot()
+    const cacheDatabase = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const privateSentinel = 'PRIVATE_CLI_CACHE_SENTINEL'
+    mkdirSync(cacheDatabase, { recursive: true })
+    writeFileSync(join(cacheDatabase, privateSentinel), privateSentinel)
+
+    const failed = run(root, ['init', '--root', root])
+
+    assert.equal(failed.status, 2)
+    assert.equal(failed.stdout, '')
+    assert.equal(failed.stderr.endsWith('\n'), true)
+    assert.equal(failed.stderr.includes(root), false)
+    assert.equal(failed.stderr.includes(privateSentinel), false)
+    const committedRecordIds = [
+      ['context', 'encephalon:init/repository-overview'],
+      ['architecture', 'encephalon:init/tooling-layout'],
+      ['workflow', 'encephalon:init/commands-ci'],
+    ].map(([kind, subject]) => {
+      const directory = join(root, 'encephalon', kind as string)
+      const record = readdirSync(directory)
+        .filter(name => name.endsWith('.json'))
+        .map(name => JSON.parse(readFileSync(join(directory, name), 'utf8')) as { id: string; subject: string })
+        .find(candidate => candidate.subject === subject)
+      assert.ok(record)
+      return record.id
+    })
+    assert.deepEqual(JSON.parse(failed.stderr), {
+      error: {
+        code: 'VALIDATION_FAILED',
+        details: {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          initProgress: {
+            cacheState: 'disposable',
+            canonicalCommitted: true,
+            committedInstructionFiles: [],
+            committedRecordIds,
+            phase: 'cachePreparation',
+            recoveryAction: 'Run prepare, run validate, then repeat the same init operation with the same options.',
+            recoveryMode: 'rerun',
+          },
+          invariant: 'regular-non-symlink-file',
+        },
+        message: 'The Encephalon cache layout is unsafe.',
+      },
+    })
+
+    rmSync(cacheDatabase, { recursive: true })
+    const rerun = run(root, ['init', '--root', root])
+
+    assert.equal(rerun.status, 0)
+    assert.equal(rerun.stderr, '')
+    assert.deepEqual((outputJson(rerun) as { recordsCreated: unknown[] }).recordsCreated, [])
+    for (const filename of ['AGENTS.md', 'CLAUDE.md']) {
+      assert.equal(
+        readFileSync(join(root, filename), 'utf8').match(/encephalon:managed-instructions:start/gu)?.length,
+        1,
+      )
+    }
+    assert.deepEqual(
+      committedRecordIds,
+      [
+        ['context', 'encephalon:init/repository-overview'],
+        ['architecture', 'encephalon:init/tooling-layout'],
+        ['workflow', 'encephalon:init/commands-ci'],
+      ].map(([kind, subject]) => {
+        const directory = join(root, 'encephalon', kind as string)
+        const record = readdirSync(directory)
+          .filter(name => name.endsWith('.json'))
+          .map(name => JSON.parse(readFileSync(join(directory, name), 'utf8')) as { id: string; subject: string })
+          .find(candidate => candidate.subject === subject)
+        assert.ok(record)
+        return record.id
+      }),
+    )
+  })
+
   test('emits exactly one JSON value for successful commands', () => {
     const root = createRoot()
     const added = run(root, [
