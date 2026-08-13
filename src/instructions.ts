@@ -46,7 +46,8 @@ type FilePlan = {
   originalIdentity?: FileIdentity
 }
 
-export type InstructionAction = {
+/** @internal */
+type InstructionAction = {
   file: (typeof FILENAMES)[number]
   action: 'removed' | 'updated'
 }
@@ -1733,7 +1734,11 @@ export const applyInstructionChangesOutcome = (root: string, plans: FilePlan[], 
   return { instructionFiles }
 }
 
-export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?: AtomicWriteHooks) => {
+export const applyInstructionChanges = (
+  root: string,
+  plans: FilePlan[],
+  hooks?: AtomicWriteHooks,
+): Array<{ action: 'removed' | 'updated'; file: (typeof FILENAMES)[number] }> => {
   const outcome = applyInstructionChangesOutcome(root, plans, hooks)
   if (outcome.error !== undefined) {
     throw outcome.error

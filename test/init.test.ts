@@ -22,7 +22,6 @@ import {
 } from 'node:fs'
 
 import { dirname, join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
@@ -246,7 +245,10 @@ describe('initialisation', () => {
     expected: {
       cacheState: 'notAttempted' | 'disposable' | 'prepared'
       code: string
-      committedInstructionFiles: Array<{ action: 'removed' | 'updated'; file: 'AGENTS.md' | 'CLAUDE.md' }>
+      committedInstructionFiles: Array<{
+        action: 'removed' | 'updated'
+        file: 'AGENTS.md' | 'CLAUDE.md'
+      }>
       committedRecordIds: string[]
       message: string
       phase: 'preflight' | 'recordPublication' | 'cachePreparation' | 'instructionApplication' | 'operationCleanup'
@@ -354,6 +356,42 @@ describe('initialisation', () => {
     })
   }
 
+  test('partial init progress reports an empty journal before the first record attempt and reruns', () => {
+    const root = createRoot()
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'before-publication') {
+                  throw Object.assign(new Error('Injected first record failure'), { code: 'EIO' })
+                }
+              },
+            },
+          },
+        ),
+      error =>
+        assertSafeInitError(error, {
+          cacheState: 'notAttempted',
+          code: 'IO_ERROR',
+          committedInstructionFiles: [],
+          committedRecordIds: [],
+          message: 'Unable to coordinate Encephalon cache access.',
+          phase: 'recordPublication',
+          recoveryAction: 'Repeat the same init operation with the same options.',
+          recoveryMode: 'rerun',
+          root,
+        }),
+    )
+
+    const rerun = api.initEncephalon({ root })
+    assert.equal(rerun.recordsCreated.length, baselineSubjects.length)
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
   test('partial init progress includes the current record after post-link verification fails', () => {
     const root = createRoot()
     const privateSentinel = 'PRIVATE_POST_LINK_RECORD_BYTES'
@@ -410,6 +448,42 @@ describe('initialisation', () => {
     )
   })
 
+  test('partial init rerun cleans owned staging after the final record fails post-link', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    let linkedRecords = 0
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'after-canonical-link') {
+                  linkedRecords += 1
+                  if (linkedRecords === baselineSubjects.length) {
+                    throw Object.assign(new Error('Injected final record verification failure'), {
+                      code: 'EIO',
+                    })
+                  }
+                }
+              },
+            },
+          },
+        ),
+      EncephalonError,
+    )
+    assert.equal(committedBaselineIds(root).length, baselineSubjects.length)
+    assert.equal(readdirSync(stagingDirectory).length, 0)
+
+    const rerun = api.initEncephalon({ root })
+
+    assert.deepEqual(rerun.recordsCreated, [])
+    assert.deepEqual(readdirSync(stagingDirectory), [])
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
   test('init cache progress reports all record commits and disposable cache state', () => {
     const root = createRoot()
     const privateSentinel = 'PRIVATE_CACHE_PAYLOAD'
@@ -444,6 +518,32 @@ describe('initialisation', () => {
     })
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('init cache inspection recovery includes canonical inspection and cache repair', () => {
+    const root = createRoot()
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        throw new EncephalonError('REPOSITORY_CHANGED', 'Injected cache identity uncertainty.')
+      }
+    }
+
+    assert.throws(
+      () => api.initEncephalon({ root }),
+      error =>
+        assertSafeInitError(error, {
+          cacheState: 'disposable',
+          code: 'REPOSITORY_CHANGED',
+          committedInstructionFiles: [],
+          committedRecordIds: committedBaselineIds(root),
+          message: 'Injected cache identity uncertainty.',
+          phase: 'cachePreparation',
+          recoveryAction:
+            'Inspect canonical state, run prepare, run validate, then repeat the same init operation with the same options.',
+          recoveryMode: 'inspectAndRerun',
+          root,
+        }),
+    )
   })
 
   test('init instruction progress retains the first action when the second file fails before commit', () => {
@@ -551,33 +651,33 @@ describe('initialisation', () => {
     const privateSentinel = 'PRIVATE_OPERATION_LOCK_OWNER'
     let capturedError: unknown
     let instructionPublications = 0
-    const originalClose = DatabaseSync.prototype.close
-
-    try {
-      initEncephalonWithHooks(
-        { root },
-        {
-          instructionWriteHooks: {
-            fault: point => {
-              if (point === 'after-publication') {
-                instructionPublications += 1
-                if (instructionPublications === 2) {
-                  DatabaseSync.prototype.close = function closeWithFailure() {
-                    originalClose.call(this)
-                    throw Object.assign(new Error(privateSentinel), { code: 'EIO' })
-                  }
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            instructionWriteHooks: {
+              fault: point => {
+                if (point === 'after-publication') {
+                  instructionPublications += 1
                 }
-              }
+              },
+            },
+            lockHooks: {
+              gateClose: database => {
+                database.close()
+                if (instructionPublications === 2) {
+                  throw Object.assign(new Error(privateSentinel), { code: 'EIO' })
+                }
+              },
             },
           },
-        },
-      )
-      assert.fail('Expected operation cleanup to fail.')
-    } catch (error) {
-      capturedError = error
-    } finally {
-      DatabaseSync.prototype.close = originalClose
-    }
+        ),
+      error => {
+        capturedError = error
+        return true
+      },
+    )
 
     assertSafeInitError(capturedError, {
       cacheState: 'prepared',
@@ -619,7 +719,9 @@ describe('initialisation', () => {
                       if (point === 'before-publication') {
                         publicationAttempts += 1
                         if (publicationAttempts === 2) {
-                          throw Object.assign(new Error('Injected record-prefix rerun failure'), { code: 'EIO' })
+                          throw Object.assign(new Error('Injected record-prefix rerun failure'), {
+                            code: 'EIO',
+                          })
                         }
                       }
                     },
@@ -664,7 +766,9 @@ describe('initialisation', () => {
                 if (point === 'before-publication') {
                   publicationAttempts += 1
                   if (publicationAttempts === 2) {
-                    throw Object.assign(new Error('Injected second resolver failure'), { code: 'EIO' })
+                    throw Object.assign(new Error('Injected second resolver failure'), {
+                      code: 'EIO',
+                    })
                   }
                 }
               },
@@ -753,7 +857,9 @@ describe('initialisation', () => {
               if (point === 'before-delete-move') {
                 deletionAttempts += 1
                 if (deletionAttempts === 2) {
-                  throw Object.assign(new Error('Injected second removal failure'), { code: 'EIO' })
+                  throw Object.assign(new Error('Injected second removal failure'), {
+                    code: 'EIO',
+                  })
                 }
               }
             },
@@ -784,6 +890,153 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
 
+  test('partial instruction rerun retains both updates when the second file fails post-commit', () => {
+    const root = createRoot()
+    let publications = 0
+    let capturedError: unknown
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            instructionWriteHooks: {
+              fault: point => {
+                if (point === 'after-publication') {
+                  publications += 1
+                  if (publications === 2) {
+                    throw Object.assign(new Error('Injected second update post-commit failure'), {
+                      code: 'EIO',
+                    })
+                  }
+                }
+              },
+            },
+          },
+        ),
+      error => {
+        capturedError = error
+        return true
+      },
+    )
+    assert.deepEqual((capturedError as EncephalonError).details.initProgress, {
+      cacheState: 'prepared',
+      canonicalCommitted: true,
+      committedInstructionFiles: [
+        { action: 'updated', file: 'AGENTS.md' },
+        { action: 'updated', file: 'CLAUDE.md' },
+      ],
+      committedRecordIds: committedBaselineIds(root),
+      phase: 'instructionApplication',
+      recoveryAction:
+        'Inspect the reported instruction files and recovery paths, then repeat the same init operation with the same options.',
+      recoveryMode: 'inspectAndRerun',
+    })
+
+    const rerun = api.initEncephalon({ root })
+    assert.deepEqual(rerun.recordsCreated, [])
+    for (const filename of ['AGENTS.md', 'CLAUDE.md']) {
+      assert.equal(
+        readFileSync(join(root, filename), 'utf8').match(/encephalon:managed-instructions:start/gu)?.length,
+        1,
+      )
+    }
+  })
+
+  test('partial instruction rerun retains both removals when cleanup fails after the second file', () => {
+    const root = createRoot()
+    api.initEncephalon({ root })
+    const baselineIds = committedBaselineIds(root)
+    let capturedError: unknown
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { remove: true, root },
+          {
+            instructionWriteHooks: {
+              rootClose: descriptor => {
+                closeSync(descriptor)
+                throw Object.assign(new Error('Injected second removal cleanup failure'), {
+                  code: 'EIO',
+                })
+              },
+            },
+          },
+        ),
+      error => {
+        capturedError = error
+        return true
+      },
+    )
+    assert.deepEqual((capturedError as EncephalonError).details.initProgress, {
+      cacheState: 'notAttempted',
+      canonicalCommitted: false,
+      committedInstructionFiles: [
+        { action: 'removed', file: 'AGENTS.md' },
+        { action: 'removed', file: 'CLAUDE.md' },
+      ],
+      committedRecordIds: [],
+      phase: 'instructionApplication',
+      recoveryAction:
+        'Inspect the reported instruction files and recovery paths, then repeat the same init operation with the same options.',
+      recoveryMode: 'inspectAndRerun',
+    })
+
+    const rerun = api.initEncephalon({ remove: true, root })
+    assert.deepEqual(rerun.recordsCreated, [])
+    assert.deepEqual(committedBaselineIds(root), baselineIds)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('no-new-record reruns report prepare and instruction failures in their exact phases', () => {
+    for (const phase of ['cachePreparation', 'instructionApplication'] as const) {
+      const root = createRoot()
+      api.initEncephalon({ root })
+      let capturedError: unknown
+      if (phase === 'cachePreparation') {
+        cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+          if (mode === 'reader') {
+            throw Object.assign(new Error('Injected no-new prepare failure'), { code: 'EIO' })
+          }
+        }
+      } else {
+        writeFileSync(join(root, 'AGENTS.md'), '# Changed guidance\n')
+      }
+
+      assert.throws(
+        () =>
+          initEncephalonWithHooks(
+            { root },
+            phase === 'instructionApplication'
+              ? {
+                  instructionWriteHooks: {
+                    fault: point => {
+                      if (point === 'during-publication') {
+                        throw Object.assign(new Error('Injected no-new instruction failure'), {
+                          code: 'EIO',
+                        })
+                      }
+                    },
+                  },
+                }
+              : {},
+          ),
+        error => {
+          capturedError = error
+          return true
+        },
+      )
+      cacheReadTestHooks.duringDatabaseInitialisation = undefined
+      const progress = (capturedError as EncephalonError).details.initProgress as Record<string, unknown>
+      assert.equal(progress.phase, phase)
+      assert.deepEqual(progress.committedRecordIds, [])
+      assert.deepEqual(progress.committedInstructionFiles, [])
+      assert.equal(progress.cacheState, phase === 'cachePreparation' ? 'disposable' : 'prepared')
+    }
+  })
+
   test('instruction apply outcome retains an earlier action when a later file fails before commit', () => {
     const root = createRoot()
     const plans = planInstructionChanges(root, false)
@@ -791,7 +1044,9 @@ describe('initialisation', () => {
     const outcome = applyInstructionChangesOutcome(root, plans, {
       fault: (point, generatedPath) => {
         if (point === 'after-temp-create' && generatedPath?.includes('.CLAUDE.md.')) {
-          throw Object.assign(new Error('Injected second-file pre-commit failure'), { code: 'EIO' })
+          throw Object.assign(new Error('Injected second-file pre-commit failure'), {
+            code: 'EIO',
+          })
         }
       },
     })
@@ -808,7 +1063,9 @@ describe('initialisation', () => {
     const outcome = applyInstructionChangesOutcome(root, [agentsPlan], {
       fault: point => {
         if (point === 'after-publication') {
-          throw Object.assign(new Error('Injected current-file post-commit failure'), { code: 'EIO' })
+          throw Object.assign(new Error('Injected current-file post-commit failure'), {
+            code: 'EIO',
+          })
         }
       },
     })
@@ -826,7 +1083,9 @@ describe('initialisation', () => {
     const outcome = applyInstructionChangesOutcome(root, [agentsPlan], {
       rootClose: descriptor => {
         closeSync(descriptor)
-        throw Object.assign(new Error('Injected deletion root descriptor close failure'), { code: 'EIO' })
+        throw Object.assign(new Error('Injected deletion root descriptor close failure'), {
+          code: 'EIO',
+        })
       },
     })
 
@@ -2610,7 +2869,9 @@ describe('initialisation', () => {
         applyInstructionChanges(root, [agentsPlan], {
           fault: (point: string) => {
             if (point === 'after-publication-link') {
-              throw Object.assign(new Error('Injected post-link authority failure'), { code: 'EIO' })
+              throw Object.assign(new Error('Injected post-link authority failure'), {
+                code: 'EIO',
+              })
             }
           },
         } as never),
@@ -2635,12 +2896,16 @@ describe('initialisation', () => {
         applyInstructionChanges(root, [agentsPlan], {
           fault: (point: string) => {
             if (point === 'after-publication') {
-              throw Object.assign(new Error('Injected committed publication failure'), { code: 'EIO' })
+              throw Object.assign(new Error('Injected committed publication failure'), {
+                code: 'EIO',
+              })
             }
           },
           rootClose: (descriptor: number) => {
             closeSync(descriptor)
-            throw Object.assign(new Error('Injected root descriptor close failure'), { code: 'EIO' })
+            throw Object.assign(new Error('Injected root descriptor close failure'), {
+              code: 'EIO',
+            })
           },
         } as never),
       (error: unknown) =>
@@ -2668,7 +2933,9 @@ describe('initialisation', () => {
         applyInstructionChanges(root, [agentsPlan], {
           rootClose: (descriptor: number) => {
             closeSync(descriptor)
-            throw Object.assign(new Error('Injected root descriptor close failure'), { code: 'EIO' })
+            throw Object.assign(new Error('Injected root descriptor close failure'), {
+              code: 'EIO',
+            })
           },
         } as never),
       (error: unknown) => assertCommittedInstructionError(error, 'IO_ERROR', 'resourceCleanup'),
@@ -2705,7 +2972,9 @@ describe('initialisation', () => {
             }
             if (point === 'during-recovery-alias-flush') {
               recoveryFlushes += 1
-              throw Object.assign(new Error('Injected recovery alias durability failure'), { code: 'EIO' })
+              throw Object.assign(new Error('Injected recovery alias durability failure'), {
+                code: 'EIO',
+              })
             }
           },
         } as never),
@@ -2838,7 +3107,9 @@ describe('initialisation', () => {
         applyInstructionChanges(root, [agentsPlan], {
           fault: (point: string) => {
             if (point === 'during-publication-flush') {
-              throw Object.assign(new Error('Injected persistent publication flush failure'), { code: 'EIO' })
+              throw Object.assign(new Error('Injected persistent publication flush failure'), {
+                code: 'EIO',
+              })
             }
           },
           generatedPath: (_canonicalPath: string, suffix: string) =>
@@ -2865,7 +3136,9 @@ describe('initialisation', () => {
         applyInstructionChanges(root, [agentsPlan], {
           syncDirectory: () => {
             syncAttempts += 1
-            throw Object.assign(new Error(`Injected unsupported directory sync ${code}`), { code })
+            throw Object.assign(new Error(`Injected unsupported directory sync ${code}`), {
+              code,
+            })
           },
         } as never),
         [{ action: 'updated', file: 'AGENTS.md' }],
@@ -2897,7 +3170,11 @@ describe('initialisation', () => {
               createdEntry = generatedPath.slice(root.length + 1)
               createdDescriptor = descriptor
               const metadata = statSync(generatedPath, { bigint: true })
-              createdIdentity = { dev: metadata.dev, ino: metadata.ino, mode: metadata.mode & 0o777n }
+              createdIdentity = {
+                dev: metadata.dev,
+                ino: metadata.ino,
+                mode: metadata.mode & 0o777n,
+              }
               renameSync(root, displacedRoot)
               mkdirSync(root)
               writeFileSync(join(root, 'successor-sentinel'), 'replacement root')
@@ -2919,7 +3196,11 @@ describe('initialisation', () => {
     assert.ok(createdEntry)
     const retainedMetadata = statSync(join(displacedRoot, createdEntry), { bigint: true })
     assert.deepEqual(
-      { dev: retainedMetadata.dev, ino: retainedMetadata.ino, mode: retainedMetadata.mode & 0o777n },
+      {
+        dev: retainedMetadata.dev,
+        ino: retainedMetadata.ino,
+        mode: retainedMetadata.mode & 0o777n,
+      },
       createdIdentity,
     )
     assert.equal(retainedMetadata.mode & 0o777n, 0o600n)
@@ -3009,7 +3290,11 @@ describe('initialisation', () => {
               createdEntry = generatedPath.slice(root.length + 1)
               createdDescriptor = descriptor
               const metadata = statSync(generatedPath, { bigint: true })
-              createdIdentity = { dev: metadata.dev, ino: metadata.ino, mode: metadata.mode & 0o777n }
+              createdIdentity = {
+                dev: metadata.dev,
+                ino: metadata.ino,
+                mode: metadata.mode & 0o777n,
+              }
               renameSync(root, displacedRoot)
               mkdirSync(root)
               writeFileSync(join(root, 'successor-sentinel'), 'replacement root')
@@ -3031,7 +3316,11 @@ describe('initialisation', () => {
     assert.ok(createdEntry)
     const retainedMetadata = statSync(join(displacedRoot, createdEntry), { bigint: true })
     assert.deepEqual(
-      { dev: retainedMetadata.dev, ino: retainedMetadata.ino, mode: retainedMetadata.mode & 0o777n },
+      {
+        dev: retainedMetadata.dev,
+        ino: retainedMetadata.ino,
+        mode: retainedMetadata.mode & 0o777n,
+      },
       createdIdentity,
     )
     assert.equal(retainedMetadata.mode & 0o777n, 0o600n)
@@ -3722,10 +4011,15 @@ describe('initialisation', () => {
                 writeFileSync(tempPath, bytes)
                 chmodSync(tempPath, mode)
                 const replacementMetadata = statSync(tempPath, { bigint: true })
-                replacementIdentity = { dev: replacementMetadata.dev, ino: replacementMetadata.ino }
+                replacementIdentity = {
+                  dev: replacementMetadata.dev,
+                  ino: replacementMetadata.ino,
+                }
                 replacedTemp = true
               }
-              throw Object.assign(new Error('Injected persistent publication flush failure'), { code: 'EIO' })
+              throw Object.assign(new Error('Injected persistent publication flush failure'), {
+                code: 'EIO',
+              })
             }
           },
         }),

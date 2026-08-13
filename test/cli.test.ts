@@ -29,6 +29,27 @@ const run = (root: string, arguments_: string[]) =>
 
 const outputJson = (result: ReturnType<typeof run>) => JSON.parse(result.stdout) as unknown
 const errorJson = (result: ReturnType<typeof run>) => JSON.parse(result.stderr) as { error: { message: string } }
+const baselineSubjects = [
+  ['context', 'encephalon:init/repository-overview'],
+  ['architecture', 'encephalon:init/tooling-layout'],
+  ['workflow', 'encephalon:init/commands-ci'],
+] as const
+const committedBaselineIds = (root: string) =>
+  baselineSubjects.map(([kind, subject]) => {
+    const directory = join(root, 'encephalon', kind)
+    const record = readdirSync(directory)
+      .filter(name => name.endsWith('.json'))
+      .map(
+        name =>
+          JSON.parse(readFileSync(join(directory, name), 'utf8')) as {
+            id: string
+            subject: string
+          },
+      )
+      .find(candidate => candidate.subject === subject)
+    assert.ok(record)
+    return record.id
+  })
 
 describe('command-line interface', () => {
   test('projects safe partial init progress and reruns without duplicate state', () => {
@@ -45,19 +66,7 @@ describe('command-line interface', () => {
     assert.equal(failed.stderr.endsWith('\n'), true)
     assert.equal(failed.stderr.includes(root), false)
     assert.equal(failed.stderr.includes(privateSentinel), false)
-    const committedRecordIds = [
-      ['context', 'encephalon:init/repository-overview'],
-      ['architecture', 'encephalon:init/tooling-layout'],
-      ['workflow', 'encephalon:init/commands-ci'],
-    ].map(([kind, subject]) => {
-      const directory = join(root, 'encephalon', kind as string)
-      const record = readdirSync(directory)
-        .filter(name => name.endsWith('.json'))
-        .map(name => JSON.parse(readFileSync(join(directory, name), 'utf8')) as { id: string; subject: string })
-        .find(candidate => candidate.subject === subject)
-      assert.ok(record)
-      return record.id
-    })
+    const committedRecordIds = committedBaselineIds(root)
     assert.deepEqual(JSON.parse(failed.stderr), {
       error: {
         code: 'VALIDATION_FAILED',
@@ -90,22 +99,7 @@ describe('command-line interface', () => {
         1,
       )
     }
-    assert.deepEqual(
-      committedRecordIds,
-      [
-        ['context', 'encephalon:init/repository-overview'],
-        ['architecture', 'encephalon:init/tooling-layout'],
-        ['workflow', 'encephalon:init/commands-ci'],
-      ].map(([kind, subject]) => {
-        const directory = join(root, 'encephalon', kind as string)
-        const record = readdirSync(directory)
-          .filter(name => name.endsWith('.json'))
-          .map(name => JSON.parse(readFileSync(join(directory, name), 'utf8')) as { id: string; subject: string })
-          .find(candidate => candidate.subject === subject)
-        assert.ok(record)
-        return record.id
-      }),
-    )
+    assert.deepEqual(committedRecordIds, committedBaselineIds(root))
   })
 
   test('emits exactly one JSON value for successful commands', () => {
@@ -156,7 +150,9 @@ describe('command-line interface', () => {
 
   test('reports post-commit add failures with committed record details', () => {
     const root = createRoot()
-    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'), { recursive: true })
+    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'), {
+      recursive: true,
+    })
 
     const result = run(root, [
       'add',
@@ -318,7 +314,9 @@ describe('command-line interface', () => {
       'repeat-one',
     ])
     assert.equal(repeatTwo.status, 0)
-    mkdirSync(join(root, 'encephalon', '_artifacts', 'decision', 'with-repeated-options'), { recursive: true })
+    mkdirSync(join(root, 'encephalon', '_artifacts', 'decision', 'with-repeated-options'), {
+      recursive: true,
+    })
     writeFileSync(join(root, 'encephalon', '_artifacts', 'decision', 'with-repeated-options', 'first.txt'), 'first')
     writeFileSync(join(root, 'encephalon', '_artifacts', 'decision', 'with-repeated-options', 'second.txt'), 'second')
     const repeated = run(root, [
@@ -437,8 +435,14 @@ describe('command-line interface', () => {
         arguments_: ['list', '--root', root, '--include-superseded=true'],
         message: '--include-superseded does not take a value.',
       },
-      { arguments_: ['show', '--root', root, '--id', '--missing'], message: '--id requires a value.' },
-      { arguments_: ['list', '--root', root, '--limit=-1'], message: '--limit must be an integer between 1 and 1000.' },
+      {
+        arguments_: ['show', '--root', root, '--id', '--missing'],
+        message: '--id requires a value.',
+      },
+      {
+        arguments_: ['list', '--root', root, '--limit=-1'],
+        message: '--limit must be an integer between 1 and 1000.',
+      },
       {
         arguments_: ['list', '--root', root, '--limit', '-1'],
         message: '--limit requires a value.',

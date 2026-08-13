@@ -225,7 +225,9 @@ test('preserves artifact manifest field ordering while converting verified obser
     )
     .digest('hex')
   const database = new DatabaseSync(cacheDatabasePath(root), { readOnly: true })
-  const actual = database.prepare("SELECT value FROM metadata WHERE key = 'manifest'").get() as { value?: unknown }
+  const actual = database.prepare("SELECT value FROM metadata WHERE key = 'manifest'").get() as {
+    value?: unknown
+  }
   database.close()
 
   assert.equal(actual.value, expected)
@@ -2484,6 +2486,55 @@ describe('SQLite cache and reads', () => {
       'entered',
     )
     assert.equal(existsSync(lockPath), false)
+  })
+
+  test('operation lock callback failure survives a simultaneous gate cleanup failure', () => {
+    const root = createRoot()
+    const callbackFailure = Object.assign(new Error('operation callback failure'), { code: 'EIO' })
+    const cleanupFailure = Object.assign(new Error('operation gate cleanup failure'), {
+      code: 'EIO',
+    })
+    let gateCloseAttempts = 0
+
+    assert.throws(
+      () =>
+        withOperationLock(
+          root,
+          () => {
+            throw callbackFailure
+          },
+          {
+            gateClose: database => {
+              gateCloseAttempts += 1
+              database.close()
+              throw cleanupFailure
+            },
+          },
+        ),
+      (error: unknown) => {
+        assert.equal((error as { cause?: unknown }).cause, callbackFailure)
+        return true
+      },
+    )
+    assert.equal(gateCloseAttempts, 1)
+  })
+
+  test('operation lock cleanup failure surfaces when the callback succeeds', () => {
+    const root = createRoot()
+    const cleanupFailure = Object.assign(new Error('operation gate cleanup failure'), {
+      code: 'EIO',
+    })
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => 'entered', {
+          gateClose: database => {
+            database.close()
+            throw cleanupFailure
+          },
+        }),
+      cleanupFailure,
+    )
   })
 
   test('recovers a malformed disposable operation gate database', () => {

@@ -2,7 +2,7 @@ import { parseInitInput } from './api-input.ts'
 import { canonicalPayload, scanBaseline } from './baseline.ts'
 import { hydrateResolvedRepository, prepareResolvedRepository } from './cache.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
-import { applyInstructionChangesOutcome, type InstructionAction, planInstructionChanges } from './instructions.ts'
+import { applyInstructionChangesOutcome, planInstructionChanges } from './instructions.ts'
 import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import {
@@ -24,6 +24,7 @@ type InitHooks = RecordReadHooks & {
   baselineScan?: () => void
   hydration?: (result: PrepareResult) => void
   instructionWriteHooks?: Parameters<typeof applyInstructionChangesOutcome>[2]
+  lockHooks?: Parameters<typeof withOperationLock>[2]
   recordWriteHooks?: RecordWriteHooks
 }
 
@@ -32,7 +33,7 @@ type InitPhase = 'preflight' | 'recordPublication' | 'cachePreparation' | 'instr
 type InitProgress = {
   phase: InitPhase
   committedRecordIds: string[]
-  committedInstructionFiles: InstructionAction[]
+  committedInstructionFiles: InitEncephalonResult['instructionFiles']
   cacheState: 'notAttempted' | 'disposable' | 'prepared'
 }
 
@@ -44,6 +45,8 @@ type InitProgressDetails = InitProgress & {
 
 const recoveryActions = {
   cachePreparation: 'Run prepare, run validate, then repeat the same init operation with the same options.',
+  inspectCachePreparation:
+    'Inspect canonical state, run prepare, run validate, then repeat the same init operation with the same options.',
   inspectInstructions:
     'Inspect the reported instruction files and recovery paths, then repeat the same init operation with the same options.',
   inspectOperationCleanup:
@@ -68,7 +71,9 @@ const progressDetails = (progress: InitProgress, error: EncephalonError): InitPr
       return recoveryActions.preflight
     }
     if (progress.phase === 'cachePreparation') {
-      return recoveryActions.cachePreparation
+      return recoveryMode === 'inspectAndRerun'
+        ? recoveryActions.inspectCachePreparation
+        : recoveryActions.cachePreparation
     }
     if (progress.phase === 'operationCleanup') {
       return recoveryActions.inspectOperationCleanup
@@ -178,72 +183,82 @@ const initResolved = (
   planInstructionChanges(root, input.remove === true)
 
   if (input.remove === true) {
-    return withOperationLock(root, () => {
-      const instructionPlans = planInstructionChanges(root, true)
-      progress.phase = 'instructionApplication'
-      const instructionOutcome = applyInstructionChangesOutcome(root, instructionPlans, hooks.instructionWriteHooks)
-      progress.committedInstructionFiles = [...instructionOutcome.instructionFiles]
-      if (instructionOutcome.error !== undefined) {
-        throw instructionOutcome.error
-      }
-      progress.phase = 'operationCleanup'
-      return {
-        instructionFiles: instructionOutcome.instructionFiles,
-        nextAction: NEXT_ACTION,
-        recordsCreated: [],
-        skippedConflicts: [],
-      }
-    })
+    return withOperationLock(
+      root,
+      () => {
+        const instructionPlans = planInstructionChanges(root, true)
+        progress.phase = 'instructionApplication'
+        const instructionOutcome = applyInstructionChangesOutcome(root, instructionPlans, hooks.instructionWriteHooks)
+        progress.committedInstructionFiles = [...instructionOutcome.instructionFiles]
+        if (instructionOutcome.error !== undefined) {
+          throw instructionOutcome.error
+        }
+        progress.phase = 'operationCleanup'
+        return {
+          instructionFiles: instructionOutcome.instructionFiles,
+          nextAction: NEXT_ACTION,
+          recordsCreated: [],
+          skippedConflicts: [],
+        }
+      },
+      hooks.lockHooks,
+    )
   }
 
-  return withOperationLock(root, location => {
-    const instructionPlans = planInstructionChanges(root, false)
-    hooks.baselineScan?.()
-    const baseline = scanBaseline(root)
-    const refresh = input.refreshBaseline === true
-    const recordSnapshot = readRecordSnapshotResolved(
-      root,
-      hooks,
-      refresh
-        ? baseline.map(candidate => ({
-            kind: candidate.kind,
-            source: 'encephalon:init',
-            subject: candidate.subject,
-          }))
-        : undefined,
-    )
-    const { records } = recordSnapshot
-    const actions = baselineActions(records, baseline, refresh)
-    const plans = actions.additions.map(addition => planRecordAddition(root, { ...addition, root }))
-    let recordsCreated: BrainRecord[] = []
-    if (plans.length > 0) {
-      assertRecordGraph(
+  return withOperationLock(
+    root,
+    location => {
+      const instructionPlans = planInstructionChanges(root, false)
+      hooks.baselineScan?.()
+      const baseline = scanBaseline(root)
+      const refresh = input.refreshBaseline === true
+      const recordSnapshot = readRecordSnapshotResolved(
         root,
-        [...records, ...plans.map(plan => plan.record)],
-        'The generated baseline would make canonical records invalid.',
         hooks,
+        refresh
+          ? baseline.map(candidate => ({
+              kind: candidate.kind,
+              source: 'encephalon:init',
+              subject: candidate.subject,
+            }))
+          : undefined,
       )
-      const authority = assertCanonicalLayoutAdditions(
-        plans.map(plan => plan.record.kind),
-        recordSnapshot.authority,
-      )
-      const recordWriteOptions = {
-        authority,
-        ...(hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }),
-      }
-      progress.phase = 'recordPublication'
-      for (const plan of plans) {
-        const publication = publishPlannedRecordOutcome(root, plan, recordWriteOptions)
-        recordsCreated = [...recordsCreated, publication.record]
-        progress.committedRecordIds = [...progress.committedRecordIds, publication.record.id]
-        progress.cacheState = 'disposable'
-        if (publication.committedError !== undefined) {
-          throw publication.committedError
+      const { records } = recordSnapshot
+      const actions = baselineActions(records, baseline, refresh)
+      const plans = actions.additions.map(addition => planRecordAddition(root, { ...addition, root }))
+      let recordsCreated: BrainRecord[] = []
+      if (plans.length > 0) {
+        assertRecordGraph(
+          root,
+          [...records, ...plans.map(plan => plan.record)],
+          'The generated baseline would make canonical records invalid.',
+          hooks,
+        )
+        const authority = assertCanonicalLayoutAdditions(
+          plans.map(plan => plan.record.kind),
+          recordSnapshot.authority,
+        )
+        const recordWriteOptions = {
+          authority,
+          ...(hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }),
+        }
+        progress.phase = 'recordPublication'
+        for (const plan of plans) {
+          const publication = publishPlannedRecordOutcome(root, plan, recordWriteOptions)
+          recordsCreated = [...recordsCreated, publication.record]
+          progress.committedRecordIds = [...progress.committedRecordIds, publication.record.id]
+          progress.cacheState = 'disposable'
+          if (publication.committedError !== undefined) {
+            throw publication.committedError
+          }
         }
       }
       progress.phase = 'cachePreparation'
       progress.cacheState = 'disposable'
-      const cacheResult = hydrateResolvedRepository(root, false, location)
+      const cacheResult =
+        plans.length > 0
+          ? hydrateResolvedRepository(root, false, location)
+          : prepareResolvedRepository(root, false, location)
       progress.cacheState = 'prepared'
       hooks.hydration?.(cacheResult)
       progress.phase = 'instructionApplication'
@@ -259,26 +274,9 @@ const initResolved = (
         recordsCreated,
         skippedConflicts: actions.conflicts,
       }
-    }
-    progress.phase = 'cachePreparation'
-    progress.cacheState = 'disposable'
-    const cacheResult = prepareResolvedRepository(root, false, location)
-    progress.cacheState = 'prepared'
-    hooks.hydration?.(cacheResult)
-    progress.phase = 'instructionApplication'
-    const instructionOutcome = applyInstructionChangesOutcome(root, instructionPlans, hooks.instructionWriteHooks)
-    progress.committedInstructionFiles = [...instructionOutcome.instructionFiles]
-    if (instructionOutcome.error !== undefined) {
-      throw instructionOutcome.error
-    }
-    progress.phase = 'operationCleanup'
-    return {
-      instructionFiles: instructionOutcome.instructionFiles,
-      nextAction: NEXT_ACTION,
-      recordsCreated,
-      skippedConflicts: actions.conflicts,
-    }
-  })
+    },
+    hooks.lockHooks,
+  )
 }
 
 const runInit = (input: InitEncephalonInput, hooks: InitHooks = {}): InitEncephalonResult => {

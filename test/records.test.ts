@@ -198,7 +198,9 @@ describe('canonical records', () => {
       hooks: {
         fault: point => {
           if (point === 'after-publication-accept') {
-            throw Object.assign(new Error('Injected post-link verification failure'), { code: 'EIO' })
+            throw Object.assign(new Error('Injected post-link verification failure'), {
+              code: 'EIO',
+            })
           }
         },
       },
@@ -207,6 +209,42 @@ describe('canonical records', () => {
     assert.equal(outcome.record.id, plan.record.id)
     assert.ok(outcome.committedError)
     assert.equal(outcome.committedError.details.canonicalCommitted, true)
+  })
+
+  test('record publication outcome preserves the first post-link verification failure', () => {
+    const root = createRoot()
+    const firstFailure = Object.assign(new Error('first post-link verification failure'), {
+      code: 'EIO',
+    })
+    const laterFailure = Object.assign(new Error('later final verification failure'), {
+      code: 'EIO',
+    })
+    const plan = planRecordAddition(root, {
+      id: 'record-publication-outcome-first-verification',
+      kind: 'decision',
+      payload: {},
+      source: 'agent',
+      subject: 'record.publication-outcome.first-verification',
+    })
+    const snapshot = readRecordSnapshotResolved(root)
+    const authority = assertCanonicalLayoutAdditions([plan.record.kind], snapshot.authority)
+
+    const outcome = publishPlannedRecordOutcome(root, plan, {
+      authority,
+      hooks: {
+        fault: point => {
+          if (point === 'after-canonical-link') {
+            throw firstFailure
+          }
+          if (point === 'before-final-publication-revalidation') {
+            throw laterFailure
+          }
+        },
+      },
+    })
+
+    assert.equal(outcome.committedError?.cause, firstFailure)
+    assert.equal(outcome.committedErrorPhase, 'publicationVerification')
   })
 
   test('record publication outcome still throws before canonical linking', () => {
@@ -1165,7 +1203,9 @@ describe('canonical records', () => {
     stagingInternals.stagingTestHooks.fsyncDirectory = descriptor => {
       flushes += 1
       if (flushes === 1) {
-        throw Object.assign(new Error('Injected staging directory fsync failure'), { code: 'EIO' })
+        throw Object.assign(new Error('Injected staging directory fsync failure'), {
+          code: 'EIO',
+        })
       }
       fsyncSync(descriptor)
     }
@@ -1391,7 +1431,9 @@ describe('canonical records', () => {
             hooks: {
               fault: point => {
                 if ((point as string) === 'before-final-publication-revalidation') {
-                  throw Object.assign(new Error('injected final directory revalidation I/O'), { code: 'EIO' })
+                  throw Object.assign(new Error('injected final directory revalidation I/O'), {
+                    code: 'EIO',
+                  })
                 }
               },
             },
