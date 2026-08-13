@@ -1844,6 +1844,44 @@ describe('initialisation', () => {
     assert.deepEqual(instructionAliasSuffixes(root), ['.backup'])
   })
 
+  test('keeps a held canonical predecessor when backup creation fails before linking', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = Buffer.from('# Existing guidance\n')
+    writeFileSync(path, original)
+    chmodSync(path, 0o741)
+    const originalMetadata = statSync(path, { bigint: true })
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: (point: string) => {
+            if (point === 'before-backup-create') {
+              throw Object.assign(new Error('Injected pre-link backup failure'), { code: 'EIO' })
+            }
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        assert.deepEqual((error as { details?: unknown }).details, {})
+        return true
+      },
+    )
+
+    assert.deepEqual(readFileSync(path), original)
+    const finalMetadata = statSync(path, { bigint: true })
+    assert.deepEqual(
+      { dev: finalMetadata.dev, ino: finalMetadata.ino },
+      { dev: originalMetadata.dev, ino: originalMetadata.ino },
+    )
+    if (process.platform !== 'win32') {
+      assert.equal(finalMetadata.mode & 0o777n, 0o741n)
+    }
+    assert.deepEqual(instructionAliasSuffixes(root), [])
+  })
+
   const instructionRecoveryAction = {
     backupCleanup:
       'Inspect the repository root and remove only a confirmed backup left by this operation before retrying.',
@@ -1896,6 +1934,52 @@ describe('initialisation', () => {
     return true
   }
 
+  test('classifies instruction authority identity failures at every apply boundary', () => {
+    for (const boundary of ['construction', 'plan-validation', 'unchanged-flush'] as const) {
+      const root = createRoot()
+      const displacedRoot = `${root}-${boundary}`
+      roots.push(displacedRoot)
+      let plans = planInstructionChanges(root, false)
+      if (boundary === 'unchanged-flush') {
+        applyInstructionChanges(root, plans)
+        plans = planInstructionChanges(root, false)
+        assert.equal(
+          plans.every(plan => plan.action === 'none'),
+          true,
+        )
+      }
+      let replaced = false
+      const replaceRoot = () => {
+        replaced = true
+        renameSync(root, displacedRoot)
+        writeFileSync(root, 'replacement root')
+      }
+      if (boundary === 'construction') {
+        replaceRoot()
+      }
+
+      assert.throws(
+        () =>
+          applyInstructionChanges(root, plans, {
+            fault: (point: string) => {
+              if (
+                (boundary === 'plan-validation' && point === 'before-plan-validation') ||
+                (boundary === 'unchanged-flush' && point === 'during-publication-flush')
+              ) {
+                replaceRoot()
+              }
+            },
+          } as never),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED', boundary)
+          return true
+        },
+      )
+      assert.equal(replaced, true, boundary)
+      assert.equal(readFileSync(root, 'utf8'), 'replacement root')
+    }
+  })
+
   test('reports a post-link authority failure even when final authority checks recover', () => {
     const root = createRoot()
     const path = join(root, 'AGENTS.md')
@@ -1913,6 +1997,39 @@ describe('initialisation', () => {
           },
         } as never),
       (error: unknown) => assertCommittedInstructionError(error, 'IO_ERROR', 'publicationVerification'),
+    )
+
+    assert.deepEqual(readFileSync(path), agentsPlan.contentBytes)
+    assert.deepEqual(instructionAliasSuffixes(root), [])
+  })
+
+  test('aggregates root authority close failure with a structured committed failure', {
+    skip: process.platform === 'win32' ? 'Windows does not hold a repository-root directory descriptor.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    writeFileSync(path, '# Existing guidance\n')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan?.contentBytes)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: (point: string) => {
+            if (point === 'after-publication') {
+              throw Object.assign(new Error('Injected committed publication failure'), { code: 'EIO' })
+            }
+          },
+          rootClose: (descriptor: number) => {
+            closeSync(descriptor)
+            throw Object.assign(new Error('Injected root descriptor close failure'), { code: 'EIO' })
+          },
+        } as never),
+      (error: unknown) =>
+        assertCommittedInstructionError(error, 'IO_ERROR', 'publicationVerification', [
+          'publicationVerification',
+          'resourceCleanup',
+        ]),
     )
 
     assert.deepEqual(readFileSync(path), agentsPlan.contentBytes)

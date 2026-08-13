@@ -386,6 +386,7 @@ type AtomicWriteFault =
   | 'before-backup-create'
   | 'before-delete-move'
   | 'before-final-backup-validation'
+  | 'before-plan-validation'
   | 'before-predecessor-open'
   | 'before-deletion'
   | 'during-delete-flush'
@@ -592,6 +593,14 @@ type PostCommitFailure = {
 type RecoveryAlias = DescriptorSnapshot & { state: 'predecessor' | 'staged' }
 
 type RecoveryAliases = Map<string, RecoveryAlias>
+
+type CommittedInstructionFailureContext = {
+  aliases: RecoveryAliases
+  failures: readonly PostCommitFailure[]
+  plan: FilePlan
+}
+
+const committedInstructionFailureContexts = new WeakMap<EncephalonError, CommittedInstructionFailureContext>()
 
 const postCommitPhasePriority = [
   'publicationVerification',
@@ -974,10 +983,14 @@ const restoreHeldBackup = (
     const canonicalExists = mapInstructionIdentity(plan.filename, () => lstatIfExists(path) !== undefined)
     if (canonicalExists) {
       if (pathIdentifiesDescriptor(path, recoveryHeld, plan.filename, true)) {
-        if (!pathIdentifiesDescriptor(backupPath, recoveryHeld, plan.filename, true)) {
+        const backupExact = pathIdentifiesDescriptor(backupPath, recoveryHeld, plan.filename, true)
+        const backupExists = mapInstructionIdentity(plan.filename, () => lstatIfExists(backupPath) !== undefined)
+        if (!backupExact && (aliases.has(backupPath) || backupExists)) {
           return instructionIdentityChanged(plan.filename)
         }
-        restoreDurableAlias(backupPath, path, recoveryHeld, plan, hooks, authority, aliases)
+        if (backupExact) {
+          restoreDurableAlias(backupPath, path, recoveryHeld, plan, hooks, authority, aliases)
+        }
       } else if (pathIdentifiesDescriptor(backupPath, recoveryHeld, plan.filename, true)) {
         return instructionIdentityChanged(plan.filename)
       } else {
@@ -1201,12 +1214,23 @@ const throwHighestPriorityCommittedFailure = (
       const message = `${plan.filename} was committed, but the ${phase} post-commit phase failed. ${recoveryAction}`
       const details = committedFailureDetails(plan, phase, failures, aliases)
       const identityFailure = failures.find(candidate => candidate.identityUncertain)
-      if (identityFailure !== undefined) {
-        throw new EncephalonError('REPOSITORY_CHANGED', message, details, {
+      let error: EncephalonError
+      if (identityFailure === undefined) {
+        try {
+          return wrapIo(message, failure.cause, details)
+        } catch (candidate) {
+          if (!(candidate instanceof EncephalonError)) {
+            throw candidate
+          }
+          error = candidate
+        }
+      } else {
+        error = new EncephalonError('REPOSITORY_CHANGED', message, details, {
           cause: identityFailure.cause,
         })
       }
-      return wrapIo(message, failure.cause, details)
+      committedInstructionFailureContexts.set(error, { aliases, failures, plan })
+      throw error
     }
   }
 }
@@ -1578,6 +1602,7 @@ export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?:
       writePlanEntry ?? plans.find(plan => plan.action !== 'none') ?? (allPlansAreUnchanged ? plans[0] : undefined)
     authority =
       authorityPlan === undefined ? undefined : new InstructionRootAuthority(root, authorityPlan.filename, hooks)
+    fault(hooks, 'before-plan-validation')
     for (const plan of plans) {
       if (plan.action !== 'none' || allPlansAreUnchanged) {
         mapInstructionIdentity(plan.filename, () => assertPlanIsCurrent(root, plan))
@@ -1618,8 +1643,21 @@ export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?:
     rootCloseError = error
   }
   if (operationError !== undefined) {
+    if (operationError instanceof EncephalonError && rootCloseError !== undefined) {
+      const context = committedInstructionFailureContexts.get(operationError)
+      if (context !== undefined) {
+        throwHighestPriorityCommittedFailure(
+          context.plan,
+          [...context.failures, postCommitFailure('resourceCleanup', rootCloseError)],
+          context.aliases,
+        )
+      }
+    }
     if (operationError instanceof EncephalonError) {
       throw operationError
+    }
+    if (operationError instanceof InstructionIdentityError) {
+      throw new EncephalonError('REPOSITORY_CHANGED', operationError.message, {}, { cause: operationError })
     }
     return wrapIo('Unable to update repository instruction files.', operationError)
   }
