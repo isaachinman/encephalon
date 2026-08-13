@@ -1,8 +1,8 @@
 import { fail } from './errors.ts'
-import { createRecordFile, validateId, validateKind } from './schema.ts'
+import type { ValidatedAddRecordInput } from './schema.ts'
+import { validateAddRecordInput, validateId, validateKind } from './schema.ts'
 import type {
   AddRecordInput,
-  BrainRecordFile,
   GatherInput,
   InitEncephalonInput,
   ListRecordsInput,
@@ -11,8 +11,9 @@ import type {
   ShowRecordInput,
 } from './types.ts'
 
+/** @internal */
 export type ParsedAddRecordInput = AddRecordInput & {
-  recordFile: BrainRecordFile
+  recordDraft: ValidatedAddRecordInput
 }
 
 const MAX_TEXT_BYTES = 1024
@@ -178,12 +179,13 @@ export const parseInitInput = (value: unknown = {}): InitEncephalonInput => {
   }
 }
 
+/** @internal */
 export const parseAddRecordInput = (value: unknown): ParsedAddRecordInput => {
   const input = objectInput(value, 'addRecord') as AddRecordInput
   const root = rootProperties(input)
   return {
     ...input,
     ...root,
-    recordFile: createRecordFile(input),
+    recordDraft: validateAddRecordInput(input),
   }
 }

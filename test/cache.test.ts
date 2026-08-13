@@ -4,13 +4,11 @@ import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import {
   chmodSync,
-  closeSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -31,6 +29,7 @@ import {
   cacheLocationTestHooks,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
+  openVerifiedCacheDatabase,
   sameCacheEntryIdentity,
 } from '../src/cache-location.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
@@ -38,35 +37,14 @@ import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import { recordWriteTestHooks } from '../src/records.ts'
-import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
+import {
+  canRenameParentWithOpenChild,
+  createTestRepository,
+  ensureParent,
+  removeTestRepository,
+} from '../test/helpers.ts'
 
 const roots: string[] = []
-
-const canRenameParentWithOpenChild = () => {
-  const root = mkdtempSync(join(tmpdir(), 'encephalon-open-child-rename-test-'))
-  try {
-    const parent = join(root, 'parent')
-    const renamed = join(root, 'renamed')
-    const child = join(parent, 'child')
-    mkdirSync(parent)
-    writeFileSync(child, 'probe')
-    const descriptor = openSync(child, 'r')
-    try {
-      renameSync(parent, renamed)
-      return true
-    } catch (error) {
-      const { code } = error as NodeJS.ErrnoException
-      if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
-        return false
-      }
-      throw error
-    } finally {
-      closeSync(descriptor)
-    }
-  } finally {
-    rmSync(root, { force: true, recursive: true })
-  }
-}
 
 const renameParentWithOpenChildSupported = canRenameParentWithOpenChild()
 
@@ -94,6 +72,7 @@ afterEach(() => {
   cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
   cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
+  cacheLocationTestHooks.regularFileRealpath = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.afterManifestKindEnumeration = undefined
   cacheReadTestHooks.afterManifestEntryLstat = undefined
@@ -930,6 +909,39 @@ describe('cache filesystem containment', () => {
     assert.deepEqual(readdirSync(cachePath), ['replacement-sentinel'])
   })
 
+  test('rejects a locked cache replacement before canonical record publication', {
+    skip: renameParentWithOpenChildSupported ? false : 'The filesystem cannot rename an open cache directory.',
+  }, () => {
+    const root = createRoot()
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const cachePath = inspectCacheLocation(root).directory
+    const displacedPath = `${cachePath}-before-record-publication`
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-scan-validation') {
+        renameSync(cachePath, displacedPath)
+        mkdirSync(cachePath)
+        writeFileSync(join(cachePath, 'replacement-sentinel'), 'replacement cache')
+      }
+    }
+
+    assert.throws(
+      () =>
+        functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')({
+          id: 'locked-location-before-publication',
+          kind: 'context',
+          payload: null,
+          root,
+          source: 'agent',
+          subject: 'cache.location-before-publication',
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(existsSync(join(root, 'encephalon', 'context', 'locked-location-before-publication.json')), false)
+  })
+
   test('rejects an operation gate database symlink without changing its target', () => {
     const root = createRoot()
     const outside = createOutsideDirectory()
@@ -1528,6 +1540,25 @@ describe('SQLite cache and reads', () => {
       join(realpathSync(root), 'node_modules', '.cache', 'encephalon'),
     )
     assert.equal(statSync(join(root, 'node_modules'), { bigint: true }).ino, before.ino)
+  })
+
+  test('tolerates an operation lock that changes before gate acquisition', () => {
+    const root = createRoot()
+    const location = inspectCacheLocation(root)
+    const lockPath = join(location.directory, 'operation.lock')
+    const displacedPath = join(root, 'displaced-operation-lock')
+    mkdirSync(lockPath)
+    cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = path => {
+      if (path === lockPath) {
+        cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = undefined
+        renameSync(path, displacedPath)
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
   })
 
   test('uses schema version rather than package version for cache compatibility', () => {
@@ -2766,6 +2797,86 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('retries a transient recovery-marker sharing violation', () => {
+    const root = createRoot()
+    const cachePath = cacheDirectoryPath(root)
+    mkdirSync(cachePath, { recursive: true })
+    writeFileSync(join(cachePath, 'operation-lock.sqlite'), 'not a sqlite database')
+    let attempts = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'operation-lock.recovery') {
+        attempts += 1
+        if (attempts === 1) {
+          throw Object.assign(new Error('recovery marker is temporarily shared'), { code: 'EPERM' })
+        }
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
+    assert.equal(attempts, 2)
+  })
+
+  test('bounds optional sidecar canonicalisation retries', () => {
+    const createWalGate = () => {
+      const root = createRoot()
+      const location = inspectCacheLocation(root)
+      const path = join(location.directory, 'operation-lock.sqlite')
+      const owner = new DatabaseSync(path)
+      assert.equal(owner.prepare('PRAGMA journal_mode = WAL').get()?.journal_mode, 'wal')
+      owner.exec('CREATE TABLE retained_sidecar (value TEXT)')
+      return { location, owner }
+    }
+
+    const transient = createWalGate()
+    let transientMismatches = 0
+    cacheLocationTestHooks.regularFileRealpath = (path, actual) => {
+      if (path.endsWith('operation-lock.sqlite-shm') && transientMismatches === 0) {
+        transientMismatches += 1
+        return `${actual}-transient-mismatch`
+      }
+      return actual
+    }
+    const reopened = openVerifiedCacheDatabase({
+      create: true,
+      DatabaseConstructor: DatabaseSync,
+      location: transient.location,
+      name: 'operation-lock.sqlite',
+      openOptions: {},
+    })
+    reopened.close()
+    transient.owner.close()
+    assert.equal(transientMismatches, 1)
+
+    const persistent = createWalGate()
+    let persistentMismatches = 0
+    cacheLocationTestHooks.regularFileRealpath = (path, actual) => {
+      if (path.endsWith('operation-lock.sqlite-shm')) {
+        persistentMismatches += 1
+        return `${actual}-persistent-mismatch`
+      }
+      return actual
+    }
+    assert.throws(
+      () =>
+        openVerifiedCacheDatabase({
+          create: true,
+          DatabaseConstructor: DatabaseSync,
+          location: persistent.location,
+          name: 'operation-lock.sqlite',
+          openOptions: {},
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+        return true
+      },
+    )
+    persistent.owner.close()
+    assert.equal(persistentMismatches, 3)
+  })
+
   test('preserves live token and identity replacements for an abandoned recovery marker', () => {
     const cases = ['replacement-token', 'replacement-identity'] as const
     for (const replacement of cases) {
@@ -3326,7 +3437,6 @@ describe('SQLite cache and reads', () => {
     const root = createRoot()
     withOperationLock(root, () => 'prepared')
     const gatePath = join(cacheDirectoryPath(root), 'operation-lock.sqlite')
-    const verifiedCacheDirectory = inspectCacheLocation(root).directory
     const database = new DatabaseSync(gatePath)
     try {
       const mode = database.prepare('PRAGMA journal_mode = WAL').get() as {
@@ -3350,23 +3460,8 @@ describe('SQLite cache and reads', () => {
       stdio: 'inherit',
     })
     waitForPath(secondAttempted, second)
-    const candidateDeadline = Date.now() + 5000
-    let secondCandidateObserved = false
-    while (
-      !(secondCandidateObserved || existsSync(secondEntered)) &&
-      first.exitCode === null &&
-      second.exitCode === null &&
-      Date.now() < candidateDeadline
-    ) {
-      secondCandidateObserved = readdirSync(verifiedCacheDirectory, { withFileTypes: true }).some(
-        entry => entry.isDirectory() && /^operation\.lock\.[0-9a-f-]{36}$/u.test(entry.name),
-      )
-      if (!secondCandidateObserved) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
-      }
-    }
     const secondEnteredBeforeRelease = existsSync(secondEntered)
-    assert.equal(secondCandidateObserved || secondEnteredBeforeRelease, true)
+    assert.equal(existsSync(secondAttempted), true)
     assert.equal(first.exitCode, null)
     assert.equal(second.exitCode, null)
     assert.equal(secondEnteredBeforeRelease, false)

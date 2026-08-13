@@ -26,6 +26,7 @@ import { classifySQLiteError, type SQLiteErrorCategory } from './sqlite-error.ts
 const LOCK_WAIT_MILLISECONDS = 60_000
 const RECOVERY_POLL_MILLISECONDS = 50
 const RECOVERY_STALE_MILLISECONDS = 5000
+const RECOVERY_RELEASE_ATTEMPTS = 3
 
 type LockOwner = {
   token: string
@@ -103,10 +104,45 @@ const readOwner = (location: CacheLocation, directory: CacheOwnedDirectory): Loc
   }
 }
 
-const releaseOwnedLock = (location: CacheLocation, directory: CacheOwnedDirectory, token: string) => {
-  const owner = readOwner(location, directory)
-  if (owner?.token === token) {
-    quarantineCacheOwnedDirectory(location, directory, () => readOwner(location, directory)?.token === token)
+const transientSharingViolation = (error: unknown) => {
+  const { code } = error as NodeJS.ErrnoException
+  return code === 'EACCES' || code === 'EBUSY' || code === 'EPERM'
+}
+
+const releaseOwnedLock = (
+  location: CacheLocation,
+  directory: CacheOwnedDirectory,
+  token: string,
+  retrySharingViolations = false,
+) => {
+  const maximumAttempts = retrySharingViolations ? RECOVERY_RELEASE_ATTEMPTS : 1
+  let complete = false
+  for (const attempt of Array.from({ length: maximumAttempts }, (_, index) => index)) {
+    const owner = readOwner(location, directory)
+    if (owner?.token === token) {
+      try {
+        quarantineCacheOwnedDirectory(location, directory, () => readOwner(location, directory)?.token === token)
+        complete = true
+      } catch (error) {
+        const canRetry = retrySharingViolations && transientSharingViolation(error) && attempt < maximumAttempts - 1
+        if (canRetry) {
+          const stillOwned =
+            cacheOwnedDirectoryIsCurrent(location, directory) && readOwner(location, directory)?.token === token
+          if (stillOwned) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RECOVERY_POLL_MILLISECONDS)
+          } else {
+            complete = true
+          }
+        } else {
+          throw error
+        }
+      }
+    } else {
+      complete = true
+    }
+    if (complete) {
+      break
+    }
   }
 }
 
@@ -410,7 +446,7 @@ export const withOperationLock = <Result>(
       }
       let cleanupError: unknown
       try {
-        releaseOwnedLock(location, ownedMarker.directory, ownedMarker.token)
+        releaseOwnedLock(location, ownedMarker.directory, ownedMarker.token, true)
         abandonedRecoveryMarkers.delete(ownedMarker.directory.path)
       } catch (error) {
         rememberAbandonedRecoveryMarker(ownedMarker)
@@ -436,8 +472,8 @@ export const withOperationLock = <Result>(
     }
     writeCacheOwner(location, candidateDirectory, `${JSON.stringify(candidateOwner)}\n`)
 
-    const observedLock = inspectCacheOwnedDirectory(location, lockName)
-    if (observedLock !== undefined) {
+    const observedLock = observeCacheOwnedDirectory(location, lockName)
+    if (observedLock.kind === 'stable') {
       testHooks.afterStaleObservation?.()
     }
 

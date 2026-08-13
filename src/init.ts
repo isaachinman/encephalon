@@ -1,6 +1,7 @@
 import { parseInitInput } from './api-input.ts'
 import { canonicalPayload, scanBaseline } from './baseline.ts'
 import { hydrateResolvedRepository, prepareResolvedRepository } from './cache.ts'
+import { assertCacheLocation } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { applyInstructionChangesOutcome, planInstructionChanges } from './instructions.ts'
 import { withOperationLock } from './lock.ts'
@@ -8,6 +9,7 @@ import { ordinalStringCompare } from './order.ts'
 import {
   assertCanonicalLayoutAdditions,
   assertRecordGraph,
+  nextRecordCreatedAt,
   planRecordAddition,
   publishPlannedRecordOutcome,
   type RecordReadHooks,
@@ -15,6 +17,7 @@ import {
   readRecordSnapshotResolved,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
+import { createRecordFile, validateAddRecordInput } from './schema.ts'
 import type { AddRecordInput, BrainRecord, InitEncephalonInput, InitEncephalonResult, PrepareResult } from './types.ts'
 
 const NEXT_ACTION =
@@ -209,6 +212,7 @@ const initResolved = (
   return withOperationLock(
     root,
     location => {
+      assertCacheLocation(location)
       const instructionPlans = planInstructionChanges(root, false)
       hooks.baselineScan?.()
       const baseline = scanBaseline(root)
@@ -223,17 +227,32 @@ const initResolved = (
               subject: candidate.subject,
             }))
           : undefined,
+        location,
       )
       const { records } = recordSnapshot
+      assertCacheLocation(location)
       const actions = baselineActions(records, baseline, refresh)
-      const plans = actions.additions.map(addition => planRecordAddition(root, { ...addition, root }))
+      const validatedAdditions = actions.additions.map(addition => validateAddRecordInput({ ...addition, root }))
       let recordsCreated: BrainRecord[] = []
-      if (plans.length > 0) {
+      if (validatedAdditions.length > 0) {
+        const validationPlans = validatedAdditions.map(addition =>
+          planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
+        )
         assertRecordGraph(
           root,
-          [...records, ...plans.map(plan => plan.record)],
+          [...records, ...validationPlans.map(plan => plan.record)],
           'The generated baseline would make canonical records invalid.',
           hooks,
+        )
+        const { plans } = validatedAdditions.reduce<{
+          cursor: BrainRecord[]
+          plans: ReturnType<typeof planRecordAddition>[]
+        }>(
+          (result, addition) => {
+            const plan = planRecordAddition(root, createRecordFile(addition, nextRecordCreatedAt(result.cursor)))
+            return { cursor: [...result.cursor, plan.record], plans: [...result.plans, plan] }
+          },
+          { cursor: records, plans: [] },
         )
         const authority = assertCanonicalLayoutAdditions(
           plans.map(plan => plan.record.kind),
@@ -257,7 +276,7 @@ const initResolved = (
       progress.phase = 'cachePreparation'
       progress.cacheState = 'disposable'
       const cacheResult =
-        plans.length > 0
+        validatedAdditions.length > 0
           ? hydrateResolvedRepository(root, false, location)
           : prepareResolvedRepository(root, false, location)
       progress.cacheState = 'prepared'

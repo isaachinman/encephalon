@@ -33,8 +33,6 @@ const ALLOWED_RECORD_KEYS = new Set([
   'payload',
   'searchText',
 ])
-let lastCreatedAtMilliseconds = 0
-
 const byteLength = (value: string) => Buffer.byteLength(value, 'utf8')
 
 const hasPortableComponentLength = (value: string) =>
@@ -397,14 +395,29 @@ const optionalArtifacts = (value: unknown, kind: string, id: string) => {
   return validateStringArray(value, 'artifacts', entry => validateArtifactPath(entry, kind, id))
 }
 
-export const createRecordFile = (input: AddRecordInput): BrainRecordFile => {
+/** @internal */
+export type ValidatedAddRecordInput = Omit<BrainRecordFile, 'createdAt'>
+
+/** @internal */
+export const createRecordFile = (input: ValidatedAddRecordInput, createdAt: string): BrainRecordFile => ({
+  ...(input.artifacts === undefined ? {} : { artifacts: input.artifacts }),
+  ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
+  createdAt: validateTimestamp(createdAt),
+  id: input.id,
+  kind: input.kind,
+  payload: input.payload,
+  ...(input.searchText === undefined ? {} : { searchText: input.searchText }),
+  source: input.source,
+  subject: input.subject,
+  ...(input.supersedes === undefined ? {} : { supersedes: input.supersedes }),
+})
+
+/** @internal */
+export const validateAddRecordInput = (input: AddRecordInput): ValidatedAddRecordInput => {
   const id = validateId(input.id ?? randomUUID())
   const kind = validateKind(input.kind)
   const subject = requiredText(input.subject, 'subject')
   const source = requiredText(input.source, 'source')
-  const now = Date.now()
-  lastCreatedAtMilliseconds = Math.max(now, lastCreatedAtMilliseconds + 1)
-  const createdAt = new Date(lastCreatedAtMilliseconds).toISOString()
   const payload = validateJsonValue(input.payload)
   const confidence = input.confidence === undefined ? undefined : validateConfidence(input.confidence)
   const supersedes = optionalStringArray(input.supersedes, 'supersedes', validateId)
@@ -414,10 +427,9 @@ export const createRecordFile = (input: AddRecordInput): BrainRecordFile => {
       ? undefined
       : normalizeOptionalText(input.searchText, 'searchText', MAX_SEARCH_TEXT_BYTES)
 
-  return {
+  const validated = {
     ...(artifacts === undefined ? {} : { artifacts }),
     ...(confidence === undefined ? {} : { confidence }),
-    createdAt,
     id,
     kind,
     payload,
@@ -426,6 +438,8 @@ export const createRecordFile = (input: AddRecordInput): BrainRecordFile => {
     subject,
     ...(supersedes === undefined ? {} : { supersedes }),
   }
+  formatRecordFile(createRecordFile(validated, '2000-01-01T00:00:00.000Z'))
+  return validated
 }
 
 export const parseRecordFile = (value: unknown): BrainRecordFile => {

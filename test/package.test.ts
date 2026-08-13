@@ -50,6 +50,7 @@ describe('package contract', () => {
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
+    assert.doesNotMatch(implementationPlan, /createdAt is assigned only after the repository operation lock is held/)
     assert.match(contract, /## Public API and CLI/)
     assert.match(contract, /## Canonical Storage/)
     assert.match(contract, /## Partial Initialisation Progress/)
@@ -58,8 +59,22 @@ describe('package contract', () => {
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
+      /Last reviewed: 2026-08-13 for code and behavioural-test snapshot `2874874096bb7d327e084d7e17d5243564244c43`\./,
+    )
+    assert.match(
+      contract,
       /MAR-2548 restart-safe partial initialisation progress and convergence: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`\./,
     )
+    assert.match(
+      contract,
+      /MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2874874096bb7d327e084d7e17d5243564244c43`\./,
+    )
+    assert.match(contract, /Historical plan's wall-clock-only `createdAt` policy/)
+    assert.match(
+      readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),
+      /creation timestamps under the repository operation lock/,
+    )
+    assert.doesNotMatch(readFileSync(resolve(root, 'dist', 'api-input.d.ts'), 'utf8'), /ValidatedAddRecordInput/)
   })
 
   test('keeps installed command guidance aligned with root-install verification', () => {

@@ -14,6 +14,7 @@ All notable changes to Encephalon are documented here.
 
 ### Changed
 
+- Assigned record creation timestamps under the repository operation lock so new records and generated baseline batches remain strictly ordered after canonical history.
 - Made canonical record staging, publication, instruction-file writes, and post-commit recovery safer across filesystem failures.
 - Made cache hydration and gather reads transactional, snapshot-consistent, and resilient to malformed disposable state.
 - Made compact search avoid materialising full record JSON and removed persistent-style copying from hot scans.
