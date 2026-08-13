@@ -18,14 +18,8 @@ import {
 } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 import { TextDecoder } from 'node:util'
-import {
-  captureDirectoryWitness,
-  type DirectoryWitness,
-  DirectoryWitnessError,
-  revalidateDirectoryWitness,
-} from './directory-witness.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
-import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.ts'
+import { sameEntryIdentity } from './filesystem-entry.ts'
 
 const FILENAMES = ['AGENTS.md', 'CLAUDE.md'] as const
 const MARKER_PREFIX = 'encephalon:managed-instructions:'
@@ -379,8 +373,12 @@ type AtomicWriteFault =
   | 'after-delete-quarantine'
   | 'after-delete-verification'
   | 'after-recovery-create'
+  | 'after-recovery-private-flush'
+  | 'after-recovery-open'
   | 'after-backup-rename'
   | 'after-plan-validation'
+  | 'after-temp-create'
+  | 'after-temp-unlink'
   | 'before-backup-cleanup-create'
   | 'before-backup-create'
   | 'before-final-backup-validation'
@@ -394,20 +392,27 @@ type AtomicWriteFault =
   | 'during-backup-restore'
   | 'during-file-flush'
   | 'during-publication'
+  | 'during-restore-flush'
   | 'during-temp-cleanup'
   | 'during-temp-write'
 
 type AtomicWriteHooks = {
-  fault?: (point: AtomicWriteFault, generatedPath?: string) => void
+  close?: (descriptor: number) => void
+  fault?: (point: AtomicWriteFault, generatedPath?: string, descriptor?: number) => void
 }
 
-const fault = (hooks: AtomicWriteHooks | undefined, point: AtomicWriteFault, generatedPath?: string) => {
-  hooks?.fault?.(point, generatedPath)
+const fault = (
+  hooks: AtomicWriteHooks | undefined,
+  point: AtomicWriteFault,
+  generatedPath?: string,
+  descriptor?: number,
+) => {
+  hooks?.fault?.(point, generatedPath, descriptor)
 }
 
 const identityBoundaryError = (error: unknown) => {
   const { code } = error as NodeJS.ErrnoException
-  return error instanceof DirectoryWitnessError || code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR'
+  return code === 'EEXIST' || code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR'
 }
 
 const mapInstructionIdentity = <Value>(filename: (typeof FILENAMES)[number], operation: () => Value): Value => {
@@ -421,58 +426,80 @@ const mapInstructionIdentity = <Value>(filename: (typeof FILENAMES)[number], ope
   }
 }
 
-const sameDirectoryIdentity = (first: DirectoryWitness, second: DirectoryWitness) =>
-  first.path === second.path &&
-  first.canonicalPath === second.canonicalPath &&
-  sameEntryIdentity(first.pathMetadata, second.pathMetadata) &&
-  sameEntryIdentity(first.canonicalMetadata, second.canonicalMetadata)
-
 class InstructionRootAuthority {
+  private readonly descriptor: number | undefined
   private filename: (typeof FILENAMES)[number]
-  private witness: DirectoryWitness | undefined
+  private readonly identity!: BigIntStats
+  private readonly root: string
 
   constructor(root: string, filename: (typeof FILENAMES)[number]) {
     this.filename = filename
-    this.witness = mapInstructionIdentity(filename, () => captureDirectoryWitness(root, { allowLink: false }))
-  }
-
-  prepareMutation() {
-    const witness = this.requiredWitness()
-    mapInstructionIdentity(this.filename, () => revalidateDirectoryWitness(witness))
-    return witness
-  }
-
-  completeMutation(previous: DirectoryWitness) {
-    this.witness = undefined
-    const next = mapInstructionIdentity(this.filename, () =>
-      captureDirectoryWitness(previous.path, { allowLink: false }),
-    )
-    if (!sameDirectoryIdentity(previous, next)) {
-      return instructionIdentityChanged(this.filename)
+    this.root = root
+    const pathMetadata = mapInstructionIdentity(filename, () => lstatSync(root, { bigint: true }))
+    if (!pathMetadata.isDirectory() || pathMetadata.isSymbolicLink()) {
+      instructionIdentityChanged(filename)
     }
-    this.witness = next
+    let descriptor: number | undefined
+    try {
+      if (process.platform !== 'win32') {
+        descriptor = mapInstructionIdentity(filename, () =>
+          openSync(root, constants.O_RDONLY | directoryFlag | noFollowFlag),
+        )
+        const descriptorMetadata = mapInstructionIdentity(filename, () =>
+          fstatSync(descriptor as number, { bigint: true }),
+        )
+        if (!(descriptorMetadata.isDirectory() && sameEntryIdentity(pathMetadata, descriptorMetadata))) {
+          instructionIdentityChanged(filename)
+        }
+      }
+      const finalPathMetadata = mapInstructionIdentity(filename, () => lstatSync(root, { bigint: true }))
+      if (
+        !finalPathMetadata.isDirectory() ||
+        finalPathMetadata.isSymbolicLink() ||
+        !sameEntryIdentity(pathMetadata, finalPathMetadata)
+      ) {
+        instructionIdentityChanged(filename)
+      }
+      this.descriptor = descriptor
+      this.identity = pathMetadata
+    } catch (error) {
+      if (descriptor !== undefined) {
+        closeAfterOperation(descriptor, true)
+      }
+      throw error
+    }
   }
 
-  mutate<Value>(operation: () => Value) {
-    const witness = this.prepareMutation()
+  acquireOwned<Value>(
+    operation: () => Value,
+    acceptOwnership: (value: Value) => void,
+    afterAcquire?: (value: Value) => void,
+  ) {
+    this.assertCurrent()
     const value = mapInstructionIdentity(this.filename, operation)
-    this.completeMutation(witness)
+    acceptOwnership(value)
+    afterAcquire?.(value)
+    this.assertCurrent()
     return value
   }
 
   assertCurrent() {
-    mapInstructionIdentity(this.filename, () => revalidateDirectoryWitness(this.requiredWitness()))
-  }
-
-  recoverCurrentGeneration() {
-    const witness = this.requiredWitness()
-    const next = mapInstructionIdentity(this.filename, () =>
-      captureDirectoryWitness(witness.path, { allowLink: false }),
-    )
-    if (!sameDirectoryIdentity(witness, next)) {
+    const pathMetadata = mapInstructionIdentity(this.filename, () => lstatSync(this.root, { bigint: true }))
+    if (
+      !pathMetadata.isDirectory() ||
+      pathMetadata.isSymbolicLink() ||
+      !sameEntryIdentity(this.identity, pathMetadata)
+    ) {
       return instructionIdentityChanged(this.filename)
     }
-    this.witness = next
+    if (this.descriptor !== undefined) {
+      const descriptorMetadata = mapInstructionIdentity(this.filename, () =>
+        fstatSync(this.descriptor as number, { bigint: true }),
+      )
+      if (!(descriptorMetadata.isDirectory() && sameEntryIdentity(this.identity, descriptorMetadata))) {
+        return instructionIdentityChanged(this.filename)
+      }
+    }
   }
 
   useFilename(filename: (typeof FILENAMES)[number]) {
@@ -480,44 +507,24 @@ class InstructionRootAuthority {
   }
 
   flush() {
-    const witness = this.requiredWitness()
-    mapInstructionIdentity(this.filename, () => revalidateDirectoryWitness(witness))
-    if (process.platform !== 'win32') {
-      let descriptor: number | undefined
-      let operationFailed = false
+    this.assertCurrent()
+    if (this.descriptor !== undefined) {
       try {
-        descriptor = mapInstructionIdentity(this.filename, () =>
-          openSync(witness.canonicalPath, constants.O_RDONLY | directoryFlag | noFollowFlag),
-        )
-        const metadata = mapInstructionIdentity(this.filename, () => fstatSync(descriptor as number, { bigint: true }))
-        if (!sameStableEntryMetadata(metadata, witness.canonicalMetadata)) {
-          return instructionIdentityChanged(this.filename)
-        }
-        try {
-          fsyncSync(descriptor)
-        } catch (error) {
-          const { code } = error as NodeJS.ErrnoException
-          if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'EPERM') {
-            throw error
-          }
-        }
+        fsyncSync(this.descriptor)
       } catch (error) {
-        operationFailed = true
-        throw error
-      } finally {
-        if (descriptor !== undefined) {
-          closeAfterOperation(descriptor, operationFailed)
+        const { code } = error as NodeJS.ErrnoException
+        if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'EPERM') {
+          throw error
         }
       }
     }
-    mapInstructionIdentity(this.filename, () => revalidateDirectoryWitness(witness))
+    this.assertCurrent()
   }
 
-  private requiredWitness() {
-    if (this.witness === undefined) {
-      return instructionIdentityChanged(this.filename)
+  close(operationFailed: boolean) {
+    if (this.descriptor !== undefined) {
+      closeAfterOperation(this.descriptor, operationFailed)
     }
-    return this.witness
   }
 }
 
@@ -568,7 +575,12 @@ const fsyncDirectory = (path: string) => {
   }
 }
 
-type PostCommitPhase = 'backupCleanup' | 'publicationFlush' | 'publicationVerification' | 'temporaryCleanup'
+type PostCommitPhase =
+  | 'backupCleanup'
+  | 'publicationFlush'
+  | 'publicationVerification'
+  | 'resourceCleanup'
+  | 'temporaryCleanup'
 
 type DescriptorSnapshot = {
   bytes: Buffer
@@ -586,20 +598,25 @@ type PostCommitFailure = {
   phase: PostCommitPhase
 }
 
+type RecoveryAliases = Map<string, DescriptorSnapshot>
+
 const postCommitPhasePriority = [
   'publicationVerification',
   'publicationFlush',
   'backupCleanup',
   'temporaryCleanup',
+  'resourceCleanup',
 ] as const satisfies readonly PostCommitPhase[]
 
 const postCommitRecoveryAction = {
   backupCleanup:
     'Inspect the repository root and remove only a confirmed backup left by this operation before retrying.',
   publicationFlush:
-    'Confirm the canonical instruction file is present; init does not re-fsync an unchanged instruction file, so treat durability as unverified until the repository directory sync succeeds.',
+    'Retry init to revalidate the unchanged canonical instruction file and sync its containing directory.',
   publicationVerification:
     'Inspect the canonical instruction file before retrying; the linked replacement may have been displaced by a concurrent change.',
+  resourceCleanup:
+    'No instruction alias requires removal. If using the API, end the current process before retrying to release any descriptor that may remain.',
   temporaryCleanup:
     'Inspect the repository root and remove only a confirmed temporary file left by this operation before retrying.',
 } as const satisfies Record<PostCommitPhase, string>
@@ -619,7 +636,9 @@ const readDescriptorBytes = (descriptor: number, size: bigint) => {
   while (offset < bytes.length) {
     const read = readSync(descriptor, bytes, offset, bytes.length - offset, offset)
     if (read <= 0) {
-      throw Object.assign(new Error('Unable to read an instruction file descriptor.'), { code: 'EIO' })
+      throw Object.assign(new Error('Unable to read an instruction file descriptor.'), {
+        code: 'EIO',
+      })
     }
     offset += read
   }
@@ -646,9 +665,21 @@ const snapshotDescriptor = (descriptor: number, filename: (typeof FILENAMES)[num
   }
 }
 
+const expectedDescriptorSnapshot = (
+  descriptor: number,
+  filename: (typeof FILENAMES)[number],
+  bytes: Buffer,
+  mode: bigint,
+) => {
+  const snapshot = snapshotDescriptor(descriptor, filename)
+  if (!snapshot.bytes.equals(bytes) || snapshot.mode !== mode) {
+    return instructionIdentityChanged(filename)
+  }
+  return snapshot
+}
+
 const holdInstructionFile = (path: string, filename: (typeof FILENAMES)[number]) => {
-  const access = process.platform === 'win32' ? constants.O_RDWR : constants.O_RDONLY
-  const descriptor = openSync(path, access | noFollowFlag)
+  const descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
   try {
     return { descriptor, ...snapshotDescriptor(descriptor, filename) }
   } catch (error) {
@@ -707,24 +738,62 @@ const pathIdentifiesDescriptor = (
   }
 }
 
+const retainRecoveryAlias = (aliases: RecoveryAliases, path: string, held: DescriptorSnapshot) => {
+  aliases.set(path, { bytes: held.bytes, identity: held.identity, mode: held.mode })
+}
+
+const releaseRecoveryAlias = (aliases: RecoveryAliases, path: string) => {
+  aliases.delete(path)
+}
+
+const currentRecoveryPaths = (aliases: RecoveryAliases, filename: (typeof FILENAMES)[number]) =>
+  [...aliases]
+    .filter(([path, expected]) => {
+      let descriptor: number | undefined
+      try {
+        descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
+        const current = snapshotDescriptor(descriptor, filename)
+        const pathname = lstatSync(path, { bigint: true })
+        return (
+          pathname.isFile() &&
+          !pathname.isSymbolicLink() &&
+          sameIdentity(current.identity, identityFor(pathname)) &&
+          sameIdentity(stableIdentity(expected.identity), stableIdentity(current.identity)) &&
+          expected.mode === current.mode &&
+          expected.bytes.equals(current.bytes)
+        )
+      } catch {
+        return false
+      } finally {
+        if (descriptor !== undefined) {
+          closeAfterOperation(descriptor, true)
+        }
+      }
+    })
+    .map(([path]) => basename(path))
+    .sort((left, right) => left.localeCompare(right, 'en'))
+    .slice(0, 4)
+
 const linkHeldAlias = (
   sourcePath: string,
   destinationPath: string,
   held: HeldInstructionFile,
   filename: (typeof FILENAMES)[number],
   authority: InstructionRootAuthority,
+  aliases?: RecoveryAliases,
 ) => {
-  const generation = authority.prepareMutation()
+  authority.assertCurrent()
   assertPathIdentifiesDescriptor(sourcePath, held, filename, true)
   try {
     linkSync(sourcePath, destinationPath)
+    aliases?.set(destinationPath, { bytes: held.bytes, identity: held.identity, mode: held.mode })
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST' || identityBoundaryError(error)) {
       return instructionIdentityChanged(filename, { cause: error })
     }
     throw error
   }
-  authority.completeMutation(generation)
+  authority.assertCurrent()
   assertPathIdentifiesDescriptor(destinationPath, held, filename, true)
 }
 
@@ -735,7 +804,7 @@ const unlinkHeldSource = (
   filename: (typeof FILENAMES)[number],
   authority: InstructionRootAuthority,
 ) => {
-  const generation = authority.prepareMutation()
+  authority.assertCurrent()
   assertPathIdentifiesDescriptor(destinationPath, held, filename, true)
   assertPathIdentifiesDescriptor(sourcePath, held, filename, true)
   try {
@@ -746,7 +815,7 @@ const unlinkHeldSource = (
     }
     throw error
   }
-  authority.completeMutation(generation)
+  authority.assertCurrent()
   assertPathIdentifiesDescriptor(destinationPath, held, filename, true)
 }
 
@@ -756,7 +825,7 @@ const unlinkHeldAlias = (
   filename: (typeof FILENAMES)[number],
   authority: InstructionRootAuthority,
 ) => {
-  const generation = authority.prepareMutation()
+  authority.assertCurrent()
   assertPathIdentifiesDescriptor(path, held, filename, true)
   try {
     unlinkSync(path)
@@ -766,7 +835,7 @@ const unlinkHeldAlias = (
     }
     throw error
   }
-  authority.completeMutation(generation)
+  authority.assertCurrent()
 }
 
 const createDescriptorRecoveryAlias = (
@@ -775,28 +844,50 @@ const createDescriptorRecoveryAlias = (
   filename: (typeof FILENAMES)[number],
   authority: InstructionRootAuthority,
   hooks: AtomicWriteHooks | undefined,
+  aliases: RecoveryAliases,
+  suffix: 'backup' | 'tmp' = 'backup',
 ) => {
-  const snapshot = snapshotDescriptor(held.descriptor, filename)
-  const recoveryPath = tempPathFor(path, 'backup')
+  const snapshot = { bytes: held.bytes, identity: held.identity, mode: held.mode }
+  const recoveryPath = tempPathFor(path, suffix)
   let recoveryDescriptor: number | undefined
   let completed = false
   try {
-    recoveryDescriptor = authority.mutate(() =>
-      openSync(recoveryPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | noFollowFlag, 0o600),
+    authority.acquireOwned(
+      () => openSync(recoveryPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | noFollowFlag, 0o600),
+      descriptor => {
+        recoveryDescriptor = descriptor
+      },
+      descriptor => fault(hooks, 'after-recovery-open', recoveryPath, descriptor),
     )
-    fault(hooks, 'after-recovery-create', recoveryPath)
+    const ownedDescriptor = recoveryDescriptor
+    if (ownedDescriptor === undefined) {
+      return fail('INTERNAL_ERROR', `${filename} recovery lost its owned descriptor.`)
+    }
+    fchmodSync(ownedDescriptor, 0o600)
+    fault(hooks, 'after-recovery-create', recoveryPath, ownedDescriptor)
     let offset = 0
     while (offset < snapshot.bytes.length) {
-      const written = writeSync(recoveryDescriptor, snapshot.bytes, offset, snapshot.bytes.length - offset, offset)
+      const written = writeSync(ownedDescriptor, snapshot.bytes, offset, snapshot.bytes.length - offset, offset)
       if (written <= 0) {
         throw Object.assign(new Error(`Unable to recover ${filename}.`), { code: 'EIO' })
       }
       offset += written
     }
-    fchmodSync(recoveryDescriptor, Number(snapshot.mode))
-    fsyncSync(recoveryDescriptor)
-    const recovery = { descriptor: recoveryDescriptor, ...snapshotDescriptor(recoveryDescriptor, filename) }
+    fsyncSync(ownedDescriptor)
+    fault(hooks, 'after-recovery-private-flush', recoveryPath, ownedDescriptor)
+    const privateRecovery = {
+      descriptor: ownedDescriptor,
+      ...expectedDescriptorSnapshot(ownedDescriptor, filename, snapshot.bytes, 0o600n),
+    }
+    assertPathIdentifiesDescriptor(recoveryPath, privateRecovery, filename, true)
+    fchmodSync(ownedDescriptor, Number(snapshot.mode))
+    fsyncSync(ownedDescriptor)
+    const recovery = {
+      descriptor: ownedDescriptor,
+      ...expectedDescriptorSnapshot(ownedDescriptor, filename, snapshot.bytes, snapshot.mode),
+    }
     assertPathIdentifiesDescriptor(recoveryPath, recovery, filename, true)
+    retainRecoveryAlias(aliases, recoveryPath, recovery)
     completed = true
     return { path: recoveryPath, recovery }
   } finally {
@@ -806,6 +897,27 @@ const createDescriptorRecoveryAlias = (
   }
 }
 
+const restoreDurableAlias = (
+  sourcePath: string,
+  path: string,
+  held: HeldInstructionFile,
+  plan: FilePlan,
+  hooks: AtomicWriteHooks | undefined,
+  authority: InstructionRootAuthority,
+  aliases: RecoveryAliases,
+) => {
+  if (!pathIdentifiesDescriptor(path, held, plan.filename, true)) {
+    linkHeldAlias(sourcePath, path, held, plan.filename, authority)
+  }
+  assertPathIdentifiesDescriptor(path, held, plan.filename, true)
+  assertPathIdentifiesDescriptor(sourcePath, held, plan.filename, true)
+  fault(hooks, 'during-restore-flush')
+  authority.flush()
+  assertPathIdentifiesDescriptor(path, held, plan.filename, true)
+  unlinkHeldSource(sourcePath, path, held, plan.filename, authority)
+  releaseRecoveryAlias(aliases, sourcePath)
+}
+
 const restoreHeldBackup = (
   path: string,
   backupPath: string,
@@ -813,50 +925,51 @@ const restoreHeldBackup = (
   plan: FilePlan,
   hooks: AtomicWriteHooks | undefined,
   authority: InstructionRootAuthority,
+  aliases: RecoveryAliases,
 ) => {
   let recoveryError: unknown
   let recoveryRetained = false
   try {
-    authority.recoverCurrentGeneration()
+    authority.assertCurrent()
     fault(hooks, 'during-backup-restore')
-    const recoveryHeld = { descriptor: held.descriptor, ...snapshotDescriptor(held.descriptor, plan.filename) }
+    const recoveryHeld = held
     const canonicalExists = mapInstructionIdentity(plan.filename, () => lstatIfExists(path) !== undefined)
     if (canonicalExists) {
-      if (pathIdentifiesDescriptor(path, recoveryHeld, plan.filename, false)) {
-        if (!pathIdentifiesDescriptor(backupPath, recoveryHeld, plan.filename, false)) {
+      if (pathIdentifiesDescriptor(path, recoveryHeld, plan.filename, true)) {
+        if (!pathIdentifiesDescriptor(backupPath, recoveryHeld, plan.filename, true)) {
           return instructionIdentityChanged(plan.filename)
         }
-        unlinkHeldSource(backupPath, path, recoveryHeld, plan.filename, authority)
-      } else if (pathIdentifiesDescriptor(backupPath, recoveryHeld, plan.filename, false)) {
+        restoreDurableAlias(backupPath, path, recoveryHeld, plan, hooks, authority, aliases)
+      } else if (pathIdentifiesDescriptor(backupPath, recoveryHeld, plan.filename, true)) {
         return instructionIdentityChanged(plan.filename)
       } else {
-        const copy = createDescriptorRecoveryAlias(path, recoveryHeld, plan.filename, authority, hooks)
+        const copy = createDescriptorRecoveryAlias(path, recoveryHeld, plan.filename, authority, hooks, aliases)
         recoveryRetained = true
         closeAfterOperation(copy.recovery.descriptor, true)
         return instructionIdentityChanged(plan.filename)
       }
-    } else {
-      if (pathIdentifiesDescriptor(backupPath, recoveryHeld, plan.filename, false)) {
-        linkHeldAlias(backupPath, path, recoveryHeld, plan.filename, authority)
-        unlinkHeldSource(backupPath, path, recoveryHeld, plan.filename, authority)
-      } else {
-        const copy = createDescriptorRecoveryAlias(path, recoveryHeld, plan.filename, authority, hooks)
-        try {
-          linkHeldAlias(copy.path, path, copy.recovery, plan.filename, authority)
-          unlinkHeldSource(copy.path, path, copy.recovery, plan.filename, authority)
-        } finally {
-          closeAfterOperation(copy.recovery.descriptor, true)
-        }
-      }
+    } else if (pathIdentifiesDescriptor(backupPath, recoveryHeld, plan.filename, true)) {
+      restoreDurableAlias(backupPath, path, recoveryHeld, plan, hooks, authority, aliases)
       assertPathIdentifiesDescriptor(path, recoveryHeld, plan.filename, true)
+    } else {
+      const copy = createDescriptorRecoveryAlias(path, recoveryHeld, plan.filename, authority, hooks, aliases)
+      try {
+        restoreDurableAlias(copy.path, path, copy.recovery, plan, hooks, authority, aliases)
+        const restored = assertPathIdentifiesDescriptor(path, copy.recovery, plan.filename, true)
+        if (!restored.bytes.equals(recoveryHeld.bytes) || restored.mode !== recoveryHeld.mode) {
+          return instructionIdentityChanged(plan.filename)
+        }
+      } finally {
+        closeAfterOperation(copy.recovery.descriptor, true)
+      }
     }
   } catch (error) {
     recoveryError = error
     try {
-      const canonicalExact = pathIdentifiesDescriptor(path, held, plan.filename, false)
-      const backupExact = pathIdentifiesDescriptor(backupPath, held, plan.filename, false)
+      const canonicalExact = pathIdentifiesDescriptor(path, held, plan.filename, true)
+      const backupExact = pathIdentifiesDescriptor(backupPath, held, plan.filename, true)
       if (!(canonicalExact || backupExact || recoveryRetained)) {
-        const copy = createDescriptorRecoveryAlias(path, held, plan.filename, authority, hooks)
+        const copy = createDescriptorRecoveryAlias(path, held, plan.filename, authority, hooks, aliases)
         closeAfterOperation(copy.recovery.descriptor, true)
       }
     } catch {
@@ -964,26 +1077,29 @@ const finaliseHeldBackup = (
   plan: FilePlan,
   hooks: AtomicWriteHooks | undefined,
   authority: InstructionRootAuthority,
+  aliases: RecoveryAliases,
 ) => {
   fault(hooks, 'during-backup-cleanup')
   const cleanupPath = tempPathFor(path, 'backup')
   fault(hooks, 'before-backup-cleanup-create', cleanupPath)
   try {
-    linkHeldAlias(backupPath, cleanupPath, held, plan.filename, authority)
+    linkHeldAlias(backupPath, cleanupPath, held, plan.filename, authority, aliases)
     unlinkHeldSource(backupPath, cleanupPath, held, plan.filename, authority)
+    releaseRecoveryAlias(aliases, backupPath)
     fault(hooks, 'before-final-backup-validation', cleanupPath)
     if (mapInstructionIdentity(plan.filename, () => lstatIfExists(backupPath) !== undefined)) {
       return instructionIdentityChanged(plan.filename)
     }
     unlinkHeldAlias(cleanupPath, held, plan.filename, authority)
+    releaseRecoveryAlias(aliases, cleanupPath)
   } catch (error) {
     if (isInstructionIdentityUncertainty(error)) {
       try {
-        const sourceExact = pathIdentifiesDescriptor(backupPath, held, plan.filename, false)
-        const cleanupExact = pathIdentifiesDescriptor(cleanupPath, held, plan.filename, false)
+        const sourceExact = pathIdentifiesDescriptor(backupPath, held, plan.filename, true)
+        const cleanupExact = pathIdentifiesDescriptor(cleanupPath, held, plan.filename, true)
         if (!(sourceExact || cleanupExact)) {
-          authority.recoverCurrentGeneration()
-          const copy = createDescriptorRecoveryAlias(path, held, plan.filename, authority, hooks)
+          authority.assertCurrent()
+          const copy = createDescriptorRecoveryAlias(path, held, plan.filename, authority, hooks, aliases)
           closeAfterOperation(copy.recovery.descriptor, true)
         }
       } catch {
@@ -997,7 +1113,12 @@ const finaliseHeldBackup = (
 const orderedFailedPhases = (failures: readonly PostCommitFailure[]) =>
   postCommitPhasePriority.filter(phase => failures.some(failure => failure.phase === phase))
 
-const committedFailureDetails = (plan: FilePlan, phase: PostCommitPhase, failures: readonly PostCommitFailure[]) => ({
+const committedFailureDetails = (
+  plan: FilePlan,
+  phase: PostCommitPhase,
+  failures: readonly PostCommitFailure[],
+  aliases: RecoveryAliases,
+) => ({
   filename: plan.filename,
   instructionCommitted: true,
   postCommitFailures: orderedFailedPhases(failures).map(failedPhase => ({
@@ -1006,9 +1127,14 @@ const committedFailureDetails = (plan: FilePlan, phase: PostCommitPhase, failure
   })),
   postCommitPhase: phase,
   recoveryAction: postCommitRecoveryAction[phase],
+  recoveryPaths: currentRecoveryPaths(aliases, plan.filename),
 })
 
-const throwHighestPriorityCommittedFailure = (plan: FilePlan, failures: readonly PostCommitFailure[]) => {
+const throwHighestPriorityCommittedFailure = (
+  plan: FilePlan,
+  failures: readonly PostCommitFailure[],
+  aliases: RecoveryAliases,
+) => {
   const phase = postCommitPhasePriority.find(candidate => failures.some(failure => failure.phase === candidate))
   if (phase !== undefined) {
     const samePhase = failures.filter(candidate => candidate.phase === phase)
@@ -1016,14 +1142,19 @@ const throwHighestPriorityCommittedFailure = (plan: FilePlan, failures: readonly
     if (failure !== undefined) {
       const recoveryAction = postCommitRecoveryAction[phase]
       const message = `${plan.filename} was committed, but the ${phase} post-commit phase failed. ${recoveryAction}`
-      const details = committedFailureDetails(plan, phase, failures)
-      if (failure.identityUncertain) {
-        throw new EncephalonError('REPOSITORY_CHANGED', message, details, { cause: failure.cause })
+      const details = committedFailureDetails(plan, phase, failures, aliases)
+      const identityFailure = failures.find(candidate => candidate.identityUncertain)
+      if (identityFailure !== undefined) {
+        throw new EncephalonError('REPOSITORY_CHANGED', message, details, {
+          cause: identityFailure.cause,
+        })
       }
       return wrapIo(message, failure.cause, details)
     }
   }
 }
+
+class PostTemporaryUnlinkError extends Error {}
 
 const cleanupHeldTempFile = (
   path: string,
@@ -1032,9 +1163,10 @@ const cleanupHeldTempFile = (
   plan: FilePlan,
   hooks: AtomicWriteHooks | undefined,
   authority: InstructionRootAuthority,
+  aliases: RecoveryAliases,
 ) => {
   fault(hooks, 'during-temp-cleanup', tempPath)
-  const generation = authority.prepareMutation()
+  authority.assertCurrent()
   assertPathIdentifiesDescriptor(path, held, plan.filename, true)
   assertPathIdentifiesDescriptor(tempPath, held, plan.filename, true)
   try {
@@ -1045,8 +1177,14 @@ const cleanupHeldTempFile = (
     }
     throw error
   }
-  authority.completeMutation(generation)
-  assertPathIdentifiesDescriptor(path, held, plan.filename, true)
+  releaseRecoveryAlias(aliases, tempPath)
+  try {
+    authority.assertCurrent()
+    fault(hooks, 'after-temp-unlink')
+    assertPathIdentifiesDescriptor(path, held, plan.filename, true)
+  } catch (error) {
+    throw new PostTemporaryUnlinkError('The staged instruction path changed after temporary unlink.', { cause: error })
+  }
 }
 
 const attemptPublicationFlush = (
@@ -1057,9 +1195,15 @@ const attemptPublicationFlush = (
   try {
     fault(hooks, 'during-publication-flush')
     authority.flush()
-    return { failures: failures.filter(failure => failure.phase !== 'publicationFlush'), succeeded: true }
+    return {
+      failures: failures.filter(failure => failure.phase !== 'publicationFlush'),
+      succeeded: true,
+    }
   } catch (error) {
-    return { failures: [...failures, postCommitFailure('publicationFlush', error)], succeeded: false }
+    return {
+      failures: [...failures, postCommitFailure('publicationFlush', error)],
+      succeeded: false,
+    }
   }
 }
 
@@ -1070,10 +1214,11 @@ const finaliseCommittedInstruction = (input: {
   path: string
   plan: FilePlan
   predecessor?: HeldInstructionFile
+  aliases: RecoveryAliases
   staged: HeldInstructionFile
   tempPath: string
 }) => {
-  const { authority, backupPath, hooks, path, plan, predecessor, staged, tempPath } = input
+  const { aliases, authority, backupPath, hooks, path, plan, predecessor, staged, tempPath } = input
   let failures: readonly PostCommitFailure[] = []
   let backupRetained = predecessor !== undefined
   let canonicalVerified = true
@@ -1115,14 +1260,14 @@ const finaliseCommittedInstruction = (input: {
       const failureCountBeforeCleanup = failures.length
       failures = capturePostCommitFailure(failures, 'backupCleanup', () => {
         assertPathIdentifiesDescriptor(path, staged, plan.filename, true)
-        finaliseHeldBackup(path, backupPath, predecessor, plan, hooks, authority)
+        finaliseHeldBackup(path, backupPath, predecessor, plan, hooks, authority, aliases)
       })
       backupRetained = failures.length !== failureCountBeforeCleanup
     }
 
     if (failures.some(failure => failure.phase === 'backupCleanup')) {
       try {
-        authority.recoverCurrentGeneration()
+        authority.assertCurrent()
       } catch {
         // The recorded backup-cleanup uncertainty remains authoritative.
       }
@@ -1138,15 +1283,30 @@ const finaliseCommittedInstruction = (input: {
 
     if (canonicalVerified) {
       const failureCountBeforeCleanup = failures.length
-      failures = capturePostCommitFailure(failures, 'temporaryCleanup', () => {
-        cleanupHeldTempFile(path, tempPath, staged, plan, hooks, authority)
-      })
+      try {
+        cleanupHeldTempFile(path, tempPath, staged, plan, hooks, authority, aliases)
+      } catch (error) {
+        if (error instanceof PostTemporaryUnlinkError) {
+          canonicalVerified = false
+          const cause = error.cause ?? error
+          failures = [...failures, postCommitFailure('publicationVerification', cause)]
+          try {
+            const copy = createDescriptorRecoveryAlias(path, staged, plan.filename, authority, hooks, aliases, 'tmp')
+            closeAfterOperation(copy.recovery.descriptor, true)
+            failures = [...failures, postCommitFailure('temporaryCleanup', cause)]
+          } catch (recoveryError) {
+            failures = [...failures, postCommitFailure('temporaryCleanup', recoveryError)]
+          }
+        } else {
+          failures = [...failures, postCommitFailure('temporaryCleanup', error)]
+        }
+      }
       temporaryRetained = failures.length !== failureCountBeforeCleanup
     }
 
     if (failures.some(failure => failure.phase === 'temporaryCleanup')) {
       try {
-        authority.recoverCurrentGeneration()
+        authority.assertCurrent()
       } catch {
         // The recorded temporary-cleanup uncertainty remains authoritative.
       }
@@ -1175,16 +1335,19 @@ const finaliseCommittedInstruction = (input: {
   }
 
   if (predecessor !== undefined) {
-    failures = capturePostCommitFailure(failures, 'backupCleanup', () => closeSync(predecessor.descriptor))
+    failures = capturePostCommitFailure(failures, 'resourceCleanup', () =>
+      (hooks?.close ?? closeSync)(predecessor.descriptor),
+    )
   }
-  failures = capturePostCommitFailure(failures, 'temporaryCleanup', () => closeSync(staged.descriptor))
-  throwHighestPriorityCommittedFailure(plan, failures)
+  failures = capturePostCommitFailure(failures, 'resourceCleanup', () => (hooks?.close ?? closeSync)(staged.descriptor))
+  throwHighestPriorityCommittedFailure(plan, failures, aliases)
 }
 
 const writePlan = (path: string, plan: FilePlan, authority: InstructionRootAuthority, hooks?: AtomicWriteHooks) => {
   const bytes = plan.contentBytes ?? Buffer.alloc(0)
   const tempPath = tempPathFor(path)
   const backupPath = tempPathFor(path, 'backup')
+  const aliases: RecoveryAliases = new Map()
   let staged: HeldInstructionFile | undefined
   let backup: HeldInstructionFile | undefined
   let descriptor: number | undefined
@@ -1192,13 +1355,28 @@ const writePlan = (path: string, plan: FilePlan, authority: InstructionRootAutho
   let preCommitError: unknown
   try {
     fault(hooks, 'before-temp-create')
-    descriptor = authority.mutate(() =>
-      openSync(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | noFollowFlag, 0o666),
+    authority.acquireOwned(
+      () => openSync(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | noFollowFlag, 0o600),
+      acquiredDescriptor => {
+        descriptor = acquiredDescriptor
+      },
+      acquiredDescriptor => fault(hooks, 'after-temp-create', tempPath, acquiredDescriptor),
     )
-    writeAll(descriptor, bytes, plan, hooks)
+    const ownedDescriptor = descriptor
+    if (ownedDescriptor === undefined) {
+      return fail('INTERNAL_ERROR', `${plan.filename} publication lost its owned descriptor.`)
+    }
+    fchmodSync(ownedDescriptor, 0o600)
+    writeAll(ownedDescriptor, bytes, plan, hooks)
     fault(hooks, 'during-file-flush')
-    fsyncSync(descriptor)
-    assertPlanIsCurrent(dirname(path), plan)
+    fsyncSync(ownedDescriptor)
+    const privateStaged = {
+      descriptor: ownedDescriptor,
+      ...expectedDescriptorSnapshot(ownedDescriptor, plan.filename, bytes, 0o600n),
+    }
+    assertPathIdentifiesDescriptor(tempPath, privateStaged, plan.filename, true)
+    mapInstructionIdentity(plan.filename, () => assertPlanIsCurrent(dirname(path), plan))
+    let intendedMode = BigInt(0o666 & ~process.umask())
     if (plan.originalFileExisted) {
       backup = holdInstructionFile(path, plan.filename)
       if (
@@ -1213,10 +1391,20 @@ const writePlan = (path: string, plan: FilePlan, authority: InstructionRootAutho
         return instructionIdentityChanged(plan.filename)
       }
       assertPathIdentifiesDescriptor(path, backup, plan.filename, true)
-      fchmodSync(descriptor, Number(backup.mode))
-      fsyncSync(descriptor)
+      intendedMode = backup.mode
+    }
+    fchmodSync(ownedDescriptor, Number(intendedMode))
+    fsyncSync(ownedDescriptor)
+    staged = {
+      descriptor: ownedDescriptor,
+      ...expectedDescriptorSnapshot(ownedDescriptor, plan.filename, bytes, intendedMode),
+    }
+    const verifiedStaged = staged
+    assertPathIdentifiesDescriptor(tempPath, verifiedStaged, plan.filename, true)
+    retainRecoveryAlias(aliases, tempPath, verifiedStaged)
+    if (backup !== undefined) {
       fault(hooks, 'before-backup-create', backupPath)
-      linkHeldAlias(path, backupPath, backup, plan.filename, authority)
+      linkHeldAlias(path, backupPath, backup, plan.filename, authority, aliases)
       fault(hooks, 'during-backup-flush')
       authority.flush()
       unlinkHeldSource(path, backupPath, backup, plan.filename, authority)
@@ -1224,20 +1412,19 @@ const writePlan = (path: string, plan: FilePlan, authority: InstructionRootAutho
       fault(hooks, 'after-backup-validation')
       assertPathIdentifiesDescriptor(backupPath, backup, plan.filename, true)
     }
-    staged = { descriptor, ...snapshotDescriptor(descriptor, plan.filename) }
     fault(hooks, 'during-publication')
-    const publicationGeneration = authority.prepareMutation()
-    assertPathIdentifiesDescriptor(tempPath, staged, plan.filename, true)
+    authority.assertCurrent()
+    assertPathIdentifiesDescriptor(tempPath, verifiedStaged, plan.filename, true)
     try {
       linkSync(tempPath, path)
       committed = true
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-        return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+      if (identityBoundaryError(error)) {
+        return instructionIdentityChanged(plan.filename, { cause: error })
       }
       throw error
     }
-    authority.completeMutation(publicationGeneration)
+    authority.assertCurrent()
   } catch (error) {
     preCommitError = error
   }
@@ -1245,12 +1432,12 @@ const writePlan = (path: string, plan: FilePlan, authority: InstructionRootAutho
   if (!committed) {
     let recoveryError: unknown
     if (backup !== undefined) {
-      recoveryError = restoreHeldBackup(path, backupPath, backup, plan, hooks, authority)
+      recoveryError = restoreHeldBackup(path, backupPath, backup, plan, hooks, authority, aliases)
     }
     let temporaryCleanupError: unknown
     try {
       try {
-        authority.recoverCurrentGeneration()
+        authority.assertCurrent()
       } catch (error) {
         temporaryCleanupError = error
       }
@@ -1258,6 +1445,7 @@ const writePlan = (path: string, plan: FilePlan, authority: InstructionRootAutho
       if (descriptor !== undefined && temporaryCleanupError === undefined) {
         const heldTemp = staged ?? { descriptor, ...snapshotDescriptor(descriptor, plan.filename) }
         unlinkHeldAlias(tempPath, heldTemp, plan.filename, authority)
+        releaseRecoveryAlias(aliases, tempPath)
       }
     } catch (error) {
       temporaryCleanupError = error
@@ -1268,21 +1456,21 @@ const writePlan = (path: string, plan: FilePlan, authority: InstructionRootAutho
     if (descriptor !== undefined) {
       closeAfterOperation(descriptor, true)
     }
+    const recoveryPaths = currentRecoveryPaths(aliases, plan.filename)
+    const recoveryDetails = recoveryPaths.length === 0 ? {} : { filename: plan.filename, recoveryPaths }
     if (
       isInstructionIdentityUncertainty(preCommitError) ||
       isInstructionIdentityUncertainty(recoveryError) ||
       isInstructionIdentityUncertainty(temporaryCleanupError)
     ) {
-      return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
+      return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`, recoveryDetails)
     }
-    if (preCommitError !== undefined) {
-      throw preCommitError
-    }
-    if (recoveryError !== undefined) {
-      throw recoveryError
-    }
-    if (temporaryCleanupError !== undefined) {
-      throw temporaryCleanupError
+    const failure = preCommitError ?? recoveryError ?? temporaryCleanupError
+    if (failure !== undefined) {
+      if (failure instanceof EncephalonError || recoveryPaths.length === 0) {
+        throw failure
+      }
+      return wrapIo(`Unable to recover ${plan.filename} before publication.`, failure, recoveryDetails)
     }
     return fail('INTERNAL_ERROR', `${plan.filename} publication ended before its commit point.`)
   }
@@ -1292,6 +1480,7 @@ const writePlan = (path: string, plan: FilePlan, authority: InstructionRootAutho
   }
 
   finaliseCommittedInstruction({
+    aliases,
     authority,
     backupPath,
     hooks,
@@ -1315,15 +1504,26 @@ export const planInstructionChanges = (root: string, remove: boolean) => {
 }
 
 export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?: AtomicWriteHooks) => {
+  let authority: InstructionRootAuthority | undefined
+  let operationFailed = false
   try {
-    const activePlan = plans.find(plan => plan.action === 'write')
-    const authority = activePlan === undefined ? undefined : new InstructionRootAuthority(root, activePlan.filename)
+    const writePlanEntry = plans.find(plan => plan.action === 'write')
+    const allPlansAreUnchanged = plans.length > 0 && plans.every(plan => plan.action === 'none')
+    const authorityPlan = writePlanEntry ?? (allPlansAreUnchanged ? plans[0] : undefined)
+    authority = authorityPlan === undefined ? undefined : new InstructionRootAuthority(root, authorityPlan.filename)
     for (const plan of plans) {
-      if (plan.action !== 'none') {
-        assertPlanIsCurrent(root, plan)
+      if (plan.action !== 'none' || allPlansAreUnchanged) {
+        mapInstructionIdentity(plan.filename, () => assertPlanIsCurrent(root, plan))
       }
     }
     fault(hooks, 'after-plan-validation')
+    if (allPlansAreUnchanged && authority !== undefined) {
+      fault(hooks, 'during-publication-flush')
+      authority.flush()
+      for (const plan of plans) {
+        mapInstructionIdentity(plan.filename, () => assertPlanIsCurrent(root, plan))
+      }
+    }
     for (const plan of plans) {
       const path = resolve(root, plan.filename)
       authority?.useFilename(plan.filename)
@@ -1341,9 +1541,12 @@ export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?:
         file: plan.filename,
       }))
   } catch (error) {
+    operationFailed = true
     if (error instanceof EncephalonError) {
       throw error
     }
     return wrapIo('Unable to update repository instruction files.', error)
+  } finally {
+    authority?.close(operationFailed)
   }
 }
