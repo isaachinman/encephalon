@@ -127,6 +127,7 @@ type CacheLocationTestHooks = {
   beforeOwnedDirectoryFinalIdentity?: ((path: string) => void) | undefined
   beforeQuarantineRename?: ((path: string) => void) | undefined
   duringOwnedDirectoryInspection?: ((path: string) => void) | undefined
+  regularFileRealpath?: ((path: string, actual: string) => string) | undefined
 }
 
 export const cacheLocationTestHooks: CacheLocationTestHooks = {}
@@ -289,7 +290,16 @@ export const assertCacheLocation = (location: CacheLocation) => {
 
 const databaseRelativePath = (name: CacheDatabaseName) => `node_modules/.cache/encephalon/${name}`
 
-type RegularFileInspection = { kind: 'changed' } | { kind: 'missing' } | { file: CacheFile; kind: 'stable' }
+type RegularFileInspection =
+  | { kind: 'changed' }
+  | { kind: 'mismatched-realpath' }
+  | { kind: 'missing' }
+  | { file: CacheFile; kind: 'stable' }
+
+const regularFileRealpath = (path: string) => {
+  const actual = realpathSync.native(path)
+  return cacheLocationTestHooks.regularFileRealpath?.(path, actual) ?? actual
+}
 
 const inspectRegularFileOnce = (path: string, relativePath: string): RegularFileInspection => {
   let metadata: BigIntStats
@@ -307,7 +317,7 @@ const inspectRegularFileOnce = (path: string, relativePath: string): RegularFile
   const captured = identityFrom(metadata)
   let actualRealpath: string
   try {
-    actualRealpath = realpathSync.native(path)
+    actualRealpath = regularFileRealpath(path)
   } catch (error) {
     if (missingPath(error)) {
       return { kind: 'changed' }
@@ -315,7 +325,7 @@ const inspectRegularFileOnce = (path: string, relativePath: string): RegularFile
     throw error
   }
   if (!samePath(actualRealpath, path)) {
-    return invalidLayout(relativePath, 'expected-realpath')
+    return { kind: 'mismatched-realpath' }
   }
   let descriptor: number | undefined
   try {
@@ -349,6 +359,9 @@ const inspectRegularFile = (path: string, relativePath: string, optional = false
     if (inspection.kind === 'missing' && (!optional || attempt === attempts - 1)) {
       return
     }
+    if (inspection.kind === 'mismatched-realpath' && (!optional || attempt === attempts - 1)) {
+      return invalidLayout(relativePath, 'expected-realpath')
+    }
   }
   return changedLayout(relativePath, 'stable-open-identity')
 }
@@ -369,7 +382,7 @@ const inspectRegularFileMetadataOnce = (path: string, relativePath: string): Reg
   const captured = identityFrom(initialMetadata)
   let actualRealpath: string
   try {
-    actualRealpath = realpathSync.native(path)
+    actualRealpath = regularFileRealpath(path)
   } catch (error) {
     if (missingPath(error)) {
       return { kind: 'changed' }
@@ -377,7 +390,7 @@ const inspectRegularFileMetadataOnce = (path: string, relativePath: string): Reg
     throw error
   }
   if (!samePath(actualRealpath, path)) {
-    return invalidLayout(relativePath, 'expected-realpath')
+    return { kind: 'mismatched-realpath' }
   }
   let finalMetadata: BigIntStats
   try {
@@ -407,6 +420,9 @@ const inspectRegularFileMetadata = (path: string, relativePath: string, optional
     }
     if (inspection.kind === 'missing' && (!optional || attempt === attempts - 1)) {
       return
+    }
+    if (inspection.kind === 'mismatched-realpath' && (!optional || attempt === attempts - 1)) {
+      return invalidLayout(relativePath, 'expected-realpath')
     }
   }
   return changedLayout(relativePath, 'stable-metadata-identity')
