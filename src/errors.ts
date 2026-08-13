@@ -128,8 +128,8 @@ export const failWithCause = (
   throw new EncephalonError(code, message, details, { cause })
 }
 
-export const wrapIo = (message: string, cause: unknown): never =>
-  failWithCause(errorCodeForCause(cause), message, {}, cause)
+export const wrapIo = (message: string, cause: unknown, details: Record<string, JsonValue> = {}): never =>
+  failWithCause(errorCodeForCause(cause), message, details, cause)
 
 const cliSafeMessage = (error: EncephalonError) => {
   if (error.code === 'INTERNAL_ERROR') {

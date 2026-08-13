@@ -24,6 +24,7 @@ All notable changes to Encephalon are documented here.
 
 - Classified expected filesystem and SQLite environment failures separately from internal defects.
 - Made committed add failures report the affected post-commit recovery phase explicitly.
+- Finalised managed instruction writes and removals with fixed-root authority, descriptor-bound private staging and durable recovery, canonical hard-link commit aggregation, concurrent-successor preservation, zero operation-owned aliases on success, and bounded safe post-commit phases and repository-relative recovery paths.
 - Made generated baseline refreshes converge on one canonical snapshot.
 - Deflaked instruction replacement identity checks across supported platforms.
 
