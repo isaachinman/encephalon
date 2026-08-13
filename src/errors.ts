@@ -119,6 +119,9 @@ export const fail = (code: EncephalonErrorCode, message: string, details: Record
   throw new EncephalonError(code, message, details)
 }
 
+export const failBudget = (field: string, budget: string, maximum: number, message: string): never =>
+  fail('INVALID_ARGUMENT', message, { budget, field, maximum })
+
 export const failWithCause = (
   code: EncephalonErrorCode,
   message: string,
