@@ -57,7 +57,9 @@ export const applyInstructionChangesOutcome = (
 ): { instructionFiles: InstructionAction[]; error?: EncephalonError }
 ```
 
-`publishPlannedRecord` and `applyInstructionChanges` remain throwing wrappers with unchanged public behaviour.
+`applyInstructionChanges` remains a throwing wrapper with unchanged behaviour. The temporary `publishPlannedRecord`
+wrapper was removed in the final tidy audit after all callers had migrated to the outcome interface; public add-record
+behaviour remains unchanged.
 
 - [x] **Step 1: Read the good-test rules before editing tests**
 
@@ -87,7 +89,7 @@ Expected: fail because `publishPlannedRecordOutcome` is absent or the post-link 
 
 - [x] **Step 4: Implement the minimal record outcome**
 
-Make `publishPlannedRecordInternal` convert every failure after successful canonical linking into its existing highest-priority `committedError` and return `PublishResult`. Keep pre-link failures throwing. Export `publishPlannedRecordOutcome` as the direct internal outcome. Keep `publishPlannedRecord` as:
+Make `publishPlannedRecordInternal` convert every failure after successful canonical linking into its existing highest-priority `committedError` and return `PublishResult`. Keep pre-link failures throwing. Export `publishPlannedRecordOutcome` as the direct internal outcome. The initial implementation kept this throwing compatibility wrapper until the final tidy audit confirmed it had no callers:
 
 ```ts
 const published = publishPlannedRecordOutcome(root, plan, options)
@@ -363,3 +365,4 @@ Verify separation of concerns, understandable state transitions, no stale assump
 - Task 3 final gates: package tests passed 7/7; lint checked 98 files; all four TypeScript projects passed; the full suite passed 413/415 with two expected filesystem skips; baseline and CI benchmark profiles passed; build, package, publish-contract, and frozen-install checks exited zero; `bun install --frozen-lockfile` reported no changes; both diff checks were clean. The audit found no Bun/config drift, declaration leak through the public entrypoint, stale contract assumption, or unrelated Task 3 change.
 - Wave-1 remediation preserved the first operation and post-link verification failures, made owned staging cleanup converge after a verified committed failure, shared the record/no-record tail, and completed focused recovery coverage. Code and behavioural-test commit: `70bbe7c413110e6f3aa5b263e15a323f06a78fe0`.
 - Wave-2 remediation retained owned staging after canonical displacement, covered sole internal inspection guidance, named canonical records in instruction-phase inspection, moved subsystem outcome tests into `test/instructions.test.ts`, and derived touched progress baselines from one scan helper while preserving an explicit ordering assertion. Code and behavioural-test commit: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`.
+- Final review remediation aligned inspection-specific preflight text, covered recovery-path-only and remove-mode cleanup journals through real subsystem paths, and removed the unused throwing record wrapper. Final code and behavioural-test provenance: `c78b08df0ac3b9b5dfe5ad27af1e0ec031c20b6e`.
