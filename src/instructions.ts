@@ -46,6 +46,11 @@ type FilePlan = {
   originalIdentity?: FileIdentity
 }
 
+export type InstructionAction = {
+  file: (typeof FILENAMES)[number]
+  action: 'removed' | 'updated'
+}
+
 type FileIdentity = {
   birthtimeNs: string
   ctimeNs: string
@@ -1590,11 +1595,61 @@ export const planInstructionChanges = (root: string, remove: boolean) => {
   }
 }
 
-export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?: AtomicWriteHooks) => {
+const actionForInstructionPlan = (plan: FilePlan): InstructionAction => ({
+  action: plan.action === 'delete' ? 'removed' : 'updated',
+  file: plan.filename,
+})
+
+const appendInstructionAction = (actions: readonly InstructionAction[], plan: FilePlan): InstructionAction[] => {
+  if (plan.action !== 'none') {
+    const action = actionForInstructionPlan(plan)
+    if (!actions.some(candidate => candidate.file === action.file && candidate.action === action.action)) {
+      return [...actions, action]
+    }
+  }
+  return [...actions]
+}
+
+const committedInstructionError = (
+  plan: FilePlan,
+  failures: readonly PostCommitFailure[],
+  aliases: RecoveryAliases,
+): EncephalonError => {
+  try {
+    throwHighestPriorityCommittedFailure(plan, failures, aliases)
+  } catch (error) {
+    if (error instanceof EncephalonError) {
+      return error
+    }
+    throw error
+  }
+  return fail('INTERNAL_ERROR', 'Committed instruction failure was not reported.')
+}
+
+const instructionApplyError = (error: unknown): EncephalonError => {
+  if (error instanceof EncephalonError) {
+    return error
+  }
+  if (error instanceof InstructionIdentityError) {
+    return new EncephalonError('REPOSITORY_CHANGED', error.message, {}, { cause: error })
+  }
+  try {
+    wrapIo('Unable to update repository instruction files.', error)
+  } catch (wrapped) {
+    if (wrapped instanceof EncephalonError) {
+      return wrapped
+    }
+    throw wrapped
+  }
+  return fail('INTERNAL_ERROR', 'Instruction apply failure was not reported.')
+}
+
+/** @internal */
+export const applyInstructionChangesOutcome = (root: string, plans: FilePlan[], hooks?: AtomicWriteHooks) => {
   let authority: InstructionRootAuthority | undefined
   let committedPlan: FilePlan | undefined
   let operationError: unknown
-  let result: { action: 'removed' | 'updated'; file: (typeof FILENAMES)[number] }[] = []
+  let instructionFiles: InstructionAction[] = []
   try {
     const writePlanEntry = plans.find(plan => plan.action === 'write')
     const allPlansAreUnchanged = plans.length > 0 && plans.every(plan => plan.action === 'none')
@@ -1621,18 +1676,15 @@ export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?:
       authority?.useFilename(plan.filename)
       if (plan.action === 'delete') {
         deletePlan(path, plan, hooks, authority as InstructionRootAuthority)
+        committedPlan = plan
+        instructionFiles = appendInstructionAction(instructionFiles, plan)
       }
       if (plan.action === 'write') {
         writePlan(path, plan, authority as InstructionRootAuthority, hooks)
         committedPlan = plan
+        instructionFiles = appendInstructionAction(instructionFiles, plan)
       }
     }
-    result = plans
-      .filter(plan => plan.action !== 'none')
-      .map(plan => ({
-        action: plan.action === 'delete' ? ('removed' as const) : ('updated' as const),
-        file: plan.filename,
-      }))
   } catch (error) {
     operationError = error
   }
@@ -1646,31 +1698,45 @@ export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?:
     if (operationError instanceof EncephalonError && rootCloseError !== undefined) {
       const context = committedInstructionFailureContexts.get(operationError)
       if (context !== undefined) {
-        throwHighestPriorityCommittedFailure(
+        operationError = committedInstructionError(
           context.plan,
           [...context.failures, postCommitFailure('resourceCleanup', rootCloseError)],
           context.aliases,
         )
       }
     }
-    if (operationError instanceof EncephalonError) {
-      throw operationError
+    const error = instructionApplyError(operationError)
+    const context = committedInstructionFailureContexts.get(error)
+    if (context !== undefined) {
+      instructionFiles = appendInstructionAction(instructionFiles, context.plan)
     }
-    if (operationError instanceof InstructionIdentityError) {
-      throw new EncephalonError('REPOSITORY_CHANGED', operationError.message, {}, { cause: operationError })
-    }
-    return wrapIo('Unable to update repository instruction files.', operationError)
+    return { error, instructionFiles }
   }
   if (rootCloseError !== undefined) {
     if (committedPlan !== undefined) {
-      throwHighestPriorityCommittedFailure(
+      const error = committedInstructionError(
         committedPlan,
         [postCommitFailure('resourceCleanup', rootCloseError)],
         new Map(),
       )
-      return fail('INTERNAL_ERROR', 'Repository instruction authority cleanup was not reported.')
+      return { error, instructionFiles }
     }
-    return wrapIo('Unable to close the repository instruction authority.', rootCloseError)
+    try {
+      wrapIo('Unable to close the repository instruction authority.', rootCloseError)
+    } catch (error) {
+      if (error instanceof EncephalonError) {
+        return { error, instructionFiles }
+      }
+      throw error
+    }
   }
-  return result
+  return { instructionFiles }
+}
+
+export const applyInstructionChanges = (root: string, plans: FilePlan[], hooks?: AtomicWriteHooks) => {
+  const outcome = applyInstructionChangesOutcome(root, plans, hooks)
+  if (outcome.error !== undefined) {
+    throw outcome.error
+  }
+  return outcome.instructionFiles
 }

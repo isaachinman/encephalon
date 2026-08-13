@@ -20,11 +20,14 @@ import * as api from '../src/index.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import {
   addRecordResolved,
+  assertCanonicalLayoutAdditions,
   assertRecordGraph,
   MAX_CANONICAL_RECORD_BYTES,
   MAX_CANONICAL_RECORDS,
   planRecordAddition,
   projectedKindDirectoryOverflow,
+  publishPlannedRecordOutcome,
+  readRecordSnapshotResolved,
   readValidatedRecordSnapshotResolved,
   recordWriteTestHooks,
   validateRecordsResolved,
@@ -178,6 +181,65 @@ afterEach(() => {
 })
 
 describe('canonical records', () => {
+  test('record publication outcome returns the canonical record with a post-link failure', () => {
+    const root = createRoot()
+    const plan = planRecordAddition(root, {
+      id: 'record-publication-outcome-committed',
+      kind: 'decision',
+      payload: { summary: 'Canonical despite verification failure' },
+      source: 'agent',
+      subject: 'record.publication-outcome.committed',
+    })
+    const snapshot = readRecordSnapshotResolved(root)
+    const authority = assertCanonicalLayoutAdditions([plan.record.kind], snapshot.authority)
+
+    const outcome = publishPlannedRecordOutcome(root, plan, {
+      authority,
+      hooks: {
+        fault: point => {
+          if (point === 'after-publication-accept') {
+            throw Object.assign(new Error('Injected post-link verification failure'), { code: 'EIO' })
+          }
+        },
+      },
+    })
+
+    assert.equal(outcome.record.id, plan.record.id)
+    assert.ok(outcome.committedError)
+    assert.equal(outcome.committedError.details.canonicalCommitted, true)
+  })
+
+  test('record publication outcome still throws before canonical linking', () => {
+    const root = createRoot()
+    const plan = planRecordAddition(root, {
+      id: 'record-publication-outcome-pre-link',
+      kind: 'decision',
+      payload: {},
+      source: 'agent',
+      subject: 'record.publication-outcome.pre-link',
+    })
+    const snapshot = readRecordSnapshotResolved(root)
+    const authority = assertCanonicalLayoutAdditions([plan.record.kind], snapshot.authority)
+
+    assert.throws(
+      () =>
+        publishPlannedRecordOutcome(root, plan, {
+          authority,
+          hooks: {
+            fault: point => {
+              if (point === 'during-staging-write') {
+                throw Object.assign(new Error('Injected pre-link write failure'), { code: 'EIO' })
+              }
+            },
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { details?: Record<string, unknown> }).details?.canonicalCommitted, undefined)
+        return true
+      },
+    )
+  })
+
   test('adds a formatted append-only record and returns a relative runtime path', () => {
     const root = createRoot()
     const record = api.addRecord({

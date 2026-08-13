@@ -28,7 +28,7 @@ import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
 import { DirectoryWitnessError } from '../src/directory-witness.ts'
 import * as api from '../src/index.ts'
 import { initEncephalonWithHooks } from '../src/init.ts'
-import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
+import { applyInstructionChanges, applyInstructionChangesOutcome, planInstructionChanges } from '../src/instructions.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import type { RecordWriteHooks } from '../src/records.ts'
 import { createOwnedStagingName } from '../src/staging.ts'
@@ -218,6 +218,58 @@ afterEach(() => {
 })
 
 describe('initialisation', () => {
+  test('instruction apply outcome retains an earlier action when a later file fails before commit', () => {
+    const root = createRoot()
+    const plans = planInstructionChanges(root, false)
+
+    const outcome = applyInstructionChangesOutcome(root, plans, {
+      fault: (point, generatedPath) => {
+        if (point === 'after-temp-create' && generatedPath?.includes('.CLAUDE.md.')) {
+          throw Object.assign(new Error('Injected second-file pre-commit failure'), { code: 'EIO' })
+        }
+      },
+    })
+
+    assert.deepEqual(outcome.instructionFiles, [{ action: 'updated', file: 'AGENTS.md' }])
+    assert.equal(outcome.error?.code, 'IO_ERROR')
+  })
+
+  test('instruction apply outcome includes the current post-commit action exactly once', () => {
+    const root = createRoot()
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    const outcome = applyInstructionChangesOutcome(root, [agentsPlan], {
+      fault: point => {
+        if (point === 'after-publication') {
+          throw Object.assign(new Error('Injected current-file post-commit failure'), { code: 'EIO' })
+        }
+      },
+    })
+
+    assert.deepEqual(outcome.instructionFiles, [{ action: 'updated', file: 'AGENTS.md' }])
+    assert.equal(outcome.error?.code, 'IO_ERROR')
+  })
+
+  test('instruction apply outcome reports committed removal when root close fails', {
+    skip: process.platform === 'win32' ? 'Windows does not hold a repository-root directory descriptor.' : false,
+  }, () => {
+    const root = createRoot()
+    const agentsPlan = createDeletePlan(root)
+
+    const outcome = applyInstructionChangesOutcome(root, [agentsPlan], {
+      rootClose: descriptor => {
+        closeSync(descriptor)
+        throw Object.assign(new Error('Injected deletion root descriptor close failure'), { code: 'EIO' })
+      },
+    })
+
+    assert.deepEqual(outcome.instructionFiles, [{ action: 'removed', file: 'AGENTS.md' }])
+    assert.ok(outcome.error)
+    assert.equal(outcome.error.details.instructionCommitted, true)
+    assert.equal(outcome.error.details.postCommitPhase, 'resourceCleanup')
+  })
+
   test('recovers a recognised stale staging entry before baseline publication', () => {
     const root = createRoot()
     const stagingDirectory = join(root, 'encephalon', '_staging')

@@ -1380,8 +1380,16 @@ const publishPlannedRecordInternal = (
       capturePostCommitError('publicationFlush', error)
     }
   } catch (error) {
-    operationFailed = true
-    throw error
+    if (published) {
+      committedError =
+        error instanceof EncephalonError && error.details.canonicalCommitted === true
+          ? error
+          : classifyPublicationVerificationError(record, error)
+      committedErrorPhase = 'publicationVerification'
+    } else {
+      operationFailed = true
+      throw error
+    }
   } finally {
     let descriptorCloseError: unknown
     if (descriptor !== undefined && (operationFailed || !published)) {
@@ -1494,12 +1502,19 @@ const publishPlannedRecordInternal = (
 }
 
 /** @internal */
+export const publishPlannedRecordOutcome = (
+  root: string,
+  plan: PlannedRecord,
+  options: { authority: CanonicalPublicationAuthority; hooks?: RecordWriteHooks },
+): PublishResult => publishPlannedRecordInternal(root, plan, options)
+
+/** @internal */
 export const publishPlannedRecord = (
   root: string,
   plan: PlannedRecord,
   options: { authority: CanonicalPublicationAuthority; hooks?: RecordWriteHooks },
 ): BrainRecord => {
-  const published = publishPlannedRecordInternal(root, plan, options)
+  const published = publishPlannedRecordOutcome(root, plan, options)
   if (published.committedError !== undefined) {
     throw published.committedError
   }
