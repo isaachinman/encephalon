@@ -357,6 +357,7 @@ describe('initialisation', () => {
   test('partial init progress includes the current record after post-link verification fails', () => {
     const root = createRoot()
     const privateSentinel = 'PRIVATE_POST_LINK_RECORD_BYTES'
+    const injectedCause = Object.assign(new Error(privateSentinel), { code: 'EIO' })
     let acceptedPublications = 0
     let capturedError: unknown
 
@@ -369,7 +370,7 @@ describe('initialisation', () => {
               if (point === 'after-publication-accept') {
                 acceptedPublications += 1
                 if (acceptedPublications === 2) {
-                  throw Object.assign(new Error(privateSentinel), { code: 'EIO' })
+                  throw injectedCause
                 }
               }
             },
@@ -398,7 +399,8 @@ describe('initialisation', () => {
       root,
       sentinels: [privateSentinel],
     })
-    const { details } = capturedError as EncephalonError
+    const { cause, details } = capturedError as EncephalonError
+    assert.equal(cause, injectedCause)
     assert.equal(details.canonicalCommitted, true)
     assert.equal(details.postCommitPhase, 'publicationVerification')
     assert.equal(details.recordId, currentRecordId)
