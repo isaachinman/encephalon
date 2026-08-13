@@ -6,7 +6,7 @@
 
 **Goal:** Finalise successful managed instruction replacements without leaking operation-owned backup or temporary aliases, and report post-commit failures unambiguously.
 
-**Architecture:** Keep the instruction publication state machine in `src/instructions.ts`. Bind the repository root, staged file, and predecessor to held no-follow descriptors; move aliases with verified no-replace hard-link-and-unlink steps; define the successful canonical hard link as the commit point; flush recovery and publication boundaries before destructive cleanup where supported; and aggregate safe structured post-commit errors through the existing `EncephalonError` model.
+**Architecture:** Keep the instruction publication state machine in `src/instructions.ts`. Bind one fixed no-follow repository-root identity plus staged and predecessor files to held descriptors; move aliases with verified no-replace hard-link-and-unlink steps; define the successful canonical hard link as the commit point; flush recovery and publication boundaries before destructive cleanup where supported; and aggregate safe structured post-commit errors and exact repository-relative recovery paths through the existing `EncephalonError` model.
 
 **Tech Stack:** TypeScript, Node.js synchronous filesystem APIs, Bun package scripts, Node test runner.
 
@@ -16,7 +16,7 @@
 - Normal success leaves no alias created by the operation.
 - Never delete historical or concurrent files merely because their names resemble generated aliases.
 - Never restore predecessor bytes over the canonical target after publication commits.
-- Error details contain no absolute path, generated token, or instruction content.
+- Error details contain no absolute path or instruction content. The only generated-name exception is a bounded exact repository-relative `recoveryPaths` list for aliases still proved to be owned by the current operation.
 - Keep `telemetry = false`, `[install].exact = true`, `[install].saveTextLockfile = true`, and plaintext `bun.lock` unchanged.
 
 ---
@@ -53,16 +53,19 @@ Add the narrow fault points `during-backup-cleanup` and `during-publication-flus
     | 'publicationVerification'
     | 'publicationFlush'
     | 'backupCleanup'
-    | 'temporaryCleanup',
+    | 'temporaryCleanup'
+    | 'resourceCleanup',
   recoveryAction: '<phase-specific safe action>',
   postCommitFailures: Array<{
     postCommitPhase:
       | 'publicationVerification'
       | 'publicationFlush'
       | 'backupCleanup'
-      | 'temporaryCleanup',
+      | 'temporaryCleanup'
+      | 'resourceCleanup',
     recoveryAction: '<phase-specific safe action>',
   }>,
+  recoveryPaths: string[],
 }
 ```
 
@@ -84,7 +87,7 @@ Allow `wrapIo(message, cause, details?)` in `src/errors.ts` to attach optional s
 
 - [x] **Step 5: Bind the staged and predecessor files to descriptors**
 
-Keep the flushed staged descriptor open until publication verification and cleanup finish. Before moving an existing target, open it no-follow, compare the descriptor and pathname identities with the preflight original incarnation and bytes, and retain that descriptor through finalisation. Allow the existing deliberate post-plan mode-change behaviour.
+Keep the flushed staged descriptor open until publication verification and cleanup finish. Create the staged path at mode `0600`; flush and compare it with the planned bytes while private, then apply the intended mode, flush, and verify exact bytes, mode, descriptor, and path again. Before moving an existing target, open it read-only and no-follow, compare the descriptor and pathname identities with the preflight original incarnation and frozen bytes, and retain that descriptor through finalisation. Descriptor recovery copies follow the same private-byte then final-mode verification sequence. Allow the existing deliberate post-plan mode-change behaviour.
 
 - [x] **Step 6: Record the publication commit point**
 
@@ -92,11 +95,11 @@ Set committed state immediately after `linkSync(tempPath, targetPath)` returns. 
 
 - [x] **Step 7: Finalise the exact backup**
 
-Create the fresh cleanup name with an exclusive hard link from the generated backup, verify the destination against the held backup descriptor, revalidate the source immediately before source unlink, and then verify the cleanup alias immediately before its unlink. Preserve any source or destination successor and retain an exact recovery alias when identity cannot be proved.
+Create the fresh cleanup name with an exclusive hard link from the generated backup, verify the destination against the held backup descriptor, revalidate the source and fixed root authority immediately before source unlink, and then verify the cleanup alias immediately before its unlink. Flush a restored canonical predecessor before removing its last durable recovery source. Preserve any canonical, source, or destination successor and retain an exact private recovery alias when identity cannot be proved, including when post-unlink temporary verification would otherwise leave the staged descriptor without a pathname.
 
 - [x] **Step 8: Aggregate post-commit failures**
 
-Capture the highest-priority phase—publication verification, publication flush, backup cleanup, then temporary cleanup—while continuing independent safe cleanup. Include every distinct failed or deferred phase in the bounded safe list, and remove a transient publication-flush failure after a later cumulative directory flush succeeds. Throw one structured committed error after descriptors and safe cleanup complete. Use `REPOSITORY_CHANGED` for identity uncertainty and central cause classification for operational failures.
+Capture the highest-priority phase—publication verification, publication flush, backup cleanup, temporary cleanup, then resource cleanup—while continuing independent safe cleanup. Include every distinct failed or deferred phase in the bounded safe list and every exact retained current-operation alias in bounded ordinal-sorted `recoveryPaths`; remove a transient publication-flush failure after a later cumulative directory flush succeeds. Throw one structured committed error after descriptors and safe cleanup complete. Use `REPOSITORY_CHANGED` when any captured failure is identity-uncertain and central cause classification for otherwise operational failures. An all-unchanged retry revalidates its canonical plans and performs the verified containing-directory sync without broad cleanup.
 
 - [x] **Step 9: Run focused and affected GREEN checks**
 
@@ -120,7 +123,7 @@ git commit -m "[MAR-2547] Finalise managed instruction replacements"
 
 - [x] **Step 11: Update maintained documentation**
 
-In `README.md`, `CHANGELOG.md`, `docs/contract.md`, and the design record, describe the exclusive hard-link-and-unlink moves, repository generation authority, durability ordering, hard-link commit point, zero-alias success, complete safe structured post-commit errors, retry behaviour, and the narrow Node final-syscall limitation. Add the exact code/test SHA to maintained contract provenance and mark this plan as a completed historical record.
+In `README.md`, `CHANGELOG.md`, `docs/contract.md`, and the design record, describe the exclusive hard-link-and-unlink moves, fixed root and descriptor authorities, private exact-byte verification, durability ordering, concurrent-successor guarantee, hard-link commit point, zero-alias success, exact safe recovery paths, complete structured post-commit errors, executable retry behaviour, and the narrow Node final-syscall limitation. Add the exact code/test SHA to maintained contract provenance and keep this plan marked as a completed historical record.
 
 - [x] **Step 12: Run all release gates**
 
