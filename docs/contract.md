@@ -91,6 +91,6 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2547 descriptor-bound managed instruction finalisation and committed-failure coverage: `2d6ef26172cc49a1a258b77e6b0a6bd38de633b4`.
+- MAR-2547 descriptor-bound managed instruction finalisation, collision preservation, and committed-failure coverage: `90173a6ea4e9e38b50041dcee163de900903c9c9`.
 - MAR-2556 bounded, generation-stable canonical layout handling and behavioural coverage: `de05ccf06119a2ad2507accf18163be8243eafec`.
 - MAR-2569 bounded, ownership-aware staging recovery and final publication-identity coverage: `a862d8ca229b07463ac45a4b442b29b7f92eb6a8`.
