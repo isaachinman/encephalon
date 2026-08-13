@@ -32,6 +32,8 @@ npx --no-install encephalon init
 
 Existing instruction files must be valid UTF-8, NUL-free, regular non-symlink files no larger than 1 MiB. Invalid files are rejected before either instruction file is changed.
 
+Managed instruction replacements commit when the flushed staged file is hard-linked at the canonical `AGENTS.md` or `CLAUDE.md` path. A successful replacement leaves the canonical file and no temporary, backup, or deletion alias created by that operation; generated-looking historical files are not discovered or removed. Failures after that hard-link preserve the committed target and return safe structured details naming the affected publication-verification, publication-flush, backup-cleanup, or temporary-cleanup phase with a recovery action. Retrying converges on the one existing managed block. Cleanup holds the staged and predecessor files by no-follow descriptors and quarantines only the exact predecessor before unlinking it. Node has no portable descriptor-relative conditional unlink, so a narrow same-user replacement window remains between the final identity check and pathname unlink.
+
 The result includes a `nextAction` asking an agent to read the installed skill and optionally enrich the baseline semantically.
 
 Refresh derived facts after meaningful tooling or layout changes:
