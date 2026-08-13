@@ -1325,12 +1325,23 @@ const publishPlannedRecordInternal = (
   let committedErrorPhase: PostCommitPhase | undefined
   let descriptor: number | undefined
   let descriptorMetadata: BigIntStats | undefined
+  let finalStagingRevalidationSucceeded = false
   let postCleanupStagingWitness: DirectoryWitness | undefined
+  let publicationAccepted = false
   let stagingWitness: DirectoryWitness | undefined
   const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
     if (committedErrorPhase === undefined || postCommitPriority[phase] > postCommitPriority[committedErrorPhase]) {
       committedError = postCommitError(record, phase, error)
       committedErrorPhase = phase
+    }
+  }
+  const capturePublicationVerificationError = (error: unknown) => {
+    if (
+      committedErrorPhase === undefined ||
+      postCommitPriority.publicationVerification > postCommitPriority[committedErrorPhase]
+    ) {
+      committedError = classifyPublicationVerificationError(record, error)
+      committedErrorPhase = 'publicationVerification'
     }
   }
   try {
@@ -1380,8 +1391,22 @@ const publishPlannedRecordInternal = (
       capturePostCommitError('publicationFlush', error)
     }
   } catch (error) {
-    operationFailed = true
-    throw error
+    if (published) {
+      if (error instanceof EncephalonError && error.details.canonicalCommitted === true) {
+        if (
+          committedErrorPhase === undefined ||
+          postCommitPriority.publicationVerification > postCommitPriority[committedErrorPhase]
+        ) {
+          committedError = error
+          committedErrorPhase = 'publicationVerification'
+        }
+      } else {
+        capturePublicationVerificationError(error)
+      }
+    } else {
+      operationFailed = true
+      throw error
+    }
   } finally {
     let descriptorCloseError: unknown
     if (descriptor !== undefined && (operationFailed || !published)) {
@@ -1408,10 +1433,25 @@ const publishPlannedRecordInternal = (
         if (stagingWitness !== undefined) {
           revalidatePublicationDirectories([stagingWitness])
         }
+        if (published && committedErrorPhase === 'publicationVerification' && descriptor !== undefined) {
+          assertCanonicalPublicationIdentity(path, descriptor)
+          options.authority.acceptPublication(
+            recordFile.kind,
+            `${recordFile.id}.json`,
+            publicationRoot,
+            publicationKind,
+          )
+          publicationAccepted = true
+          fault(options.hooks, 'after-publication-accept')
+          assertCanonicalPublicationIdentity(path, descriptor)
+          if (stagingWitness !== undefined) {
+            revalidatePublicationDirectories([stagingWitness])
+          }
+        }
+        finalStagingRevalidationSucceeded = committedErrorPhase !== 'publicationVerification' || publicationAccepted
       } catch (error) {
         if (published) {
-          committedError = classifyPublicationVerificationError(record, error)
-          committedErrorPhase = 'publicationVerification'
+          capturePublicationVerificationError(error)
         } else if (!operationFailed) {
           cleanupError = error
         }
@@ -1423,7 +1463,7 @@ const publishPlannedRecordInternal = (
     }
     if (
       stagingCleanupFault === undefined &&
-      committedErrorPhase !== 'publicationVerification' &&
+      (committedErrorPhase !== 'publicationVerification' || finalStagingRevalidationSucceeded) &&
       cleanupError === undefined
     ) {
       try {
@@ -1441,8 +1481,7 @@ const publishPlannedRecordInternal = (
       } catch (error) {
         if (published) {
           if (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED') {
-            committedError = publicationVerificationError(record, error)
-            committedErrorPhase = 'publicationVerification'
+            capturePublicationVerificationError(error)
           } else {
             capturePostCommitError('stagingCleanup', error)
           }
@@ -1455,7 +1494,14 @@ const publishPlannedRecordInternal = (
   if (cleanupError !== undefined) {
     throw cleanupError
   }
-  if (
+  if (publicationAccepted && descriptor !== undefined && postCleanupStagingWitness !== undefined) {
+    try {
+      assertCanonicalPublicationIdentity(path, descriptor)
+      assertStagingEmpty(postCleanupStagingWitness)
+    } catch (error) {
+      capturePublicationVerificationError(error)
+    }
+  } else if (
     committedErrorPhase !== 'publicationVerification' &&
     descriptor !== undefined &&
     postCleanupStagingWitness !== undefined
@@ -1468,8 +1514,7 @@ const publishPlannedRecordInternal = (
       assertCanonicalPublicationIdentity(path, descriptor)
       assertStagingEmpty(postCleanupStagingWitness)
     } catch (error) {
-      committedError = classifyPublicationVerificationError(record, error)
-      committedErrorPhase = 'publicationVerification'
+      capturePublicationVerificationError(error)
     }
   } else if (committedErrorPhase === undefined && descriptor !== undefined) {
     committedError = publicationVerificationError(
@@ -1494,17 +1539,11 @@ const publishPlannedRecordInternal = (
 }
 
 /** @internal */
-export const publishPlannedRecord = (
+export const publishPlannedRecordOutcome = (
   root: string,
   plan: PlannedRecord,
   options: { authority: CanonicalPublicationAuthority; hooks?: RecordWriteHooks },
-): BrainRecord => {
-  const published = publishPlannedRecordInternal(root, plan, options)
-  if (published.committedError !== undefined) {
-    throw published.committedError
-  }
-  return published.record
-}
+): PublishResult => publishPlannedRecordInternal(root, plan, options)
 
 const addRecordFileResolved = (
   root: string,

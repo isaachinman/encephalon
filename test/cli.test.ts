@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
@@ -29,8 +29,79 @@ const run = (root: string, arguments_: string[]) =>
 
 const outputJson = (result: ReturnType<typeof run>) => JSON.parse(result.stdout) as unknown
 const errorJson = (result: ReturnType<typeof run>) => JSON.parse(result.stderr) as { error: { message: string } }
+const baselineSubjects = [
+  ['context', 'encephalon:init/repository-overview'],
+  ['architecture', 'encephalon:init/tooling-layout'],
+  ['workflow', 'encephalon:init/commands-ci'],
+] as const
+const committedBaselineIds = (root: string) =>
+  baselineSubjects.map(([kind, subject]) => {
+    const directory = join(root, 'encephalon', kind)
+    const record = readdirSync(directory)
+      .filter(name => name.endsWith('.json'))
+      .map(
+        name =>
+          JSON.parse(readFileSync(join(directory, name), 'utf8')) as {
+            id: string
+            subject: string
+          },
+      )
+      .find(candidate => candidate.subject === subject)
+    assert.ok(record)
+    return record.id
+  })
 
 describe('command-line interface', () => {
+  test('projects safe partial init progress and reruns without duplicate state', () => {
+    const root = createRoot()
+    const cacheDatabase = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const privateSentinel = 'PRIVATE_CLI_CACHE_SENTINEL'
+    mkdirSync(cacheDatabase, { recursive: true })
+    writeFileSync(join(cacheDatabase, privateSentinel), privateSentinel)
+
+    const failed = run(root, ['init', '--root', root])
+
+    assert.equal(failed.status, 2)
+    assert.equal(failed.stdout, '')
+    assert.equal(failed.stderr.endsWith('\n'), true)
+    assert.equal(failed.stderr.includes(root), false)
+    assert.equal(failed.stderr.includes(privateSentinel), false)
+    const committedRecordIds = committedBaselineIds(root)
+    assert.deepEqual(JSON.parse(failed.stderr), {
+      error: {
+        code: 'VALIDATION_FAILED',
+        details: {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          initProgress: {
+            cacheState: 'disposable',
+            canonicalCommitted: true,
+            committedInstructionFiles: [],
+            committedRecordIds,
+            phase: 'cachePreparation',
+            recoveryAction: 'Run prepare, run validate, then repeat the same init operation with the same options.',
+            recoveryMode: 'rerun',
+          },
+          invariant: 'regular-non-symlink-file',
+        },
+        message: 'The Encephalon cache layout is unsafe.',
+      },
+    })
+
+    rmSync(cacheDatabase, { recursive: true })
+    const rerun = run(root, ['init', '--root', root])
+
+    assert.equal(rerun.status, 0)
+    assert.equal(rerun.stderr, '')
+    assert.deepEqual((outputJson(rerun) as { recordsCreated: unknown[] }).recordsCreated, [])
+    for (const filename of ['AGENTS.md', 'CLAUDE.md']) {
+      assert.equal(
+        readFileSync(join(root, filename), 'utf8').match(/encephalon:managed-instructions:start/gu)?.length,
+        1,
+      )
+    }
+    assert.deepEqual(committedRecordIds, committedBaselineIds(root))
+  })
+
   test('emits exactly one JSON value for successful commands', () => {
     const root = createRoot()
     const added = run(root, [
@@ -79,7 +150,9 @@ describe('command-line interface', () => {
 
   test('reports post-commit add failures with committed record details', () => {
     const root = createRoot()
-    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'), { recursive: true })
+    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'), {
+      recursive: true,
+    })
 
     const result = run(root, [
       'add',
@@ -241,7 +314,9 @@ describe('command-line interface', () => {
       'repeat-one',
     ])
     assert.equal(repeatTwo.status, 0)
-    mkdirSync(join(root, 'encephalon', '_artifacts', 'decision', 'with-repeated-options'), { recursive: true })
+    mkdirSync(join(root, 'encephalon', '_artifacts', 'decision', 'with-repeated-options'), {
+      recursive: true,
+    })
     writeFileSync(join(root, 'encephalon', '_artifacts', 'decision', 'with-repeated-options', 'first.txt'), 'first')
     writeFileSync(join(root, 'encephalon', '_artifacts', 'decision', 'with-repeated-options', 'second.txt'), 'second')
     const repeated = run(root, [
@@ -360,8 +435,14 @@ describe('command-line interface', () => {
         arguments_: ['list', '--root', root, '--include-superseded=true'],
         message: '--include-superseded does not take a value.',
       },
-      { arguments_: ['show', '--root', root, '--id', '--missing'], message: '--id requires a value.' },
-      { arguments_: ['list', '--root', root, '--limit=-1'], message: '--limit must be an integer between 1 and 1000.' },
+      {
+        arguments_: ['show', '--root', root, '--id', '--missing'],
+        message: '--id requires a value.',
+      },
+      {
+        arguments_: ['list', '--root', root, '--limit=-1'],
+        message: '--limit must be an integer between 1 and 1000.',
+      },
       {
         arguments_: ['list', '--root', root, '--limit', '-1'],
         message: '--limit requires a value.',

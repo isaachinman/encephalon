@@ -38,6 +38,7 @@ type LockTestHooks = {
   afterRecoveryStaleObservation?: (() => void) | undefined
   afterStaleObservation?: (() => void) | undefined
   duringRecoveryObservation?: (() => void) | undefined
+  gateClose?: ((database: DatabaseSync) => void) | undefined
   now?: (() => number) | undefined
 }
 
@@ -293,8 +294,12 @@ export const withOperationLock = <Result>(
       }
     }
     gateTransaction = false
-    gate?.close()
+    const database = gate
     gate = undefined
+    if (database !== undefined) {
+      const close = testHooks.gateClose ?? ((current: DatabaseSync) => current.close())
+      close(database)
+    }
   }
 
   const beginGateWhileRecoveryOwned = (ownedMarker: OwnedRecoveryMarker) => {
@@ -420,6 +425,8 @@ export const withOperationLock = <Result>(
     }
   }
 
+  let operationError: unknown
+  let operationOutcome: { value: Result } | undefined
   try {
     candidateDirectory = createCacheOwnedDirectory(location, candidateName)
     const candidateOwner: LockOwner = {
@@ -460,7 +467,7 @@ export const withOperationLock = <Result>(
     ownedLockDirectory = promoteCacheOwnedDirectory(location, candidateDirectory, lockName)
     candidateDirectory = undefined
     try {
-      return operation(location)
+      operationOutcome = { value: operation(location) }
     } finally {
       try {
         releaseOwnedLock(location, ownedLockDirectory, token)
@@ -470,18 +477,37 @@ export const withOperationLock = <Result>(
     }
   } catch (error) {
     if (error instanceof EncephalonError) {
-      throw error
-    }
-    return wrapIo('Unable to coordinate Encephalon cache access.', error)
-  } finally {
-    releaseGate()
-    try {
-      const remainingCandidate = candidateDirectory ?? inspectCacheOwnedDirectory(location, candidateName)
-      if (remainingCandidate !== undefined) {
-        quarantineCacheOwnedDirectory(location, remainingCandidate)
+      operationError = error
+    } else {
+      try {
+        wrapIo('Unable to coordinate Encephalon cache access.', error)
+      } catch (wrappedError) {
+        operationError = wrappedError
       }
-    } catch {
-      // Candidate cleanup must not mask the operation outcome.
     }
   }
+  let gateCleanupError: unknown
+  try {
+    releaseGate()
+  } catch (error) {
+    gateCleanupError = error
+  }
+  try {
+    const remainingCandidate = candidateDirectory ?? inspectCacheOwnedDirectory(location, candidateName)
+    if (remainingCandidate !== undefined) {
+      quarantineCacheOwnedDirectory(location, remainingCandidate)
+    }
+  } catch {
+    // Candidate cleanup must not mask the operation outcome.
+  }
+  if (operationError !== undefined) {
+    throw operationError
+  }
+  if (gateCleanupError !== undefined) {
+    throw gateCleanupError
+  }
+  if (operationOutcome === undefined) {
+    return fail('INTERNAL_ERROR', 'The Encephalon operation lock ended without an outcome.')
+  }
+  return operationOutcome.value
 }
