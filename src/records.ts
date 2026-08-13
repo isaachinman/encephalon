@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { BigIntStats, Stats } from 'node:fs'
 import {
   closeSync,
@@ -73,7 +73,13 @@ type RecordScan = {
   errors: ValidationIssue[]
   bytes: number
   layout?: CanonicalLayoutWitness
-  observations: Array<{ metadata: Stats; path: string }>
+  observations: RecordObservation[]
+}
+
+type RecordObservation = {
+  digest: string
+  metadata: Stats
+  path: string
 }
 
 type ValidatedRecordScan = {
@@ -99,6 +105,7 @@ type CanonicalPublicationAuthority = {
     recordName: string,
     rootSnapshot: CanonicalDirectorySnapshot,
     kindSnapshot: CanonicalDirectorySnapshot,
+    digest: string,
   ) => void
   projection: () => {
     kindCount: number
@@ -309,6 +316,8 @@ const sameStableMetadataExceptCtime = (first: Stats, second: Stats) =>
   first.mode === second.mode &&
   first.mtimeMs === second.mtimeMs
 
+const recordDigest = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex')
+
 const assertRealDirectory = (root: string, path: string) => {
   const metadata = lstatSync(path)
   if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
@@ -401,7 +410,7 @@ const readRecord = (
   kindPath: string,
   kindIdentity: FileIdentity,
   hooks?: RecordReadHooks,
-): { metadata: Stats; record: BrainRecord } => {
+): { digest: string; metadata: Stats; record: BrainRecord } => {
   const relativePath = posixRelative(root, path)
   const pathMetadata = lstatSync(path)
   readFault(hooks, 'after-record-lstat', path)
@@ -436,7 +445,7 @@ const readRecord = (
     }
     const parsed = parseRecordJson(decodeRecordBytes(bytes))
     const record = parseRecordFile(parsed)
-    return { metadata: finalMetadata, record: { ...record, path: relativePath } }
+    return { digest: recordDigest(bytes), metadata: finalMetadata, record: { ...record, path: relativePath } }
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -654,7 +663,11 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
                     ),
                   )
                 }
-                scanned.observations.push({ metadata: observation.metadata, path: recordPath })
+                scanned.observations.push({
+                  digest: observation.digest,
+                  metadata: observation.metadata,
+                  path: recordPath,
+                })
                 scanned.records.push(record)
               } catch (error) {
                 const message = error instanceof Error ? error.message : 'Record could not be parsed.'
@@ -1067,7 +1080,8 @@ const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allow
 const canonicalPublicationAuthority = (
   root: string,
   initialLayout: CanonicalLayoutWitness,
-  initialObservations: readonly { metadata: Stats; path: string }[],
+  initialObservations: readonly RecordObservation[],
+  cacheLocation?: CacheLocation,
 ): CanonicalPublicationAuthority => {
   let layout = initialLayout
   let observations = [...initialObservations]
@@ -1088,6 +1102,59 @@ const canonicalPublicationAuthority = (
         return repositoryChangedBeforePublication()
       }
     }
+  }
+  const inspectObservation = (observation: RecordObservation): RecordObservation => {
+    let descriptor: number | undefined
+    let primaryError: unknown
+    let result: RecordObservation | undefined
+    try {
+      const pathMetadata = currentObservationMetadata(observation.path)
+      if (!sameStableMetadataExceptCtime(observation.metadata, pathMetadata)) {
+        repositoryChangedBeforePublication()
+      }
+      descriptor = openSync(observation.path, constants.O_RDONLY | noFollowFlag)
+      const descriptorMetadata = fstatSync(descriptor)
+      if (!sameStableMetadata(pathMetadata, descriptorMetadata)) {
+        repositoryChangedBeforePublication()
+      }
+      const bytes = readBoundedDescriptor(descriptor, descriptorMetadata.size)
+      const finalDescriptorMetadata = fstatSync(descriptor)
+      const finalPathMetadata = currentObservationMetadata(observation.path)
+      if (
+        !(
+          sameStableMetadata(descriptorMetadata, finalDescriptorMetadata) &&
+          sameStableMetadata(finalDescriptorMetadata, finalPathMetadata)
+        ) ||
+        recordDigest(bytes) !== observation.digest
+      ) {
+        repositoryChangedBeforePublication()
+      }
+      result = { digest: observation.digest, metadata: finalDescriptorMetadata, path: observation.path }
+    } catch (error) {
+      primaryError = error
+    }
+    let closeError: unknown
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor)
+      } catch (error) {
+        closeError = error
+      }
+    }
+    if (primaryError !== undefined) {
+      const { code } = primaryError as NodeJS.ErrnoException
+      if (code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR') {
+        return repositoryChangedBeforePublication()
+      }
+      throw primaryError
+    }
+    if (closeError !== undefined) {
+      throw closeError
+    }
+    if (result === undefined) {
+      return repositoryChangedBeforePublication()
+    }
+    return result
   }
   const projection = () => {
     const rootEntries = layout.root === null ? [] : layout.root.entries
@@ -1133,7 +1200,7 @@ const canonicalPublicationAuthority = (
       }
       authority.assertCurrent()
     },
-    acceptPublication: (kind, recordName, rootSnapshot, kindSnapshot) => {
+    acceptPublication: (kind, recordName, rootSnapshot, kindSnapshot, digest) => {
       try {
         if (layout.root !== rootSnapshot || layout.kinds.get(kind) !== kindSnapshot) {
           return repositoryChangedBeforePublication()
@@ -1147,7 +1214,14 @@ const canonicalPublicationAuthority = (
           return repositoryChangedBeforePublication()
         }
         const recordPath = resolve(root, 'encephalon', kind, recordName)
-        observations = [...observations, { metadata: lstatSync(recordPath), path: recordPath }]
+        observations = [
+          ...observations,
+          {
+            digest,
+            metadata: lstatSync(recordPath),
+            path: recordPath,
+          },
+        ]
         layout = { kinds: new Map(layout.kinds).set(kind, nextKind), root: rootSnapshot }
         authority.assertCurrent()
       } catch (error) {
@@ -1158,19 +1232,19 @@ const canonicalPublicationAuthority = (
       }
     },
     acceptStagingCleanup: () => {
-      observations = observations.map(observation => {
-        const metadata = currentObservationMetadata(observation.path)
-        if (!sameStableMetadataExceptCtime(observation.metadata, metadata)) {
-          return repositoryChangedBeforePublication()
-        }
-        return { metadata, path: observation.path }
-      })
+      observations = observations.map(inspectObservation)
       authority.assertCurrent()
     },
     assertCurrent: () => {
+      if (cacheLocation !== undefined) {
+        assertCacheLocation(cacheLocation)
+      }
       assertObservedRecordsCurrent()
       assertLayoutWitnessCurrent(root, layout)
       assertObservedRecordsCurrent()
+      if (cacheLocation !== undefined) {
+        assertCacheLocation(cacheLocation)
+      }
     },
     projection,
   }
@@ -1192,13 +1266,18 @@ export const readValidatedRecordSnapshotResolved = (
 }
 
 /** @internal */
-export const readRecordSnapshotResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
+export const readRecordSnapshotResolved = (
+  root: string,
+  hooks: RecordReadHooks = {},
+  allowed?: AllowedMultiHead[],
+  cacheLocation?: CacheLocation,
+) => {
   const { scan } = readRecordScanResolved(root, hooks, allowed)
   if (scan.layout === undefined) {
     return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')
   }
   return {
-    authority: canonicalPublicationAuthority(root, scan.layout, scan.observations),
+    authority: canonicalPublicationAuthority(root, scan.layout, scan.observations, cacheLocation),
     records: scan.records,
   }
 }
@@ -1527,6 +1606,7 @@ const publishPlannedRecordInternal = (
             `${recordFile.id}.json`,
             publicationRoot,
             publicationKind,
+            recordDigest(formatted),
           )
           publicationAccepted = true
           fault(options.hooks, 'after-publication-accept')
@@ -1596,7 +1676,13 @@ const publishPlannedRecordInternal = (
     try {
       assertCanonicalPublicationIdentity(path, descriptor)
       assertStagingEmpty(postCleanupStagingWitness)
-      options.authority.acceptPublication(recordFile.kind, `${recordFile.id}.json`, publicationRoot, publicationKind)
+      options.authority.acceptPublication(
+        recordFile.kind,
+        `${recordFile.id}.json`,
+        publicationRoot,
+        publicationKind,
+        recordDigest(formatted),
+      )
       fault(options.hooks, 'after-publication-accept')
       assertCanonicalPublicationIdentity(path, descriptor)
       assertStagingEmpty(postCleanupStagingWitness)
@@ -1679,7 +1765,7 @@ const addRecordFileResolved = (
   }
   const authority = assertCanonicalLayoutAdditions(
     [plan.record.kind],
-    canonicalPublicationAuthority(root, scan.layout, scan.observations),
+    canonicalPublicationAuthority(root, scan.layout, scan.observations, options.cacheLocation),
   )
 
   const publishOptions = {

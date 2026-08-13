@@ -11,7 +11,9 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
@@ -369,6 +371,33 @@ describe('canonical records', () => {
       'REPOSITORY_CHANGED',
     )
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'replacement-root-candidate.json')), false)
+  })
+
+  test('does not publish into a repository root replaced after scan validation', () => {
+    const root = createRoot()
+    const replacement = createRoot()
+    const displaced = `${root}-post-scan-root`
+    roots.push(displaced)
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-scan-validation') {
+        renameSync(root, displaced)
+        renameSync(replacement, root)
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'post-scan-replacement-root-candidate',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'timestamp.post-scan-replacement-root',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'post-scan-replacement-root-candidate.json')), false)
   })
 
   test('does not publish after an observed canonical record changes in place', () => {
@@ -1324,6 +1353,42 @@ describe('canonical records', () => {
 
     assert.deepEqual(readdirSync(stagingDirectory), [])
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'after-hard-link-aliases.json')), true)
+  })
+
+  test('does not adopt an in-place canonical rewrite during stale staging cleanup', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'canonical-during-staging-cleanup' })
+    const canonicalPath = join(root, 'encephalon', 'decision', 'canonical-during-staging-cleanup.json')
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    mkdirSync(stagingDirectory, { recursive: true })
+    writeFileSync(join(stagingDirectory, ownedStagingName(0)), 'stale')
+    const fixedTime = new Date('2026-01-01T00:00:00.000Z')
+    utimesSync(canonicalPath, fixedTime, fixedTime)
+    const original = readFileSync(canonicalPath, 'utf8')
+    const originalMetadata = statSync(canonicalPath)
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-staging-cleanup-preflight') {
+        writeFileSync(canonicalPath, original.replace('"payload": {}', '"payload": []'))
+        utimesSync(canonicalPath, originalMetadata.atime, originalMetadata.mtime)
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate-after-staging-cleanup-rewrite',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'staging.canonical-rewrite',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(
+      existsSync(join(root, 'encephalon', 'decision', 'candidate-after-staging-cleanup-rewrite.json')),
+      false,
+    )
   })
 
   test('preserves a stale entry whose incarnation changes after cleanup preflight', () => {

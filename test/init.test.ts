@@ -932,6 +932,34 @@ describe('initialisation', () => {
     }
   })
 
+  test('does not initialise a repository root replaced at record publication', () => {
+    const root = createRoot()
+    const replacement = createRoot()
+    const displaced = `${root}-init-publication-root`
+    roots.push(displaced)
+    let replaced = false
+
+    assertErrorCode(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'before-directory-preparation' && !replaced) {
+                  replaced = true
+                  renameSync(root, displaced)
+                  renameSync(replacement, root)
+                }
+              },
+            },
+          },
+        ),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(existsSync(join(root, 'encephalon')), false)
+  })
+
   test('partial refresh rerun repairs only the unresolved generated subject', () => {
     const root = createRoot()
     api.initEncephalon({ root })

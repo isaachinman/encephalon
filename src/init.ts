@@ -227,6 +227,7 @@ const initResolved = (
               subject: candidate.subject,
             }))
           : undefined,
+        location,
       )
       const { records } = recordSnapshot
       assertCacheLocation(location)
