@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { parseArgs } from 'node:util'
-import { cliErrorResponse, fail } from './errors.ts'
+import { cliErrorResponse, fail, failBudget } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import {
   addRecord,
@@ -16,6 +16,7 @@ import {
   showRecord,
   validateRecords,
 } from './index.ts'
+import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import type { JsonValue } from './types.ts'
 
 const HELP = `Usage: encephalon [--root <path>] <command> [options]
@@ -24,14 +25,17 @@ Commands:
   init [--refresh-baseline] [--remove]
   add [--id <id>] --kind <kind> --subject <subject> --source <source> --data <json>
       [--confidence <0..1>] [--text <text>] [--supersedes <id> ...] [--artifact <path> ...]
+      Accepts at most ${OPERATION_BUDGETS.supersessionEdges.maximum.toLocaleString('en-GB')} supersession targets.
   prepare
   hydrate
   validate
-  list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <1..1000>]
+  list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <${OPERATION_BUDGETS.fullResultLimit.minimum}..${OPERATION_BUDGETS.fullResultLimit.maximum}>]
   show --id <id> [--active-only]
-  search [--compact] [--kind <kind>] [--include-superseded] [--limit <1..1000>] [--] <query>
+  search [--kind <kind>] [--include-superseded] [--limit <${OPERATION_BUDGETS.fullResultLimit.minimum}..${OPERATION_BUDGETS.fullResultLimit.maximum}>] [--] <query>
+  search --compact [--kind <kind>] [--include-superseded] [--limit <${OPERATION_BUDGETS.compactResultLimit.minimum}..${OPERATION_BUDGETS.compactResultLimit.maximum}>] [--] <query>
   gather [--search <query> ...] [--show <id> ...] [--hydrate] [--include-superseded]
-         [--kind <kind>] [--limit <1..1000>]
+         [--kind <kind>] [--limit <${OPERATION_BUDGETS.compactResultLimit.minimum}..${OPERATION_BUDGETS.compactResultLimit.maximum}>]
+         Accepts at most ${OPERATION_BUDGETS.gatherSearches.maximum} searches and ${OPERATION_BUDGETS.gatherShows.maximum} shows.
 
 Global options:
   --root <path>   Use this exact Git repository root.
@@ -170,15 +174,23 @@ const noPositionals = (options: ParsedOptions) => {
   }
 }
 
-const parseLimit = (value: string | undefined) => {
+type ResultLimitBudgetName = 'compactResultLimit' | 'fullResultLimit'
+
+const parseLimit = (value: string | undefined, budgetName: ResultLimitBudgetName) => {
   if (value === undefined) {
     return
   }
+  const budget = OPERATION_BUDGETS[budgetName]
   const parsed = Number(value)
-  if (Number.isInteger(parsed) && parsed > 0 && parsed <= 1000) {
+  if (Number.isInteger(parsed) && parsed >= budget.minimum && parsed <= budget.maximum) {
     return parsed
   }
-  return invalid('--limit must be an integer between 1 and 1000.')
+  return failBudget(
+    budget.field,
+    budgetName,
+    budget.maximum,
+    `--limit must be an integer between ${budget.minimum} and ${budget.maximum}.`,
+  )
 }
 
 const parsePayload = (value: string) => {
@@ -231,6 +243,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
         values: ['id', 'kind', 'subject', 'source', 'data', 'text', 'confidence'],
       })
       noPositionals(options)
+      const supersedes = many(options, 'supersedes')
       const kind = one(options, 'kind')
       const subject = one(options, 'subject')
       const source = one(options, 'source')
@@ -242,6 +255,14 @@ const dispatch = (arguments_: string[]): CommandResult => {
       const requiredSubject = requiredOption(subject, 'add requires --kind, --subject, --source, and --data.')
       const requiredSource = requiredOption(source, 'add requires --kind, --subject, --source, and --data.')
       const requiredData = requiredOption(data, 'add requires --kind, --subject, --source, and --data.')
+      if (supersedes.length > OPERATION_BUDGETS.supersessionEdges.maximum) {
+        failBudget(
+          OPERATION_BUDGETS.supersessionEdges.field,
+          'supersessionEdges',
+          OPERATION_BUDGETS.supersessionEdges.maximum,
+          `--supersedes may be supplied at most ${OPERATION_BUDGETS.supersessionEdges.maximum} times.`,
+        )
+      }
       const confidenceValue = one(options, 'confidence')
       const confidence = confidenceValue === undefined ? undefined : Number(confidenceValue)
       const id = one(options, 'id')
@@ -254,7 +275,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
           source: requiredSource,
           subject: requiredSubject,
           ...(confidence === undefined ? {} : { confidence }),
-          ...(many(options, 'supersedes').length === 0 ? {} : { supersedes: many(options, 'supersedes') }),
+          ...(supersedes.length === 0 ? {} : { supersedes }),
           ...(many(options, 'artifact').length === 0 ? {} : { artifacts: many(options, 'artifact') }),
           payload: parsePayload(requiredData),
           ...(searchText === undefined ? {} : { searchText }),
@@ -285,7 +306,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
       noPositionals(options)
       const kind = one(options, 'kind')
       const subject = one(options, 'subject')
-      const limit = parseLimit(one(options, 'limit'))
+      const limit = parseLimit(one(options, 'limit'), 'fullResultLimit')
       return {
         value: listRecords({
           ...root,
@@ -323,7 +344,8 @@ const dispatch = (arguments_: string[]): CommandResult => {
         invalid('search requires a query.')
       }
       const kind = one(options, 'kind')
-      const limit = parseLimit(one(options, 'limit'))
+      const compact = options.flags.has('compact')
+      const limit = parseLimit(one(options, 'limit'), compact ? 'compactResultLimit' : 'fullResultLimit')
       const input = {
         ...root,
         query,
@@ -332,7 +354,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
         ...(limit === undefined ? {} : { limit }),
       }
       return {
-        value: options.flags.has('compact') ? searchCompactRecords(input) : searchRecords(input),
+        value: compact ? searchCompactRecords(input) : searchRecords(input),
       }
     }
     case 'gather': {
@@ -342,13 +364,31 @@ const dispatch = (arguments_: string[]): CommandResult => {
         values: ['kind', 'limit'],
       })
       noPositionals(options)
+      const searches = many(options, 'search')
+      if (searches.length > OPERATION_BUDGETS.gatherSearches.maximum) {
+        failBudget(
+          OPERATION_BUDGETS.gatherSearches.field,
+          'gatherSearches',
+          OPERATION_BUDGETS.gatherSearches.maximum,
+          `gather may contain at most ${OPERATION_BUDGETS.gatherSearches.maximum} searches.`,
+        )
+      }
+      const shows = many(options, 'show')
+      if (shows.length > OPERATION_BUDGETS.gatherShows.maximum) {
+        failBudget(
+          OPERATION_BUDGETS.gatherShows.field,
+          'gatherShows',
+          OPERATION_BUDGETS.gatherShows.maximum,
+          `gather may contain at most ${OPERATION_BUDGETS.gatherShows.maximum} shows.`,
+        )
+      }
       const kind = one(options, 'kind')
-      const limit = parseLimit(one(options, 'limit'))
+      const limit = parseLimit(one(options, 'limit'), 'compactResultLimit')
       return {
         value: gatherRecords({
           ...root,
-          searches: many(options, 'search'),
-          shows: many(options, 'show'),
+          searches,
+          shows,
           ...(kind === undefined ? {} : { kind }),
           ...(limit === undefined ? {} : { limit }),
           hydrate: options.flags.has('hydrate'),

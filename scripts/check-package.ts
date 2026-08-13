@@ -31,6 +31,20 @@ const run = (command: string[], cwd = root) => {
   throw new Error(`${command[0]} failed with exit code ${result.exitCode}.`)
 }
 
+const runExpectedFailure = (command: string[], cwd = root) => {
+  const result = Bun.spawnSync({
+    cmd: command,
+    cwd,
+    stderr: 'pipe',
+    stdout: 'pipe',
+  })
+  return {
+    exitCode: result.exitCode,
+    stderr: result.stderr.toString(),
+    stdout: result.stdout.toString(),
+  }
+}
+
 const collectFiles = (directory: string): string[] =>
   readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
     const path = resolve(directory, entry.name)
@@ -275,11 +289,55 @@ try {
   )
   const installedCli = resolve(consumer, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
   const cli = (arguments_: string[]) => run(['node', installedCli, ...arguments_], consumer)
+  const cliFailure = (arguments_: string[]) => runExpectedFailure(['node', installedCli, ...arguments_], consumer)
   const cliJson = (arguments_: string[]) => JSON.parse(cli(arguments_)) as unknown
 
-  if (!/^Usage: encephalon/m.test(cli(['--help'])) || cli(['--version']) !== `${packageJson.version}\n`) {
+  const help = cli(['--help'])
+  const helpFragments = [
+    'list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <1..50>]',
+    'search [--kind <kind>] [--include-superseded] [--limit <1..50>] [--] <query>',
+    'search --compact [--kind <kind>] [--include-superseded] [--limit <1..100>] [--] <query>',
+    'gather [--search <query> ...] [--show <id> ...] [--hydrate] [--include-superseded]\n' +
+      '         [--kind <kind>] [--limit <1..100>]',
+    'Accepts at most 16 searches and 64 shows.',
+    'Accepts at most 1,000 supersession targets.',
+  ]
+  if (
+    !/^Usage: encephalon/m.test(help) ||
+    helpFragments.some(fragment => !help.includes(fragment)) ||
+    cli(['--version']) !== `${packageJson.version}\n`
+  ) {
     throw new Error('The packed Node-only CLI help/version contract failed.')
   }
+
+  const assertPackedBudgetFailure = (
+    arguments_: string[],
+    expectedDetails: { budget: string; field: string; maximum: number },
+  ) => {
+    const result = cliFailure(arguments_)
+    const body = JSON.parse(result.stderr) as {
+      error?: { code?: unknown; details?: unknown }
+    }
+    if (
+      result.exitCode !== 2 ||
+      result.stdout !== '' ||
+      body.error?.code !== 'INVALID_ARGUMENT' ||
+      JSON.stringify(body.error.details) !== JSON.stringify(expectedDetails)
+    ) {
+      throw new Error('The packed Node-only CLI operation budget contract failed.')
+    }
+  }
+
+  assertPackedBudgetFailure(['list', '--root', consumer, '--limit=51'], {
+    budget: 'fullResultLimit',
+    field: 'limit',
+    maximum: 50,
+  })
+  assertPackedBudgetFailure(['search', '--root', consumer, '--compact', '--limit=101', 'x'], {
+    budget: 'compactResultLimit',
+    field: 'limit',
+    maximum: 100,
+  })
 
   const prepared = cliJson(['--root', consumer, 'prepare']) as { hydrated?: unknown; recordsIndexed?: unknown }
   if (prepared.hydrated !== true || prepared.recordsIndexed !== 0) {
