@@ -51,6 +51,7 @@ const recoveryActions = {
     'Inspect the reported canonical records, instruction files and recovery paths, then repeat the same init operation with the same options.',
   inspectOperationCleanup:
     'Inspect operation cleanup state, then repeat the same init operation with the same options.',
+  inspectPreflight: 'Inspect the reported preflight state, then repeat the same init operation with the same options.',
   inspectRecords: 'Inspect the reported canonical records, then repeat the same init operation with the same options.',
   preflight: 'Resolve the reported preflight issue, then repeat the same init operation with the same options.',
   rerun: 'Repeat the same init operation with the same options.',
@@ -68,7 +69,7 @@ const progressDetails = (progress: InitProgress, error: EncephalonError): InitPr
   const recoveryMode = inspectionRequired(progress, error) ? 'inspectAndRerun' : 'rerun'
   const recoveryAction = (() => {
     if (progress.phase === 'preflight') {
-      return recoveryActions.preflight
+      return recoveryMode === 'inspectAndRerun' ? recoveryActions.inspectPreflight : recoveryActions.preflight
     }
     if (progress.phase === 'cachePreparation') {
       return recoveryMode === 'inspectAndRerun'

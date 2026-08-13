@@ -316,6 +316,37 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
   })
 
+  test('init preflight progress requires inspection for an internal failure', () => {
+    const root = createRoot()
+    const privateSentinel = 'PRIVATE_INTERNAL_PREFLIGHT_FAILURE'
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            baselineScan: () => {
+              throw new Error(privateSentinel)
+            },
+          },
+        ),
+      error =>
+        assertSafeInitError(error, {
+          cacheState: 'notAttempted',
+          code: 'INTERNAL_ERROR',
+          committedInstructionFiles: [],
+          committedRecordIds: [],
+          message: 'Unable to coordinate Encephalon cache access.',
+          phase: 'preflight',
+          recoveryAction:
+            'Inspect the reported preflight state, then repeat the same init operation with the same options.',
+          recoveryMode: 'inspectAndRerun',
+          root,
+          sentinels: [privateSentinel],
+        }),
+    )
+  })
+
   for (const failureAttempt of [2, 3] as const) {
     test(`partial init progress retains the committed prefix before record attempt ${failureAttempt}`, () => {
       const root = createRoot()
@@ -738,6 +769,117 @@ describe('initialisation', () => {
       root,
       sentinels: [privateSentinel],
     })
+  })
+
+  test('partial remove progress retains both removals when operation cleanup fails and reruns', () => {
+    const root = createRoot()
+    api.initEncephalon({ root })
+    const baselineIds = committedBaselineIds(root)
+    const privateSentinel = 'PRIVATE_REMOVE_OPERATION_CLEANUP_FAILURE'
+    let capturedError: unknown
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { remove: true, root },
+          {
+            lockHooks: {
+              gateClose: database => {
+                database.close()
+                throw Object.assign(new Error(privateSentinel), { code: 'EIO' })
+              },
+            },
+          },
+        ),
+      error => {
+        capturedError = error
+        return true
+      },
+    )
+
+    assertSafeInitError(capturedError, {
+      cacheState: 'notAttempted',
+      code: 'IO_ERROR',
+      committedInstructionFiles: [
+        { action: 'removed', file: 'AGENTS.md' },
+        { action: 'removed', file: 'CLAUDE.md' },
+      ],
+      committedRecordIds: [],
+      message: 'Unable to initialise Encephalon.',
+      phase: 'operationCleanup',
+      recoveryAction: 'Inspect operation cleanup state, then repeat the same init operation with the same options.',
+      recoveryMode: 'inspectAndRerun',
+      root,
+      sentinels: [privateSentinel],
+    })
+    assert.deepEqual(committedBaselineIds(root), baselineIds)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+
+    const rerun = api.initEncephalon({ remove: true, root })
+
+    assert.deepEqual(rerun.instructionFiles, [])
+    assert.deepEqual(rerun.recordsCreated, [])
+    assert.deepEqual(committedBaselineIds(root), baselineIds)
+  })
+
+  test('partial init progress requires inspection for a retained pre-commit recovery path', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const retainedPredecessor = join(root, 'retained-undurable-predecessor')
+    let backupPath: string | undefined
+    writeFileSync(path, '# Existing guidance\n')
+    let capturedError: unknown
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            instructionWriteHooks: {
+              fault: point => {
+                if (point === 'after-backup-validation') {
+                  const [backupName] = readdirSync(root).filter(name => name.endsWith('.backup'))
+                  assert.ok(backupName)
+                  backupPath = join(root, backupName)
+                  throw Object.assign(new Error('Injected pre-commit failure'), { code: 'EIO' })
+                }
+                if (point === 'during-backup-restore') {
+                  assert.ok(backupPath)
+                  renameSync(backupPath, retainedPredecessor)
+                }
+                if (point === 'during-recovery-alias-flush') {
+                  throw Object.assign(new Error('Injected recovery alias durability failure'), {
+                    code: 'EIO',
+                  })
+                }
+              },
+            },
+          },
+        ),
+      error => {
+        capturedError = error
+        return true
+      },
+    )
+
+    assertSafeInitError(capturedError, {
+      cacheState: 'prepared',
+      code: 'IO_ERROR',
+      committedInstructionFiles: [],
+      committedRecordIds: committedBaselineIds(root),
+      message: 'Unable to recover AGENTS.md before publication.',
+      phase: 'instructionApplication',
+      recoveryAction:
+        'Inspect the reported canonical records, instruction files and recovery paths, then repeat the same init operation with the same options.',
+      recoveryMode: 'inspectAndRerun',
+      root,
+    })
+    const { details } = capturedError as EncephalonError
+    assert.equal(details.instructionCommitted, undefined)
+    assert.ok(Array.isArray(details.recoveryPaths))
+    assert.equal(details.recoveryPaths.length, 1)
+    assert.match(details.recoveryPaths[0] as string, /^\.AGENTS\.md\..+\.backup$/u)
   })
 
   test('partial init rerun creates only records missing after prefix and cache failures', () => {

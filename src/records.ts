@@ -1545,19 +1545,6 @@ export const publishPlannedRecordOutcome = (
   options: { authority: CanonicalPublicationAuthority; hooks?: RecordWriteHooks },
 ): PublishResult => publishPlannedRecordInternal(root, plan, options)
 
-/** @internal */
-export const publishPlannedRecord = (
-  root: string,
-  plan: PlannedRecord,
-  options: { authority: CanonicalPublicationAuthority; hooks?: RecordWriteHooks },
-): BrainRecord => {
-  const published = publishPlannedRecordOutcome(root, plan, options)
-  if (published.committedError !== undefined) {
-    throw published.committedError
-  }
-  return published.record
-}
-
 const addRecordFileResolved = (
   root: string,
   recordFile: BrainRecordFile,
