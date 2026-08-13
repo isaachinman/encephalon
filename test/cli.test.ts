@@ -339,7 +339,7 @@ describe('command-line interface', () => {
 
     const supersedesArguments = Array.from({ length: 1001 }, (_, index) => [
       '--supersedes',
-      `private-supersedes-${index}`,
+      index === 0 ? 'private-supersedes' : 'x',
     ]).flat()
     const added = run(root, [
       'add',
