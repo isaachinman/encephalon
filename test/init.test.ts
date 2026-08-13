@@ -1137,7 +1137,9 @@ describe('initialisation', () => {
     }
   })
 
-  test('partial instruction rerun retains both removals when cleanup fails after the second file', () => {
+  test('partial instruction rerun retains both removals when cleanup fails after the second file', {
+    skip: process.platform === 'win32' ? 'Windows does not hold a repository-root directory descriptor.' : false,
+  }, () => {
     const root = createRoot()
     api.initEncephalon({ root })
     const baselineIds = committedBaselineIds(root)
