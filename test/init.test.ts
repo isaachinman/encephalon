@@ -65,6 +65,28 @@ const readOnlyHoldSkip = (() => {
   }
 })()
 removeTestRepository(readOnlyProbeRoot)
+const openChildRenameProbeRoot = createTestRepository()
+const openChildRenameProbeParent = join(openChildRenameProbeRoot, 'parent')
+const openChildRenameProbeTarget = join(openChildRenameProbeRoot, 'renamed')
+mkdirSync(openChildRenameProbeParent)
+const openChildRenameProbePath = join(openChildRenameProbeParent, 'child')
+writeFileSync(openChildRenameProbePath, 'probe')
+const openChildRenameProbeDescriptor = openSync(openChildRenameProbePath, 'r')
+const renameParentWithOpenChildSkip = (() => {
+  try {
+    renameSync(openChildRenameProbeParent, openChildRenameProbeTarget)
+    return false
+  } catch (error) {
+    const { code } = error as NodeJS.ErrnoException
+    if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
+      return 'The filesystem does not allow replacing a parent while a child descriptor is open.'
+    }
+    throw error
+  } finally {
+    closeSync(openChildRenameProbeDescriptor)
+    removeTestRepository(openChildRenameProbeRoot)
+  }
+})()
 
 const generatedPayload = (records: readonly { payload: unknown; subject: string }[], subject: string) => {
   const payload = records.find(record => record.subject === subject)?.payload
@@ -2027,7 +2049,9 @@ describe('initialisation', () => {
     assert.deepEqual(instructionAliasSuffixes(root), [])
   })
 
-  test('reports and retains an alias linked through the documented root-path syscall window', () => {
+  test('reports and retains an alias linked through the documented root-path syscall window', {
+    skip: renameParentWithOpenChildSkip,
+  }, () => {
     const root = createRoot()
     const displacedRoot = `${root}-alias-link-window`
     const path = join(root, 'AGENTS.md')
@@ -2116,7 +2140,9 @@ describe('initialisation', () => {
     }
   })
 
-  test('closes an owned staged descriptor when root validation fails after its open', () => {
+  test('closes an owned staged descriptor when root validation fails after its open', {
+    skip: renameParentWithOpenChildSkip,
+  }, () => {
     const root = createRoot()
     const displacedRoot = `${root}-staged-open-authority`
     let createdDescriptor: number | undefined
@@ -2198,7 +2224,10 @@ describe('initialisation', () => {
       },
     )
 
-    assert.equal(privateMode, 0o600)
+    assert.equal(typeof privateMode, 'number')
+    if (process.platform !== 'win32') {
+      assert.equal(privateMode, 0o600)
+    }
     assert.deepEqual(readFileSync(path), original)
     assert.deepEqual(instructionAliasSuffixes(root), [])
   })
@@ -2216,7 +2245,9 @@ describe('initialisation', () => {
     assert.deepEqual(instructionAliasSuffixes(root), [])
   })
 
-  test('closes an owned recovery descriptor when root validation fails after its open', () => {
+  test('closes an owned recovery descriptor when root validation fails after its open', {
+    skip: renameParentWithOpenChildSkip,
+  }, () => {
     const root = createRoot()
     const displacedRoot = `${root}-recovery-open-authority`
     const path = join(root, 'AGENTS.md')
@@ -2586,7 +2617,9 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(displacedRoot, 'AGENTS.md')), false)
   })
 
-  test('does not redirect committed cleanup into a replacement repository root generation', () => {
+  test('does not redirect committed cleanup into a replacement repository root generation', {
+    skip: renameParentWithOpenChildSkip,
+  }, () => {
     const root = createRoot()
     const displacedRoot = `${root}-committed-instruction-generation`
     const path = join(root, 'AGENTS.md')
