@@ -122,10 +122,11 @@ When an implementation change intentionally alters this contract:
 | CI and release gates evolved after the original plan. | Owned by MAR-2527 for CI package gates. The maintained release contract remains the checked package scripts plus manual publishing. |
 | Initialisation result and managed-file mutation details changed during implementation. | Implemented and tested in the init, instruction-file, package, and CLI suites; the README and this contract describe the maintained behaviour. |
 | `canonicalRecordPath` was exported from `src/records.ts` without a public API surface. | Retained as an internal helper used by cache path validation; not exported from `src/index.ts`. |
+| Historical plan's wall-clock-only `createdAt` policy predates cross-process mutation ordering. | MAR-2563 assigns timestamps from validated canonical history while the repository operation lock is held; the maintained behaviour is specified in this contract. |
 
 ## Change Provenance
 
-- MAR-2563 operation-locked record timestamp assignment and cross-process ordering: `44776a94085bcedc361c46707b7f3b93e743c9e7`.
+- MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `5abd56a90258bfb6acb639c1bd630924dda85132`.
 - MAR-2548 restart-safe partial initialisation progress and convergence: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`.
 - MAR-2547 fixed-root and descriptor-bound managed instruction finalisation, exact private bytes, collision and successor preservation, durability ordering, and complete safe recovery details: `bbb2182fe616ebd1264744647213cce4d9e9e429`.
 - MAR-2556 bounded, generation-stable canonical layout handling and behavioural coverage: `de05ccf06119a2ad2507accf18163be8243eafec`.

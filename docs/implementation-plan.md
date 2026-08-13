@@ -430,10 +430,9 @@ export type BrainRecord = BrainRecordFile & {
 `createdAt`:
 
 - Must use canonical UTC RFC3339 with millisecond precision: `YYYY-MM-DDTHH:mm:ss.sssZ`.
-- Input validation completes before repository discovery, but `createdAt` is assigned only after the repository operation lock is held and canonical history has been validated.
-- New records use the later of the current millisecond and one millisecond after the latest canonical record. A baseline batch advances that cursor once per planned record.
+- New records use `new Date().toISOString()`.
 - Records are ordered by parsed timestamp and then ID, not by filesystem order.
-- Writers using the repository operation lock are strictly ordered after canonical history, including across processes. No cross-machine claim is made outside that shared repository lock.
+- No cross-process or cross-machine monotonicity claim is made.
 
 `confidence`:
 
@@ -667,13 +666,12 @@ If external files changed, retry the entire validated hydration up to three time
 
 1. Validate the input and candidate path.
 2. Read and validate the current record graph.
-3. Assign `createdAt` strictly after the latest canonical timestamp while the lock is held.
-4. Validate supplied supersession targets and artifacts.
-5. Format the canonical JSON with two-space indentation and one final newline.
-6. Check the 1 MiB formatted-file limit.
-7. Create the kind directory if necessary.
-8. Create the record file exclusively; never overwrite.
-9. Rebuild the cache transactionally before returning success.
+3. Validate supplied supersession targets and artifacts.
+4. Format the canonical JSON with two-space indentation and one final newline.
+5. Check the 1 MiB formatted-file limit.
+6. Create the kind directory if necessary.
+7. Create the record file exclusively; never overwrite.
+8. Rebuild the cache transactionally before returning success.
 
 If the JSON file is created but cache rebuilding fails, the JSON remains canonical and the operation returns an error. A later successful `prepare()` can recover. Never delete newly written canonical knowledge merely because the disposable cache failed.
 
