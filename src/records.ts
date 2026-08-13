@@ -41,6 +41,7 @@ import { type DirectoryWitness, DirectoryWitnessError, revalidateDirectoryWitnes
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.ts'
 import { withOperationLock } from './lock.ts'
+import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { ordinalStringCompare } from './order.ts'
 import { resolveRepository } from './repository.ts'
 import {
@@ -271,7 +272,7 @@ export const MAX_CANONICAL_RECORDS = 1000
 /** @internal */
 export const MAX_CANONICAL_RECORD_BYTES = 8 * 1024 * 1024
 /** @internal */
-export const MAX_SUPERSESSION_EDGES = 1000
+export const MAX_SUPERSESSION_EDGES = OPERATION_BUDGETS.supersessionEdges.maximum
 /** @internal */
 export const MAX_ARTIFACT_REFERENCES = 1000
 /** @internal */

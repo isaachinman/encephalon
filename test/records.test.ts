@@ -38,7 +38,7 @@ import {
   validateRecordsResolved,
 } from '../src/records.ts'
 import { discoverRepository, repositoryTestHooks } from '../src/repository.ts'
-import { validateKind } from '../src/schema.ts'
+import { parseRecordFile, validateAddRecordInput, validateKind } from '../src/schema.ts'
 import * as stagingInternals from '../src/staging.ts'
 import type { BrainRecord, ValidateResult } from '../src/types.ts'
 import {
@@ -2327,8 +2327,13 @@ describe('canonical records', () => {
 
     const edgeRoot = createRoot()
     writeCanonicalRecord(edgeRoot, {
-      id: 'too-many-edges',
-      supersedes: Array.from({ length: 1001 }, (_, index) => `missing-${index}`),
+      id: 'edge-budget-at-maximum',
+      supersedes: Array.from({ length: 1000 }, (_, index) => `missing-${index}`),
+    })
+    writeCanonicalRecord(edgeRoot, {
+      createdAt: timestampAt(1),
+      id: 'edge-budget-overflow',
+      supersedes: ['one-more-missing-edge'],
     })
     const edgeResult = api.validateRecords({ root: edgeRoot })
     assert.equal(edgeResult.valid, false)
@@ -2658,6 +2663,52 @@ describe('canonical records', () => {
     assert.equal(created, true)
     assert.deepEqual(readdirSync(join(root, 'encephalon', 'new-kind')), [])
     assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+  })
+
+  test('enforces supersedes count before item validation and repository access', () => {
+    const validSupersedes = Array.from({ length: 1000 }, (_, index) => `superseded-${index}`)
+    const candidate = {
+      id: 'supersedes-boundary-candidate',
+      kind: 'decision',
+      payload: {},
+      source: 'test',
+      subject: 'validation.supersedes-boundary',
+      supersedes: validSupersedes,
+    }
+    assert.equal(validateAddRecordInput(candidate).supersedes?.length, 1000)
+    assert.equal(parseRecordFile({ ...candidate, createdAt: timestampAt(0) }).supersedes?.length, 1000)
+
+    const root = createRoot()
+    const oversizedSupersedes = ['not a valid supersedes id', ...validSupersedes]
+    let repositoryHookCalls = 0
+    repositoryTestHooks.afterGitMarkerDecision = () => {
+      repositoryHookCalls += 1
+    }
+    const assertSupersedesBudget = (operation: () => unknown) => {
+      assert.throws(operation, (error: unknown) => {
+        const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+        assert.equal(actual.code, 'INVALID_ARGUMENT')
+        assert.deepEqual(actual.details, {
+          budget: 'supersessionEdges',
+          field: 'supersedes',
+          maximum: 1000,
+        })
+        const exposed = JSON.stringify({ details: actual.details, message: actual.message })
+        assert.equal(
+          oversizedSupersedes.some(entry => exposed.includes(entry)),
+          false,
+        )
+        return true
+      })
+    }
+
+    assertSupersedesBudget(() =>
+      parseRecordFile({ ...candidate, createdAt: timestampAt(0), supersedes: oversizedSupersedes }),
+    )
+    assertSupersedesBudget(() => api.addRecord({ ...candidate, root, supersedes: oversizedSupersedes }))
+    assert.equal(repositoryHookCalls, 0)
+    assert.equal(existsSync(join(root, 'encephalon')), false)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon')), false)
   })
 
   test('rejects addRecord when the candidate would exceed corpus count or byte budgets', () => {

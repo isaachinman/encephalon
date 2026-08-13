@@ -85,10 +85,10 @@ afterEach(() => {
 
 const functionFromApi = <T>(name: string) => (api as unknown as Record<string, T>)[name] as T
 
-const assertBudgetError = (operation: () => unknown, budget: string) => {
+const assertBudgetError = (operation: () => unknown, expected: { budget: string; field: string; maximum: number }) => {
   assert.throws(operation, (error: unknown) => {
     assert.equal((error as { code?: unknown }).code, 'INVALID_ARGUMENT')
-    assert.equal((error as { details?: { budget?: unknown } }).details?.budget, budget)
+    assert.deepEqual((error as { details?: unknown }).details, expected)
     return true
   })
 }
@@ -1782,50 +1782,60 @@ describe('SQLite cache and reads', () => {
       Array.from({ length: 64 }, () => 'missing'),
     )
 
-    const invalidCases: Array<{ budget: string; run: (root: string) => void }> = [
-      { budget: 'fullResultLimit', run: root => listRecords({ limit: 51, root }) },
-      { budget: 'fullResultLimit', run: root => searchRecords({ limit: 51, query: 'x', root }) },
+    const invalidCases: Array<{
+      expected: { budget: string; field: string; maximum: number }
+      run: (root: string) => void
+    }> = [
       {
-        budget: 'compactResultLimit',
+        expected: { budget: 'fullResultLimit', field: 'limit', maximum: 50 },
+        run: root => listRecords({ limit: 51, root }),
+      },
+      {
+        expected: { budget: 'fullResultLimit', field: 'limit', maximum: 50 },
+        run: root => searchRecords({ limit: 51, query: 'x', root }),
+      },
+      {
+        expected: { budget: 'compactResultLimit', field: 'limit', maximum: 100 },
         run: root => searchCompactRecords({ limit: 101, query: 'x', root }),
       },
       {
-        budget: 'queryBytes',
+        expected: { budget: 'queryBytes', field: 'query', maximum: 1024 },
         run: root => searchRecords({ query: `${'x'.repeat(1024)}y`, root }),
       },
       {
-        budget: 'queryBytes',
+        expected: { budget: 'queryBytes', field: 'query', maximum: 1024 },
         run: root => searchCompactRecords({ query: `${'x'.repeat(1024)}y`, root }),
       },
       {
-        budget: 'queryTerms',
+        expected: { budget: 'queryTerms', field: 'query', maximum: 32 },
         run: root => searchRecords({ query: Array.from({ length: 33 }, () => 'x').join(' '), root }),
       },
       {
-        budget: 'queryTerms',
+        expected: { budget: 'queryTerms', field: 'query', maximum: 32 },
         run: root => searchCompactRecords({ query: Array.from({ length: 33 }, () => 'x').join(' '), root }),
       },
       {
-        budget: 'gatherSearches',
-        run: root => gatherRecords({ root, searches: Array.from({ length: 17 }, () => 'x') }),
+        expected: { budget: 'gatherSearches', field: 'searches', maximum: 16 },
+        run: root => gatherRecords({ root, searches: [42, ...Array.from({ length: 16 }, () => 'x')] }),
       },
       {
-        budget: 'gatherShows',
-        run: root => gatherRecords({ root, shows: Array.from({ length: 65 }, () => 'missing') }),
+        expected: { budget: 'gatherShows', field: 'shows', maximum: 64 },
+        run: root =>
+          gatherRecords({ root, shows: ['not a valid record id', ...Array.from({ length: 64 }, () => 'missing')] }),
       },
       {
-        budget: 'compactResultLimit',
+        expected: { budget: 'compactResultLimit', field: 'limit', maximum: 100 },
         run: root => gatherRecords({ limit: 101, root, searches: ['x'] }),
       },
       {
-        budget: 'queryTerms',
+        expected: { budget: 'queryTerms', field: 'query', maximum: 32 },
         run: root => gatherRecords({ root, searches: [Array.from({ length: 33 }, () => 'x').join(' ')] }),
       },
     ]
 
     for (const invalidCase of invalidCases) {
       const root = createRoot()
-      assertBudgetError(() => invalidCase.run(root), invalidCase.budget)
+      assertBudgetError(() => invalidCase.run(root), invalidCase.expected)
       assert.equal(existsSync(cacheDirectoryPath(root)), false)
     }
   })
@@ -1847,7 +1857,11 @@ describe('SQLite cache and reads', () => {
 
     const searchRecords =
       functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
-    assertBudgetError(() => searchRecords({ limit: 5, query: 'response budget marker', root }), 'fullResponseBytes')
+    assertBudgetError(() => searchRecords({ limit: 5, query: 'response budget marker', root }), {
+      budget: 'fullResponseBytes',
+      field: 'response',
+      maximum: 4 * 1024 * 1024,
+    })
 
     const searchCompactRecords =
       functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')

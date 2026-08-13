@@ -174,9 +174,6 @@ export const parseFullSearchRecordsInput = (value: unknown): SearchRecordsInput 
 export const parseCompactSearchRecordsInput = (value: unknown): SearchRecordsInput =>
   parseSearchRecordsInputWithBudget(value, OPERATION_BUDGETS.compactResultLimit)
 
-/** @internal */
-export const parseSearchRecordsInput = parseFullSearchRecordsInput
-
 export const parseGatherInput = (value: unknown): GatherInput => {
   const input = objectInput(value, 'gatherRecords')
   const root = rootProperties(input)
