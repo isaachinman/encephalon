@@ -55,6 +55,7 @@ describe('API input budgets', () => {
     }>
 
     for (const limitCase of limitCases) {
+      assert.equal(limitCase.parse(1).limit, 1)
       assert.equal(limitCase.parse(limitCase.accept).limit, limitCase.accept)
       assertBudget(() => limitCase.parse(limitCase.maximum + 1), {
         budget: limitCase.budget,
