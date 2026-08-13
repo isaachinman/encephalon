@@ -58,7 +58,7 @@ describe('package contract', () => {
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /MAR-2548 restart-safe partial initialisation progress and convergence: `fc5a08b460554264b424dd64e385518e1ff52f36`\./,
+      /MAR-2548 restart-safe partial initialisation progress and convergence: `70bbe7c413110e6f3aa5b263e15a323f06a78fe0`\./,
     )
   })
 

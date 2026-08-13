@@ -107,4 +107,4 @@ Normal init, idempotent init, refresh, remove, package, and declaration tests re
 
 ## Reviewed implementation provenance
 
-The exact reviewed code and behavioural-test snapshot implementing this design is `fc5a08b460554264b424dd64e385518e1ff52f36`. Documentation changes do not alter the runtime API, package exports, or generated declarations.
+The exact reviewed code and behavioural-test snapshot implementing this design is `70bbe7c413110e6f3aa5b263e15a323f06a78fe0`. Documentation changes do not alter the runtime API, package exports, or generated declarations.
