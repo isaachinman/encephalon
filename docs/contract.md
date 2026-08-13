@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-13 for code and behavioural-test snapshot `77f1221a57a2b6e5b67b41203aa3bd1775fa830e`.
+Last reviewed: 2026-08-13 for code and behavioural-test snapshot `2f8ea09c3dd96fc2184b8223e374ad1e4f70da12`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -126,7 +126,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `77f1221a57a2b6e5b67b41203aa3bd1775fa830e`.
+- MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2f8ea09c3dd96fc2184b8223e374ad1e4f70da12`.
 - MAR-2548 restart-safe partial initialisation progress and convergence: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`.
 - MAR-2547 fixed-root and descriptor-bound managed instruction finalisation, exact private bytes, collision and successor preservation, durability ordering, and complete safe recovery details: `bbb2182fe616ebd1264744647213cce4d9e9e429`.
 - MAR-2556 bounded, generation-stable canonical layout handling and behavioural coverage: `de05ccf06119a2ad2507accf18163be8243eafec`.
