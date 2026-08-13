@@ -67,7 +67,7 @@ Rules:
 - `cacheState` becomes `disposable` when cache work starts or when a record commit makes an older cache stale. It becomes `prepared` only after hydrate/prepare returns successfully.
 - Existing subsystem fields such as `postCommitPhase`, `postCommitFailures`, `recordId`, `filename`, and `recoveryPaths` remain intact and therefore retain secondary failure metadata.
 - `inspectAndRerun` is used for identity uncertainty, internal failure, committed publication verification/durability/cleanup uncertainty, or retained instruction recovery paths. A deterministic cache rebuild or a later pre-commit failure uses `rerun`.
-- Recovery text is selected from fixed phase/mode constants. Cache failure directs the caller to run `prepare`, then `validate`, then repeat the same init operation. Other failures direct the caller to resolve or inspect the reported state as required, then repeat the same init operation with the same options.
+- Recovery text is selected from fixed phase/mode constants. Cache failure directs the caller to run `prepare`, then `validate`, then repeat the same init operation. Instruction-phase inspection names reported canonical records, instruction files, and recovery paths together; other failures direct the caller to resolve or inspect the reported state as required, then repeat the same init operation with the same options.
 
 Preflight errors also receive this object with empty commit lists and `cacheState: 'notAttempted'`, making the absence of durable effects explicit.
 
@@ -107,4 +107,4 @@ Normal init, idempotent init, refresh, remove, package, and declaration tests re
 
 ## Reviewed implementation provenance
 
-The exact reviewed code and behavioural-test snapshot implementing this design is `70bbe7c413110e6f3aa5b263e15a323f06a78fe0`. Documentation changes do not alter the runtime API, package exports, or generated declarations.
+The exact reviewed code and behavioural-test snapshot implementing this design is `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`. Documentation changes do not alter the runtime API, package exports, or generated declarations.
