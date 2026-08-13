@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-13 for code and behavioural-test snapshot `44776a94085bcedc361c46707b7f3b93e743c9e7`.
+Last reviewed: 2026-08-13 for code and behavioural-test snapshot `d6ccda5e88ddef00202d4925379db42ea59d94a1`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -22,7 +22,7 @@ This document is the concise contract maintainers should update when public beha
 - The runtime-only `path` field is never written to canonical record files.
 - Supersession records must use the same kind and subject as their targets. Active records are records not listed in any other record’s `supersedes`.
 - Existing records are not rewritten or deleted by normal mutations; changed knowledge is represented by a new record that supersedes the active head.
-- Add-record inputs are fully validated, including their eventual fixed-width formatted size, before repository discovery or filesystem mutation. Their `createdAt` value is assigned only after the repository operation lock is held and the current canonical record snapshot has been validated. It is the later of the current millisecond and one millisecond after the latest canonical timestamp. Initialisation advances the same cursor once per planned baseline record under its existing lock. Failed pre-commit attempts consume no process-global timestamp state, and a canonical timestamp at the schema ceiling fails validation rather than wrapping or rewriting history.
+- Add-record inputs are fully validated, including their eventual fixed-width formatted size, before repository discovery or filesystem mutation. Their `createdAt` value is assigned only after the repository operation lock is held and the current canonical record snapshot has been validated. It is the later of the current millisecond and one millisecond after the latest canonical timestamp. Initialisation advances the same cursor once per planned baseline record under its existing lock. The locked repository location remains part of publication authority through preparation, linking, and final acceptance. Existing record incarnations and byte digests are revalidated before cleanup-induced change-time updates are accepted. Failed pre-commit attempts consume no process-global timestamp state, and a canonical timestamp at the schema ceiling fails validation rather than wrapping or rewriting history.
 - Canonical layout validation reads at most 1,003 entries from `encephalon` and 1,001 entries from any kind directory to distinguish the inclusive limits from overflow. The root permits 1,002 total entries and 1,000 kind directories; `_artifacts` and `_staging` consume root-entry capacity but not kind-directory capacity. Each kind directory permits 1,000 entries. Overflow returns one deterministic `CORPUS_DIRECTORY_ENTRY_LIMIT` issue naming only the repository-relative containing directory and its maximum.
 - Canonical root and kind enumeration is bound to captured real-directory generations and revalidated before acceptance. A replacement, symlink substitution, dangling root link, or ancestor-generation change cannot produce a valid mixed-generation corpus.
 - Record addition and initialisation carry the validated root and kind generations through graph validation, layout preflight, directory preparation, canonical publication, and post-link verification. They account for every planned raw entry grouped by kind, all candidate new kind directories, and a newly introduced `_staging` root entry before any staging or canonical publication; replacements fail with `REPOSITORY_CHANGED`, while a candidate that would cross a directory bound fails validation with the same deterministic directory-entry-limit issue. Post-link generation loss is reported as a committed `REPOSITORY_CHANGED` result and stops batch initialisation.
@@ -126,7 +126,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `5abd56a90258bfb6acb639c1bd630924dda85132`.
+- MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `d6ccda5e88ddef00202d4925379db42ea59d94a1`.
 - MAR-2548 restart-safe partial initialisation progress and convergence: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`.
 - MAR-2547 fixed-root and descriptor-bound managed instruction finalisation, exact private bytes, collision and successor preservation, durability ordering, and complete safe recovery details: `bbb2182fe616ebd1264744647213cce4d9e9e429`.
 - MAR-2556 bounded, generation-stable canonical layout handling and behavioural coverage: `de05ccf06119a2ad2507accf18163be8243eafec`.
