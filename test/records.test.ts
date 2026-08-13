@@ -247,6 +247,49 @@ describe('canonical records', () => {
     assert.equal(outcome.committedErrorPhase, 'publicationVerification')
   })
 
+  test('record publication outcome retains staging when canonical publication is displaced after verification fails', () => {
+    const root = createRoot()
+    const firstFailure = Object.assign(new Error('first post-link verification failure'), {
+      code: 'EIO',
+    })
+    const successorBytes = 'concurrent canonical successor\n'
+    const displacedPath = join(root, 'displaced-record-publication.json')
+    const plan = planRecordAddition(root, {
+      id: 'record-publication-outcome-displaced',
+      kind: 'decision',
+      payload: { summary: 'Preserve recovery staging' },
+      source: 'agent',
+      subject: 'record.publication-outcome.displaced',
+    })
+    const canonicalPath = join(root, plan.record.path)
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    const snapshot = readRecordSnapshotResolved(root)
+    const authority = assertCanonicalLayoutAdditions([plan.record.kind], snapshot.authority)
+    let publishedBytes = ''
+
+    const outcome = publishPlannedRecordOutcome(root, plan, {
+      authority,
+      hooks: {
+        fault: point => {
+          if (point === 'after-canonical-link') {
+            throw firstFailure
+          }
+          if (point === 'before-final-publication-revalidation') {
+            publishedBytes = readFileSync(canonicalPath, 'utf8')
+            renameSync(canonicalPath, displacedPath)
+            writeFileSync(canonicalPath, successorBytes)
+          }
+        },
+      },
+    })
+
+    assert.equal(outcome.committedError?.cause, firstFailure)
+    assert.equal(outcome.committedErrorPhase, 'publicationVerification')
+    assert.equal(readFileSync(displacedPath, 'utf8'), publishedBytes)
+    assert.equal(readFileSync(canonicalPath, 'utf8'), successorBytes)
+    assert.equal(readdirSync(stagingDirectory).length, 1)
+  })
+
   test('record publication outcome still throws before canonical linking', () => {
     const root = createRoot()
     const plan = planRecordAddition(root, {

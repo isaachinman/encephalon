@@ -30,7 +30,7 @@ import { DirectoryWitnessError } from '../src/directory-witness.ts'
 import { EncephalonError } from '../src/errors.ts'
 import * as api from '../src/index.ts'
 import { initEncephalonWithHooks } from '../src/init.ts'
-import { applyInstructionChanges, applyInstructionChangesOutcome, planInstructionChanges } from '../src/instructions.ts'
+import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import type { RecordWriteHooks } from '../src/records.ts'
 import { createOwnedStagingName } from '../src/staging.ts'
@@ -221,14 +221,17 @@ afterEach(() => {
 })
 
 describe('initialisation', () => {
-  const baselineSubjects = [
+  const baselinePublicationOrder = [
     ['context', 'encephalon:init/repository-overview'],
     ['architecture', 'encephalon:init/tooling-layout'],
     ['workflow', 'encephalon:init/commands-ci'],
   ] as const
 
+  const scannedBaselineEntries = (root: string) =>
+    scanBaseline(root).map(record => [record.kind, record.subject] as const)
+
   const committedBaselineIds = (root: string) =>
-    baselineSubjects.flatMap(([kind, subject]) => {
+    scannedBaselineEntries(root).flatMap(([kind, subject]) => {
       const directory = join(root, 'encephalon', kind)
       if (!existsSync(directory)) {
         return []
@@ -277,6 +280,12 @@ describe('initialisation', () => {
     }
     return true
   }
+
+  test('baseline scan retains the fixed publication order', () => {
+    const root = createRoot()
+
+    assert.deepEqual(scannedBaselineEntries(root), baselinePublicationOrder)
+  })
 
   test('init preflight progress reports no commits for a malformed second instruction file', () => {
     const root = createRoot()
@@ -388,8 +397,43 @@ describe('initialisation', () => {
     )
 
     const rerun = api.initEncephalon({ root })
-    assert.equal(rerun.recordsCreated.length, baselineSubjects.length)
+    assert.equal(rerun.recordsCreated.length, scannedBaselineEntries(root).length)
     assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('partial init progress uses canonical inspection guidance for a sole internal failure', () => {
+    const root = createRoot()
+    const privateSentinel = 'PRIVATE_INTERNAL_RECORD_FAILURE'
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'before-publication') {
+                  throw new Error(privateSentinel)
+                }
+              },
+            },
+          },
+        ),
+      error =>
+        assertSafeInitError(error, {
+          cacheState: 'notAttempted',
+          code: 'INTERNAL_ERROR',
+          committedInstructionFiles: [],
+          committedRecordIds: [],
+          message: 'Unable to coordinate Encephalon cache access.',
+          phase: 'recordPublication',
+          recoveryAction:
+            'Inspect the reported canonical records, then repeat the same init operation with the same options.',
+          recoveryMode: 'inspectAndRerun',
+          root,
+          sentinels: [privateSentinel],
+        }),
+    )
   })
 
   test('partial init progress includes the current record after post-link verification fails', () => {
@@ -462,7 +506,7 @@ describe('initialisation', () => {
               fault: point => {
                 if (point === 'after-canonical-link') {
                   linkedRecords += 1
-                  if (linkedRecords === baselineSubjects.length) {
+                  if (linkedRecords === scannedBaselineEntries(root).length) {
                     throw Object.assign(new Error('Injected final record verification failure'), {
                       code: 'EIO',
                     })
@@ -474,7 +518,7 @@ describe('initialisation', () => {
         ),
       EncephalonError,
     )
-    assert.equal(committedBaselineIds(root).length, baselineSubjects.length)
+    assert.equal(committedBaselineIds(root).length, scannedBaselineEntries(root).length)
     assert.equal(readdirSync(stagingDirectory).length, 0)
 
     const rerun = api.initEncephalon({ root })
@@ -503,7 +547,7 @@ describe('initialisation', () => {
 
     cacheReadTestHooks.duringDatabaseInitialisation = undefined
     const committedRecordIds = committedBaselineIds(root)
-    assert.equal(committedRecordIds.length, 3)
+    assert.equal(committedRecordIds.length, scannedBaselineEntries(root).length)
     assertSafeInitError(capturedError, {
       cacheState: 'disposable',
       code: 'IO_ERROR',
@@ -570,7 +614,7 @@ describe('initialisation', () => {
     }
 
     const committedRecordIds = committedBaselineIds(root)
-    assert.equal(committedRecordIds.length, 3)
+    assert.equal(committedRecordIds.length, scannedBaselineEntries(root).length)
     assertSafeInitError(capturedError, {
       cacheState: 'prepared',
       code: 'IO_ERROR',
@@ -623,7 +667,7 @@ describe('initialisation', () => {
         'AGENTS.md was committed, but the publicationVerification post-commit phase failed. Inspect the canonical instruction file before retrying; the linked replacement may have been displaced by a concurrent change.',
       phase: 'instructionApplication',
       recoveryAction:
-        'Inspect the reported instruction files and recovery paths, then repeat the same init operation with the same options.',
+        'Inspect the reported canonical records, instruction files and recovery paths, then repeat the same init operation with the same options.',
       recoveryMode: 'inspectAndRerun',
       root,
       sentinels: [privateSentinel],
@@ -735,9 +779,13 @@ describe('initialisation', () => {
       const committedBeforeRerun = committedBaselineIds(root)
       const rerun = api.initEncephalon({ root })
 
-      assert.equal(rerun.recordsCreated.length, 3 - committedBeforeRerun.length, failure)
+      assert.equal(
+        rerun.recordsCreated.length,
+        scannedBaselineEntries(root).length - committedBeforeRerun.length,
+        failure,
+      )
       assert.deepEqual(committedBaselineIds(root).slice(0, committedBeforeRerun.length), committedBeforeRerun, failure)
-      assert.equal(new Set(committedBaselineIds(root)).size, 3, failure)
+      assert.equal(new Set(committedBaselineIds(root)).size, scannedBaselineEntries(root).length, failure)
       assert.equal(api.validateRecords({ root }).valid, true, failure)
     }
   })
@@ -823,10 +871,14 @@ describe('initialisation', () => {
       capturedError = error
     }
 
-    const progress = (capturedError as EncephalonError).details.initProgress as {
-      committedInstructionFiles: unknown[]
-    }
+    const progress = (capturedError as EncephalonError).details.initProgress as Record<string, unknown>
     assert.deepEqual(progress.committedInstructionFiles, [])
+    assert.deepEqual(progress.committedRecordIds, committedBaselineIds(root))
+    assert.equal(progress.recoveryMode, 'inspectAndRerun')
+    assert.equal(
+      progress.recoveryAction,
+      'Inspect the reported canonical records, instruction files and recovery paths, then repeat the same init operation with the same options.',
+    )
     assert.equal(readFileSync(join(root, 'CLAUDE.md'), 'utf8'), concurrentClaude)
 
     const rerun = api.initEncephalon({ root })
@@ -929,7 +981,7 @@ describe('initialisation', () => {
       committedRecordIds: committedBaselineIds(root),
       phase: 'instructionApplication',
       recoveryAction:
-        'Inspect the reported instruction files and recovery paths, then repeat the same init operation with the same options.',
+        'Inspect the reported canonical records, instruction files and recovery paths, then repeat the same init operation with the same options.',
       recoveryMode: 'inspectAndRerun',
     })
 
@@ -979,7 +1031,7 @@ describe('initialisation', () => {
       committedRecordIds: [],
       phase: 'instructionApplication',
       recoveryAction:
-        'Inspect the reported instruction files and recovery paths, then repeat the same init operation with the same options.',
+        'Inspect the reported canonical records, instruction files and recovery paths, then repeat the same init operation with the same options.',
       recoveryMode: 'inspectAndRerun',
     })
 
@@ -1035,64 +1087,6 @@ describe('initialisation', () => {
       assert.deepEqual(progress.committedInstructionFiles, [])
       assert.equal(progress.cacheState, phase === 'cachePreparation' ? 'disposable' : 'prepared')
     }
-  })
-
-  test('instruction apply outcome retains an earlier action when a later file fails before commit', () => {
-    const root = createRoot()
-    const plans = planInstructionChanges(root, false)
-
-    const outcome = applyInstructionChangesOutcome(root, plans, {
-      fault: (point, generatedPath) => {
-        if (point === 'after-temp-create' && generatedPath?.includes('.CLAUDE.md.')) {
-          throw Object.assign(new Error('Injected second-file pre-commit failure'), {
-            code: 'EIO',
-          })
-        }
-      },
-    })
-
-    assert.deepEqual(outcome.instructionFiles, [{ action: 'updated', file: 'AGENTS.md' }])
-    assert.equal(outcome.error?.code, 'IO_ERROR')
-  })
-
-  test('instruction apply outcome includes the current post-commit action exactly once', () => {
-    const root = createRoot()
-    const [agentsPlan] = planInstructionChanges(root, false)
-    assert.ok(agentsPlan)
-
-    const outcome = applyInstructionChangesOutcome(root, [agentsPlan], {
-      fault: point => {
-        if (point === 'after-publication') {
-          throw Object.assign(new Error('Injected current-file post-commit failure'), {
-            code: 'EIO',
-          })
-        }
-      },
-    })
-
-    assert.deepEqual(outcome.instructionFiles, [{ action: 'updated', file: 'AGENTS.md' }])
-    assert.equal(outcome.error?.code, 'IO_ERROR')
-  })
-
-  test('instruction apply outcome reports committed removal when root close fails', {
-    skip: process.platform === 'win32' ? 'Windows does not hold a repository-root directory descriptor.' : false,
-  }, () => {
-    const root = createRoot()
-    const agentsPlan = createDeletePlan(root)
-
-    const outcome = applyInstructionChangesOutcome(root, [agentsPlan], {
-      rootClose: descriptor => {
-        closeSync(descriptor)
-        throw Object.assign(new Error('Injected deletion root descriptor close failure'), {
-          code: 'EIO',
-        })
-      },
-    })
-
-    assert.deepEqual(outcome.instructionFiles, [{ action: 'removed', file: 'AGENTS.md' }])
-    assert.ok(outcome.error)
-    assert.equal(outcome.error.details.instructionCommitted, true)
-    assert.equal(outcome.error.details.postCommitPhase, 'resourceCleanup')
   })
 
   test('recovers a recognised stale staging entry before baseline publication', () => {

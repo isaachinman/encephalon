@@ -1327,6 +1327,7 @@ const publishPlannedRecordInternal = (
   let descriptorMetadata: BigIntStats | undefined
   let finalStagingRevalidationSucceeded = false
   let postCleanupStagingWitness: DirectoryWitness | undefined
+  let publicationAccepted = false
   let stagingWitness: DirectoryWitness | undefined
   const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
     if (committedErrorPhase === undefined || postCommitPriority[phase] > postCommitPriority[committedErrorPhase]) {
@@ -1432,7 +1433,22 @@ const publishPlannedRecordInternal = (
         if (stagingWitness !== undefined) {
           revalidatePublicationDirectories([stagingWitness])
         }
-        finalStagingRevalidationSucceeded = true
+        if (published && committedErrorPhase === 'publicationVerification' && descriptor !== undefined) {
+          assertCanonicalPublicationIdentity(path, descriptor)
+          options.authority.acceptPublication(
+            recordFile.kind,
+            `${recordFile.id}.json`,
+            publicationRoot,
+            publicationKind,
+          )
+          publicationAccepted = true
+          fault(options.hooks, 'after-publication-accept')
+          assertCanonicalPublicationIdentity(path, descriptor)
+          if (stagingWitness !== undefined) {
+            revalidatePublicationDirectories([stagingWitness])
+          }
+        }
+        finalStagingRevalidationSucceeded = committedErrorPhase !== 'publicationVerification' || publicationAccepted
       } catch (error) {
         if (published) {
           capturePublicationVerificationError(error)
@@ -1478,7 +1494,14 @@ const publishPlannedRecordInternal = (
   if (cleanupError !== undefined) {
     throw cleanupError
   }
-  if (
+  if (publicationAccepted && descriptor !== undefined && postCleanupStagingWitness !== undefined) {
+    try {
+      assertCanonicalPublicationIdentity(path, descriptor)
+      assertStagingEmpty(postCleanupStagingWitness)
+    } catch (error) {
+      capturePublicationVerificationError(error)
+    }
+  } else if (
     committedErrorPhase !== 'publicationVerification' &&
     descriptor !== undefined &&
     postCleanupStagingWitness !== undefined

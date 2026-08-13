@@ -48,7 +48,7 @@ const recoveryActions = {
   inspectCachePreparation:
     'Inspect canonical state, run prepare, run validate, then repeat the same init operation with the same options.',
   inspectInstructions:
-    'Inspect the reported instruction files and recovery paths, then repeat the same init operation with the same options.',
+    'Inspect the reported canonical records, instruction files and recovery paths, then repeat the same init operation with the same options.',
   inspectOperationCleanup:
     'Inspect operation cleanup state, then repeat the same init operation with the same options.',
   inspectRecords: 'Inspect the reported canonical records, then repeat the same init operation with the same options.',
