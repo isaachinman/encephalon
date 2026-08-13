@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-13 for audited snapshot `9681b6c03f1cbf73263570f923493d45da1aa291`.
+Last reviewed: 2026-08-13 for code and behavioural-test snapshot `fc5a08b460554264b424dd64e385518e1ff52f36`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -41,6 +41,38 @@ This document is the concise contract maintainers should update when public beha
 - `init` may read root `AGENTS.md` and `CLAUDE.md` byte-for-byte only to manage the Encephalon block while preserving unrelated bytes.
 - Unrelated instruction text, source bodies, README content, environment files, registry configuration, Git history, Git remotes, and CI workflow contents must not enter generated records, cache search text, stdout, or structured error details.
 - The managed instruction block points agents to `./node_modules/encephalon/skills/encephalon/SKILL.md` and remains exactly reversible where Encephalon created or updated it.
+
+## Partial Initialisation Progress
+
+- Multi-resource initialisation is monotonic, not globally transactional. It does not delete committed append-only records, revert committed instruction changes, or treat disposable cache state as canonical. The first failure stops later authoritative mutations, apart from the failing subsystem's existing identity-bound cleanup.
+- Every failed `initEncephalon` call preserves the failing subsystem's `EncephalonError` code, message, cause, and existing safe detail fields. No new error code or public API type is introduced. Secondary details such as `recordId`, `filename`, `postCommitPhase`, `postCommitFailures`, and `recoveryPaths` remain available when supplied by that subsystem.
+- The error adds one bounded `details.initProgress` object with this exact shape:
+
+```ts
+{
+  phase:
+    | 'preflight'
+    | 'recordPublication'
+    | 'cachePreparation'
+    | 'instructionApplication'
+    | 'operationCleanup',
+  canonicalCommitted: boolean,
+  committedRecordIds: string[],
+  committedInstructionFiles: Array<{
+    file: 'AGENTS.md' | 'CLAUDE.md',
+    action: 'updated' | 'removed'
+  }>,
+  cacheState: 'notAttempted' | 'disposable' | 'prepared',
+  recoveryMode: 'rerun' | 'inspectAndRerun',
+  recoveryAction: string
+}
+```
+
+- `phase` is the phase active when the failure surfaced. `canonicalCommitted` is true exactly when `committedRecordIds` is non-empty. Record IDs occur once in deterministic publication order, and instruction actions occur once in fixed `AGENTS.md`, `CLAUDE.md` order. Each entry reports that this call reached the subsystem's authoritative commit event; it does not assert that the same pathname incarnation is still current after a repository change.
+- `cacheState` is `notAttempted` before cache work and remains so for remove mode, becomes `disposable` when a record commit makes prior cache state stale or cache work begins, and becomes `prepared` only after cache preparation returns successfully. Cache failure recovery is to run `prepare`, run `validate`, then repeat the same init operation with the same options.
+- `recoveryMode: 'rerun'` directs the caller to resolve any reported preflight issue or deterministic failure and repeat the same init operation with the same options. `inspectAndRerun` requires inspection of the reported canonical records, instruction files and repository-relative recovery paths, or operation-cleanup state before that same-options rerun; it is selected for identity uncertainty, internal failure, committed post-publication uncertainty, retained instruction recovery paths, and operation-cleanup failure. `recoveryAction` is selected from fixed phase/mode text and is not derived from private failure prose.
+- Every same-options rerun rescans and replans current canonical and instruction state. Partial baseline creation publishes only missing generated subjects; partial refresh does not create another resolver for an already repaired subject; partial instruction application creates no duplicate managed block; and partial remove resumes from current instruction bytes without deleting baseline records. Cache state is rebuilt from canonical records as needed.
+- `initProgress` contains only bounded validated record IDs, fixed repository-relative `AGENTS.md`/`CLAUDE.md` actions, fixed enum values, and fixed recovery text. It excludes subjects, payloads, instruction bytes, absolute paths, cache paths, raw causes, ownership tokens, stacks, and arbitrary filesystem names. Preflight failure has empty commit lists and `cacheState: 'notAttempted'`.
 
 ## Cache Compatibility
 
@@ -92,6 +124,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
+- MAR-2548 restart-safe partial initialisation progress and convergence: `fc5a08b460554264b424dd64e385518e1ff52f36`.
 - MAR-2547 fixed-root and descriptor-bound managed instruction finalisation, exact private bytes, collision and successor preservation, durability ordering, and complete safe recovery details: `bbb2182fe616ebd1264744647213cce4d9e9e429`.
 - MAR-2556 bounded, generation-stable canonical layout handling and behavioural coverage: `de05ccf06119a2ad2507accf18163be8243eafec`.
 - MAR-2569 bounded, ownership-aware staging recovery and final publication-identity coverage: `a862d8ca229b07463ac45a4b442b29b7f92eb6a8`.

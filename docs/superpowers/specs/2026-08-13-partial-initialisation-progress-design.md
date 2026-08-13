@@ -84,8 +84,8 @@ Rerunning the same command always rescans and replans:
 - already committed generated baseline subjects are recognised and not duplicated;
 - a partial refresh resolver is not recreated, while unresolved subjects receive only their missing resolver;
 - disposable cache state is rebuilt from canonical records;
-- unchanged managed blocks are revalidated and durability-flushed;
-- incomplete instruction application resumes from current file contents and creates no duplicate managed block.
+- unchanged managed blocks are revalidated and durability-flushed, while incomplete instruction application resumes from current file contents and creates no duplicate managed block;
+- incomplete remove mode resumes from current instruction bytes without deleting baseline records.
 
 No rollback or compensating deletion is introduced.
 
@@ -104,3 +104,7 @@ The smallest complementary behavioural matrix covers:
 - exact CLI JSON, exit-code preservation, deterministic order, and absence of private data.
 
 Normal init, idempotent init, refresh, remove, package, and declaration tests remain regression gates.
+
+## Reviewed implementation provenance
+
+The exact reviewed code and behavioural-test snapshot implementing this design is `fc5a08b460554264b424dd64e385518e1ff52f36`. Documentation changes do not alter the runtime API, package exports, or generated declarations.

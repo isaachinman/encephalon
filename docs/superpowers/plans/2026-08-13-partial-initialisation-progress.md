@@ -59,11 +59,11 @@ export const applyInstructionChangesOutcome = (
 
 `publishPlannedRecord` and `applyInstructionChanges` remain throwing wrappers with unchanged public behaviour.
 
-- [ ] **Step 1: Read the good-test rules before editing tests**
+- [x] **Step 1: Read the good-test rules before editing tests**
 
 Read `superpowers:test-driven-development`'s `writing-good-tests.md`. Name the production mutation each new test detects before writing it.
 
-- [ ] **Step 2: Add focused failing record-outcome tests**
+- [x] **Step 2: Add focused failing record-outcome tests**
 
 Add complementary tests proving:
 
@@ -75,7 +75,7 @@ assert.equal(outcome.committedError?.details.canonicalCommitted, true)
 
 Inject a post-link publication verification or flush failure. Also assert a pre-link failure still throws and cannot produce a committed outcome. Do not duplicate existing low-level identity or cleanup tests.
 
-- [ ] **Step 3: Run the record RED test**
+- [x] **Step 3: Run the record RED test**
 
 Run:
 
@@ -85,7 +85,7 @@ node --test --test-name-pattern='record publication outcome' test/records.test.t
 
 Expected: fail because `publishPlannedRecordOutcome` is absent or the post-link error still escapes without an outcome.
 
-- [ ] **Step 4: Implement the minimal record outcome**
+- [x] **Step 4: Implement the minimal record outcome**
 
 Make `publishPlannedRecordInternal` convert every failure after successful canonical linking into its existing highest-priority `committedError` and return `PublishResult`. Keep pre-link failures throwing. Export `publishPlannedRecordOutcome` as the direct internal outcome. Keep `publishPlannedRecord` as:
 
@@ -97,7 +97,7 @@ if (published.committedError !== undefined) {
 return published.record
 ```
 
-- [ ] **Step 5: Run record GREEN and affected record tests**
+- [x] **Step 5: Run record GREEN and affected record tests**
 
 Run:
 
@@ -107,7 +107,7 @@ node --test --test-name-pattern='record publication outcome|post-link|post-commi
 
 Expected: all selected tests pass with existing codes/details unchanged.
 
-- [ ] **Step 6: Add focused failing instruction-outcome tests**
+- [x] **Step 6: Add focused failing instruction-outcome tests**
 
 Add tests for:
 
@@ -121,7 +121,7 @@ assert.equal(outcome.error?.code, expectedCode)
 
 Cover one successful first file followed by a second-file pre-commit failure, and a current-file post-commit failure that includes the current action exactly once. Add the equivalent committed removal/root-close characterisation only if existing removal coverage does not already prove it.
 
-- [ ] **Step 7: Run the instruction RED test**
+- [x] **Step 7: Run the instruction RED test**
 
 Run:
 
@@ -131,7 +131,7 @@ node --test --test-name-pattern='instruction apply outcome' test/init.test.ts
 
 Expected: fail because `applyInstructionChangesOutcome` is absent and previous/current commit actions cannot be recovered from the throwing batch API.
 
-- [ ] **Step 8: Implement the minimal instruction outcome**
+- [x] **Step 8: Implement the minimal instruction outcome**
 
 Refactor the existing apply function into an internal outcome producer. Append an action only after the subsystem commit point is authoritative. When an `EncephalonError` has a `CommittedInstructionFailureContext`, include that current plan once before returning the error. Preserve root-close aggregation and set the committed plan for successful deletion as well as write. Implement the existing `applyInstructionChanges` as a wrapper:
 
@@ -143,7 +143,7 @@ if (outcome.error !== undefined) {
 return outcome.instructionFiles
 ```
 
-- [ ] **Step 9: Run subsystem GREEN and static checks**
+- [x] **Step 9: Run subsystem GREEN and static checks**
 
 Run:
 
@@ -155,7 +155,7 @@ bun run typecheck
 
 Expected: all affected tests and all four TypeScript projects pass; public declarations remain unchanged.
 
-- [ ] **Step 10: Commit subsystem outcomes**
+- [x] **Step 10: Commit subsystem outcomes**
 
 ```bash
 git add src/records.ts src/instructions.ts test/records.test.ts test/init.test.ts
@@ -194,7 +194,7 @@ type InitProgressDetails = {
 
 The error detail key is exactly `initProgress`.
 
-- [ ] **Step 1: Add exact RED cases for phase and progress aggregation**
+- [x] **Step 1: Add exact RED cases for phase and progress aggregation**
 
 Add a compact table plus targeted convergence tests covering:
 
@@ -208,7 +208,7 @@ Add a compact table plus targeted convergence tests covering:
 
 Each error assertion must prove original code/message, deterministic order, and absence of injected secrets/absolute paths/payload or instruction bytes.
 
-- [ ] **Step 2: Run the init-progress RED tests**
+- [x] **Step 2: Run the init-progress RED tests**
 
 Run:
 
@@ -218,7 +218,7 @@ node --test --test-name-pattern='partial init progress|init preflight progress|i
 
 Expected: failures show absent `initProgress`, lost prior commits, or wrong current-phase accounting.
 
-- [ ] **Step 3: Implement the bounded progress journal**
+- [x] **Step 3: Implement the bounded progress journal**
 
 Create one contained mutable journal outside `withOperationLock`; use immutable array replacement when recording outcomes. Transition phase immediately before each phase starts and cache state at its documented boundaries. Replace `plans.map(...)` with deterministic sequential publication through `publishPlannedRecordOutcome`; append the returned record before throwing `committedError`. Apply instructions through `applyInstructionChangesOutcome`; append its actions before throwing its error.
 
@@ -233,11 +233,11 @@ new EncephalonError(error.code, error.message, {
 
 Raw errors still pass through central `wrapIo` first. Select recovery mode/action from fixed constants and existing safe fields; never parse prose. Cache failure uses: `Run prepare, run validate, then repeat the same init operation with the same options.`
 
-- [ ] **Step 4: Run init-progress GREEN**
+- [x] **Step 4: Run init-progress GREEN**
 
 Run the same focused command from Step 2. Expected: all selected tests pass.
 
-- [ ] **Step 5: Add and witness rerun/refresh RED cases**
+- [x] **Step 5: Add and witness rerun/refresh RED cases**
 
 Add complementary tests proving:
 
@@ -254,15 +254,15 @@ node --test --test-name-pattern='partial init rerun|partial refresh rerun|partia
 
 Expected: fail before production changes or before missing convergence handling is complete.
 
-- [ ] **Step 6: Complete minimal rerun handling**
+- [x] **Step 6: Complete minimal rerun handling**
 
 Only adjust orchestration where the RED tests prove a gap. Always rescan and replan; do not persist progress, reuse plans, compensate, or add a transaction layer.
 
-- [ ] **Step 7: Add one exact CLI projection test**
+- [x] **Step 7: Add one exact CLI projection test**
 
 Exercise a deterministic init failure through the CLI. Assert one stderr JSON value, unchanged exit classification, exact safe `initProgress`, no stdout, and no private sentinel/absolute path. Remove the fault and assert the same command succeeds without duplicate records or managed blocks.
 
-- [ ] **Step 8: Run affected and full verification before commit**
+- [x] **Step 8: Run affected and full verification before commit**
 
 Run:
 
@@ -281,7 +281,7 @@ bun install --frozen-lockfile
 
 Expected: all commands exit zero; publish check may report the repository's expected already-published-version refusal while exiting zero; two existing filesystem capability skips remain acceptable.
 
-- [ ] **Step 9: Commit init progress and tests**
+- [x] **Step 9: Commit init progress and tests**
 
 ```bash
 git add src/init.ts test/init.test.ts test/cli.test.ts
@@ -304,7 +304,7 @@ git commit -m "[MAR-2548] Report partial initialisation progress"
 - Consumes: the exact code/test commit SHA from Tasks 1-2 and the final tested `initProgress` schema.
 - Produces: concise user guidance, normative maintained contract, exact provenance, and a completed historical plan. No runtime interface.
 
-- [ ] **Step 1: Update maintained documentation**
+- [x] **Step 1: Update maintained documentation**
 
 Document:
 
@@ -319,11 +319,11 @@ Document:
 
 Mark this plan's checkboxes complete only for commands actually run and record exact RED/GREEN evidence. Do not rewrite the historical MAR-2547 design or superseded broad implementation plan.
 
-- [ ] **Step 2: Add or update the smallest contract assertion**
+- [x] **Step 2: Add or update the smallest contract assertion**
 
 In `test/package.test.ts`, assert only stable maintained-document requirements not already proven by behavioural tests, such as the named `initProgress` contract and exact provenance relationship. Avoid copying large Markdown blocks.
 
-- [ ] **Step 3: Run final documentation and release gates**
+- [x] **Step 3: Run final documentation and release gates**
 
 Run:
 
@@ -344,13 +344,20 @@ git status --short
 
 Expected: all gates pass, Bun files remain unchanged and plaintext, public declarations contain no new internal types, diff check is clean, and status contains only intended documentation changes before commit.
 
-- [ ] **Step 4: Commit documentation and provenance**
+- [x] **Step 4: Commit documentation and provenance**
 
 ```bash
 git add README.md CHANGELOG.md docs/contract.md docs/superpowers/specs/2026-08-13-partial-initialisation-progress-design.md docs/superpowers/plans/2026-08-13-partial-initialisation-progress.md test/package.test.ts
 git commit -m "[MAR-2548] Document restart-safe initialisation"
 ```
 
-- [ ] **Step 5: Final tidy audit**
+- [x] **Step 5: Final tidy audit**
 
 Verify separation of concerns, understandable state transitions, no stale assumptions, dead hooks, experiments, obsolete error text, declaration leaks, documentation drift, Bun drift, or unrelated changes. Report exact commits, RED/GREEN evidence, gates, and any concern.
+
+## Completion evidence
+
+- Task 1 record RED: `node --test --test-name-pattern='record publication outcome' test/records.test.ts` exited `1` because the outcome export was absent. Record GREEN: the focused record outcome/post-commit command passed 4/4. Instruction RED exited `1` because its outcome export was absent; the committed-removal characterisation also failed on the missing commit marker. Instruction GREEN passed 3/3. Commit: `0cdc343`.
+- Task 2 aggregation RED: the focused init-progress command failed 8/8 because `initProgress` was absent. Aggregation GREEN passed 8/8. The rerun/refresh RED run passed 3/4 and exposed an invalid runtime-only fixture field; after correcting that test fixture, GREEN passed 4/4. The final combined progress/convergence selection passed 12/12, and CLI projection passed 1/1. Commits: `e4b4721`, with cause-preservation follow-up `fc5a08b`.
+- Task 3 contract RED: `node --test test/package.test.ts` passed 6/7 and failed because the maintained `## Partial Initialisation Progress` section was absent. GREEN passed 7/7 after documenting the exact contract and reviewed code/test provenance `fc5a08b460554264b424dd64e385518e1ff52f36`.
+- Task 3 final gates: package tests passed 7/7; lint checked 98 files; all four TypeScript projects passed; the full suite passed 413/415 with two expected filesystem skips; baseline and CI benchmark profiles passed; build, package, publish-contract, and frozen-install checks exited zero; `bun install --frozen-lockfile` reported no changes; both diff checks were clean. The audit found no Bun/config drift, declaration leak through the public entrypoint, stale contract assumption, or unrelated Task 3 change.

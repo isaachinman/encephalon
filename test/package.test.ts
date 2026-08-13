@@ -52,9 +52,14 @@ describe('package contract', () => {
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
     assert.match(contract, /## Public API and CLI/)
     assert.match(contract, /## Canonical Storage/)
+    assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
     assert.match(contract, /## Package and Release Gates/)
     assert.match(contract, /## Historical Plan Divergence Checklist/)
+    assert.match(
+      contract,
+      /MAR-2548 restart-safe partial initialisation progress and convergence: `fc5a08b460554264b424dd64e385518e1ff52f36`\./,
+    )
   })
 
   test('keeps installed command guidance aligned with root-install verification', () => {
