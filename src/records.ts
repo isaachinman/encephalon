@@ -43,7 +43,15 @@ import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.t
 import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import { resolveRepository } from './repository.ts'
-import { createRecordFile, formatRecordFile, MAX_RECORD_BYTES, parseRecordFile, validateKind } from './schema.ts'
+import {
+  createRecordFile,
+  formatRecordFile,
+  MAX_RECORD_BYTES,
+  parseRecordFile,
+  type ValidatedAddRecordInput,
+  validateAddRecordInput,
+  validateKind,
+} from './schema.ts'
 import {
   assertStagingEmpty,
   cleanupOwnedStagingEntry,
@@ -124,6 +132,7 @@ type RecordWriteFault =
 
 /** @internal */
 export type RecordWriteHooks = {
+  beforeOperationLock?: (() => void) | undefined
   fault?: ((point: RecordWriteFault) => void) | undefined
 }
 
@@ -1140,8 +1149,7 @@ export const readRecordsAllowingGeneratedMultiHeads = (input: RootInput, allowed
   readRecordsResolved(resolveRepository(input), {}, allowed)
 
 /** @internal */
-export const planRecordAddition = (root: string, input: AddRecordInput): PlannedRecord => {
-  const recordFile = createRecordFile(input)
+export const planRecordAddition = (root: string, recordFile: BrainRecordFile): PlannedRecord => {
   const relativePath = `encephalon/${recordFile.kind}/${recordFile.id}.json`
   const path = resolve(root, ...relativePath.split('/'))
   if (existsSync(path)) {
@@ -1157,6 +1165,21 @@ export const planRecordAddition = (root: string, input: AddRecordInput): Planned
     recordFile,
     relativePath,
   }
+}
+
+const MAX_CREATED_AT_MILLISECONDS = Date.parse('9999-12-31T23:59:59.999Z')
+
+/** @internal */
+export const nextRecordCreatedAt = (records: readonly Pick<BrainRecordFile, 'createdAt'>[], now = Date.now()) => {
+  const latest = records.reduce(
+    (maximum, record) => Math.max(maximum, Date.parse(record.createdAt)),
+    Number.NEGATIVE_INFINITY,
+  )
+  const next = Math.max(now, latest + 1)
+  if (next > MAX_CREATED_AT_MILLISECONDS) {
+    return fail('VALIDATION_FAILED', 'Canonical record history has no later representable creation timestamp.')
+  }
+  return new Date(next).toISOString()
 }
 
 /** @internal */
@@ -1547,19 +1570,16 @@ export const publishPlannedRecordOutcome = (
 
 const addRecordFileResolved = (
   root: string,
-  recordFile: BrainRecordFile,
+  recordDraft: ValidatedAddRecordInput,
   options: AddRecordOptions = {},
 ): BrainRecord => {
-  const relativePath = `encephalon/${recordFile.kind}/${recordFile.id}.json`
+  const relativePath = `encephalon/${recordDraft.kind}/${recordDraft.id}.json`
   const path = resolve(root, ...relativePath.split('/'))
   if (existsSync(path)) {
-    return fail('RECORD_EXISTS', `Record ${recordFile.id} already exists.`, {
+    return fail('RECORD_EXISTS', `Record ${recordDraft.id} already exists.`, {
       path: relativePath,
     })
   }
-  const record: BrainRecord = { ...recordFile, path: relativePath }
-  const formatted = formatRecordFile(recordFile)
-  const plan: PlannedRecord = { formatted, path, record, recordFile, relativePath }
 
   const scan = scanCanonicalRecords(root)
   if (scan.errors.length > 0) {
@@ -1570,6 +1590,10 @@ const addRecordFileResolved = (
       })),
     })
   }
+  const recordFile = createRecordFile(recordDraft, nextRecordCreatedAt(scan.records))
+  const record: BrainRecord = { ...recordFile, path: relativePath }
+  const formatted = formatRecordFile(recordFile)
+  const plan: PlannedRecord = { formatted, path, record, recordFile, relativePath }
   assertRecordGraph(
     root,
     [...scan.records, plan.record],
@@ -1611,14 +1635,15 @@ const addRecordFileResolved = (
 
 /** @internal */
 export const addRecordResolved = (root: string, input: AddRecordInput, options: AddRecordOptions = {}): BrainRecord =>
-  addRecordFileResolved(root, createRecordFile(input), options)
+  addRecordFileResolved(root, validateAddRecordInput(input), options)
 
 export const addRecord = (input: AddRecordInput): BrainRecord => {
   const parsed = parseAddRecordInput(input)
   const root = resolveRepository(parsed)
   try {
+    recordWriteTestHooks.beforeOperationLock?.()
     return withOperationLock(root, cacheLocation =>
-      addRecordFileResolved(root, parsed.recordFile, {
+      addRecordFileResolved(root, parsed.recordDraft, {
         cacheLocation,
         hooks: recordWriteTestHooks,
       }),

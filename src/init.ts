@@ -8,6 +8,7 @@ import { ordinalStringCompare } from './order.ts'
 import {
   assertCanonicalLayoutAdditions,
   assertRecordGraph,
+  nextRecordCreatedAt,
   planRecordAddition,
   publishPlannedRecordOutcome,
   type RecordReadHooks,
@@ -15,6 +16,7 @@ import {
   readRecordSnapshotResolved,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
+import { createRecordFile, validateAddRecordInput } from './schema.ts'
 import type { AddRecordInput, BrainRecord, InitEncephalonInput, InitEncephalonResult, PrepareResult } from './types.ts'
 
 const NEXT_ACTION =
@@ -226,7 +228,20 @@ const initResolved = (
       )
       const { records } = recordSnapshot
       const actions = baselineActions(records, baseline, refresh)
-      const plans = actions.additions.map(addition => planRecordAddition(root, { ...addition, root }))
+      const { plans } = actions.additions.reduce<{
+        cursor: BrainRecord[]
+        plans: ReturnType<typeof planRecordAddition>[]
+      }>(
+        (result, addition) => {
+          const recordFile = createRecordFile(
+            validateAddRecordInput({ ...addition, root }),
+            nextRecordCreatedAt(result.cursor),
+          )
+          const plan = planRecordAddition(root, recordFile)
+          return { cursor: [...result.cursor, plan.record], plans: [...result.plans, plan] }
+        },
+        { cursor: records, plans: [] },
+      )
       let recordsCreated: BrainRecord[] = []
       if (plans.length > 0) {
         assertRecordGraph(
