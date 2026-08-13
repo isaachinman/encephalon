@@ -59,7 +59,7 @@ describe('package contract', () => {
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /Last reviewed: 2026-08-13 for code and behavioural-test snapshot `d6ccda5e88ddef00202d4925379db42ea59d94a1`\./,
+      /Last reviewed: 2026-08-13 for code and behavioural-test snapshot `5a380f932b53b34256cd460f7664943412b0d265`\./,
     )
     assert.match(
       contract,
@@ -67,7 +67,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `d6ccda5e88ddef00202d4925379db42ea59d94a1`\./,
+      /MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `5a380f932b53b34256cd460f7664943412b0d265`\./,
     )
     assert.match(contract, /Historical plan's wall-clock-only `createdAt` policy/)
     assert.match(
