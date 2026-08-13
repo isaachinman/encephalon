@@ -1752,6 +1752,57 @@ describe('initialisation', () => {
     )
   })
 
+  test('instruction backup creation preserves an exact destination collision', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = Buffer.from('# Existing guidance\n')
+    const collisionBytes = Buffer.from('historical backup collision')
+    let collisionPath: string | undefined
+    let collisionIdentity: { dev: bigint; ino: bigint } | undefined
+    writeFileSync(path, original)
+    chmodSync(path, 0o741)
+    const originalMetadata = statSync(path, { bigint: true })
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: (point, generatedPath) => {
+            if (point === 'before-backup-create') {
+              assert.ok(generatedPath)
+              collisionPath = generatedPath
+              writeFileSync(generatedPath, collisionBytes)
+              const metadata = statSync(generatedPath, { bigint: true })
+              collisionIdentity = { dev: metadata.dev, ino: metadata.ino }
+            }
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+
+    assert.deepEqual(readFileSync(path), original)
+    const finalCanonicalMetadata = statSync(path, { bigint: true })
+    assert.deepEqual(
+      { dev: finalCanonicalMetadata.dev, ino: finalCanonicalMetadata.ino },
+      { dev: originalMetadata.dev, ino: originalMetadata.ino },
+    )
+    if (process.platform !== 'win32') {
+      assert.equal(finalCanonicalMetadata.mode & 0o777n, originalMetadata.mode & 0o777n)
+    }
+    assert.ok(collisionPath)
+    assert.deepEqual(readFileSync(collisionPath), collisionBytes)
+    const finalMetadata = statSync(collisionPath, { bigint: true })
+    assert.deepEqual({ dev: finalMetadata.dev, ino: finalMetadata.ino }, collisionIdentity)
+    assert.equal(
+      readdirSync(root).some(name => name.startsWith('.AGENTS.md.') && name.endsWith('.tmp')),
+      false,
+    )
+  })
+
   const instructionRecoveryAction = {
     backupCleanup:
       'Inspect the repository root and remove only a confirmed backup left by this operation before retrying.',
@@ -1943,6 +1994,51 @@ describe('initialisation', () => {
     assert.deepEqual({ dev: finalMetadata.dev, ino: finalMetadata.ino }, replacementIdentity)
   })
 
+  test('instruction backup cleanup preserves an exact quarantine destination collision', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const collisionBytes = Buffer.from('historical cleanup collision')
+    let collisionPath: string | undefined
+    let collisionIdentity: { dev: bigint; ino: bigint } | undefined
+    let predecessorPath: string | undefined
+    writeFileSync(path, '# Existing guidance\n')
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan?.contentBytes)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: (point, generatedPath) => {
+            if (point === 'after-backup-validation') {
+              const [backupName] = readdirSync(root).filter(name => name.endsWith('.backup'))
+              assert.ok(backupName)
+              predecessorPath = join(root, backupName)
+            }
+            if (point === 'before-backup-cleanup-create') {
+              assert.ok(generatedPath)
+              collisionPath = generatedPath
+              writeFileSync(generatedPath, collisionBytes)
+              const metadata = statSync(generatedPath, { bigint: true })
+              collisionIdentity = { dev: metadata.dev, ino: metadata.ino }
+            }
+          },
+        }),
+      (error: unknown) => assertCommittedInstructionError(error, 'REPOSITORY_CHANGED', 'backupCleanup'),
+    )
+
+    assert.deepEqual(readFileSync(path), agentsPlan.contentBytes)
+    assert.ok(collisionPath)
+    assert.deepEqual(readFileSync(collisionPath), collisionBytes)
+    const finalMetadata = statSync(collisionPath, { bigint: true })
+    assert.deepEqual({ dev: finalMetadata.dev, ino: finalMetadata.ino }, collisionIdentity)
+    assert.ok(predecessorPath)
+    assert.equal(readFileSync(predecessorPath, 'utf8'), '# Existing guidance\n')
+    assert.equal(
+      readdirSync(root).some(name => name.startsWith('.AGENTS.md.') && name.endsWith('.tmp')),
+      false,
+    )
+  })
+
   test('reports old-descriptor mutation during instruction backup cleanup', {
     skip: process.platform === 'win32' ? 'Windows does not allow this POSIX descriptor race.' : false,
   }, () => {
@@ -1985,6 +2081,7 @@ describe('initialisation', () => {
     const original = Buffer.from('# Exact predecessor bytes\r\n')
     writeFileSync(path, original)
     chmodSync(path, 0o741)
+    const originalMetadata = statSync(path, { bigint: true })
     const [agentsPlan] = planInstructionChanges(root, false)
     assert.ok(agentsPlan)
 
@@ -2005,10 +2102,91 @@ describe('initialisation', () => {
     )
 
     assert.deepEqual(readFileSync(path), original)
+    const finalMetadata = statSync(path, { bigint: true })
+    assert.deepEqual(
+      { dev: finalMetadata.dev, ino: finalMetadata.ino, mode: finalMetadata.mode & 0o777n },
+      { dev: originalMetadata.dev, ino: originalMetadata.ino, mode: originalMetadata.mode & 0o777n },
+    )
+    assert.deepEqual(
+      readdirSync(root).filter(name => name.startsWith('.AGENTS.md.')),
+      [],
+    )
+  })
+
+  test('restores exact predecessor state after the instruction backup move cannot continue', {
+    skip: process.platform === 'win32' ? 'Windows does not expose POSIX mode changes consistently.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = Buffer.from('# Exact predecessor after move\r\n')
+    writeFileSync(path, original)
+    chmodSync(path, 0o741)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-backup-rename') {
+              throw Object.assign(new Error('Injected post-move descriptor failure'), { code: 'EIO' })
+            }
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        return true
+      },
+    )
+
+    assert.deepEqual(readFileSync(path), original)
     assert.equal(statSync(path).mode & 0o777, 0o741)
     assert.deepEqual(
       readdirSync(root).filter(name => name.startsWith('.AGENTS.md.')),
       [],
+    )
+  })
+
+  test('instruction backup recovery does not overwrite a post-move canonical successor', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const original = Buffer.from('# Existing guidance\n')
+    const successor = Buffer.from('# Concurrent successor\n')
+    let successorIdentity: { dev: bigint; ino: bigint } | undefined
+    let backupPath: string | undefined
+    writeFileSync(path, original)
+    const [agentsPlan] = planInstructionChanges(root, false)
+    assert.ok(agentsPlan)
+
+    assert.throws(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-backup-rename') {
+              writeFileSync(path, successor)
+              const metadata = statSync(path, { bigint: true })
+              successorIdentity = { dev: metadata.dev, ino: metadata.ino }
+              const [backupName] = readdirSync(root).filter(name => name.endsWith('.backup'))
+              assert.ok(backupName)
+              backupPath = join(root, backupName)
+              throw Object.assign(new Error('Injected post-move descriptor failure'), { code: 'EIO' })
+            }
+          },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        return true
+      },
+    )
+
+    assert.deepEqual(readFileSync(path), successor)
+    const finalSuccessorMetadata = statSync(path, { bigint: true })
+    assert.deepEqual({ dev: finalSuccessorMetadata.dev, ino: finalSuccessorMetadata.ino }, successorIdentity)
+    assert.ok(backupPath)
+    assert.deepEqual(readFileSync(backupPath), original)
+    assert.equal(
+      readdirSync(root).some(name => name.startsWith('.AGENTS.md.') && name.endsWith('.tmp')),
+      false,
     )
   })
 

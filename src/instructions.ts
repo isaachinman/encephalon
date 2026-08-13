@@ -372,7 +372,10 @@ type AtomicWriteFault =
   | 'after-delete-quarantine'
   | 'after-delete-verification'
   | 'after-final-backup-validation'
+  | 'after-backup-rename'
   | 'after-plan-validation'
+  | 'before-backup-cleanup-create'
+  | 'before-backup-create'
   | 'before-deletion'
   | 'during-delete-flush'
   | 'during-backup-cleanup'
@@ -386,11 +389,11 @@ type AtomicWriteFault =
   | 'during-temp-write'
 
 type AtomicWriteHooks = {
-  fault?: (point: AtomicWriteFault) => void
+  fault?: (point: AtomicWriteFault, generatedPath?: string) => void
 }
 
-const fault = (hooks: AtomicWriteHooks | undefined, point: AtomicWriteFault) => {
-  hooks?.fault?.(point)
+const fault = (hooks: AtomicWriteHooks | undefined, point: AtomicWriteFault, generatedPath?: string) => {
+  hooks?.fault?.(point, generatedPath)
 }
 
 const closeAfterOperation = (descriptor: number, operationFailed: boolean) => {
@@ -616,6 +619,10 @@ const restoreHeldBackup = (
           throw error
         }
       }
+    } else {
+      assertPathIdentifiesDescriptor(path, held, plan.filename, false)
+      assertPathIdentifiesDescriptor(backupPath, held, plan.filename, false)
+      unlinkSync(backupPath)
     }
   } catch {
     // Keep any exact backup or generated recovery copy for a later safe retry.
@@ -723,7 +730,16 @@ const finaliseHeldBackup = (
 ) => {
   fault(hooks, 'during-backup-cleanup')
   const cleanupPath = tempPathFor(path, 'backup')
-  renameSync(backupPath, cleanupPath)
+  fault(hooks, 'before-backup-cleanup-create', cleanupPath)
+  try {
+    linkSync(backupPath, cleanupPath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      return instructionIdentityChanged(plan.filename, { cause: error })
+    }
+    throw error
+  }
+  unlinkSync(backupPath)
   fault(hooks, 'after-final-backup-validation')
   const backupPathReplaced = lstatIfExists(backupPath) !== undefined
   assertPathIdentifiesDescriptor(cleanupPath, held, plan.filename, true)
@@ -787,13 +803,24 @@ const writePlan = (root: string, path: string, plan: FilePlan, hooks?: AtomicWri
     fsyncSync(descriptor)
     assertPlanIsCurrent(root, plan)
     if (plan.originalFileExisted) {
-      renameSync(path, backupPath)
-      backup = holdInstructionFile(backupPath, plan.filename)
+      backup = holdInstructionFile(path, plan.filename)
       if (!backup.bytes.equals(plan.originalBytes)) {
         return instructionIdentityChanged(plan.filename)
       }
+      assertPathIdentifiesDescriptor(path, backup, plan.filename, true)
       fchmodSync(descriptor, Number(backup.mode))
       fsyncSync(descriptor)
+      fault(hooks, 'before-backup-create', backupPath)
+      try {
+        linkSync(path, backupPath)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+          return instructionIdentityChanged(plan.filename, { cause: error })
+        }
+        throw error
+      }
+      unlinkSync(path)
+      fault(hooks, 'after-backup-rename')
       fault(hooks, 'after-backup-validation')
       assertPathIdentifiesDescriptor(backupPath, backup, plan.filename, true)
     }
