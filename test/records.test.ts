@@ -41,9 +41,17 @@ import { discoverRepository, repositoryTestHooks } from '../src/repository.ts'
 import { validateKind } from '../src/schema.ts'
 import * as stagingInternals from '../src/staging.ts'
 import type { BrainRecord, ValidateResult } from '../src/types.ts'
-import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
+import {
+  canRenameParentWithOpenChild,
+  createTestRepository,
+  ensureParent,
+  removeTestRepository,
+} from '../test/helpers.ts'
 
 const roots: string[] = []
+const renameParentWithOpenChildSkip = canRenameParentWithOpenChild()
+  ? false
+  : 'The filesystem does not allow replacing a parent while a child descriptor is open.'
 
 const createRoot = () => {
   const root = createTestRepository()
@@ -348,7 +356,9 @@ describe('canonical records', () => {
     )
   })
 
-  test('does not publish into a repository root replaced after lock acquisition', () => {
+  test('does not publish into a repository root replaced after lock acquisition', {
+    skip: renameParentWithOpenChildSkip,
+  }, () => {
     const root = createRoot()
     const replacement = createRoot()
     const displaced = `${root}-locked-root`
@@ -373,7 +383,9 @@ describe('canonical records', () => {
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'replacement-root-candidate.json')), false)
   })
 
-  test('does not publish into a repository root replaced after scan validation', () => {
+  test('does not publish into a repository root replaced after scan validation', {
+    skip: renameParentWithOpenChildSkip,
+  }, () => {
     const root = createRoot()
     const replacement = createRoot()
     const displaced = `${root}-post-scan-root`
@@ -1388,6 +1400,53 @@ describe('canonical records', () => {
     assert.equal(
       existsSync(join(root, 'encephalon', 'decision', 'candidate-after-staging-cleanup-rewrite.json')),
       false,
+    )
+  })
+
+  test('cleans a stale owned alias of an existing canonical record before publication', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'canonical-with-stale-staging-alias' })
+    const canonicalPath = join(root, 'encephalon', 'decision', 'canonical-with-stale-staging-alias.json')
+    const canonicalBytes = readFileSync(canonicalPath, 'utf8')
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    mkdirSync(stagingDirectory, { recursive: true })
+    linkSync(canonicalPath, join(stagingDirectory, ownedStagingName(0)))
+
+    api.addRecord({
+      id: 'candidate-after-canonical-staging-alias',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'staging.canonical-alias',
+    })
+
+    assert.deepEqual(readdirSync(stagingDirectory), [])
+    assert.equal(readFileSync(canonicalPath, 'utf8'), canonicalBytes)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', 'candidate-after-canonical-staging-alias.json')), true)
+  })
+
+  test('reports baseline corpus limits before a canonical timestamp ceiling', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: MAX_CANONICAL_RECORDS }, (_, position) => position)) {
+      writeCanonicalRecord(root, {
+        createdAt: index === MAX_CANONICAL_RECORDS - 1 ? '9999-12-31T23:59:59.999Z' : timestampAt(index),
+        id: `baseline-limit-${index.toString().padStart(4, '0')}`,
+        subject: `baseline.limit.${index}`,
+      })
+    }
+
+    assert.throws(
+      () => api.initEncephalon({ root }),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: { errors?: Array<{ code?: unknown }> } }
+        assert.equal(actual.code, 'VALIDATION_FAILED')
+        assert.equal(
+          actual.details?.errors?.some(issue => issue.code === 'CORPUS_RECORD_LIMIT'),
+          true,
+        )
+        return true
+      },
     )
   })
 

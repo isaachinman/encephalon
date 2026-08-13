@@ -35,7 +35,12 @@ import { ordinalStringCompare } from '../src/order.ts'
 import type { RecordWriteHooks } from '../src/records.ts'
 import { createOwnedStagingName } from '../src/staging.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
-import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
+import {
+  canRenameParentWithOpenChild,
+  createTestRepository,
+  ensureParent,
+  removeTestRepository,
+} from '../test/helpers.ts'
 
 const roots: string[] = []
 const unreadableDirectorySkip =
@@ -67,28 +72,9 @@ const readOnlyHoldSkip = (() => {
   }
 })()
 removeTestRepository(readOnlyProbeRoot)
-const openChildRenameProbeRoot = createTestRepository()
-const openChildRenameProbeParent = join(openChildRenameProbeRoot, 'parent')
-const openChildRenameProbeTarget = join(openChildRenameProbeRoot, 'renamed')
-mkdirSync(openChildRenameProbeParent)
-const openChildRenameProbePath = join(openChildRenameProbeParent, 'child')
-writeFileSync(openChildRenameProbePath, 'probe')
-const openChildRenameProbeDescriptor = openSync(openChildRenameProbePath, 'r')
-const renameParentWithOpenChildSkip = (() => {
-  try {
-    renameSync(openChildRenameProbeParent, openChildRenameProbeTarget)
-    return false
-  } catch (error) {
-    const { code } = error as NodeJS.ErrnoException
-    if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
-      return 'The filesystem does not allow replacing a parent while a child descriptor is open.'
-    }
-    throw error
-  } finally {
-    closeSync(openChildRenameProbeDescriptor)
-    removeTestRepository(openChildRenameProbeRoot)
-  }
-})()
+const renameParentWithOpenChildSkip = canRenameParentWithOpenChild()
+  ? false
+  : 'The filesystem does not allow replacing a parent while a child descriptor is open.'
 
 const generatedPayload = (records: readonly { payload: unknown; subject: string }[], subject: string) => {
   const payload = records.find(record => record.subject === subject)?.payload
@@ -932,7 +918,9 @@ describe('initialisation', () => {
     }
   })
 
-  test('does not initialise a repository root replaced at record publication', () => {
+  test('does not initialise a repository root replaced at record publication', {
+    skip: renameParentWithOpenChildSkip,
+  }, () => {
     const root = createRoot()
     const replacement = createRoot()
     const displaced = `${root}-init-publication-root`

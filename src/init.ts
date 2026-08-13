@@ -232,27 +232,27 @@ const initResolved = (
       const { records } = recordSnapshot
       assertCacheLocation(location)
       const actions = baselineActions(records, baseline, refresh)
-      const { plans } = actions.additions.reduce<{
-        cursor: BrainRecord[]
-        plans: ReturnType<typeof planRecordAddition>[]
-      }>(
-        (result, addition) => {
-          const recordFile = createRecordFile(
-            validateAddRecordInput({ ...addition, root }),
-            nextRecordCreatedAt(result.cursor),
-          )
-          const plan = planRecordAddition(root, recordFile)
-          return { cursor: [...result.cursor, plan.record], plans: [...result.plans, plan] }
-        },
-        { cursor: records, plans: [] },
-      )
+      const validatedAdditions = actions.additions.map(addition => validateAddRecordInput({ ...addition, root }))
       let recordsCreated: BrainRecord[] = []
-      if (plans.length > 0) {
+      if (validatedAdditions.length > 0) {
+        const validationPlans = validatedAdditions.map(addition =>
+          planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
+        )
         assertRecordGraph(
           root,
-          [...records, ...plans.map(plan => plan.record)],
+          [...records, ...validationPlans.map(plan => plan.record)],
           'The generated baseline would make canonical records invalid.',
           hooks,
+        )
+        const { plans } = validatedAdditions.reduce<{
+          cursor: BrainRecord[]
+          plans: ReturnType<typeof planRecordAddition>[]
+        }>(
+          (result, addition) => {
+            const plan = planRecordAddition(root, createRecordFile(addition, nextRecordCreatedAt(result.cursor)))
+            return { cursor: [...result.cursor, plan.record], plans: [...result.plans, plan] }
+          },
+          { cursor: records, plans: [] },
         )
         const authority = assertCanonicalLayoutAdditions(
           plans.map(plan => plan.record.kind),
@@ -276,7 +276,7 @@ const initResolved = (
       progress.phase = 'cachePreparation'
       progress.cacheState = 'disposable'
       const cacheResult =
-        plans.length > 0
+        validatedAdditions.length > 0
           ? hydrateResolvedRepository(root, false, location)
           : prepareResolvedRepository(root, false, location)
       progress.cacheState = 'prepared'
