@@ -436,8 +436,8 @@ export const withOperationLock = <Result>(
     }
     writeCacheOwner(location, candidateDirectory, `${JSON.stringify(candidateOwner)}\n`)
 
-    const observedLock = inspectCacheOwnedDirectory(location, lockName)
-    if (observedLock !== undefined) {
+    const observedLock = observeCacheOwnedDirectory(location, lockName)
+    if (observedLock.kind === 'stable') {
       testHooks.afterStaleObservation?.()
     }
 

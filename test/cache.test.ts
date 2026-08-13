@@ -1540,6 +1540,25 @@ describe('SQLite cache and reads', () => {
     assert.equal(statSync(join(root, 'node_modules'), { bigint: true }).ino, before.ino)
   })
 
+  test('tolerates an operation lock that changes before gate acquisition', () => {
+    const root = createRoot()
+    const location = inspectCacheLocation(root)
+    const lockPath = join(location.directory, 'operation.lock')
+    const displacedPath = join(root, 'displaced-operation-lock')
+    mkdirSync(lockPath)
+    cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = path => {
+      if (path === lockPath) {
+        cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = undefined
+        renameSync(path, displacedPath)
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
+  })
+
   test('uses schema version rather than package version for cache compatibility', () => {
     const root = createRoot()
     const prepare =
