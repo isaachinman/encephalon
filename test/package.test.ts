@@ -60,6 +60,10 @@ describe('package contract', () => {
       contract,
       /MAR-2548 restart-safe partial initialisation progress and convergence: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`\./,
     )
+    assert.match(
+      contract,
+      /MAR-2563 operation-locked record timestamp assignment and cross-process ordering: `44776a94085bcedc361c46707b7f3b93e743c9e7`\./,
+    )
   })
 
   test('keeps installed command guidance aligned with root-install verification', () => {
