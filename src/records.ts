@@ -1683,6 +1683,7 @@ const publishPlannedRecordInternal = (
         publicationKind,
         recordDigest(formatted),
       )
+      publicationAccepted = true
       fault(options.hooks, 'after-publication-accept')
       assertCanonicalPublicationIdentity(path, descriptor)
       assertStagingEmpty(postCleanupStagingWitness)
@@ -1703,6 +1704,13 @@ const publishPlannedRecordInternal = (
       capturePostCommitError('publicationVerification', error)
     }
     descriptor = undefined
+  }
+  if (publicationAccepted) {
+    try {
+      options.authority.acceptStagingCleanup()
+    } catch (error) {
+      capturePublicationVerificationError(error)
+    }
   }
   return {
     record,
