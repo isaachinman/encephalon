@@ -28,7 +28,10 @@ const run = (root: string, arguments_: string[]) =>
   })
 
 const outputJson = (result: ReturnType<typeof run>) => JSON.parse(result.stdout) as unknown
-const errorJson = (result: ReturnType<typeof run>) => JSON.parse(result.stderr) as { error: { message: string } }
+const errorJson = (result: ReturnType<typeof run>) =>
+  JSON.parse(result.stderr) as {
+    error: { code: string; details: Record<string, unknown>; message: string }
+  }
 const baselineSubjects = [
   ['context', 'encephalon:init/repository-overview'],
   ['architecture', 'encephalon:init/tooling-layout'],
@@ -249,6 +252,21 @@ describe('command-line interface', () => {
     const help = run(root, ['--help'])
     assert.equal(help.status, 0)
     assert.match(help.stdout, /^Usage: encephalon/m)
+    assert.ok(
+      help.stdout.includes('list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <1..50>]'),
+    )
+    assert.ok(help.stdout.includes('search [--kind <kind>] [--include-superseded] [--limit <1..50>] [--] <query>'))
+    assert.ok(
+      help.stdout.includes('search --compact [--kind <kind>] [--include-superseded] [--limit <1..100>] [--] <query>'),
+    )
+    assert.ok(
+      help.stdout.includes(
+        'gather [--search <query> ...] [--show <id> ...] [--hydrate] [--include-superseded]\n' +
+          '         [--kind <kind>] [--limit <1..100>]',
+      ),
+    )
+    assert.ok(help.stdout.includes('Accepts at most 16 searches and 64 shows.'))
+    assert.ok(help.stdout.includes('Accepts at most 1,000 supersession targets.'))
     assert.match(help.stdout, /only remaining argv token/)
     assert.match(help.stdout, /must use --name=value/)
     const version = run(root, ['--version'])
@@ -257,6 +275,128 @@ describe('command-line interface', () => {
     const commandHelp = run(root, ['list', '--help'])
     assert.equal(commandHelp.status, 2)
     assert.equal(errorJson(commandHelp).error.message, 'Unknown option --help.')
+  })
+
+  test('enforces operation-specific limit budgets before API invocation', () => {
+    const root = createRoot()
+    const cases = [
+      {
+        accepted: ['list', '--limit=50'],
+        budget: 'fullResultLimit',
+        maximum: 50,
+        rejected: ['list', '--limit=51'],
+      },
+      {
+        accepted: ['search', '--limit=50', 'x'],
+        budget: 'fullResultLimit',
+        maximum: 50,
+        rejected: ['search', '--limit=51', 'x'],
+      },
+      {
+        accepted: ['search', '--compact', '--limit=100', 'x'],
+        budget: 'compactResultLimit',
+        maximum: 100,
+        rejected: ['search', '--compact', '--limit=101', 'x'],
+      },
+      {
+        accepted: ['gather', '--limit=100'],
+        budget: 'compactResultLimit',
+        maximum: 100,
+        rejected: ['gather', '--limit=101'],
+      },
+    ] as const
+
+    for (const entry of cases) {
+      const accepted = run(root, [...entry.accepted, '--root', root])
+      assert.equal(accepted.status, 0, entry.accepted.join(' '))
+
+      const rejected = run(root, [...entry.rejected, '--root', root])
+      assert.equal(rejected.status, 2, entry.rejected.join(' '))
+      assert.deepEqual(errorJson(rejected).error.details, {
+        budget: entry.budget,
+        field: 'limit',
+        maximum: entry.maximum,
+      })
+      assert.equal(errorJson(rejected).error.message, `--limit must be an integer between 1 and ${entry.maximum}.`)
+    }
+  })
+
+  test('enforces repeated-option count budgets before parsing their contents', () => {
+    const root = createRoot()
+    const oversizedQuery = Array.from({ length: 33 }, (_, index) => `private-query-${index}`).join(' ')
+    const gatherArguments = Array.from({ length: 17 }, (_, index) => [
+      '--search',
+      index === 0 ? oversizedQuery : `query-${index}`,
+    ]).flat()
+    const gathered = run(root, ['gather', '--root', root, ...gatherArguments])
+
+    assert.equal(gathered.status, 2)
+    assert.deepEqual(errorJson(gathered).error.details, {
+      budget: 'gatherSearches',
+      field: 'searches',
+      maximum: 16,
+    })
+    assert.equal(gathered.stderr.includes('private-query'), false)
+
+    const supersedesArguments = Array.from({ length: 1001 }, (_, index) => [
+      '--supersedes',
+      index === 0 ? 'private-supersedes' : 'x',
+    ]).flat()
+    const added = run(root, [
+      'add',
+      '--root',
+      root,
+      '--kind',
+      'decision',
+      '--subject',
+      'cli.budget',
+      '--source',
+      'agent',
+      '--data',
+      '{private-invalid-json',
+      ...supersedesArguments,
+    ])
+
+    assert.equal(added.status, 2)
+    assert.deepEqual(errorJson(added).error.details, {
+      budget: 'supersessionEdges',
+      field: 'supersedes',
+      maximum: 1000,
+    })
+    assert.equal(added.stderr.includes('private-invalid-json'), false)
+    assert.equal(added.stderr.includes('private-supersedes'), false)
+
+    const rawCountCases = [
+      {
+        arguments: ['gather', ...Array.from({ length: 17 }, () => '--search=')],
+        details: { budget: 'gatherSearches', field: 'searches', maximum: 16 },
+        message: 'gather may contain at most 16 searches.',
+      },
+      {
+        arguments: ['gather', ...Array.from({ length: 65 }, () => '--show=')],
+        details: { budget: 'gatherShows', field: 'shows', maximum: 64 },
+        message: 'gather may contain at most 64 shows.',
+      },
+      {
+        arguments: [
+          'add',
+          '--kind=decision',
+          '--subject=cli.budget',
+          '--source=agent',
+          '--data={}',
+          ...Array.from({ length: 1001 }, () => '--supersedes='),
+        ],
+        details: { budget: 'supersessionEdges', field: 'supersedes', maximum: 1000 },
+        message: '--supersedes may be supplied at most 1000 times.',
+      },
+    ] as const
+
+    for (const rawCountCase of rawCountCases) {
+      const result = run(root, [...rawCountCase.arguments, '--root', root])
+      assert.equal(result.status, 2)
+      assert.deepEqual(errorJson(result).error.details, rawCountCase.details)
+      assert.equal(errorJson(result).error.message, rawCountCase.message)
+    }
   })
 
   test('parses terminators, hyphen-leading queries, and repeated options predictably', () => {
@@ -441,7 +581,7 @@ describe('command-line interface', () => {
       },
       {
         arguments_: ['list', '--root', root, '--limit=-1'],
-        message: '--limit must be an integer between 1 and 1000.',
+        message: '--limit must be an integer between 1 and 50.',
       },
       {
         arguments_: ['list', '--root', root, '--limit', '-1'],

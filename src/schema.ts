@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { ARTIFACTS_DIRECTORY_NAME } from './canonical-layout.ts'
-import { fail } from './errors.ts'
+import { fail, failBudget } from './errors.ts'
+import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import type { AddRecordInput, BrainRecordFile, JsonValue } from './types.ts'
 
 export const MAX_RECORD_BYTES = 1024 * 1024
@@ -366,17 +367,27 @@ const normalizeOptionalText = (value: unknown, field: string, maximumBytes: numb
   return fail('INVALID_ARGUMENT', `${field} must be a non-empty string within its size limit.`, { field })
 }
 
-const optionalStringArray = (value: unknown, field: string, item: (value: unknown) => string) => {
+const validateSupersedes = (value: unknown) => {
+  if (Array.isArray(value) && value.length > OPERATION_BUDGETS.supersessionEdges.maximum) {
+    return failBudget(
+      'supersessionEdges',
+      `supersedes may contain at most ${OPERATION_BUDGETS.supersessionEdges.maximum} record ids.`,
+    )
+  }
+  return validateStringArray(value, 'supersedes', validateId)
+}
+
+const optionalSupersedes = (value: unknown) => {
   if (value === undefined) {
     return
   }
   if (!Array.isArray(value)) {
-    return fail('INVALID_ARGUMENT', `${field} must be an array of strings.`, { field })
+    return fail('INVALID_ARGUMENT', 'supersedes must be an array of strings.', { field: 'supersedes' })
   }
   if (value.length === 0) {
     return
   }
-  return validateStringArray(value, field, item)
+  return validateSupersedes(value)
 }
 
 const optionalArtifacts = (value: unknown, kind: string, id: string) => {
@@ -420,7 +431,7 @@ export const validateAddRecordInput = (input: AddRecordInput): ValidatedAddRecor
   const source = requiredText(input.source, 'source')
   const payload = validateJsonValue(input.payload)
   const confidence = input.confidence === undefined ? undefined : validateConfidence(input.confidence)
-  const supersedes = optionalStringArray(input.supersedes, 'supersedes', validateId)
+  const supersedes = optionalSupersedes(input.supersedes)
   const artifacts = optionalArtifacts(input.artifacts, kind, id)
   const searchText =
     input.searchText === undefined
@@ -480,7 +491,7 @@ export const parseRecordFile = (value: unknown): BrainRecordFile => {
     record.searchText = normalizeOptionalText(object.searchText, 'searchText', MAX_SEARCH_TEXT_BYTES)
   }
   if (object.supersedes !== undefined) {
-    record.supersedes = validateStringArray(object.supersedes, 'supersedes', validateId)
+    record.supersedes = validateSupersedes(object.supersedes)
   }
   return record
 }

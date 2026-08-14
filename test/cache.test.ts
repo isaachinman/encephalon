@@ -37,6 +37,7 @@ import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import { recordWriteTestHooks } from '../src/records.ts'
+import { repositoryTestHooks } from '../src/repository.ts'
 import {
   canRenameParentWithOpenChild,
   createTestRepository,
@@ -80,15 +81,16 @@ afterEach(() => {
   cacheReadTestHooks.beforeManifestEntryLstat = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   recordWriteTestHooks.fault = undefined
+  repositoryTestHooks.afterGitMarkerDecision = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
 
 const functionFromApi = <T>(name: string) => (api as unknown as Record<string, T>)[name] as T
 
-const assertBudgetError = (operation: () => unknown, budget: string) => {
+const assertBudgetError = (operation: () => unknown, expected: { budget: string; field: string; maximum: number }) => {
   assert.throws(operation, (error: unknown) => {
     assert.equal((error as { code?: unknown }).code, 'INVALID_ARGUMENT')
-    assert.equal((error as { details?: { budget?: unknown } }).details?.budget, budget)
+    assert.deepEqual((error as { details?: unknown }).details, expected)
     return true
   })
 }
@@ -1782,50 +1784,76 @@ describe('SQLite cache and reads', () => {
       Array.from({ length: 64 }, () => 'missing'),
     )
 
-    const invalidCases: Array<{ budget: string; run: (root: string) => void }> = [
-      { budget: 'fullResultLimit', run: root => listRecords({ limit: 51, root }) },
-      { budget: 'fullResultLimit', run: root => searchRecords({ limit: 51, query: 'x', root }) },
+    const invalidCases: Array<{
+      expected: { budget: string; field: string; maximum: number }
+      run: (root: string) => void
+    }> = [
       {
-        budget: 'compactResultLimit',
+        expected: { budget: 'fullResultLimit', field: 'limit', maximum: 50 },
+        run: root => listRecords({ limit: 51, root }),
+      },
+      {
+        expected: { budget: 'fullResultLimit', field: 'limit', maximum: 50 },
+        run: root => searchRecords({ limit: 51, query: 'x', root }),
+      },
+      {
+        expected: { budget: 'compactResultLimit', field: 'limit', maximum: 100 },
         run: root => searchCompactRecords({ limit: 101, query: 'x', root }),
       },
       {
-        budget: 'queryBytes',
+        expected: { budget: 'queryBytes', field: 'query', maximum: 1024 },
         run: root => searchRecords({ query: `${'x'.repeat(1024)}y`, root }),
       },
       {
-        budget: 'queryBytes',
+        expected: { budget: 'queryBytes', field: 'query', maximum: 1024 },
         run: root => searchCompactRecords({ query: `${'x'.repeat(1024)}y`, root }),
       },
       {
-        budget: 'queryTerms',
+        expected: { budget: 'queryTerms', field: 'query', maximum: 32 },
         run: root => searchRecords({ query: Array.from({ length: 33 }, () => 'x').join(' '), root }),
       },
       {
-        budget: 'queryTerms',
+        expected: { budget: 'queryTerms', field: 'query', maximum: 32 },
         run: root => searchCompactRecords({ query: Array.from({ length: 33 }, () => 'x').join(' '), root }),
       },
       {
-        budget: 'gatherSearches',
-        run: root => gatherRecords({ root, searches: Array.from({ length: 17 }, () => 'x') }),
+        expected: { budget: 'gatherSearches', field: 'searches', maximum: 16 },
+        run: root => gatherRecords({ root, searches: [42, ...Array.from({ length: 16 }, () => 'x')] }),
       },
       {
-        budget: 'gatherShows',
-        run: root => gatherRecords({ root, shows: Array.from({ length: 65 }, () => 'missing') }),
+        expected: { budget: 'gatherShows', field: 'shows', maximum: 64 },
+        run: root =>
+          gatherRecords({ root, shows: ['not a valid record id', ...Array.from({ length: 64 }, () => 'missing')] }),
       },
       {
-        budget: 'compactResultLimit',
+        expected: { budget: 'gatherShows', field: 'shows', maximum: 64 },
+        run: root => gatherRecords({ root, searches: [42], shows: Array.from({ length: 65 }, () => 'missing') }),
+      },
+      {
+        expected: { budget: 'compactResultLimit', field: 'limit', maximum: 100 },
         run: root => gatherRecords({ limit: 101, root, searches: ['x'] }),
       },
       {
-        budget: 'queryTerms',
+        expected: { budget: 'queryTerms', field: 'query', maximum: 32 },
         run: root => gatherRecords({ root, searches: [Array.from({ length: 33 }, () => 'x').join(' ')] }),
       },
     ]
 
     for (const invalidCase of invalidCases) {
       const root = createRoot()
-      assertBudgetError(() => invalidCase.run(root), invalidCase.budget)
+      let repositoryInspections = 0
+      let cacheLocationInspections = 0
+      repositoryTestHooks.afterGitMarkerDecision = () => {
+        repositoryInspections += 1
+        throw new Error('repository inspection must not run for rejected budget input')
+      }
+      cacheLocationTestHooks.beforeLocationInspection = () => {
+        cacheLocationInspections += 1
+        throw new Error('cache inspection must not run for rejected budget input')
+      }
+      assertBudgetError(() => invalidCase.run(root), invalidCase.expected)
+      assert.equal(repositoryInspections, 0)
+      assert.equal(cacheLocationInspections, 0)
       assert.equal(existsSync(cacheDirectoryPath(root)), false)
     }
   })
@@ -1847,7 +1875,32 @@ describe('SQLite cache and reads', () => {
 
     const searchRecords =
       functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
-    assertBudgetError(() => searchRecords({ limit: 5, query: 'response budget marker', root }), 'fullResponseBytes')
+    assertBudgetError(() => searchRecords({ limit: 5, query: 'response budget marker', root }), {
+      budget: 'fullResponseBytes',
+      field: 'response',
+      maximum: 4 * 1024 * 1024,
+    })
+
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+    assertBudgetError(
+      () =>
+        gatherRecords({
+          root,
+          shows: Array.from({ length: 5 }, () => 'large-response-0'),
+        }),
+      {
+        budget: 'fullResponseBytes',
+        field: 'response',
+        maximum: 4 * 1024 * 1024,
+      },
+    )
+    const gathered = gatherRecords({ limit: 5, root, searches: ['response budget marker'] }) as {
+      searches: Array<{ results: unknown[] }>
+    }
+    assert.deepEqual(
+      gathered.searches.map(search => search.results.length),
+      [5],
+    )
 
     const searchCompactRecords =
       functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')

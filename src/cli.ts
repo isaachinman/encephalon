@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { parseArgs } from 'node:util'
-import { cliErrorResponse, fail } from './errors.ts'
+import { cliErrorResponse, fail, failBudget } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import {
   addRecord,
@@ -16,6 +16,7 @@ import {
   showRecord,
   validateRecords,
 } from './index.ts'
+import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import type { JsonValue } from './types.ts'
 
 const HELP = `Usage: encephalon [--root <path>] <command> [options]
@@ -24,14 +25,17 @@ Commands:
   init [--refresh-baseline] [--remove]
   add [--id <id>] --kind <kind> --subject <subject> --source <source> --data <json>
       [--confidence <0..1>] [--text <text>] [--supersedes <id> ...] [--artifact <path> ...]
+      Accepts at most ${OPERATION_BUDGETS.supersessionEdges.maximum.toLocaleString('en-GB')} supersession targets.
   prepare
   hydrate
   validate
-  list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <1..1000>]
+  list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <${OPERATION_BUDGETS.fullResultLimit.minimum}..${OPERATION_BUDGETS.fullResultLimit.maximum}>]
   show --id <id> [--active-only]
-  search [--compact] [--kind <kind>] [--include-superseded] [--limit <1..1000>] [--] <query>
+  search [--kind <kind>] [--include-superseded] [--limit <${OPERATION_BUDGETS.fullResultLimit.minimum}..${OPERATION_BUDGETS.fullResultLimit.maximum}>] [--] <query>
+  search --compact [--kind <kind>] [--include-superseded] [--limit <${OPERATION_BUDGETS.compactResultLimit.minimum}..${OPERATION_BUDGETS.compactResultLimit.maximum}>] [--] <query>
   gather [--search <query> ...] [--show <id> ...] [--hydrate] [--include-superseded]
-         [--kind <kind>] [--limit <1..1000>]
+         [--kind <kind>] [--limit <${OPERATION_BUDGETS.compactResultLimit.minimum}..${OPERATION_BUDGETS.compactResultLimit.maximum}>]
+         Accepts at most ${OPERATION_BUDGETS.gatherSearches.maximum} searches and ${OPERATION_BUDGETS.gatherShows.maximum} shows.
 
 Global options:
   --root <path>   Use this exact Git repository root.
@@ -52,8 +56,55 @@ type CommandResult = {
   format?: 'json' | 'text'
 }
 
+type RepeatedOptionBudget = {
+  budgetKey: 'gatherSearches' | 'gatherShows' | 'supersessionEdges'
+  message: (maximum: number) => string
+  option: 'search' | 'show' | 'supersedes'
+}
+
+const REPEATED_OPTION_BUDGETS = {
+  search: {
+    budgetKey: 'gatherSearches',
+    message: (maximum: number) => `gather may contain at most ${maximum} searches.`,
+    option: 'search',
+  },
+  show: {
+    budgetKey: 'gatherShows',
+    message: (maximum: number) => `gather may contain at most ${maximum} shows.`,
+    option: 'show',
+  },
+  supersedes: {
+    budgetKey: 'supersessionEdges',
+    message: (maximum: number) => `--supersedes may be supplied at most ${maximum} times.`,
+    option: 'supersedes',
+  },
+} as const satisfies Record<string, RepeatedOptionBudget>
+
 const invalid = (message: string, details: Record<string, JsonValue> = {}): never =>
   fail('INVALID_ARGUMENT', message, details)
+
+const rawOptionCount = (arguments_: readonly string[], option: string) =>
+  arguments_.reduce(
+    (state, argument) => {
+      if (!state.terminated) {
+        if (argument === '--') {
+          return { ...state, terminated: true }
+        }
+        if (argument === `--${option}` || argument.startsWith(`--${option}=`)) {
+          return { ...state, count: state.count + 1 }
+        }
+      }
+      return state
+    },
+    { count: 0, terminated: false },
+  ).count
+
+const preflightRepeatedOptionBudget = (arguments_: readonly string[], specification: RepeatedOptionBudget) => {
+  const budget = OPERATION_BUDGETS[specification.budgetKey]
+  if (rawOptionCount(arguments_, specification.option) > budget.maximum) {
+    return failBudget(specification.budgetKey, specification.message(budget.maximum))
+  }
+}
 
 const extractRoot = (arguments_: string[]) => {
   const roots: string[] = []
@@ -170,15 +221,18 @@ const noPositionals = (options: ParsedOptions) => {
   }
 }
 
-const parseLimit = (value: string | undefined) => {
+type ResultLimitBudgetName = 'compactResultLimit' | 'fullResultLimit'
+
+const parseLimit = (value: string | undefined, budgetName: ResultLimitBudgetName) => {
   if (value === undefined) {
     return
   }
+  const budget = OPERATION_BUDGETS[budgetName]
   const parsed = Number(value)
-  if (Number.isInteger(parsed) && parsed > 0 && parsed <= 1000) {
+  if (Number.isInteger(parsed) && parsed >= budget.minimum && parsed <= budget.maximum) {
     return parsed
   }
-  return invalid('--limit must be an integer between 1 and 1000.')
+  return failBudget(budgetName, `--limit must be an integer between ${budget.minimum} and ${budget.maximum}.`)
 }
 
 const parsePayload = (value: string) => {
@@ -226,11 +280,13 @@ const dispatch = (arguments_: string[]): CommandResult => {
       }
     }
     case 'add': {
+      preflightRepeatedOptionBudget(commandArguments, REPEATED_OPTION_BUDGETS.supersedes)
       const options = parseOptions(commandArguments, {
         repeated: ['supersedes', 'artifact'],
         values: ['id', 'kind', 'subject', 'source', 'data', 'text', 'confidence'],
       })
       noPositionals(options)
+      const supersedes = many(options, 'supersedes')
       const kind = one(options, 'kind')
       const subject = one(options, 'subject')
       const source = one(options, 'source')
@@ -254,7 +310,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
           source: requiredSource,
           subject: requiredSubject,
           ...(confidence === undefined ? {} : { confidence }),
-          ...(many(options, 'supersedes').length === 0 ? {} : { supersedes: many(options, 'supersedes') }),
+          ...(supersedes.length === 0 ? {} : { supersedes }),
           ...(many(options, 'artifact').length === 0 ? {} : { artifacts: many(options, 'artifact') }),
           payload: parsePayload(requiredData),
           ...(searchText === undefined ? {} : { searchText }),
@@ -285,7 +341,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
       noPositionals(options)
       const kind = one(options, 'kind')
       const subject = one(options, 'subject')
-      const limit = parseLimit(one(options, 'limit'))
+      const limit = parseLimit(one(options, 'limit'), 'fullResultLimit')
       return {
         value: listRecords({
           ...root,
@@ -323,7 +379,8 @@ const dispatch = (arguments_: string[]): CommandResult => {
         invalid('search requires a query.')
       }
       const kind = one(options, 'kind')
-      const limit = parseLimit(one(options, 'limit'))
+      const compact = options.flags.has('compact')
+      const limit = parseLimit(one(options, 'limit'), compact ? 'compactResultLimit' : 'fullResultLimit')
       const input = {
         ...root,
         query,
@@ -332,23 +389,27 @@ const dispatch = (arguments_: string[]): CommandResult => {
         ...(limit === undefined ? {} : { limit }),
       }
       return {
-        value: options.flags.has('compact') ? searchCompactRecords(input) : searchRecords(input),
+        value: compact ? searchCompactRecords(input) : searchRecords(input),
       }
     }
     case 'gather': {
+      preflightRepeatedOptionBudget(commandArguments, REPEATED_OPTION_BUDGETS.search)
+      preflightRepeatedOptionBudget(commandArguments, REPEATED_OPTION_BUDGETS.show)
       const options = parseOptions(commandArguments, {
         flags: ['hydrate', 'include-superseded'],
         repeated: ['search', 'show'],
         values: ['kind', 'limit'],
       })
       noPositionals(options)
+      const searches = many(options, 'search')
+      const shows = many(options, 'show')
       const kind = one(options, 'kind')
-      const limit = parseLimit(one(options, 'limit'))
+      const limit = parseLimit(one(options, 'limit'), 'compactResultLimit')
       return {
         value: gatherRecords({
           ...root,
-          searches: many(options, 'search'),
-          shows: many(options, 'show'),
+          searches,
+          shows,
           ...(kind === undefined ? {} : { kind }),
           ...(limit === undefined ? {} : { limit }),
           hydrate: options.flags.has('hydrate'),

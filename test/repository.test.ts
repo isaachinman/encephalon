@@ -28,6 +28,7 @@ const createIsolatedPackage = () => {
     'directory-witness.ts',
     'errors.ts',
     'filesystem-entry.ts',
+    'operation-budgets.ts',
     'repository.ts',
     'sqlite-error.ts',
     'verified-file.ts',
