@@ -6,8 +6,8 @@ import {
   parseGatherInput,
   parseListRecordsInput,
 } from '../src/api-input.ts'
-import { EncephalonError } from '../src/errors.ts'
-import type { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
+import { EncephalonError, failBudget } from '../src/errors.ts'
+import { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
 
 type BudgetName = keyof typeof OPERATION_BUDGETS
 
@@ -21,6 +21,22 @@ const assertBudget = (operation: () => unknown, expected: { budget: BudgetName; 
 }
 
 describe('API input budgets', () => {
+  test('derives bounded error details from a typed budget key', () => {
+    assertBudget(() => failBudget('gatherShows', 'gather is over budget.'), {
+      budget: 'gatherShows',
+      field: 'shows',
+      maximum: 64,
+    })
+  })
+
+  test('freezes the budget authority and every nested specification at runtime', () => {
+    assert.equal(Object.isFrozen(OPERATION_BUDGETS), true)
+    assert.equal(
+      Object.values(OPERATION_BUDGETS).every(budget => Object.isFrozen(budget)),
+      true,
+    )
+  })
+
   test('applies operation-specific result limits', () => {
     const limitCases = [
       {
@@ -73,6 +89,14 @@ describe('API input budgets', () => {
     })
     assertBudget(
       () => parseGatherInput({ shows: ['not a valid id!', ...Array.from({ length: 64 }, () => 'valid-id')] }),
+      { budget: 'gatherShows', field: 'shows', maximum: 64 },
+    )
+    assertBudget(
+      () =>
+        parseGatherInput({
+          searches: [42],
+          shows: Array.from({ length: 65 }, () => 'valid-id'),
+        }),
       { budget: 'gatherShows', field: 'shows', maximum: 64 },
     )
   })

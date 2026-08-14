@@ -370,9 +370,7 @@ const normalizeOptionalText = (value: unknown, field: string, maximumBytes: numb
 const validateSupersedes = (value: unknown) => {
   if (Array.isArray(value) && value.length > OPERATION_BUDGETS.supersessionEdges.maximum) {
     return failBudget(
-      OPERATION_BUDGETS.supersessionEdges.field,
       'supersessionEdges',
-      OPERATION_BUDGETS.supersessionEdges.maximum,
       `supersedes may contain at most ${OPERATION_BUDGETS.supersessionEdges.maximum} record ids.`,
     )
   }

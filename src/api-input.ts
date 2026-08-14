@@ -19,6 +19,8 @@ export type ParsedAddRecordInput = AddRecordInput & {
 
 const MAX_TEXT_BYTES = 1024
 
+type OperationBudgetKey = keyof typeof OPERATION_BUDGETS
+
 const objectInput = (value: unknown, name: string): Record<string, unknown> => {
   if (value === undefined) {
     return {}
@@ -49,19 +51,15 @@ const optionalBoolean = (value: unknown, field: string) => {
   return fail('INVALID_ARGUMENT', `${field} must be a boolean.`, { field })
 }
 
-type ResultLimitBudget = typeof OPERATION_BUDGETS.compactResultLimit | typeof OPERATION_BUDGETS.fullResultLimit
+type ResultLimitBudgetKey = Extract<OperationBudgetKey, 'compactResultLimit' | 'fullResultLimit'>
 
-const optionalLimit = (value: unknown, budget: ResultLimitBudget) => {
+const optionalLimit = (value: unknown, budgetKey: ResultLimitBudgetKey) => {
   if (value !== undefined) {
+    const budget = OPERATION_BUDGETS[budgetKey]
     if (typeof value === 'number' && Number.isInteger(value) && value >= budget.minimum && value <= budget.maximum) {
       return value
     }
-    return failBudget(
-      budget.field,
-      budget === OPERATION_BUDGETS.fullResultLimit ? 'fullResultLimit' : 'compactResultLimit',
-      budget.maximum,
-      `limit must be an integer between ${budget.minimum} and ${budget.maximum}.`,
-    )
+    return failBudget(budgetKey, `limit must be an integer between ${budget.minimum} and ${budget.maximum}.`)
   }
 }
 
@@ -90,28 +88,27 @@ const optionalQuery = (value: unknown, field: string) => {
   return fail('INVALID_ARGUMENT', `${field} must be a string.`, { field })
 }
 
-const optionalBoundedStringArray = (
-  value: unknown,
-  budget: typeof OPERATION_BUDGETS.gatherSearches | typeof OPERATION_BUDGETS.gatherShows,
-  budgetName: 'gatherSearches' | 'gatherShows',
-  item: (value: unknown) => string,
-) => {
+type GatherArrayBudgetKey = Extract<OperationBudgetKey, 'gatherSearches' | 'gatherShows'>
+
+const optionalBoundedArray = (value: unknown, budgetKey: GatherArrayBudgetKey) => {
   if (value !== undefined) {
-    if (Array.isArray(value)) {
-      if (value.length > budget.maximum) {
-        return failBudget(
-          budget.field,
-          budgetName,
-          budget.maximum,
-          `gather may contain at most ${budget.maximum} ${budget.field}.`,
-        )
-      }
-      if (value.every(entry => typeof entry === 'string')) {
-        return value.map(item)
-      }
+    const budget = OPERATION_BUDGETS[budgetKey]
+    if (!Array.isArray(value)) {
+      return fail('INVALID_ARGUMENT', `${budget.field} must be an array of strings.`, { field: budget.field })
     }
-    return fail('INVALID_ARGUMENT', `${budget.field} must be an array of strings.`, { field: budget.field })
+    if (value.length > budget.maximum) {
+      return failBudget(budgetKey, `gather may contain at most ${budget.maximum} ${budget.field}.`)
+    }
+    return value
   }
+}
+
+const mapBoundedStringArray = (value: unknown[], budgetKey: GatherArrayBudgetKey, item: (value: unknown) => string) => {
+  const budget = OPERATION_BUDGETS[budgetKey]
+  if (value.every(entry => typeof entry === 'string')) {
+    return value.map(item)
+  }
+  return fail('INVALID_ARGUMENT', `${budget.field} must be an array of strings.`, { field: budget.field })
 }
 
 const rootProperties = (input: Record<string, unknown>): RootInput => {
@@ -128,7 +125,7 @@ export const parseListRecordsInput = (value: unknown = {}): ListRecordsInput => 
   const kind = input.kind === undefined ? undefined : validateKind(input.kind)
   const subject = optionalText(input.subject, 'subject')
   const includeSuperseded = optionalBoolean(input.includeSuperseded, 'includeSuperseded')
-  const limit = optionalLimit(input.limit, OPERATION_BUDGETS.fullResultLimit)
+  const limit = optionalLimit(input.limit, 'fullResultLimit')
   return {
     ...root,
     ...(kind === undefined ? {} : { kind }),
@@ -149,12 +146,12 @@ export const parseShowRecordInput = (value: unknown): ShowRecordInput => {
   }
 }
 
-const parseSearchRecordsInputWithBudget = (value: unknown, budget: ResultLimitBudget): SearchRecordsInput => {
+const parseSearchRecordsInputWithBudget = (value: unknown, budgetKey: ResultLimitBudgetKey): SearchRecordsInput => {
   const input = objectInput(value, 'searchRecords')
   const root = rootProperties(input)
   const kind = input.kind === undefined ? undefined : validateKind(input.kind)
   const includeSuperseded = optionalBoolean(input.includeSuperseded, 'includeSuperseded')
-  const limit = optionalLimit(input.limit, budget)
+  const limit = optionalLimit(input.limit, budgetKey)
   const query = optionalQuery(input.query, 'query')
   if (query === undefined) {
     return fail('INVALID_ARGUMENT', 'query must be a string.', { field: 'query' })
@@ -169,10 +166,10 @@ const parseSearchRecordsInputWithBudget = (value: unknown, budget: ResultLimitBu
 }
 
 export const parseFullSearchRecordsInput = (value: unknown): SearchRecordsInput =>
-  parseSearchRecordsInputWithBudget(value, OPERATION_BUDGETS.fullResultLimit)
+  parseSearchRecordsInputWithBudget(value, 'fullResultLimit')
 
 export const parseCompactSearchRecordsInput = (value: unknown): SearchRecordsInput =>
-  parseSearchRecordsInputWithBudget(value, OPERATION_BUDGETS.compactResultLimit)
+  parseSearchRecordsInputWithBudget(value, 'compactResultLimit')
 
 export const parseGatherInput = (value: unknown): GatherInput => {
   const input = objectInput(value, 'gatherRecords')
@@ -180,14 +177,15 @@ export const parseGatherInput = (value: unknown): GatherInput => {
   const kind = input.kind === undefined ? undefined : validateKind(input.kind)
   const includeSuperseded = optionalBoolean(input.includeSuperseded, 'includeSuperseded')
   const hydrate = optionalBoolean(input.hydrate, 'hydrate')
-  const limit = optionalLimit(input.limit, OPERATION_BUDGETS.compactResultLimit)
-  const searches = optionalBoundedStringArray(
-    input.searches,
-    OPERATION_BUDGETS.gatherSearches,
-    'gatherSearches',
-    entry => optionalQuery(entry, 'searches') ?? '',
-  )
-  const shows = optionalBoundedStringArray(input.shows, OPERATION_BUDGETS.gatherShows, 'gatherShows', validateId)
+  const limit = optionalLimit(input.limit, 'compactResultLimit')
+  const unvalidatedSearches = optionalBoundedArray(input.searches, 'gatherSearches')
+  const unvalidatedShows = optionalBoundedArray(input.shows, 'gatherShows')
+  const searches =
+    unvalidatedSearches === undefined
+      ? undefined
+      : mapBoundedStringArray(unvalidatedSearches, 'gatherSearches', entry => optionalQuery(entry, 'searches') ?? '')
+  const shows =
+    unvalidatedShows === undefined ? undefined : mapBoundedStringArray(unvalidatedShows, 'gatherShows', validateId)
   return {
     ...root,
     ...(searches === undefined ? {} : { searches }),

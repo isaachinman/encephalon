@@ -55,13 +55,11 @@ import type {
 
 const SCHEMA_VERSION = '1'
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
-export const MAX_QUERY_BYTES = OPERATION_BUDGETS.queryBytes.maximum
-export const MAX_QUERY_TERMS = OPERATION_BUDGETS.queryTerms.maximum
-export const MAX_GATHER_SEARCHES = OPERATION_BUDGETS.gatherSearches.maximum
-export const MAX_GATHER_SHOWS = OPERATION_BUDGETS.gatherShows.maximum
-export const MAX_FULL_RESULT_LIMIT = OPERATION_BUDGETS.fullResultLimit.maximum
-export const MAX_COMPACT_RESULT_LIMIT = OPERATION_BUDGETS.compactResultLimit.maximum
-export const MAX_FULL_RESPONSE_BYTES = OPERATION_BUDGETS.fullResponseBytes.maximum
+const MAX_QUERY_BYTES = OPERATION_BUDGETS.queryBytes.maximum
+const MAX_QUERY_TERMS = OPERATION_BUDGETS.queryTerms.maximum
+const MAX_GATHER_SEARCHES = OPERATION_BUDGETS.gatherSearches.maximum
+const MAX_GATHER_SHOWS = OPERATION_BUDGETS.gatherShows.maximum
+const MAX_FULL_RESPONSE_BYTES = OPERATION_BUDGETS.fullResponseBytes.maximum
 const SQLITE_BUSY_TIMEOUT_MILLISECONDS = 1000
 const MAX_CACHE_METADATA_BYTES = 1024 * 1024
 const MAX_CACHE_RECORD_BYTES = MAX_RECORD_BYTES + 4096
@@ -934,25 +932,20 @@ export const hydrate = (input: RootInput = {}): HydrateResult => {
   }
 }
 
-type ResultLimitBudget = typeof OPERATION_BUDGETS.compactResultLimit | typeof OPERATION_BUDGETS.fullResultLimit
+type ResultLimitBudgetKey = 'compactResultLimit' | 'fullResultLimit'
 
-const positiveLimit = (value: unknown, budget: ResultLimitBudget, budgetName: string) => {
+const positiveLimit = (value: unknown, budgetKey: ResultLimitBudgetKey) => {
+  const budget = OPERATION_BUDGETS[budgetKey]
   const limit = value === undefined ? budget.default : value
   if (typeof limit === 'number' && Number.isInteger(limit) && limit >= budget.minimum && limit <= budget.maximum) {
     return limit
   }
-  return failBudget(
-    budget.field,
-    budgetName,
-    budget.maximum,
-    `limit must be an integer between ${budget.minimum} and ${budget.maximum}.`,
-  )
+  return failBudget(budgetKey, `limit must be an integer between ${budget.minimum} and ${budget.maximum}.`)
 }
 
-const fullResultLimit = (value: unknown) => positiveLimit(value, OPERATION_BUDGETS.fullResultLimit, 'fullResultLimit')
+const fullResultLimit = (value: unknown) => positiveLimit(value, 'fullResultLimit')
 
-const compactResultLimit = (value: unknown) =>
-  positiveLimit(value, OPERATION_BUDGETS.compactResultLimit, 'compactResultLimit')
+const compactResultLimit = (value: unknown) => positiveLimit(value, 'compactResultLimit')
 
 const readFreshDatabase = <Result>(root: string, location: CacheLocation, read: (database: DatabaseSync) => Result) => {
   const database = openReaderDatabase(location)
@@ -1013,9 +1006,7 @@ const parseRecordRowWithinBudget = (row: RecordRow, budget: FullResponseBudget) 
   budget.bytes += recordRowBytes(row)
   if (budget.bytes > MAX_FULL_RESPONSE_BYTES) {
     return failBudget(
-      OPERATION_BUDGETS.fullResponseBytes.field,
       'fullResponseBytes',
-      MAX_FULL_RESPONSE_BYTES,
       `full-record responses may contain at most ${MAX_FULL_RESPONSE_BYTES} UTF-8 bytes.`,
     )
   }
@@ -1071,21 +1062,11 @@ const literalMatchQuery = (query: unknown) => {
     })
   }
   if (byteLength(query) > MAX_QUERY_BYTES) {
-    return failBudget(
-      OPERATION_BUDGETS.queryBytes.field,
-      'queryBytes',
-      MAX_QUERY_BYTES,
-      `query must contain at most ${MAX_QUERY_BYTES} UTF-8 bytes.`,
-    )
+    return failBudget('queryBytes', `query must contain at most ${MAX_QUERY_BYTES} UTF-8 bytes.`)
   }
   const terms = query.split(/[^A-Za-z0-9_]+/u).filter(term => term.length > 0)
   if (terms.length > MAX_QUERY_TERMS) {
-    return failBudget(
-      OPERATION_BUDGETS.queryTerms.field,
-      'queryTerms',
-      MAX_QUERY_TERMS,
-      `query may contain at most ${MAX_QUERY_TERMS} literal terms.`,
-    )
+    return failBudget('queryTerms', `query may contain at most ${MAX_QUERY_TERMS} literal terms.`)
   }
   return terms.map(term => `"${term.replaceAll('"', '""')}"`).join(' AND ')
 }
@@ -1221,20 +1202,10 @@ const assertGatherBudgets = (input: GatherInput) => {
   const searches = input.searches ?? []
   const shows = input.shows ?? []
   if (searches.length > MAX_GATHER_SEARCHES) {
-    return failBudget(
-      OPERATION_BUDGETS.gatherSearches.field,
-      'gatherSearches',
-      MAX_GATHER_SEARCHES,
-      `gather may contain at most ${MAX_GATHER_SEARCHES} searches.`,
-    )
+    return failBudget('gatherSearches', `gather may contain at most ${MAX_GATHER_SEARCHES} searches.`)
   }
   if (shows.length > MAX_GATHER_SHOWS) {
-    return failBudget(
-      OPERATION_BUDGETS.gatherShows.field,
-      'gatherShows',
-      MAX_GATHER_SHOWS,
-      `gather may contain at most ${MAX_GATHER_SHOWS} shows.`,
-    )
+    return failBudget('gatherShows', `gather may contain at most ${MAX_GATHER_SHOWS} shows.`)
   }
   searches.forEach(literalMatchQuery)
 }

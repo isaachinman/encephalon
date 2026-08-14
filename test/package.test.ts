@@ -84,6 +84,11 @@ describe('package contract', () => {
       /creation timestamps under the repository operation lock/,
     )
     assert.doesNotMatch(readFileSync(resolve(root, 'dist', 'api-input.d.ts'), 'utf8'), /ValidatedAddRecordInput/)
+    assert.doesNotMatch(readFileSync(resolve(root, 'dist', 'errors.d.ts'), 'utf8'), /failBudget|operation-budgets/)
+    assert.doesNotMatch(
+      readFileSync(resolve(root, 'dist', 'operation-budgets.d.ts'), 'utf8'),
+      /OPERATION_BUDGETS|OperationBudgetKey/,
+    )
   })
 
   test('keeps installed command guidance aligned with root-install verification', () => {

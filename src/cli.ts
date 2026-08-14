@@ -56,8 +56,55 @@ type CommandResult = {
   format?: 'json' | 'text'
 }
 
+type RepeatedOptionBudget = {
+  budgetKey: 'gatherSearches' | 'gatherShows' | 'supersessionEdges'
+  message: (maximum: number) => string
+  option: 'search' | 'show' | 'supersedes'
+}
+
+const REPEATED_OPTION_BUDGETS = {
+  search: {
+    budgetKey: 'gatherSearches',
+    message: (maximum: number) => `gather may contain at most ${maximum} searches.`,
+    option: 'search',
+  },
+  show: {
+    budgetKey: 'gatherShows',
+    message: (maximum: number) => `gather may contain at most ${maximum} shows.`,
+    option: 'show',
+  },
+  supersedes: {
+    budgetKey: 'supersessionEdges',
+    message: (maximum: number) => `--supersedes may be supplied at most ${maximum} times.`,
+    option: 'supersedes',
+  },
+} as const satisfies Record<string, RepeatedOptionBudget>
+
 const invalid = (message: string, details: Record<string, JsonValue> = {}): never =>
   fail('INVALID_ARGUMENT', message, details)
+
+const rawOptionCount = (arguments_: readonly string[], option: string) =>
+  arguments_.reduce(
+    (state, argument) => {
+      if (!state.terminated) {
+        if (argument === '--') {
+          return { ...state, terminated: true }
+        }
+        if (argument === `--${option}` || argument.startsWith(`--${option}=`)) {
+          return { ...state, count: state.count + 1 }
+        }
+      }
+      return state
+    },
+    { count: 0, terminated: false },
+  ).count
+
+const preflightRepeatedOptionBudget = (arguments_: readonly string[], specification: RepeatedOptionBudget) => {
+  const budget = OPERATION_BUDGETS[specification.budgetKey]
+  if (rawOptionCount(arguments_, specification.option) > budget.maximum) {
+    return failBudget(specification.budgetKey, specification.message(budget.maximum))
+  }
+}
 
 const extractRoot = (arguments_: string[]) => {
   const roots: string[] = []
@@ -185,12 +232,7 @@ const parseLimit = (value: string | undefined, budgetName: ResultLimitBudgetName
   if (Number.isInteger(parsed) && parsed >= budget.minimum && parsed <= budget.maximum) {
     return parsed
   }
-  return failBudget(
-    budget.field,
-    budgetName,
-    budget.maximum,
-    `--limit must be an integer between ${budget.minimum} and ${budget.maximum}.`,
-  )
+  return failBudget(budgetName, `--limit must be an integer between ${budget.minimum} and ${budget.maximum}.`)
 }
 
 const parsePayload = (value: string) => {
@@ -238,6 +280,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
       }
     }
     case 'add': {
+      preflightRepeatedOptionBudget(commandArguments, REPEATED_OPTION_BUDGETS.supersedes)
       const options = parseOptions(commandArguments, {
         repeated: ['supersedes', 'artifact'],
         values: ['id', 'kind', 'subject', 'source', 'data', 'text', 'confidence'],
@@ -255,14 +298,6 @@ const dispatch = (arguments_: string[]): CommandResult => {
       const requiredSubject = requiredOption(subject, 'add requires --kind, --subject, --source, and --data.')
       const requiredSource = requiredOption(source, 'add requires --kind, --subject, --source, and --data.')
       const requiredData = requiredOption(data, 'add requires --kind, --subject, --source, and --data.')
-      if (supersedes.length > OPERATION_BUDGETS.supersessionEdges.maximum) {
-        failBudget(
-          OPERATION_BUDGETS.supersessionEdges.field,
-          'supersessionEdges',
-          OPERATION_BUDGETS.supersessionEdges.maximum,
-          `--supersedes may be supplied at most ${OPERATION_BUDGETS.supersessionEdges.maximum} times.`,
-        )
-      }
       const confidenceValue = one(options, 'confidence')
       const confidence = confidenceValue === undefined ? undefined : Number(confidenceValue)
       const id = one(options, 'id')
@@ -358,6 +393,8 @@ const dispatch = (arguments_: string[]): CommandResult => {
       }
     }
     case 'gather': {
+      preflightRepeatedOptionBudget(commandArguments, REPEATED_OPTION_BUDGETS.search)
+      preflightRepeatedOptionBudget(commandArguments, REPEATED_OPTION_BUDGETS.show)
       const options = parseOptions(commandArguments, {
         flags: ['hydrate', 'include-superseded'],
         repeated: ['search', 'show'],
@@ -365,23 +402,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
       })
       noPositionals(options)
       const searches = many(options, 'search')
-      if (searches.length > OPERATION_BUDGETS.gatherSearches.maximum) {
-        failBudget(
-          OPERATION_BUDGETS.gatherSearches.field,
-          'gatherSearches',
-          OPERATION_BUDGETS.gatherSearches.maximum,
-          `gather may contain at most ${OPERATION_BUDGETS.gatherSearches.maximum} searches.`,
-        )
-      }
       const shows = many(options, 'show')
-      if (shows.length > OPERATION_BUDGETS.gatherShows.maximum) {
-        failBudget(
-          OPERATION_BUDGETS.gatherShows.field,
-          'gatherShows',
-          OPERATION_BUDGETS.gatherShows.maximum,
-          `gather may contain at most ${OPERATION_BUDGETS.gatherShows.maximum} shows.`,
-        )
-      }
       const kind = one(options, 'kind')
       const limit = parseLimit(one(options, 'limit'), 'compactResultLimit')
       return {

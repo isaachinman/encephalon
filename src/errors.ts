@@ -1,3 +1,4 @@
+import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type { EncephalonErrorCode, JsonValue } from './types.ts'
 
@@ -27,6 +28,8 @@ const MAX_CLI_ARRAY_LENGTH = 25
 const MAX_CLI_OBJECT_KEYS = 25
 const MAX_CLI_NUMBER_MAGNITUDE = 1_000_000_000_000
 const UNSAFE_CLI_DETAIL_KEYS = new Set(['cause', 'stack'])
+
+type OperationBudgetKey = keyof typeof OPERATION_BUDGETS
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && !Array.isArray(value) && typeof value === 'object'
@@ -119,8 +122,15 @@ export const fail = (code: EncephalonErrorCode, message: string, details: Record
   throw new EncephalonError(code, message, details)
 }
 
-export const failBudget = (field: string, budget: string, maximum: number, message: string): never =>
-  fail('INVALID_ARGUMENT', message, { budget, field, maximum })
+/** @internal */
+export const failBudget = (budgetKey: OperationBudgetKey, message: string): never => {
+  const budget = OPERATION_BUDGETS[budgetKey]
+  return fail('INVALID_ARGUMENT', message, {
+    budget: budgetKey,
+    field: budget.field,
+    maximum: budget.maximum,
+  })
+}
 
 export const failWithCause = (
   code: EncephalonErrorCode,

@@ -37,6 +37,7 @@ import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import { recordWriteTestHooks } from '../src/records.ts'
+import { repositoryTestHooks } from '../src/repository.ts'
 import {
   canRenameParentWithOpenChild,
   createTestRepository,
@@ -80,6 +81,7 @@ afterEach(() => {
   cacheReadTestHooks.beforeManifestEntryLstat = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   recordWriteTestHooks.fault = undefined
+  repositoryTestHooks.afterGitMarkerDecision = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
 
@@ -1824,6 +1826,10 @@ describe('SQLite cache and reads', () => {
           gatherRecords({ root, shows: ['not a valid record id', ...Array.from({ length: 64 }, () => 'missing')] }),
       },
       {
+        expected: { budget: 'gatherShows', field: 'shows', maximum: 64 },
+        run: root => gatherRecords({ root, searches: [42], shows: Array.from({ length: 65 }, () => 'missing') }),
+      },
+      {
         expected: { budget: 'compactResultLimit', field: 'limit', maximum: 100 },
         run: root => gatherRecords({ limit: 101, root, searches: ['x'] }),
       },
@@ -1835,7 +1841,19 @@ describe('SQLite cache and reads', () => {
 
     for (const invalidCase of invalidCases) {
       const root = createRoot()
+      let repositoryInspections = 0
+      let cacheLocationInspections = 0
+      repositoryTestHooks.afterGitMarkerDecision = () => {
+        repositoryInspections += 1
+        throw new Error('repository inspection must not run for rejected budget input')
+      }
+      cacheLocationTestHooks.beforeLocationInspection = () => {
+        cacheLocationInspections += 1
+        throw new Error('cache inspection must not run for rejected budget input')
+      }
       assertBudgetError(() => invalidCase.run(root), invalidCase.expected)
+      assert.equal(repositoryInspections, 0)
+      assert.equal(cacheLocationInspections, 0)
       assert.equal(existsSync(cacheDirectoryPath(root)), false)
     }
   })

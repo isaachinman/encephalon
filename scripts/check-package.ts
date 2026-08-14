@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { isDeepStrictEqual } from 'node:util'
 import { gunzipSync } from 'node:zlib'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -322,7 +323,7 @@ try {
       result.exitCode !== 2 ||
       result.stdout !== '' ||
       body.error?.code !== 'INVALID_ARGUMENT' ||
-      JSON.stringify(body.error.details) !== JSON.stringify(expectedDetails)
+      !isDeepStrictEqual(body.error.details, expectedDetails)
     ) {
       throw new Error('The packed Node-only CLI operation budget contract failed.')
     }

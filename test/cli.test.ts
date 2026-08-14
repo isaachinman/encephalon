@@ -317,6 +317,7 @@ describe('command-line interface', () => {
         field: 'limit',
         maximum: entry.maximum,
       })
+      assert.equal(errorJson(rejected).error.message, `--limit must be an integer between 1 and ${entry.maximum}.`)
     }
   })
 
@@ -364,6 +365,38 @@ describe('command-line interface', () => {
     })
     assert.equal(added.stderr.includes('private-invalid-json'), false)
     assert.equal(added.stderr.includes('private-supersedes'), false)
+
+    const rawCountCases = [
+      {
+        arguments: ['gather', ...Array.from({ length: 17 }, () => '--search=')],
+        details: { budget: 'gatherSearches', field: 'searches', maximum: 16 },
+        message: 'gather may contain at most 16 searches.',
+      },
+      {
+        arguments: ['gather', ...Array.from({ length: 65 }, () => '--show=')],
+        details: { budget: 'gatherShows', field: 'shows', maximum: 64 },
+        message: 'gather may contain at most 64 shows.',
+      },
+      {
+        arguments: [
+          'add',
+          '--kind=decision',
+          '--subject=cli.budget',
+          '--source=agent',
+          '--data={}',
+          ...Array.from({ length: 1001 }, () => '--supersedes='),
+        ],
+        details: { budget: 'supersessionEdges', field: 'supersedes', maximum: 1000 },
+        message: '--supersedes may be supplied at most 1000 times.',
+      },
+    ] as const
+
+    for (const rawCountCase of rawCountCases) {
+      const result = run(root, [...rawCountCase.arguments, '--root', root])
+      assert.equal(result.status, 2)
+      assert.deepEqual(errorJson(result).error.details, rawCountCase.details)
+      assert.equal(errorJson(result).error.message, rawCountCase.message)
+    }
   })
 
   test('parses terminators, hyphen-leading queries, and repeated options predictably', () => {
