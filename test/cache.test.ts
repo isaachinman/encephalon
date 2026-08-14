@@ -1881,6 +1881,27 @@ describe('SQLite cache and reads', () => {
       maximum: 4 * 1024 * 1024,
     })
 
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+    assertBudgetError(
+      () =>
+        gatherRecords({
+          root,
+          shows: Array.from({ length: 5 }, () => 'large-response-0'),
+        }),
+      {
+        budget: 'fullResponseBytes',
+        field: 'response',
+        maximum: 4 * 1024 * 1024,
+      },
+    )
+    const gathered = gatherRecords({ limit: 5, root, searches: ['response budget marker'] }) as {
+      searches: Array<{ results: unknown[] }>
+    }
+    assert.deepEqual(
+      gathered.searches.map(search => search.results.length),
+      [5],
+    )
+
     const searchCompactRecords =
       functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
     assert.equal(searchCompactRecords({ limit: 5, query: 'response budget marker', root }).length, 5)
