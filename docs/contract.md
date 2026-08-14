@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-13 for code and behavioural-test snapshot `6dc60e13e8e99b05fef566d4b80aeb663328664c`.
+Last reviewed: 2026-08-13 for code and behavioural-test snapshot `011360c808a61a94a98683cbecf059da46a18471`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -20,7 +20,7 @@ This document is the concise contract maintainers should update when public beha
 - `list` and full `search` accept result limits from 1 through 50. Compact `search` and each `gather` search accept result limits from 1 through 100. The default remains 20.
 - A `gather` input contains at most 16 searches and 64 shows. An add-record input contains at most 1,000 supersession targets.
 - Every search query contains at most 1,024 UTF-8 bytes and 32 literal terms. Full-record responses from list, show, full search, and gather contain at most 4 MiB of aggregate record JSON.
-- An oversized result limit, gather input count, or supersedes input count fails with `INVALID_ARGUMENT` before item validation, repository discovery, cache-location inspection, SQLite access, hydration, or other repository/cache hooks. Count checks run before mapping or uniqueness-set construction. Cache execution retains matching defensive checks for internal callers and future refactors.
+- An oversized result limit, gather input count, or supersedes input count fails with `INVALID_ARGUMENT` before item validation, repository discovery, cache-location inspection, SQLite access, hydration, or other repository/cache hooks. Both gather arrays are structurally checked and count-checked before either array's items are validated or mapped. The CLI preflights raw repeated-option counts before option-value normalisation. Cache execution retains matching defensive checks for internal callers and future refactors.
 - Budget failures contain exactly the bounded details `{ field, budget, maximum }`. Stable budget names are `fullResultLimit`, `compactResultLimit`, `queryBytes`, `queryTerms`, `gatherSearches`, `gatherShows`, `supersessionEdges`, and `fullResponseBytes`; details exclude arrays, individual values, queries, paths, and other input content.
 - The fixed budget authority is internal. It is not exported by `src/index.ts` and does not change the public TypeScript input or result shapes.
 
@@ -126,7 +126,7 @@ When an implementation change intentionally alters this contract:
 | --- | --- |
 | The implementation plan claimed to be the authoritative specification. | Superseded by this maintained contract; the plan is now marked historical. |
 | Managed instruction files use atomic byte-preserving replacement rather than the original broad plan wording. | Implemented and tested by the instruction-file atomicity work tracked in MAR-2509, MAR-2511, and MAR-2512. |
-| CLI parsing is being moved to `node:util` `parseArgs`. | Owned by MAR-2536. Until that PR lands, current behaviour remains covered by CLI tests. |
+| CLI parsing moved from bespoke parsing to `node:util` `parseArgs`. | Completed under MAR-2536; current option semantics remain covered by CLI tests. |
 | Cache versioning and runtime package-version handling drifted from the original plan. | Owned by MAR-2524 and the cache compatibility tests. The maintained contract treats the cache as disposable derived state gated by explicit metadata. |
 | The packaged skill uses `npx --no-install encephalon ...` examples instead of direct `node ./node_modules/encephalon/dist/cli.mjs` examples. | Accepted current contract. Root-install verification prevents ephemeral package execution, and package tests assert the skill guidance. |
 | CI and release gates evolved after the original plan. | Owned by MAR-2527 for CI package gates. The maintained release contract remains the checked package scripts plus manual publishing. |

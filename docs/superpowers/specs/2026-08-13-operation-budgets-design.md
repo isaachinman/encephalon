@@ -6,21 +6,21 @@ Make every public request budget authoritative at the first safe parsing boundar
 
 ## Chosen approach
 
-Add one dependency-free `src/operation-budgets.ts` module containing immutable budget specifications. Consumers import the same values rather than declaring local numeric maxima. This is preferred over keeping constants in `src/cache.ts`, which would preserve parser/cache coupling and invite dependency cycles, and over a configurable budget framework, which is outside the fixed-budget scope of MAR-2561.
+Add one dependency-free `src/operation-budgets.ts` module containing immutable budget specifications. The authority and every nested specification are frozen at runtime. Consumers import the same values rather than declaring local numeric maxima. This is preferred over keeping constants in `src/cache.ts`, which would preserve parser/cache coupling and invite dependency cycles, and over a configurable budget framework, which is outside the fixed-budget scope of MAR-2561.
 
 The authority contains:
 
 ```ts
-export const OPERATION_BUDGETS = {
-  compactResultLimit: { default: 20, field: 'limit', maximum: 100, minimum: 1 },
-  fullResponseBytes: { field: 'response', maximum: 4 * 1024 * 1024 },
-  fullResultLimit: { default: 20, field: 'limit', maximum: 50, minimum: 1 },
-  gatherSearches: { field: 'searches', maximum: 16 },
-  gatherShows: { field: 'shows', maximum: 64 },
-  queryBytes: { field: 'query', maximum: 1024 },
-  queryTerms: { field: 'query', maximum: 32 },
-  supersessionEdges: { field: 'supersedes', maximum: 1000 },
-} as const
+export const OPERATION_BUDGETS = Object.freeze({
+  compactResultLimit: Object.freeze({ default: 20, field: 'limit', maximum: 100, minimum: 1 }),
+  fullResponseBytes: Object.freeze({ field: 'response', maximum: 4 * 1024 * 1024 }),
+  fullResultLimit: Object.freeze({ default: 20, field: 'limit', maximum: 50, minimum: 1 }),
+  gatherSearches: Object.freeze({ field: 'searches', maximum: 16 }),
+  gatherShows: Object.freeze({ field: 'shows', maximum: 64 }),
+  queryBytes: Object.freeze({ field: 'query', maximum: 1024 }),
+  queryTerms: Object.freeze({ field: 'query', maximum: 32 }),
+  supersessionEdges: Object.freeze({ field: 'supersedes', maximum: 1000 }),
+} as const)
 ```
 
 The module imports nothing and is not re-exported through `src/index.ts`; it remains an internal authority and does not expand the package API. Artifact limits remain in `src/schema.ts`: artifacts already enforce their fixed count before mapping, and moving them is unnecessary for this ticket.
@@ -32,7 +32,7 @@ The module imports nothing and is not re-exported through `src/index.ts`; it rem
 - list and full search use `fullResultLimit`, accepting 1–50;
 - compact search and gather use `compactResultLimit`, accepting 1–100;
 - full and compact search have distinct internal parser entry points backed by one private common parser, preventing callers from pairing the wrong maximum with a mode;
-- gather checks `searches.length` against 16 and `shows.length` against 64 before `.every`, `.map`, query parsing, or ID validation.
+- gather structurally validates and count-checks both arrays before validating or mapping either array's items; `searches.length` is bounded at 16 and `shows.length` at 64 before `.every`, `.map`, query parsing, or ID validation.
 
 `src/schema.ts` checks `supersedes.length` against 1,000 before mapping IDs or constructing a uniqueness `Set`, for both candidate input and canonical record parsing. `src/records.ts` consumes the same numeric authority for the aggregate 1,000-edge corpus limit. Exactly 1,000 targets remains accepted by the per-record parser; aggregate graph validation remains independently authoritative for the complete corpus.
 
@@ -46,7 +46,7 @@ All request parsing and count checks occur before `resolveRepository`, cache-loc
 
 ## CLI and documentation
 
-`src/cli.ts` parameterises `parseLimit` by the shared budget specification. List and non-compact search use the full limit; `search --compact` and gather use the compact limit. Search selects its specification after parsing the `--compact` flag but before invoking the API.
+`src/cli.ts` parameterises `parseLimit` by the shared budget key. List and non-compact search use the full limit; `search --compact` and gather use the compact limit. Search selects its key after parsing the `--compact` flag but before invoking the API. Gather search/show counts and add supersedes counts are scanned from raw command arguments before `parseArgs` normalises, filters, or copies repeated values; public API parsing remains defence-in-depth.
 
 Help text interpolates the shared values and states:
 
@@ -59,7 +59,7 @@ README and the maintained contract describe the same public limits. Package chec
 
 ## Error contract
 
-Budget failures remain `INVALID_ARGUMENT`. A shared internal helper in `src/errors.ts` constructs details containing only:
+Budget failures remain `INVALID_ARGUMENT`. A shared internal helper in `src/errors.ts` accepts a typed operation-budget key and derives its field and maximum from the authority. It constructs details containing only:
 
 ```ts
 { field, budget, maximum }
@@ -86,10 +86,10 @@ No public input or result type changes. No pagination, configurable limits, stre
 The smallest complementary behavioural matrix covers:
 
 - pure full and compact parser boundaries at the maximum and one over, with exact bounded details;
-- 17 gather searches and 65 shows whose first ordinary element is invalid, proving the count error wins before item validation and before repository/cache access;
+- 17 gather searches and 65 shows whose first ordinary element is invalid, including one request with invalid searches and 65 shows, proving both count checks run before either item-validation pass and before repository/cache access;
 - 1,001 supersedes whose first ordinary element is invalid, proving the count error wins before ID validation, mapping, uniqueness allocation, or repository access;
-- strengthened existing cache budget assertions for exact field, budget, maximum, and no cache path;
-- CLI list/full-search and compact-search/gather boundaries, exact help ranges, exit status, and structured details;
+- strengthened existing cache budget assertions for exact field, budget, maximum, no cache path, and untouched repository/cache inspection hooks;
+- CLI list/full-search and compact-search/gather boundaries, exact help ranges, exit status, structured details, and raw empty repeated values at 17 searches, 65 shows, and 1,001 supersedes;
 - packed CLI help and representative full/compact over-limit failures;
 - unchanged query-byte, query-term, response-byte, empty-array, duplicate-order, public type, and package declaration regressions.
 
@@ -97,4 +97,4 @@ Tests use ordinary dense arrays. They do not add proxies, getters, sparse arrays
 
 ## Reviewed implementation provenance
 
-The exact reviewed code and behavioural-test snapshot implementing this design is `6dc60e13e8e99b05fef566d4b80aeb663328664c`. Documentation changes do not alter the runtime API, package exports, or generated declarations.
+The exact reviewed code and behavioural-test snapshot implementing this design is `011360c808a61a94a98683cbecf059da46a18471`. Documentation changes do not alter the runtime API, package exports, or generated declarations.
