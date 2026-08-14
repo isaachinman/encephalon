@@ -64,7 +64,7 @@ describe('package contract', () => {
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /Last reviewed: 2026-08-13 for code and behavioural-test snapshot `011360c808a61a94a98683cbecf059da46a18471`\./,
+      /Last reviewed: 2026-08-13 for code and behavioural-test snapshot `1e913807c20a332dc49a004be672205fbeabfe15`\./,
     )
     assert.match(
       contract,
@@ -77,7 +77,7 @@ describe('package contract', () => {
     assert.match(contract, /Historical plan's wall-clock-only `createdAt` policy/)
     assert.match(
       operationBudgetsDesign,
-      /The exact reviewed code and behavioural-test snapshot implementing this design is `011360c808a61a94a98683cbecf059da46a18471`\./,
+      /The exact reviewed code and behavioural-test snapshot implementing this design is `1e913807c20a332dc49a004be672205fbeabfe15`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),

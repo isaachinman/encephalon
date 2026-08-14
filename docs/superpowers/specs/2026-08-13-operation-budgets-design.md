@@ -40,7 +40,7 @@ Empty and omitted arrays preserve their current semantics. Sparse arrays, access
 
 ## Cache execution
 
-`src/cache.ts` consumes the shared constants and retains its defensive assertions for result counts, query bytes, query terms, gather counts, and full-response bytes. Public parsing is the first authoritative boundary; cache checks protect internal callers and future refactors. Both layers use the same specification, stable budget name, field, and maximum.
+`src/cache.ts` consumes the shared constants and retains its defensive assertions for result counts, query bytes, query terms, gather counts, and full-response bytes. One gather reader shares a single full-response byte counter across every shown record, while compact gather search results remain excluded. Public parsing is the first authoritative boundary; cache checks protect internal callers and future refactors. Both layers use the same specification, stable budget name, field, and maximum.
 
 All request parsing and count checks occur before `resolveRepository`, cache-location inspection, SQLite access, or hydration. The default result limit remains 20.
 
@@ -89,6 +89,7 @@ The smallest complementary behavioural matrix covers:
 - 17 gather searches and 65 shows whose first ordinary element is invalid, including one request with invalid searches and 65 shows, proving both count checks run before either item-validation pass and before repository/cache access;
 - 1,001 supersedes whose first ordinary element is invalid, proving the count error wins before ID validation, mapping, uniqueness allocation, or repository access;
 - strengthened existing cache budget assertions for exact field, budget, maximum, no cache path, and untouched repository/cache inspection hooks;
+- repeated gather shows whose individual record is valid but whose cumulative full response exceeds 4 MiB, plus compact gather searches that remain usable independently of that budget;
 - CLI list/full-search and compact-search/gather boundaries, exact help ranges, exit status, structured details, and raw empty repeated values at 17 searches, 65 shows, and 1,001 supersedes;
 - packed CLI help and representative full/compact over-limit failures;
 - unchanged query-byte, query-term, response-byte, empty-array, duplicate-order, public type, and package declaration regressions.
@@ -97,4 +98,4 @@ Tests use ordinary dense arrays. They do not add proxies, getters, sparse arrays
 
 ## Reviewed implementation provenance
 
-The exact reviewed code and behavioural-test snapshot implementing this design is `011360c808a61a94a98683cbecf059da46a18471`. Documentation changes do not alter the runtime API, package exports, or generated declarations.
+The exact reviewed code and behavioural-test snapshot implementing this design is `1e913807c20a332dc49a004be672205fbeabfe15`. Documentation changes do not alter the runtime API, package exports, or generated declarations.
