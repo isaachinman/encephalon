@@ -94,3 +94,7 @@ The smallest complementary behavioural matrix covers:
 - unchanged query-byte, query-term, response-byte, empty-array, duplicate-order, public type, and package declaration regressions.
 
 Tests use ordinary dense arrays. They do not add proxies, getters, sparse arrays, or accessor semantics belonging to MAR-2572.
+
+## Reviewed implementation provenance
+
+The exact reviewed code and behavioural-test snapshot implementing this design is `6dc60e13e8e99b05fef566d4b80aeb663328664c`. Documentation changes do not alter the runtime API, package exports, or generated declarations.

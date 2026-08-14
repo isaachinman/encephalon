@@ -47,11 +47,16 @@ describe('package contract', () => {
   test('marks the old implementation plan historical and maintains a concise contract', () => {
     const implementationPlan = readFileSync(resolve(root, 'docs', 'implementation-plan.md'), 'utf8')
     const contract = readFileSync(resolve(root, 'docs', 'contract.md'), 'utf8')
+    const operationBudgetsDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-13-operation-budgets-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
     assert.doesNotMatch(implementationPlan, /createdAt is assigned only after the repository operation lock is held/)
     assert.match(contract, /## Public API and CLI/)
+    assert.match(contract, /## Operation Budgets/)
     assert.match(contract, /## Canonical Storage/)
     assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
@@ -70,6 +75,10 @@ describe('package contract', () => {
       /MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2874874096bb7d327e084d7e17d5243564244c43`\./,
     )
     assert.match(contract, /Historical plan's wall-clock-only `createdAt` policy/)
+    assert.match(
+      operationBudgetsDesign,
+      /The exact reviewed code and behavioural-test snapshot implementing this design is `6dc60e13e8e99b05fef566d4b80aeb663328664c`\./,
+    )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),
       /creation timestamps under the repository operation lock/,

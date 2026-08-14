@@ -15,6 +15,15 @@ This document is the concise contract maintainers should update when public beha
 - Git marker files and package manifests used for repository or executing-package identity are read through bounded, no-follow regular-file descriptors with stable identity and fatal UTF-8 decoding. Worktree targets must be non-empty and NUL-free, and are accepted only when their real-directory identity remains stable across native realpath resolution. Repository and executing-package ascent also revalidate each child generation after capturing its parent.
 - Executing package identity is cached only after its manifest and exact canonical directory generation have been verified successfully. Each repository root still reverifies its installed Encephalon manifest and directory generation on every resolution, and the installed generation must match the cached executing generation. The discovered repository generation remains verified through root-installation acceptance. Unsafe or malformed installed manifests use the generic root-install-required failure; path-generation changes use the stable repository classification while operational filesystem failures retain the stable I/O error classification.
 
+## Operation Budgets
+
+- `list` and full `search` accept result limits from 1 through 50. Compact `search` and each `gather` search accept result limits from 1 through 100. The default remains 20.
+- A `gather` input contains at most 16 searches and 64 shows. An add-record input contains at most 1,000 supersession targets.
+- Every search query contains at most 1,024 UTF-8 bytes and 32 literal terms. Full-record responses from list, show, full search, and gather contain at most 4 MiB of aggregate record JSON.
+- An oversized result limit, gather input count, or supersedes input count fails with `INVALID_ARGUMENT` before item validation, repository discovery, cache-location inspection, SQLite access, hydration, or other repository/cache hooks. Count checks run before mapping or uniqueness-set construction. Cache execution retains matching defensive checks for internal callers and future refactors.
+- Budget failures contain exactly the bounded details `{ field, budget, maximum }`. Stable budget names are `fullResultLimit`, `compactResultLimit`, `queryBytes`, `queryTerms`, `gatherSearches`, `gatherShows`, `supersessionEdges`, and `fullResponseBytes`; details exclude arrays, individual values, queries, paths, and other input content.
+- The fixed budget authority is internal. It is not exported by `src/index.ts` and does not change the public TypeScript input or result shapes.
+
 ## Canonical Storage
 
 - Canonical knowledge is append-only JSON under `encephalon/<kind>/<id>.json`.
