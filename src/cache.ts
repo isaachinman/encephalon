@@ -286,13 +286,6 @@ const assertTableColumns = (
   }
 }
 
-const removeCorruptCache = (location: CacheLocation, error: unknown) => {
-  if (error instanceof CacheDatabaseFailure) {
-    return quarantineCacheDatabase(location, error.database)
-  }
-  throw error
-}
-
 const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync']) => {
   if (sqliteFeaturesVerified) {
     return
@@ -1054,16 +1047,7 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
       continue
     }
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-    let database: DatabaseSync
-    try {
-      database = openWriterDatabase(location)
-    } catch (error) {
-      if (!isRecoverableCacheFailure(error)) {
-        throw error
-      }
-      removeCorruptCache(location, error)
-      database = openWriterDatabase(location)
-    }
+    const database = openWriterDatabase(location)
     try {
       let existingMetadata: Metadata | undefined
       try {
@@ -1129,25 +1113,69 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
   return fail('INTERNAL_ERROR', 'The Encephalon cache rebuild ended unexpectedly.')
 }
 
+const recoverDisposableCacheOnce = (root: string, location: CacheLocation, failure: unknown): PrepareResult => {
+  if (!isRecoverableCacheFailure(failure)) {
+    throw failure
+  }
+  return withOperationLock(
+    root,
+    captured => {
+      if (failure instanceof CacheDatabaseFailure) {
+        quarantineCacheDatabase(captured, failure.database)
+      } else {
+        throw failure
+      }
+      return rebuildCache(root, captured)
+    },
+    {},
+    location,
+  )
+}
+
+const runWithDisposableCacheRecovery = <Result>(
+  root: string,
+  location: CacheLocation,
+  operation: () => Result,
+): Result => {
+  try {
+    return operation()
+  } catch (failure) {
+    if (failure instanceof EncephalonError || !isRecoverableCacheFailure(failure)) {
+      throw failure
+    }
+    recoverDisposableCacheOnce(root, location, failure)
+    return operation()
+  }
+}
+
 const prepareResolvedWithoutCorruptionRecovery = (
   root: string,
   location: CacheLocation,
   lock = true,
 ): PrepareResult => {
-  const serialize = <Result>(operation: (captured: CacheLocation) => Result) =>
-    lock ? withOperationLock(root, operation, {}, location) : operation(location)
+  const serialize = <Result>(operation: (captured: CacheLocation) => Result) => {
+    if (lock) {
+      try {
+        return withOperationLock(root, operation, {}, location)
+      } catch (failure) {
+        if (
+          failure instanceof EncephalonError &&
+          failure.cause instanceof CacheDatabaseFailure &&
+          isRecoverableCacheFailure(failure.cause)
+        ) {
+          throw failure.cause
+        }
+        throw failure
+      }
+    }
+    return operation(location)
+  }
   if (inspectCacheDatabase(location, 'brain.sqlite') === undefined) {
     return serialize(captured => {
       if (inspectCacheDatabase(captured, 'brain.sqlite') !== undefined) {
-        try {
-          const metadata = readFreshMetadata(root, captured)
-          if (metadata !== undefined) {
-            return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
-          }
-        } catch (error) {
-          if (!isRecoverableCacheFailure(error)) {
-            throw error
-          }
+        const metadata = readFreshMetadata(root, captured)
+        if (metadata !== undefined) {
+          return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
         }
       }
       return rebuildCache(root, captured)
@@ -1158,15 +1186,9 @@ const prepareResolvedWithoutCorruptionRecovery = (
     return { hydrated: false, recordsIndexed: cachedMetadata.recordsIndexed }
   }
   return serialize(captured => {
-    try {
-      const metadata = readFreshMetadata(root, captured)
-      if (metadata !== undefined) {
-        return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
-      }
-    } catch (error) {
-      if (!isRecoverableCacheFailure(error)) {
-        throw error
-      }
+    const metadata = readFreshMetadata(root, captured)
+    if (metadata !== undefined) {
+      return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
     }
     return rebuildCache(root, captured)
   })
@@ -1177,16 +1199,13 @@ const prepareResolved = (
   lock = true,
   capturedLocation: CacheLocation = inspectCacheLocation(root),
 ): PrepareResult => {
-  try {
-    return prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lock)
-  } catch (error) {
-    if (!isRecoverableCacheFailure(error)) {
-      throw error
-    }
-    return lock
-      ? withOperationLock(root, location => rebuildCache(root, location), {}, capturedLocation)
-      : rebuildCache(root, capturedLocation)
+  let attempts = 0
+  const operation = () => {
+    attempts += 1
+    const result = prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lock)
+    return attempts > 1 ? { ...result, hydrated: true } : result
   }
+  return lock ? runWithDisposableCacheRecovery(root, capturedLocation, operation) : operation()
 }
 
 export const prepareResolvedRepository = (root: string, lock = true, location?: CacheLocation): PrepareResult =>
@@ -1250,25 +1269,15 @@ const readFreshCache = <Result>(root: string, location: CacheLocation, read: (da
 
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
   const root = resolveRepository(input)
-  let location: CacheLocation | undefined
   try {
-    location = inspectCacheLocation(root)
-    prepareResolved(root, true, location)
-    return readFreshCache(root, location, read)
+    const location = inspectCacheLocation(root)
+    return runWithDisposableCacheRecovery(root, location, () => {
+      prepareResolvedWithoutCorruptionRecovery(root, location)
+      return readFreshCache(root, location, read)
+    })
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
-    }
-    if (isRecoverableCacheFailure(error) && location !== undefined) {
-      withOperationLock(root, captured => rebuildCache(root, captured), {}, location)
-      try {
-        return readFreshCache(root, location, read)
-      } catch (retryError) {
-        if (retryError instanceof EncephalonError) {
-          throw retryError
-        }
-        return wrapIo('Unable to read the Encephalon cache.', retryError)
-      }
     }
     return wrapIo('Unable to read the Encephalon cache.', error)
   }
@@ -1523,38 +1532,19 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
   assertGatherBudgets(parsed)
   compactResultLimit(parsed.limit)
   const root = resolveRepository(parsed)
-  let location: CacheLocation | undefined
   try {
-    location = inspectCacheLocation(root)
-    let hydrated: HydrateResult | null = null
+    const location = inspectCacheLocation(root)
     if (parsed.hydrate === true) {
-      hydrated = {
-        recordsIndexed: hydrateResolvedRepository(root, true, location).recordsIndexed,
-      }
-    } else {
-      prepareResolved(root, true, location)
+      hydrateResolvedRepository(root, true, location)
     }
-    return readFreshCache(root, location, database => readGatherFromDatabase(database, parsed, hydrated))
+    return runWithDisposableCacheRecovery(root, location, () => {
+      const prepared = prepareResolvedWithoutCorruptionRecovery(root, location)
+      const hydrated = parsed.hydrate === true ? { recordsIndexed: prepared.recordsIndexed } : null
+      return readFreshCache(root, location, database => readGatherFromDatabase(database, parsed, hydrated))
+    })
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
-    }
-    if (isRecoverableCacheFailure(error) && location !== undefined) {
-      const recovered = withOperationLock(root, captured => rebuildCache(root, captured), {}, location)
-      try {
-        return readFreshCache(root, location, database =>
-          readGatherFromDatabase(
-            database,
-            parsed,
-            parsed.hydrate === true ? { recordsIndexed: recovered.recordsIndexed } : null,
-          ),
-        )
-      } catch (retryError) {
-        if (retryError instanceof EncephalonError) {
-          throw retryError
-        }
-        return wrapIo('Unable to gather Encephalon records.', retryError)
-      }
     }
     return wrapIo('Unable to gather Encephalon records.', error)
   }

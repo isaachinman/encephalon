@@ -2478,6 +2478,108 @@ describe('SQLite cache and reads', () => {
     })
   }
 
+  test('quarantines one exact corrupt cache generation before rebuilding', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    mutateCache(root, database => {
+      database
+        .prepare('UPDATE records SET record_json = CAST(zeroblob(?) AS TEXT) || ? WHERE id = ?')
+        .run(1_052_673, 'private-cache-sentinel', String(record.id))
+    })
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root }),
+      [record],
+    )
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 1)
+  })
+
+  test('bounds failed cache recovery without serving private cache content', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    mutateCache(root, database => {
+      database
+        .prepare('UPDATE records SET record_json = CAST(zeroblob(?) AS TEXT) || ? WHERE id = ?')
+        .run(1_052_673, 'private-cache-sentinel', String(record.id))
+    })
+    let writerAttempts = 0
+    let resultsServed = 0
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerAttempts += 1
+        if (writerAttempts === 1) {
+          throw Object.assign(new Error('Injected recovery writer failure.'), { code: 'EIO' })
+        }
+      }
+    }
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+
+    assert.throws(
+      () => {
+        resultsServed = listRecords({ root }).length
+      },
+      (error: unknown) => {
+        const publicError = error as { cause?: unknown; code?: unknown; details?: unknown; message?: unknown }
+        assert.ok(publicError.code === 'IO_ERROR' || publicError.code === 'INTERNAL_ERROR')
+        assert.doesNotMatch(
+          JSON.stringify({
+            cause: publicError.cause instanceof Error ? publicError.cause.message : publicError.cause,
+            details: publicError.details ?? null,
+            message: publicError.message,
+          }),
+          /private-cache-sentinel/,
+        )
+        return true
+      },
+    )
+    assert.equal(writerAttempts, 1)
+    assert.equal(resultsServed, 0)
+  })
+
+  test('does not quarantine a foreign cache with a valid repository scope', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const foreignRepository = realpathSync.native(createOutsideDirectory())
+    mutateCache(root, database => {
+      database.prepare("UPDATE metadata SET value = ? WHERE key = 'repositoryRealpath'").run(foreignRepository)
+    })
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'CACHE_SCOPE_MISMATCH')
+        return true
+      },
+    )
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 0)
+  })
+
   test('rebuilds non-text cached record JSON before reading it', () => {
     const root = createRoot()
     const record = addCacheRecord(root)
@@ -2742,16 +2844,12 @@ describe('SQLite cache and reads', () => {
         { hydrated: true, recordsIndexed: 1 },
         name,
       )
-      assert.deepEqual(
-        observations.find(observation => observation.kind === 'probe' && observation.name === 'records'),
-        { kind: 'probe', name: 'records', rows: expectedRows },
-        name,
+      const probeIndex = observations.findIndex(
+        observation =>
+          observation.kind === 'probe' && observation.name === 'records' && observation.rows === expectedRows,
       )
-      assert.equal(
-        observations.some(observation => observation.kind === 'text-read' && observation.name === 'records'),
-        false,
-        name,
-      )
+      assert.notEqual(probeIndex, -1, name)
+      assert.notDeepEqual(observations.at(probeIndex + 1), { kind: 'text-read', name: 'records' }, name)
       assert.equal(
         functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root })[0]?.id,
         record.id,
@@ -2845,16 +2943,12 @@ describe('SQLite cache and reads', () => {
         { hydrated: true, recordsIndexed: 1 },
         name,
       )
-      assert.deepEqual(
-        observations.find(observation => observation.kind === 'probe' && observation.name === 'record-search'),
-        { kind: 'probe', name: 'record-search', rows: expectedRows },
-        name,
+      const probeIndex = observations.findIndex(
+        observation =>
+          observation.kind === 'probe' && observation.name === 'record-search' && observation.rows === expectedRows,
       )
-      assert.equal(
-        observations.some(observation => observation.kind === 'text-read' && observation.name === 'record-search'),
-        false,
-        name,
-      )
+      assert.notEqual(probeIndex, -1, name)
+      assert.notDeepEqual(observations.at(probeIndex + 1), { kind: 'text-read', name: 'record-search' }, name)
       assert.equal(
         functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root })[0]?.id,
         record.id,

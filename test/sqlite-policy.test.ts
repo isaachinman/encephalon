@@ -3,7 +3,7 @@ import { afterEach, describe, test } from 'node:test'
 import { cacheReadTestHooks } from '../src/cache.ts'
 import { cacheLocationTestHooks } from '../src/cache-location.ts'
 import { EncephalonError, wrapIo } from '../src/errors.ts'
-import { prepare } from '../src/index.ts'
+import { listRecords, prepare } from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { classifySQLiteError, type SQLiteErrorCategory } from '../src/sqlite-error.ts'
 import { createTestRepository, removeTestRepository } from './helpers.ts'
@@ -118,6 +118,27 @@ describe('SQLite consumer policies', () => {
     }
     assertErrorCode(() => prepare({ root }), 'INTERNAL_ERROR')
     assert.equal(exhaustedSchemaInitialisations, 2)
+  })
+
+  test('cache recovery does not rebuild after a second recoverable validation failure', () => {
+    const root = createRoot()
+    prepare({ root })
+    let readerInitialisations = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'reader') {
+        readerInitialisations += 1
+        if (readerInitialisations <= 2) {
+          throw sqliteError('no such table: metadata', { code: 'ERR_SQLITE_ERROR' })
+        }
+      } else {
+        writerInitialisations += 1
+      }
+    }
+
+    assertErrorCode(() => listRecords({ root }), 'INTERNAL_ERROR')
+    assert.equal(readerInitialisations, 2)
+    assert.equal(writerInitialisations, 1)
   })
 
   test('operation gate handles only contention and disposable corruption categories', () => {
