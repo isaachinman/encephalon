@@ -1155,15 +1155,26 @@ const prepareResolvedWithoutCorruptionRecovery = (
 ): PrepareResult => {
   const serialize = <Result>(operation: (captured: CacheLocation) => Result) => {
     if (lock) {
+      let databaseFailure: CacheDatabaseFailure | undefined
       try {
-        return withOperationLock(root, operation, {}, location)
+        return withOperationLock(
+          root,
+          captured => {
+            try {
+              return operation(captured)
+            } catch (failure) {
+              if (failure instanceof CacheDatabaseFailure) {
+                databaseFailure = failure
+              }
+              throw failure
+            }
+          },
+          {},
+          location,
+        )
       } catch (failure) {
-        if (
-          failure instanceof EncephalonError &&
-          failure.cause instanceof CacheDatabaseFailure &&
-          isRecoverableCacheFailure(failure.cause)
-        ) {
-          throw failure.cause
+        if (databaseFailure !== undefined) {
+          throw databaseFailure
         }
         throw failure
       }

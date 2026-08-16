@@ -28,6 +28,7 @@ import { cacheReadTestHooks } from '../src/cache.ts'
 import {
   CacheDatabaseFailure,
   cacheLocationTestHooks,
+  inspectCacheDatabase,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
   openVerifiedCacheDatabase,
@@ -2578,6 +2579,50 @@ describe('SQLite cache and reads', () => {
     )
     assert.equal(primaryQuarantines, 0)
     assert.equal(writerInitialisations, 0)
+  })
+
+  test('preserves terminal Encephalon cache errors regardless of recoverable causes', () => {
+    const root = createRoot()
+    api.prepare({ root })
+    mutateCache(root, database => {
+      database.prepare("UPDATE metadata SET value = 'stale' WHERE key = 'manifest'").run()
+    })
+    const location = inspectCacheLocation(root)
+    const cacheDatabase = inspectCacheDatabase(location, 'brain.sqlite')
+    assert.ok(cacheDatabase)
+    const sqliteFailure = Object.assign(new Error('injected schema-like cause'), { code: 'SQLITE_SCHEMA' })
+    const databaseFailure = new CacheDatabaseFailure(sqliteFailure, cacheDatabase, { cause: sqliteFailure })
+    const terminalError = new api.EncephalonError(
+      'REPOSITORY_CHANGED',
+      'Injected terminal cache error.',
+      { invariant: 'terminal-error-priority' },
+      { cause: databaseFailure },
+    )
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (writerInitialisations === 1) {
+          throw terminalError
+        }
+      }
+    }
+
+    assert.throws(
+      () => api.prepare({ root }),
+      (error: unknown) => {
+        assert.equal(error, terminalError)
+        return true
+      },
+    )
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 1)
   })
 
   test('rebuilds non-text cached record JSON before reading it', () => {
