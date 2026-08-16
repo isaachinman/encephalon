@@ -75,10 +75,12 @@ afterEach(() => {
   cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
   cacheLocationTestHooks.regularFileRealpath = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
+  cacheReadTestHooks.afterIntegrityProbe = undefined
   cacheReadTestHooks.afterManifestKindEnumeration = undefined
   cacheReadTestHooks.afterManifestEntryLstat = undefined
   cacheReadTestHooks.afterManifestRootEnumeration = undefined
   cacheReadTestHooks.beforeManifestEntryLstat = undefined
+  cacheReadTestHooks.beforeIntegrityTextRead = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   recordWriteTestHooks.fault = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
@@ -371,6 +373,17 @@ const mutateCache = (root: string, mutation: (database: DatabaseSync) => void) =
   } finally {
     database.close()
   }
+}
+
+const observeCacheIntegrity = () => {
+  const observations: Array<{ kind: 'probe'; name: string; rows: number } | { kind: 'text-read'; name: string }> = []
+  cacheReadTestHooks.afterIntegrityProbe = ({ name, rows }) => {
+    observations.push({ kind: 'probe', name, rows })
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead = name => {
+    observations.push({ kind: 'text-read', name })
+  }
+  return observations
 }
 
 const assertCacheLayoutRejected = (operation: () => unknown) => {
@@ -2522,6 +2535,114 @@ describe('SQLite cache and reads', () => {
       hydrated: true,
       recordsIndexed: 1,
     })
+  })
+
+  test('bounds schema and metadata before transferring untrusted text', () => {
+    const cases = [
+      {
+        expectedProbe: { name: 'metadata-columns', rows: 2 },
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            CREATE TABLE replacement_metadata(key TEXT, private_metadata_sentinel TEXT);
+            DROP TABLE metadata;
+            ALTER TABLE replacement_metadata RENAME TO metadata;
+          `)
+        },
+        name: 'oversized metadata column name',
+      },
+      {
+        expectedProbe: { name: 'record-search-schema', rows: 1 },
+        mutate: (database: DatabaseSync) => {
+          database.enableDefensive(false)
+          database.exec(`
+            DROP TABLE record_search;
+            CREATE VIRTUAL TABLE record_search USING fts5(
+              ${' '.repeat(4096)}id UNINDEXED,
+              text
+            );
+          `)
+        },
+        name: 'oversized record_search schema SQL',
+      },
+      {
+        expectedProbe: { name: 'metadata', rows: 7 },
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            CREATE TABLE replacement_metadata(key TEXT, value TEXT);
+            INSERT INTO replacement_metadata SELECT key, value FROM metadata;
+            DROP TABLE metadata;
+            ALTER TABLE replacement_metadata RENAME TO metadata;
+            INSERT INTO metadata(key, value) VALUES ('duplicate', 'private-metadata-sentinel');
+          `)
+        },
+        name: 'seventh metadata row',
+      },
+      {
+        expectedProbe: { name: 'metadata', rows: 6 },
+        mutate: (database: DatabaseSync) => {
+          database
+            .prepare("UPDATE metadata SET value = CAST(zeroblob(?) AS TEXT) WHERE key = 'manifest'")
+            .run(1024 * 1024 + 1)
+        },
+        name: 'oversized metadata value containing NUL',
+      },
+    ]
+
+    for (const { expectedProbe, mutate, name } of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, mutate)
+      const observations = observeCacheIntegrity()
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        name,
+      )
+      const probeIndex = observations.findIndex(
+        observation => observation.kind === 'probe' && observation.name === expectedProbe.name,
+      )
+      assert.notEqual(probeIndex, -1, name)
+      assert.deepEqual(observations.at(probeIndex), { kind: 'probe', ...expectedProbe }, name)
+      assert.notDeepEqual(observations.at(probeIndex + 1), { kind: 'text-read', name: expectedProbe.name }, name)
+    }
+  })
+
+  test('requires canonical recordsIndexed metadata', () => {
+    const cases: Array<{
+      expected: { hydrated: boolean; recordsIndexed: number }
+      name: string
+      value: Buffer | string
+    }> = [
+      { expected: { hydrated: false, recordsIndexed: 1 }, name: 'canonical integer', value: '1' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'negative integer', value: '-1' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'fraction', value: '1.5' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'exponent', value: '1e0' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'leading zero', value: '01' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'leading whitespace', value: ' 1' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'trailing whitespace', value: '1 ' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'SQLite BLOB', value: Buffer.from('1') },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'canonical limit overflow', value: '1001' },
+    ]
+
+    for (const { expected, name, value } of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, database => {
+        database.prepare("UPDATE metadata SET value = ? WHERE key = 'recordsIndexed'").run(value)
+      })
+
+      try {
+        assert.deepEqual(
+          functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+          expected,
+          name,
+        )
+      } catch (error) {
+        assert.equal(String(error).includes(String(value)), false, name)
+        throw error
+      }
+    }
   })
 
   test('rebuilds missing and duplicate FTS rows', () => {

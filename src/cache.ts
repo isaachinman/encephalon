@@ -20,6 +20,7 @@ import {
   openVerifiedCacheDatabase,
   quarantineCacheDatabase,
 } from './cache-location.ts'
+import { CANONICAL_BUDGETS } from './canonical-budgets.ts'
 import {
   CanonicalDirectoryChangedError,
   CanonicalDirectoryEntryLimitError,
@@ -62,6 +63,8 @@ const MAX_GATHER_SHOWS = OPERATION_BUDGETS.gatherShows.maximum
 const MAX_FULL_RESPONSE_BYTES = OPERATION_BUDGETS.fullResponseBytes.maximum
 const SQLITE_BUSY_TIMEOUT_MILLISECONDS = 1000
 const MAX_CACHE_METADATA_BYTES = 1024 * 1024
+const MAX_CACHE_METADATA_AGGREGATE_BYTES = 6 * MAX_CACHE_METADATA_BYTES
+const MAX_CACHE_SCHEMA_BYTES = 4 * 1024
 const MAX_CACHE_RECORD_BYTES = MAX_RECORD_BYTES + 4096
 const MAX_CACHE_RECORDS = 100_000
 const METADATA_KEYS = [
@@ -117,20 +120,48 @@ type CompactRow = {
 
 type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind' | 'limit'>
 
+type CacheIntegrityProbeName =
+  | 'metadata'
+  | 'metadata-columns'
+  | 'records'
+  | 'records-columns'
+  | 'record-search'
+  | 'record-search-columns'
+  | 'record-search-schema'
+
+type CacheIntegrityProbe = {
+  exceeds_aggregate_bytes?: unknown
+  has_invalid_type?: unknown
+  has_oversized_value?: unknown
+  row_count?: unknown
+}
+
+type CacheIntegrityObservation = {
+  exceedsAggregateBytes: 0 | 1
+  hasInvalidType: 0 | 1
+  hasOversizedValue: 0 | 1
+  name: CacheIntegrityProbeName
+  rows: number
+}
+
 type CacheReadTestHooks = {
   afterCanonicalValidation?: (() => void) | undefined
+  afterIntegrityProbe?: ((observation: CacheIntegrityObservation) => void) | undefined
   afterManifestEntryLstat?: ((path: string) => void) | undefined
   afterManifestKindEnumeration?: ((path: string) => void) | undefined
   afterManifestRootEnumeration?: ((path: string) => void) | undefined
   afterCompactSearchRead?: ((query: string) => void) | undefined
   afterShowRead?: ((id: string) => void) | undefined
   beforeManifestEntryLstat?: ((path: string) => void) | undefined
+  beforeIntegrityTextRead?: ((name: CacheIntegrityProbeName) => void) | undefined
   duringDatabaseInitialisation?: ((mode: 'reader' | 'writer') => void) | undefined
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
 }
 
 class CacheSchemaMismatch extends Error {}
+
+const isIntegrityFlag = (value: unknown): value is 0 | 1 => value === 0 || value === 1
 
 let sqliteModule: SQLiteModule | undefined
 let sqliteFeaturesVerified = false
@@ -172,11 +203,80 @@ const isRecoverableCacheFailure = (error: unknown) => {
   )
 }
 
-const assertTableColumns = (database: DatabaseSync, table: string, expected: string[]) => {
-  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+const readIntegrityProbe = (
+  name: CacheIntegrityProbeName,
+  row: CacheIntegrityProbe | undefined,
+  maximumRows: number,
+): CacheIntegrityObservation => {
+  const rows = row?.row_count
+  const exceedsAggregateBytes = row?.exceeds_aggregate_bytes
+  const hasInvalidType = row?.has_invalid_type
+  const hasOversizedValue = row?.has_oversized_value
+  if (
+    typeof rows !== 'number' ||
+    !Number.isSafeInteger(rows) ||
+    rows < 0 ||
+    rows > maximumRows ||
+    !isIntegrityFlag(exceedsAggregateBytes) ||
+    !isIntegrityFlag(hasInvalidType) ||
+    !isIntegrityFlag(hasOversizedValue)
+  ) {
+    throw new CacheSchemaMismatch('The cache integrity probe returned an invalid result.')
+  }
+  const observation = {
+    exceedsAggregateBytes,
+    hasInvalidType,
+    hasOversizedValue,
+    name,
+    rows,
+  }
+  cacheReadTestHooks.afterIntegrityProbe?.(observation)
+  return observation
+}
+
+const assertTableColumns = (
+  database: DatabaseSync,
+  table: 'metadata' | 'record_search' | 'records',
+  expected: string[],
+) => {
+  const maximumRows = expected.length + 1
+  const maximumNameBytes = Math.max(...expected.map(name => Buffer.byteLength(name, 'utf8')))
+  const probeName = `${table.replace('_', '-')}-columns` as CacheIntegrityProbeName
+  const probe = readIntegrityProbe(
+    probeName,
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          0 AS exceeds_aggregate_bytes,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+        FROM (
+          SELECT
+            CASE WHEN typeof(name) = 'text' THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(name) = 'text' AND length(CAST(name AS BLOB)) <= ? THEN 0 ELSE 1 END AS oversized
+          FROM pragma_table_info(?)
+          LIMIT ?
+        )`,
+      )
+      .get(maximumNameBytes, table, maximumRows) as CacheIntegrityProbe | undefined,
+    maximumRows,
+  )
+  if (
+    probe.rows !== expected.length ||
+    probe.exceedsAggregateBytes !== 0 ||
+    probe.hasInvalidType !== 0 ||
+    probe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.(probeName)
+  const columns = database
+    .prepare('SELECT name FROM pragma_table_info(?) LIMIT ?')
+    .iterate(table, maximumRows) as Iterable<{
     name?: unknown
   }>
-  const names = columns.map(column => column.name)
+  const names = [...columns].map(column => column.name)
   if (JSON.stringify(names) !== JSON.stringify(expected)) {
     throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
   }
@@ -228,8 +328,38 @@ const assertCacheSchema = (database: DatabaseSync) => {
     'record_json',
   ])
   assertTableColumns(database, 'record_search', ['id', 'text'])
+  const searchSchemaProbe = readIntegrityProbe(
+    'record-search-schema',
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          0 AS exceeds_aggregate_bytes,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+        FROM (
+          SELECT
+            CASE WHEN typeof(sql) = 'text' THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(sql) = 'text' AND length(CAST(sql AS BLOB)) <= ? THEN 0 ELSE 1 END AS oversized
+          FROM sqlite_master
+          WHERE type = 'table' AND name = 'record_search'
+          LIMIT 2
+        )`,
+      )
+      .get(MAX_CACHE_SCHEMA_BYTES) as CacheIntegrityProbe | undefined,
+    2,
+  )
+  if (
+    searchSchemaProbe.rows !== 1 ||
+    searchSchemaProbe.exceedsAggregateBytes !== 0 ||
+    searchSchemaProbe.hasInvalidType !== 0 ||
+    searchSchemaProbe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.('record-search-schema')
   const searchSchema = database
-    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'record_search'")
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'record_search' LIMIT 2")
     .get() as { sql?: unknown } | undefined
   if (typeof searchSchema?.sql !== 'string' || !/\bUSING\s+fts5\b/i.test(searchSchema.sql)) {
     throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
@@ -520,13 +650,54 @@ const summaryForRecord = (record: BrainRecord) => {
 }
 
 const readMetadata = (database: DatabaseSync): Metadata | undefined => {
-  const rows = database.prepare('SELECT key, value FROM metadata').all() as Array<{
+  const maximumRows = METADATA_KEYS.length + 1
+  const maximumKeyBytes = Math.max(...METADATA_KEYS.map(key => Buffer.byteLength(key, 'utf8')))
+  const probe = readIntegrityProbe(
+    'metadata',
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value,
+          CASE WHEN TOTAL(value_bytes) > ? THEN 1 ELSE 0 END AS exceeds_aggregate_bytes
+        FROM (
+          SELECT
+            CASE WHEN typeof(key) = 'text' AND typeof(value) = 'text' THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(key) = 'text' AND length(CAST(key AS BLOB)) <= ?
+                       AND typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= ?
+                 THEN 0 ELSE 1 END AS oversized,
+            CASE WHEN typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= ?
+                 THEN length(CAST(value AS BLOB)) ELSE 0 END AS value_bytes
+          FROM metadata
+          LIMIT ?
+        )`,
+      )
+      .get(
+        MAX_CACHE_METADATA_AGGREGATE_BYTES,
+        maximumKeyBytes,
+        MAX_CACHE_METADATA_BYTES,
+        MAX_CACHE_METADATA_BYTES,
+        maximumRows,
+      ) as CacheIntegrityProbe | undefined,
+    maximumRows,
+  )
+  if (probe.rows === 0) {
+    return
+  }
+  if (
+    probe.rows >= maximumRows ||
+    probe.exceedsAggregateBytes !== 0 ||
+    probe.hasInvalidType !== 0 ||
+    probe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch('The cache metadata contains invalid keys or values.')
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.('metadata')
+  const rows = database.prepare('SELECT key, value FROM metadata LIMIT ?').iterate(maximumRows) as Iterable<{
     key?: unknown
     value?: unknown
   }>
-  if (rows.length === 0) {
-    return
-  }
   const values = new Map<string, string>()
   for (const row of rows) {
     if (
@@ -548,13 +719,13 @@ const readMetadata = (database: DatabaseSync): Metadata | undefined => {
     throw new CacheSchemaMismatch('The cache metadata key set is incomplete.')
   }
   const artifactPaths = parseCacheJson(artifactPathsValue, MAX_CACHE_METADATA_BYTES)
-  const recordsIndexed = Number(recordsIndexedValue)
+  const recordsIndexed = /^(?:0|[1-9]\d*)$/.test(recordsIndexedValue) ? Number(recordsIndexedValue) : Number.NaN
   if (
     !Array.isArray(artifactPaths) ||
-    artifactPaths.length > MAX_CACHE_RECORDS ||
+    artifactPaths.length > CANONICAL_BUDGETS.records ||
     !Number.isSafeInteger(recordsIndexed) ||
     recordsIndexed < 0 ||
-    recordsIndexed > MAX_CACHE_RECORDS
+    recordsIndexed > CANONICAL_BUDGETS.records
   ) {
     throw new CacheSchemaMismatch('The cache metadata contains invalid values.')
   }
