@@ -183,3 +183,7 @@ The complete lint, four-project typecheck, full test, benchmark, build, package,
 - Per-operation cache-generation memoisation remains MAR-2552.
 - Compact and gather response-byte budgets remain MAR-2554.
 - Incremental hydration, pagination, streaming, schema migration, configurable budgets, and new canonical storage remain out of scope.
+
+## Reviewed implementation provenance
+
+The exact reviewed code and behavioural-test snapshot implementing this design is `d0b4a28020c1394de9c8897436adc794ff865c55`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.

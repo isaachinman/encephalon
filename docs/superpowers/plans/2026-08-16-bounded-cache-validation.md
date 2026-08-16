@@ -39,7 +39,7 @@
 - Consumes: existing `CacheSchemaMismatch`, `DatabaseSync`, `METADATA_KEYS`, `cacheReadTestHooks`, `parseCacheJson`, and cache schema expectations.
 - Produces: `CANONICAL_BUDGETS`; unchanged internal aliases `MAX_RECORD_BYTES`, `MAX_CANONICAL_RECORDS`, and `MAX_CANONICAL_RECORD_BYTES`; `readIntegrityProbe`; bounded schema and metadata validation; internal `afterIntegrityProbe` and `beforeIntegrityTextRead` hooks used by later tasks.
 
-- [ ] **Step 1: Add focused failing metadata and schema tests**
+- [x] **Step 1: Add focused failing metadata and schema tests**
 
 Extend `CacheReadTestHooks` imports already used by `test/cache.test.ts` and add a helper that records only probe names/row counts and text-read names. Add one table-driven test with these corrupt cache generations:
 
@@ -76,7 +76,7 @@ test('bounds schema and metadata before transferring untrusted text', () => {
 
 Extend the existing metadata-value cases with canonical control `'1'` and rejected encodings `'-1'`, `'1.5'`, `'1e0'`, `'01'`, `' 1'`, `'1 '`, an SQLite BLOB, and `'1001'`. Assert every rejected value rebuilds to the one canonical record and never appears in a public error.
 
-- [ ] **Step 2: Run the focused tests and witness RED**
+- [x] **Step 2: Run the focused tests and witness RED**
 
 Run:
 
@@ -86,7 +86,7 @@ node --test --test-name-pattern='bounds schema and metadata|canonical recordsInd
 
 Expected: FAIL because the numeric/text hooks do not exist, metadata still uses unbounded `.all()`, and `Number(recordsIndexed)` accepts noncanonical encodings.
 
-- [ ] **Step 3: Add the dependency-free canonical authority**
+- [x] **Step 3: Add the dependency-free canonical authority**
 
 Create `src/canonical-budgets.ts`:
 
@@ -101,7 +101,7 @@ export const CANONICAL_BUDGETS = Object.freeze({
 
 Derive the existing internal aliases in `src/schema.ts` and `src/records.ts` from these fields. Do not export the authority from `src/index.ts`.
 
-- [ ] **Step 4: Implement a bounded numeric-probe authority in `src/cache.ts`**
+- [x] **Step 4: Implement a bounded numeric-probe authority in `src/cache.ts`**
 
 Add exact internal types:
 
@@ -140,7 +140,7 @@ beforeIntegrityTextRead?: ((name: CacheIntegrityProbeName) => void) | undefined
 
 Implement `readIntegrityProbe(name, row, maximumRows)` to accept only a safe integer from `0..maximumRows` and exact `0 | 1` flags. Any other result throws a fixed `CacheSchemaMismatch` without including values.
 
-- [ ] **Step 5: Replace schema and metadata `.all()` reads with two-phase validation**
+- [x] **Step 5: Replace schema and metadata `.all()` reads with two-phase validation**
 
 For each expected table, use a numeric aggregate over `SELECT name FROM pragma_table_info(?) LIMIT expected + 1`, then iterate at most `expected + 1` bounded names only on success. Probe `sqlite_master.sql` with `LIMIT 2` and a 4 KiB BLOB-byte maximum before reading its one text value. Preserve the current ordered column-name and FTS5 regex semantics.
 
@@ -167,7 +167,7 @@ FROM (
 
 Require fewer than seven rows before `beforeIntegrityTextRead('metadata')`, then iterate `LIMIT 7`. Require exactly six known keys. Parse `recordsIndexed` only after matching `^(?:0|[1-9]\d*)$`, and enforce `0..CANONICAL_BUDGETS.records`. Keep each metadata value at 1 MiB and aggregate values at 6 MiB.
 
-- [ ] **Step 6: Run focused and affected GREEN checks**
+- [x] **Step 6: Run focused and affected GREEN checks**
 
 Run:
 
@@ -179,12 +179,14 @@ bun run typecheck
 
 Expected: focused tests pass, lint reports no changes, and all four TypeScript projects pass.
 
-- [ ] **Step 7: Commit Task 1**
+- [x] **Step 7: Commit Task 1**
 
 ```bash
 git add src/canonical-budgets.ts src/schema.ts src/records.ts src/cache.ts test/cache.test.ts
 git commit -m "[MAR-2549] Bound cache metadata validation"
 ```
+
+**Task 1 evidence:** RED: the focused metadata/schema command ran 2 tests with 0 passed and 2 failed before implementation. GREEN: the final focused command passed 4/4, lint and all four TypeScript projects passed, and the full suite passed 453/455 with two established platform skips. Committed as `f5c3284`.
 
 ---
 
@@ -201,7 +203,7 @@ git commit -m "[MAR-2549] Bound cache metadata validation"
 - Consumes: `CANONICAL_BUDGETS`, `readIntegrityProbe`, `CacheIntegrityProbeName`, `openVerifiedCacheDatabase`, `parseCachedRecord`, existing record/FTS consistency checks, and Task 1 hooks.
 - Produces: `readVerifiedCacheTransaction<Result>(location, read)`; bounded record and FTS preflights; transaction-consistent validation plus actual public read; unchanged public list/show/search/gather results.
 
-- [ ] **Step 1: Add focused failing record and FTS overflow tests**
+- [x] **Step 1: Add focused failing record and FTS overflow tests**
 
 Use recursive SQL CTEs rather than JavaScript arrays:
 
@@ -232,11 +234,11 @@ Add complementary cases for:
 
 Each test calls `prepare({ root })`, expects one rebuilt canonical record, asserts the numeric probe, and asserts no corrupt-generation text-materialisation hook.
 
-- [ ] **Step 2: Add a failing snapshot-race test**
+- [x] **Step 2: Add a failing snapshot-race test**
 
 During `afterIntegrityProbe` for records, open a second `DatabaseSync` connection to the cache in WAL mode, update the current record to a different valid bounded JSON generation, and commit. Assert the operation either sees the original complete snapshot or retries/rebuilds; it must never combine the original numeric probe with successor text. Record the exact returned ID/generation rather than relying on timing or sleep.
 
-- [ ] **Step 3: Run the focused tests and witness RED**
+- [x] **Step 3: Run the focused tests and witness RED**
 
 Run:
 
@@ -246,7 +248,7 @@ node --test --test-name-pattern='bounds cached record|bounds FTS|pins cache vali
 
 Expected: FAIL because record rows still materialise with `.all()`, FTS lacks type/byte probes, hostile integers can escape Node conversion, and freshness validation is not uniformly transaction-pinned.
 
-- [ ] **Step 4: Implement record and FTS numeric preflights**
+- [x] **Step 4: Implement record and FTS numeric preflights**
 
 Define cache-specific bounds:
 
@@ -263,7 +265,7 @@ Probe `records` through an inner `LIMIT 1001`. Return only row count and flags p
 
 Probe `record_search` through an inner `LIMIT 1001`. Prove both columns are text, each ID is at most 255 bytes, each text is at most `MAX_CACHE_RECORD_BYTES`, aggregate IDs are at most `MAX_CACHE_FTS_ID_BYTES`, and aggregate text is at most `MAX_CACHE_RECORD_JSON_BYTES`. Only then run the current distinct/missing/orphan relationship checks. Do not compare FTS text semantics.
 
-- [ ] **Step 5: Move validation and actual reads into one verified transaction**
+- [x] **Step 5: Move validation and actual reads into one verified transaction**
 
 Replace `openReaderDatabase`, `readFreshDatabase`, and duplicated transaction handling with:
 
@@ -308,7 +310,7 @@ const readVerifiedCacheTransaction = <Result>(
 
 Use a private sentinel rather than `undefined` if a legitimate operation result may be undefined. Make `readFreshMetadata`, normal prepared reads, and gather reads call this helper so schema/content validation and actual result production share the transaction and captured database identity.
 
-- [ ] **Step 6: Run focused, cache, lint, and type checks**
+- [x] **Step 6: Run focused, cache, lint, and type checks**
 
 Run:
 
@@ -321,12 +323,14 @@ bun run typecheck
 
 Expected: focused tests pass; the complete cache suite passes; lint and all TypeScript projects pass.
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 ```bash
 git add src/cache.ts test/cache.test.ts
 git commit -m "[MAR-2549] Bound cache record validation"
 ```
+
+**Task 2 evidence:** RED: the focused record/FTS/snapshot command ran 3 tests with 0 passed and 3 failed before implementation. GREEN: the final focused command passed 10/10, the cache suite passed 109/109, lint and all four TypeScript projects passed, and the full suite passed 457/459 with two established platform skips. Committed as `b8ce191`.
 
 ---
 
@@ -344,7 +348,7 @@ git commit -m "[MAR-2549] Bound cache record validation"
 - Consumes: `CacheDatabaseFailure.database`, `isRecoverableCacheFailure`, `quarantineCacheDatabase`, `withOperationLock`, `rebuildCache`, `readVerifiedCacheTransaction`, and existing public error wrapping.
 - Produces: one private `recoverDisposableCacheOnce` authority shared by prepare/list/show/search/gather; exact quarantine for validation corruption; stable one-rebuild/one-retry behaviour; bounded privacy-preserving terminal errors.
 
-- [ ] **Step 1: Add failing exact-recovery and privacy tests**
+- [x] **Step 1: Add failing exact-recovery and privacy tests**
 
 Add one representative `listRecords` corruption test that:
 
@@ -371,7 +375,7 @@ assert.equal(resultsServed, 0)
 
 Add a valid foreign `repositoryRealpath` test asserting `CACHE_SCOPE_MISMATCH`, zero quarantine calls, and zero writer rebuilds.
 
-- [ ] **Step 2: Run the focused tests and witness RED**
+- [x] **Step 2: Run the focused tests and witness RED**
 
 Run:
 
@@ -381,7 +385,7 @@ node --test --test-name-pattern='quarantines one exact corrupt cache|bounds fail
 
 Expected: FAIL because content `CacheSchemaMismatch` is rebuilt in place, prepare and read layers own separate recovery paths, and failure counts are not centrally bounded.
 
-- [ ] **Step 3: Implement central exact-generation recovery**
+- [x] **Step 3: Implement central exact-generation recovery**
 
 Add:
 
@@ -412,7 +416,7 @@ const recoverDisposableCacheOnce = (
 
 All schema/content validation failures should now arrive as `CacheDatabaseFailure` because Task 2 runs them inside `openVerifiedCacheDatabase.afterVerifiedOpen`. Preserve valid `EncephalonError` values such as `CACHE_SCOPE_MISMATCH` before recoverability checks.
 
-- [ ] **Step 4: Consolidate prepare and read retry ownership**
+- [x] **Step 4: Consolidate prepare and read retry ownership**
 
 Make prepare, ordinary reads, and gather use one shared operation shape:
 
@@ -436,7 +440,7 @@ const runWithDisposableCacheRecovery = <Result>(
 
 The retry call must be outside another recovery wrapper. If it fails, propagate it to the existing public `wrapIo` boundary without another quarantine or rebuild. Remove duplicate prepare/gather recovery branches and any now-dead in-place corruption cleanup helper. Hydrate remains an explicit rebuild operation rather than a retry wrapper.
 
-- [ ] **Step 5: Preserve error priority and retry policy tests**
+- [x] **Step 5: Preserve error priority and retry policy tests**
 
 Extend `test/sqlite-policy.test.ts` only where needed to prove:
 
@@ -445,7 +449,7 @@ Extend `test/sqlite-policy.test.ts` only where needed to prove:
 - a second recoverable validation failure does not cause a second rebuild;
 - `CACHE_SCOPE_MISMATCH` remains terminal and unmodified.
 
-- [ ] **Step 6: Run affected and full static checks**
+- [x] **Step 6: Run affected and full static checks**
 
 Run:
 
@@ -458,12 +462,14 @@ bun run typecheck
 
 Expected: all selected and affected tests pass; lint and all four TypeScript projects pass.
 
-- [ ] **Step 7: Commit Task 3**
+- [x] **Step 7: Commit Task 3**
 
 ```bash
 git add src/cache.ts test/cache.test.ts test/sqlite-policy.test.ts
 git commit -m "[MAR-2549] Recover exact corrupt cache generations"
 ```
+
+**Task 3 evidence:** RED: the initial four-case recovery run had 2 failures that exposed in-place rebuild and double-recovery ownership; a reviewed terminal-error regression then failed 0/1 before its correction. GREEN: the corrected focused run passed 5/5, affected suites passed 127/127, lint and all four TypeScript projects passed, and the full suite passed 462/464 with two established platform skips. Implementation and reviewed correction are `f20a4fd` and `d0b4a28`.
 
 ---
 
@@ -481,7 +487,7 @@ git commit -m "[MAR-2549] Recover exact corrupt cache generations"
 - Consumes: exact Task 3 code/test commit SHA, completed behavioural evidence, existing maintained-contract provenance convention, and package documentation tests.
 - Produces: current README/contract semantics, exact implementation provenance, completed plan evidence, release-gate report, and a clean ticket branch ready for the six-role review wave.
 
-- [ ] **Step 1: Witness documentation provenance RED**
+- [x] **Step 1: Witness documentation provenance RED**
 
 Extend `test/package.test.ts` to require a `## Bounded Disposable Cache Validation` contract section and the exact Task 3 code/test SHA in the maintained contract and design provenance. Run:
 
@@ -491,7 +497,7 @@ node --test test/package.test.ts
 
 Expected: FAIL because the section and exact implementation provenance are absent.
 
-- [ ] **Step 2: Update public and maintained documentation**
+- [x] **Step 2: Update public and maintained documentation**
 
 Document:
 
@@ -505,7 +511,7 @@ Document:
 
 Add the exact Task 3 SHA as the design's reviewed implementation/test provenance. Mark every completed plan checkbox and add concise RED/GREEN evidence beneath each task without changing historical requirements.
 
-- [ ] **Step 3: Run documentation GREEN and Encephalon validation**
+- [x] **Step 3: Run documentation GREEN and Encephalon validation**
 
 Run:
 
@@ -516,7 +522,7 @@ npx --no-install encephalon validate
 
 Expected: package test passes. If the repository package still refuses self-root execution with `ROOT_INSTALL_REQUIRED`, record that established tooling limitation in the ignored report; do not inspect or edit Encephalon record JSON directly.
 
-- [ ] **Step 4: Run the complete verification matrix**
+- [x] **Step 4: Run the complete verification matrix**
 
 Run sequentially:
 
@@ -535,7 +541,7 @@ git diff --check origin/main...HEAD
 
 Expected: lint passes; all four TypeScript projects pass; full tests have zero failures with only established capability skips; both benchmarks pass; build/package pass; publish-contract exits zero with the expected already-published `0.2.0` refusal; frozen install changes nothing; diff check is clean.
 
-- [ ] **Step 5: Audit package, declarations, Bun files, and scope**
+- [x] **Step 5: Audit package, declarations, Bun files, and scope**
 
 Verify:
 
@@ -547,17 +553,21 @@ git status --short
 
 Expected: Bun/package diff is empty; no internal budget/probe/hook symbol appears in public declarations; the tracked worktree contains only intentional ticket changes; `bun.lock` remains plaintext JSON.
 
-- [ ] **Step 6: Write the ignored task report**
+- [x] **Step 6: Write the ignored task report**
 
 Record exact branch/base/merge-base, commits, RED/GREEN commands, test counts, benchmark results, release gates, declaration/config audits, scope exclusions, and any platform capability skips in `.superpowers/sdd/2026-08-16-bounded-cache-validation/task-report.md`. Confirm it remains ignored with `git check-ignore`.
 
-- [ ] **Step 7: Commit Task 4**
+- [x] **Step 7: Commit Task 4**
 
 ```bash
 git add README.md docs/contract.md docs/superpowers/specs/2026-08-16-bounded-cache-validation-design.md docs/superpowers/plans/2026-08-16-bounded-cache-validation.md test/package.test.ts
 git commit -m "[MAR-2549] Document bounded cache validation"
 ```
 
+**Task 4 evidence:** RED: the package contract command ran 7 tests with 6 passed and 1 failed on the absent bounded-cache section. GREEN: the same command passed 7/7 after the maintained contract and exact `d0b4a28020c1394de9c8897436adc794ff865c55` provenance were added. The sequential release matrix passed with 462/464 full tests and two established capability skips; both benchmark profiles, build, package, expected publish refusal, frozen install, declaration, Bun, package-content, and diff audits passed. The exact `npx` validation attempt hit the local root-owned npm-cache limitation, while the built CLI confirmed the established `ROOT_INSTALL_REQUIRED` self-root classification. Both Task 4 reports are confirmed ignored.
+
 - [ ] **Step 8: Prepare the branch review package without merging**
+
+**Controller handoff:** Step 8 remains pending. No push, PR or Linear mutation, CodeRabbit run, branch-review wave, or merge was performed by Task 4.
 
 Create the PR from the exact Linear branch, keep it unmerged, and provide the base SHA, head SHA, diff, plan, spec, report, and acceptance criteria to six parallel GPT-5.6 Terra reviewers: security, correctness, data/race, tests, maintainability, and UX/API. Apply no more than three review waves, fix all high/medium-confidence findings, rerun affected/full gates, perform the main-thread SoC/tidy/docs audit, and leave the reviewed PR open until every ticket in the supplied sequence is complete.

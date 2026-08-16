@@ -76,7 +76,7 @@ npx --no-install encephalon gather \
   --show "<record-id>"
 ```
 
-Every `list`, `show`, `search`, and `gather` call prepares the cache automatically. `prepare` rebuilds only when canonical inputs changed; `hydrate` forces a transactional rebuild.
+Every `list`, `show`, `search`, and `gather` call prepares the cache automatically. `prepare` reuses a valid fresh cache and rebuilds after canonical inputs change or a recoverable cache failure; `hydrate` forces a transactional rebuild.
 
 ```bash
 npx --no-install encephalon list --kind decision
@@ -148,6 +148,10 @@ Canonical directory enumeration is also bounded before record contents are read.
 Payload values are validated without invoking accessors. They may contain at most 64 nested levels and 10,000 JSON nodes, counting the root value, arrays, objects, and primitive values.
 
 The disposable cache lives at `node_modules/.cache/encephalon/brain.sqlite` and should not be committed. Encephalon verifies that its cache ancestors, SQLite files, sidecars, and operation-lock entries are real contained entries before use and identity-specific cleanup. It uses SQLite WAL mode, FTS5, a repository-scoped operation lock, manifest-based freshness, and transactional table rebuilds. Canonical records remain the source of truth.
+
+Disposable-cache validation treats every SQLite value as untrusted. Numeric-only probes run before text transfer and observe at most seven metadata rows or 1,001 record/FTS rows. The canonical authorities remain 1 MiB per record and 8 MiB for the 1,000-record corpus; cached `record_json` receives only a fixed 4 KiB-per-record runtime-path allowance, for a 12 MiB derived aggregate ceiling. Schema, metadata, record, and FTS validation, freshness checks, and the requested public read share one verified SQLite transaction, so results cannot mix database generations.
+
+On the first recoverable cache failure, Encephalon quarantines the exact captured database and sidecar identities under the operation lock, rebuilds once from canonical JSON, and retries the complete operation once. A second failure is terminal. A valid foreign cache remains `CACHE_SCOPE_MISMATCH` and is never quarantined; repository changes, busy/locked contention, operational I/O, and unknown SQLite failures retain their fail-closed policies. Semantic SQLite schema validation remains assigned to MAR-2553, and equality between FTS text and canonical cached records remains assigned to MAR-2550.
 
 Artifacts must be regular, non-symlink files beneath `_artifacts/<kind>/<id>/`. Record IDs and artifact paths are checked for traversal, platform portability, Windows-reserved names, case collisions, size limits, and containment. Validation binds every ancestor to the verified brain-root generation and derives cache metadata from one stable, read-only, nonblocking artifact descriptor; cache freshness enumerates records before reusing the same no-follow artifact inspection.
 
