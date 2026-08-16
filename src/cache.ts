@@ -154,6 +154,7 @@ type CacheReadTestHooks = {
   afterManifestEntryLstat?: ((path: string) => void) | undefined
   afterManifestKindEnumeration?: ((path: string) => void) | undefined
   afterManifestRootEnumeration?: ((path: string) => void) | undefined
+  afterPrimaryDatabaseObservation?: ((phase: 'prepare-fast-path' | 'reader-missing') => void) | undefined
   afterCompactSearchRead?: ((query: string) => void) | undefined
   afterShowRead?: ((id: string) => void) | undefined
   beforeManifestEntryLstat?: ((path: string) => void) | undefined
@@ -164,6 +165,8 @@ type CacheReadTestHooks = {
 }
 
 class CacheSchemaMismatch extends Error {}
+
+class CacheDatabaseObservedMissing extends Error {}
 
 const isIntegrityFlag = (value: unknown): value is 0 | 1 => value === 0 || value === 1
 
@@ -199,6 +202,7 @@ const isRecoverableCacheFailure = (error: unknown) => {
   const category = classifySQLiteError(failure)
   return (
     failure instanceof CacheSchemaMismatch ||
+    failure instanceof CacheDatabaseObservedMissing ||
     category === 'cantopen' ||
     category === 'corrupt' ||
     category === 'notadb' ||
@@ -439,7 +443,8 @@ const readVerifiedCacheTransaction = <Result>(
     DatabaseConstructor,
     location,
     missing: () => {
-      throw new CacheSchemaMismatch('The cache database disappeared before it was opened.')
+      cacheReadTestHooks.afterPrimaryDatabaseObservation?.('reader-missing')
+      throw new CacheDatabaseObservedMissing('The cache database disappeared before it was opened.')
     },
     name: 'brain.sqlite',
     openOptions: {
@@ -617,8 +622,9 @@ const parseCacheJson = (value: unknown, maximum: number) => {
   assertCacheValueSize(value, maximum)
   try {
     return JSON.parse(value) as unknown
-  } catch (error) {
-    throw new CacheSchemaMismatch('The cache contains malformed JSON.', { cause: error })
+  } catch {
+    // biome-ignore lint/style/useErrorCause: V8 parser errors can retain private untrusted cache source text.
+    throw new CacheSchemaMismatch('The cache contains malformed JSON.')
   }
 }
 
@@ -1113,38 +1119,90 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
   return fail('INTERNAL_ERROR', 'The Encephalon cache rebuild ended unexpectedly.')
 }
 
-const recoverDisposableCacheOnce = (root: string, location: CacheLocation, failure: unknown): PrepareResult => {
-  if (!isRecoverableCacheFailure(failure)) {
+const withCacheOperationLock = <Result>(
+  root: string,
+  location: CacheLocation,
+  operation: (captured: CacheLocation) => Result,
+): Result => {
+  let capturedFailure: unknown
+  let hasCapturedFailure = false
+  try {
+    return withOperationLock(
+      root,
+      captured => {
+        try {
+          return operation(captured)
+        } catch (failure) {
+          if (!(failure instanceof EncephalonError) && isRecoverableCacheFailure(failure)) {
+            capturedFailure = failure
+            hasCapturedFailure = true
+          }
+          throw failure
+        }
+      },
+      {},
+      location,
+    )
+  } catch (failure) {
+    if (hasCapturedFailure) {
+      throw capturedFailure
+    }
     throw failure
   }
-  return withOperationLock(
-    root,
-    captured => {
-      if (failure instanceof CacheDatabaseFailure) {
-        quarantineCacheDatabase(captured, failure.database)
-      } else {
-        throw failure
-      }
-      return rebuildCache(root, captured)
-    },
-    {},
-    location,
-  )
+}
+
+type DisposableCacheRecovery = { kind: 'rebuilt'; result: PrepareResult } | { kind: 'retry' }
+
+const recoverDisposableCacheUnderLock = (
+  root: string,
+  location: CacheLocation,
+  failure: unknown,
+): DisposableCacheRecovery => {
+  if (failure instanceof CacheDatabaseFailure) {
+    quarantineCacheDatabase(location, failure.database)
+    return { kind: 'rebuilt', result: rebuildCache(root, location) }
+  }
+  if (failure instanceof CacheDatabaseObservedMissing) {
+    if (inspectCacheDatabase(location, 'brain.sqlite') === undefined) {
+      return { kind: 'rebuilt', result: rebuildCache(root, location) }
+    }
+    return { kind: 'retry' }
+  }
+  throw failure
+}
+
+const recoverDisposableCacheOnce = (
+  root: string,
+  location: CacheLocation,
+  failure: unknown,
+  lock: boolean,
+): DisposableCacheRecovery => {
+  if (isRecoverableCacheFailure(failure)) {
+    return lock
+      ? withCacheOperationLock(root, location, captured => recoverDisposableCacheUnderLock(root, captured, failure))
+      : recoverDisposableCacheUnderLock(root, location, failure)
+  }
+  throw failure
 }
 
 const runWithDisposableCacheRecovery = <Result>(
   root: string,
   location: CacheLocation,
   operation: () => Result,
+  lock = true,
+  afterRebuild?: (result: PrepareResult) => Result,
 ): Result => {
   try {
     return operation()
   } catch (failure) {
-    if (failure instanceof EncephalonError || !isRecoverableCacheFailure(failure)) {
-      throw failure
+    if (!(failure instanceof EncephalonError) && isRecoverableCacheFailure(failure)) {
+      const recovery = recoverDisposableCacheOnce(root, location, failure, lock)
+      if (recovery.kind === 'rebuilt' && afterRebuild !== undefined) {
+        return afterRebuild(recovery.result)
+      }
+      return operation()
     }
-    recoverDisposableCacheOnce(root, location, failure)
-    return operation()
+    throw failure
   }
 }
 
@@ -1155,33 +1213,12 @@ const prepareResolvedWithoutCorruptionRecovery = (
 ): PrepareResult => {
   const serialize = <Result>(operation: (captured: CacheLocation) => Result) => {
     if (lock) {
-      let databaseFailure: CacheDatabaseFailure | undefined
-      try {
-        return withOperationLock(
-          root,
-          captured => {
-            try {
-              return operation(captured)
-            } catch (failure) {
-              if (failure instanceof CacheDatabaseFailure) {
-                databaseFailure = failure
-              }
-              throw failure
-            }
-          },
-          {},
-          location,
-        )
-      } catch (failure) {
-        if (databaseFailure !== undefined) {
-          throw databaseFailure
-        }
-        throw failure
-      }
+      return withCacheOperationLock(root, location, operation)
     }
     return operation(location)
   }
-  if (inspectCacheDatabase(location, 'brain.sqlite') === undefined) {
+  const existingDatabase = inspectCacheDatabase(location, 'brain.sqlite')
+  if (existingDatabase === undefined) {
     return serialize(captured => {
       if (inspectCacheDatabase(captured, 'brain.sqlite') !== undefined) {
         const metadata = readFreshMetadata(root, captured)
@@ -1192,6 +1229,7 @@ const prepareResolvedWithoutCorruptionRecovery = (
       return rebuildCache(root, captured)
     })
   }
+  cacheReadTestHooks.afterPrimaryDatabaseObservation?.('prepare-fast-path')
   const cachedMetadata = readFreshMetadata(root, location)
   if (cachedMetadata !== undefined) {
     return { hydrated: false, recordsIndexed: cachedMetadata.recordsIndexed }
@@ -1210,13 +1248,11 @@ const prepareResolved = (
   lock = true,
   capturedLocation: CacheLocation = inspectCacheLocation(root),
 ): PrepareResult => {
-  let attempts = 0
-  const operation = () => {
-    attempts += 1
-    const result = prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lock)
-    return attempts > 1 ? { ...result, hydrated: true } : result
-  }
-  return lock ? runWithDisposableCacheRecovery(root, capturedLocation, operation) : operation()
+  const operation = () => prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lock)
+  return runWithDisposableCacheRecovery(root, capturedLocation, operation, lock, () => ({
+    ...operation(),
+    hydrated: true,
+  }))
 }
 
 export const prepareResolvedRepository = (root: string, lock = true, location?: CacheLocation): PrepareResult =>
@@ -1224,9 +1260,15 @@ export const prepareResolvedRepository = (root: string, lock = true, location?: 
 
 export const hydrateResolvedRepository = (root: string, lock = true, location?: CacheLocation): PrepareResult => {
   const captured = location ?? inspectCacheLocation(root)
-  return lock
-    ? withOperationLock(root, heldLocation => rebuildCache(root, heldLocation), {}, captured)
-    : rebuildCache(root, captured)
+  const hydrateUnderLock = (heldLocation: CacheLocation) =>
+    runWithDisposableCacheRecovery(
+      root,
+      heldLocation,
+      () => rebuildCache(root, heldLocation),
+      false,
+      result => result,
+    )
+  return lock ? withCacheOperationLock(root, captured, hydrateUnderLock) : hydrateUnderLock(captured)
 }
 
 export const prepare = (input: RootInput = {}): PrepareResult => {
@@ -1546,12 +1588,23 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
   try {
     const location = inspectCacheLocation(root)
     if (parsed.hydrate === true) {
-      hydrateResolvedRepository(root, true, location)
+      const readAfterHydration = (heldLocation: CacheLocation, hydration: PrepareResult) =>
+        readFreshCache(root, heldLocation, database =>
+          readGatherFromDatabase(database, parsed, { recordsIndexed: hydration.recordsIndexed }),
+        )
+      return withCacheOperationLock(root, location, heldLocation =>
+        runWithDisposableCacheRecovery(
+          root,
+          heldLocation,
+          () => readAfterHydration(heldLocation, rebuildCache(root, heldLocation)),
+          false,
+          hydration => readAfterHydration(heldLocation, hydration),
+        ),
+      )
     }
     return runWithDisposableCacheRecovery(root, location, () => {
-      const prepared = prepareResolvedWithoutCorruptionRecovery(root, location)
-      const hydrated = parsed.hydrate === true ? { recordsIndexed: prepared.recordsIndexed } : null
-      return readFreshCache(root, location, database => readGatherFromDatabase(database, parsed, hydrated))
+      prepareResolvedWithoutCorruptionRecovery(root, location)
+      return readFreshCache(root, location, database => readGatherFromDatabase(database, parsed, null))
     })
   } catch (error) {
     if (error instanceof EncephalonError) {
