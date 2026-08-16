@@ -39,7 +39,7 @@ import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { ordinalStringCompare } from './order.ts'
 import { canonicalRecordPath, readRecords, readValidatedRecordSnapshotResolved } from './records.ts'
 import { resolveRepository } from './repository.ts'
-import { MAX_RECORD_BYTES, parseRecordFile, validateArtifactPath } from './schema.ts'
+import { parseRecordFile, validateArtifactPath } from './schema.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type {
   BrainRecord,
@@ -65,8 +65,12 @@ const SQLITE_BUSY_TIMEOUT_MILLISECONDS = 1000
 const MAX_CACHE_METADATA_BYTES = 1024 * 1024
 const MAX_CACHE_METADATA_AGGREGATE_BYTES = 6 * MAX_CACHE_METADATA_BYTES
 const MAX_CACHE_SCHEMA_BYTES = 4 * 1024
-const MAX_CACHE_RECORD_BYTES = MAX_RECORD_BYTES + 4096
-const MAX_CACHE_RECORDS = 100_000
+const MAX_CACHE_RECORD_OVERHEAD_BYTES = 4096
+const MAX_CACHE_RECORD_BYTES = CANONICAL_BUDGETS.recordBytes + MAX_CACHE_RECORD_OVERHEAD_BYTES
+const MAX_CACHE_RECORD_JSON_BYTES =
+  CANONICAL_BUDGETS.recordJsonBytes + CANONICAL_BUDGETS.records * MAX_CACHE_RECORD_OVERHEAD_BYTES
+const MAX_CACHE_RECORD_TEXT_BYTES = MAX_CACHE_RECORD_JSON_BYTES * 2
+const MAX_CACHE_FTS_ID_BYTES = CANONICAL_BUDGETS.records * 255
 const METADATA_KEYS = [
   'artifactPaths',
   'manifest',
@@ -412,13 +416,31 @@ const openWriterDatabase = (location: CacheLocation) => {
   })
 }
 
-const openReaderDatabase = (location: CacheLocation) => {
+const NO_VERIFIED_CACHE_RESULT = Symbol('no-verified-cache-result')
+
+const readVerifiedCacheTransaction = <Result>(
+  location: CacheLocation,
+  read: (database: DatabaseSync) => Result,
+): Result => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  return openVerifiedCacheDatabase({
-    afterVerifiedOpen: database => {
-      assertCacheSchema(database)
-      cacheReadTestHooks.duringDatabaseInitialisation?.('reader')
+  let result: Result | typeof NO_VERIFIED_CACHE_RESULT = NO_VERIFIED_CACHE_RESULT
+  const database = openVerifiedCacheDatabase({
+    afterVerifiedOpen: opened => {
+      opened.exec('BEGIN')
+      try {
+        assertCacheSchema(opened)
+        cacheReadTestHooks.duringDatabaseInitialisation?.('reader')
+        result = read(opened)
+        opened.exec('ROLLBACK')
+      } catch (error) {
+        try {
+          opened.exec('ROLLBACK')
+        } catch {
+          // Preserve the original validation/read error.
+        }
+        throw error
+      }
     },
     create: false,
     DatabaseConstructor,
@@ -432,6 +454,11 @@ const openReaderDatabase = (location: CacheLocation) => {
       timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
     },
   })
+  database.close()
+  if (result === NO_VERIFIED_CACHE_RESULT) {
+    return fail('INTERNAL_ERROR', 'The verified cache read returned no result.')
+  }
+  return result
 }
 
 const posixRelative = (root: string, path: string) =>
@@ -758,9 +785,72 @@ const assertCacheScope = (root: string, metadata: Metadata | undefined) => {
 }
 
 const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata) => {
+  const maximumRows = CANONICAL_BUDGETS.records + 1
+  const recordsProbe = readIntegrityProbe(
+    'records',
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          CASE WHEN TOTAL(record_json_bytes) > ?1 OR TOTAL(record_text_bytes) > ?2
+            THEN 1 ELSE 0 END AS exceeds_aggregate_bytes,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+        FROM (
+          SELECT
+            CASE WHEN typeof(id) = 'text'
+                       AND typeof(kind) = 'text'
+                       AND typeof(subject) = 'text'
+                       AND typeof(source) = 'text'
+                       AND typeof(created_at) = 'text'
+                       AND typeof(path) = 'text'
+                       AND typeof(active) = 'integer'
+                       AND active IN (0, 1)
+                       AND typeof(summary) IN ('null', 'text')
+                       AND typeof(record_json) = 'text'
+                 THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= ?3
+                       AND typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?3
+                       AND typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= ?3
+                       AND typeof(source) = 'text' AND length(CAST(source AS BLOB)) <= ?3
+                       AND typeof(created_at) = 'text' AND length(CAST(created_at AS BLOB)) <= ?3
+                       AND typeof(path) = 'text' AND length(CAST(path AS BLOB)) <= ?3
+                       AND (typeof(summary) = 'null'
+                         OR (typeof(summary) = 'text' AND length(CAST(summary AS BLOB)) <= ?3))
+                       AND typeof(record_json) = 'text' AND length(CAST(record_json AS BLOB)) <= ?3
+                 THEN 0 ELSE 1 END AS oversized,
+            CASE WHEN typeof(record_json) = 'text'
+                 THEN length(CAST(record_json AS BLOB)) ELSE 0 END AS record_json_bytes,
+            (CASE WHEN typeof(id) = 'text' THEN length(CAST(id AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(kind) = 'text' THEN length(CAST(kind AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(subject) = 'text' THEN length(CAST(subject AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(source) = 'text' THEN length(CAST(source AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(created_at) = 'text' THEN length(CAST(created_at AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(path) = 'text' THEN length(CAST(path AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(summary) = 'text' THEN length(CAST(summary AS BLOB)) ELSE 0 END
+            ) AS record_text_bytes
+          FROM records
+          LIMIT ?4
+        )`,
+      )
+      .get(MAX_CACHE_RECORD_JSON_BYTES, MAX_CACHE_RECORD_TEXT_BYTES, MAX_CACHE_RECORD_BYTES, maximumRows) as
+      | CacheIntegrityProbe
+      | undefined,
+    maximumRows,
+  )
+  if (
+    recordsProbe.rows !== metadata.recordsIndexed ||
+    recordsProbe.rows >= maximumRows ||
+    recordsProbe.exceedsAggregateBytes !== 0 ||
+    recordsProbe.hasInvalidType !== 0 ||
+    recordsProbe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch('The cache record table does not match its metadata.')
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.('records')
   const recordRows = database
-    .prepare('SELECT id, kind, subject, source, created_at, path, active, summary, record_json FROM records')
-    .all() as Array<
+    .prepare('SELECT id, kind, subject, source, created_at, path, active, summary, record_json FROM records LIMIT ?')
+    .iterate(maximumRows) as Iterable<
     RecordRow & {
       active?: unknown
       created_at?: unknown
@@ -772,10 +862,7 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
       summary?: unknown
     }
   >
-  if (recordRows.length !== metadata.recordsIndexed || recordRows.length > MAX_CACHE_RECORDS) {
-    throw new CacheSchemaMismatch('The cache record table does not match its metadata.')
-  }
-  const records = recordRows.map(row => ({ record: parseCachedRecord(row.record_json), row }))
+  const records = Array.from(recordRows, row => ({ record: parseCachedRecord(row.record_json), row }))
   const superseded = new Set(records.flatMap(({ record }) => record.supersedes ?? []))
   for (const { record, row } of records) {
     const active = superseded.has(record.id) ? 0 : 1
@@ -792,6 +879,44 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
       throw new CacheSchemaMismatch('The cache record table does not match its canonical JSON.')
     }
   }
+  const searchProbe = readIntegrityProbe(
+    'record-search',
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          CASE WHEN TOTAL(id_bytes) > ?1 OR TOTAL(text_bytes) > ?2
+            THEN 1 ELSE 0 END AS exceeds_aggregate_bytes,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+        FROM (
+          SELECT
+            CASE WHEN typeof(id) = 'text' AND typeof(text) = 'text'
+                 THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= ?3
+                       AND typeof(text) = 'text' AND length(CAST(text AS BLOB)) <= ?4
+                 THEN 0 ELSE 1 END AS oversized,
+            CASE WHEN typeof(id) = 'text' THEN length(CAST(id AS BLOB)) ELSE 0 END AS id_bytes,
+            CASE WHEN typeof(text) = 'text' THEN length(CAST(text AS BLOB)) ELSE 0 END AS text_bytes
+          FROM record_search
+          LIMIT ?5
+        )`,
+      )
+      .get(MAX_CACHE_FTS_ID_BYTES, MAX_CACHE_RECORD_JSON_BYTES, 255, MAX_CACHE_RECORD_BYTES, maximumRows) as
+      | CacheIntegrityProbe
+      | undefined,
+    maximumRows,
+  )
+  if (
+    searchProbe.rows !== metadata.recordsIndexed ||
+    searchProbe.rows >= maximumRows ||
+    searchProbe.exceedsAggregateBytes !== 0 ||
+    searchProbe.hasInvalidType !== 0 ||
+    searchProbe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.('record-search')
   const counts = database
     .prepare(
       `SELECT
@@ -866,15 +991,11 @@ const writeMetadata = (database: DatabaseSync, metadata: Metadata) => {
   }
 }
 
-const readFreshMetadata = (root: string, location: CacheLocation): Metadata | undefined => {
-  const database = openReaderDatabase(location)
-  try {
+const readFreshMetadata = (root: string, location: CacheLocation): Metadata | undefined =>
+  readVerifiedCacheTransaction(location, database => {
     const metadata = readMetadata(database)
     return metadataIsFresh(root, database, metadata) ? metadata : undefined
-  } finally {
-    database.close()
-  }
-}
+  })
 
 const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocation(root)): PrepareResult => {
   const attempts = Array.from({ length: MAX_REPOSITORY_CHANGE_RETRIES }, (_, index) => index)
@@ -1118,18 +1239,14 @@ const fullResultLimit = (value: unknown) => positiveLimit(value, 'fullResultLimi
 
 const compactResultLimit = (value: unknown) => positiveLimit(value, 'compactResultLimit')
 
-const readFreshDatabase = <Result>(root: string, location: CacheLocation, read: (database: DatabaseSync) => Result) => {
-  const database = openReaderDatabase(location)
-  try {
+const readFreshCache = <Result>(root: string, location: CacheLocation, read: (database: DatabaseSync) => Result) =>
+  readVerifiedCacheTransaction(location, database => {
     const metadata = readMetadata(database)
     if (!metadataIsFresh(root, database, metadata)) {
       throw new CacheSchemaMismatch('The cache is stale before read.')
     }
     return read(database)
-  } finally {
-    database.close()
-  }
-}
+  })
 
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
   const root = resolveRepository(input)
@@ -1137,7 +1254,7 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
   try {
     location = inspectCacheLocation(root)
     prepareResolved(root, true, location)
-    return readFreshDatabase(root, location, read)
+    return readFreshCache(root, location, read)
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -1145,7 +1262,7 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
     if (isRecoverableCacheFailure(error) && location !== undefined) {
       withOperationLock(root, captured => rebuildCache(root, captured), {}, location)
       try {
-        return readFreshDatabase(root, location, read)
+        return readFreshCache(root, location, read)
       } catch (retryError) {
         if (retryError instanceof EncephalonError) {
           throw retryError
@@ -1381,33 +1498,6 @@ const assertGatherBudgets = (input: GatherInput) => {
   searches.forEach(literalMatchQuery)
 }
 
-const readFreshTransaction = <Result>(
-  root: string,
-  location: CacheLocation,
-  read: (database: DatabaseSync) => Result,
-) => {
-  const database = openReaderDatabase(location)
-  try {
-    database.exec('BEGIN')
-    const metadata = readMetadata(database)
-    if (!metadataIsFresh(root, database, metadata)) {
-      throw new CacheSchemaMismatch('The cache is stale before read.')
-    }
-    const result = read(database)
-    database.exec('ROLLBACK')
-    return result
-  } catch (error) {
-    try {
-      database.exec('ROLLBACK')
-    } catch {
-      // The original read failure is more useful than a secondary rollback failure.
-    }
-    throw error
-  } finally {
-    database.close()
-  }
-}
-
 const readGatherFromDatabase = (
   database: DatabaseSync,
   input: GatherInput,
@@ -1444,7 +1534,7 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
     } else {
       prepareResolved(root, true, location)
     }
-    return readFreshTransaction(root, location, database => readGatherFromDatabase(database, parsed, hydrated))
+    return readFreshCache(root, location, database => readGatherFromDatabase(database, parsed, hydrated))
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -1452,7 +1542,7 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
     if (isRecoverableCacheFailure(error) && location !== undefined) {
       const recovered = withOperationLock(root, captured => rebuildCache(root, captured), {}, location)
       try {
-        return readFreshTransaction(root, location, database =>
+        return readFreshCache(root, location, database =>
           readGatherFromDatabase(
             database,
             parsed,

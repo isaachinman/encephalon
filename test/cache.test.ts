@@ -26,6 +26,7 @@ import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
 import {
+  CacheDatabaseFailure,
   cacheLocationTestHooks,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
@@ -417,6 +418,47 @@ describe('cache filesystem containment', () => {
       ),
       false,
     )
+  })
+
+  test('preserves a verified database failure when close also fails', () => {
+    const root = createRoot()
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const location = inspectCacheLocation(root)
+    const primaryFailure = new Error('verified read failure')
+    const closeFailure = new Error('database close failure')
+    let closeAttempts = 0
+    class CloseFailingDatabase {
+      readonly database: DatabaseSync
+
+      constructor(path: string) {
+        this.database = new DatabaseSync(path)
+      }
+
+      close() {
+        closeAttempts += 1
+        this.database.close()
+        throw closeFailure
+      }
+    }
+
+    assert.throws(
+      () =>
+        openVerifiedCacheDatabase({
+          afterVerifiedOpen: () => {
+            throw primaryFailure
+          },
+          create: false,
+          DatabaseConstructor: CloseFailingDatabase,
+          location,
+          name: 'brain.sqlite',
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof CacheDatabaseFailure)
+        assert.equal(error.failure, primaryFailure)
+        return true
+      },
+    )
+    assert.equal(closeAttempts, 1)
   })
 
   test('rejects cache ancestor redirects without changing the redirect target', () => {
@@ -2606,6 +2648,257 @@ describe('SQLite cache and reads', () => {
       assert.deepEqual(observations.at(probeIndex), { kind: 'probe', ...expectedProbe }, name)
       assert.notDeepEqual(observations.at(probeIndex + 1), { kind: 'text-read', name: expectedProbe.name }, name)
     }
+  })
+
+  test('bounds cached record validation before transferring untrusted rows', () => {
+    const cases = [
+      {
+        expectedRows: 1001,
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DELETE FROM records;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 1001
+            )
+            INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+            SELECT
+              printf('overflow-%04d', value), 'context', 'cache.overflow', 'test',
+              '2026-08-16T00:00:00.000Z', printf('encephalon/context/overflow-%04d.json', value),
+              1, NULL, '{}'
+            FROM generated;
+          `)
+        },
+        name: '1,001 rows',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.prepare('UPDATE records SET record_json = CAST(zeroblob(?) AS TEXT)').run(1_052_673)
+        },
+        name: 'oversized record JSON containing NUL',
+      },
+      {
+        expectedRows: 13,
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DELETE FROM records;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 13
+            )
+            INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+            SELECT
+              printf('aggregate-%04d', value), 'context', 'cache.aggregate', 'test',
+              '2026-08-16T00:00:00.000Z', printf('encephalon/context/aggregate-%04d.json', value),
+              1, NULL, CAST(zeroblob(1048576) AS TEXT)
+            FROM generated;
+            UPDATE metadata SET value = '13' WHERE key = 'recordsIndexed';
+          `)
+        },
+        name: 'aggregate record JSON above 12 MiB',
+      },
+      {
+        expectedRows: 25,
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            CREATE TEMP TABLE original_record AS SELECT * FROM records;
+            DELETE FROM records;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 25
+            )
+            INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+            SELECT
+              printf('aggregate-text-%04d-', value) || CAST(zeroblob(1048500) AS TEXT),
+              kind, subject, source, created_at, path, active, summary, record_json
+            FROM original_record CROSS JOIN generated;
+            DROP TABLE original_record;
+            UPDATE metadata SET value = '25' WHERE key = 'recordsIndexed';
+          `)
+        },
+        name: 'aggregate denormalised record text above its bound',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.exec('PRAGMA ignore_check_constraints = ON; UPDATE records SET active = 9223372036854775807;')
+        },
+        name: 'hostile 64-bit active integer',
+      },
+    ] as const
+
+    for (const { expectedRows, mutate, name } of cases) {
+      const root = createRoot()
+      const record = addCacheRecord(root)
+      mutateCache(root, mutate)
+      const observations = observeCacheIntegrity()
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        name,
+      )
+      assert.deepEqual(
+        observations.find(observation => observation.kind === 'probe' && observation.name === 'records'),
+        { kind: 'probe', name: 'records', rows: expectedRows },
+        name,
+      )
+      assert.equal(
+        observations.some(observation => observation.kind === 'text-read' && observation.name === 'records'),
+        false,
+        name,
+      )
+      assert.equal(
+        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root })[0]?.id,
+        record.id,
+        name,
+      )
+    }
+  })
+
+  test('bounds FTS validation before running relationship checks', () => {
+    const cases = [
+      {
+        expectedRows: 1001,
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DELETE FROM record_search;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 1001
+            )
+            INSERT INTO record_search(id, text)
+            SELECT printf('overflow-%04d', value), 'overflow search text'
+            FROM generated;
+          `)
+        },
+        name: '1,001 rows',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.prepare('UPDATE record_search SET text = CAST(zeroblob(?) AS TEXT)').run(1_052_673)
+        },
+        name: 'oversized FTS text containing NUL',
+      },
+      {
+        expectedRows: 13,
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            CREATE TABLE replacement_records AS
+            SELECT id, kind, subject, source, created_at, path, active, summary, record_json
+            FROM records
+            WHERE 0;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 13
+            )
+            INSERT INTO replacement_records
+            SELECT id, kind, subject, source, created_at, path, active, summary, record_json
+            FROM records CROSS JOIN generated;
+            DROP TABLE records;
+            ALTER TABLE replacement_records RENAME TO records;
+            DELETE FROM record_search;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 13
+            )
+            INSERT INTO record_search(id, text)
+            SELECT 'cache-record', CAST(zeroblob(1048576) AS TEXT)
+            FROM generated;
+            UPDATE metadata SET value = '13' WHERE key = 'recordsIndexed';
+          `)
+        },
+        name: 'aggregate FTS text above 12 MiB',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.exec('UPDATE record_search SET id = 9223372036854775807;')
+        },
+        name: 'FTS integer ID',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.exec("UPDATE record_search SET id = x'63616368652d7265636f7264';")
+        },
+        name: 'FTS BLOB ID',
+      },
+    ] as const
+
+    for (const { expectedRows, mutate, name } of cases) {
+      const root = createRoot()
+      const record = addCacheRecord(root)
+      mutateCache(root, mutate)
+      const observations = observeCacheIntegrity()
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        name,
+      )
+      assert.deepEqual(
+        observations.find(observation => observation.kind === 'probe' && observation.name === 'record-search'),
+        { kind: 'probe', name: 'record-search', rows: expectedRows },
+        name,
+      )
+      assert.equal(
+        observations.some(observation => observation.kind === 'text-read' && observation.name === 'record-search'),
+        false,
+        name,
+      )
+      assert.equal(
+        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root })[0]?.id,
+        record.id,
+        name,
+      )
+    }
+  })
+
+  test('pins cache validation and the public read to one verified SQLite snapshot', () => {
+    const root = createRoot()
+    const record = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'snapshot-record',
+      kind: 'context',
+      payload: { generation: 'original' },
+      root,
+      source: 'agent',
+      subject: 'cache.snapshot',
+    })
+    let recordProbes = 0
+    let mutations = 0
+    cacheReadTestHooks.afterIntegrityProbe = observation => {
+      if (observation.name === 'records') {
+        recordProbes += 1
+        if (recordProbes === 2) {
+          mutations += 1
+          const successor = JSON.stringify({ ...record, payload: { generation: 'successor' } })
+          const database = new DatabaseSync(cacheDatabasePath(root))
+          try {
+            database.exec('PRAGMA journal_mode = WAL; BEGIN IMMEDIATE;')
+            database.prepare('UPDATE records SET record_json = ? WHERE id = ?').run(successor, String(record.id))
+            database.exec('COMMIT')
+          } finally {
+            database.close()
+          }
+        }
+      }
+    }
+
+    const [returned] = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
+      root,
+    })
+    const generation = (returned?.payload as { generation?: unknown } | undefined)?.generation
+    assert.equal(mutations, 1)
+    assert.deepEqual({ generation, id: returned?.id }, { generation: 'original', id: record.id })
   })
 
   test('requires canonical recordsIndexed metadata', () => {

@@ -532,6 +532,14 @@ const assertCacheDatabaseMetadata = (location: CacheLocation, database: CacheDat
   return { ...database, sidecars }
 }
 
+const closeDatabaseAfterFailure = (database: { close: () => void }) => {
+  try {
+    database.close()
+  } catch {
+    // Preserve the failure that made the database unusable.
+  }
+}
+
 export const openVerifiedCacheDatabase = <Database extends { close: () => void }>(
   options: VerifiedCacheDatabaseOptions<Database>,
 ) => {
@@ -579,7 +587,7 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
       return database
     } catch (error) {
       if (error instanceof CacheDatabaseSidecarChanged) {
-        database.close()
+        closeDatabaseAfterFailure(database)
         snapshot = error.database
         if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
           throw error
@@ -593,7 +601,7 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
         } catch (candidate) {
           validationError = candidate
         }
-        database.close()
+        closeDatabaseAfterFailure(database)
         if (validationError !== undefined) {
           throw validationError
         }
