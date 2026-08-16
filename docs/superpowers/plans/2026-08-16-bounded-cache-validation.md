@@ -12,7 +12,7 @@
 
 - Preserve public TypeScript input/result shapes, package exports, CLI behaviour, cache schema, and canonical files.
 - The canonical authorities are exactly 1,000 records, 1 MiB per canonical record file, and 8 MiB aggregate canonical JSON.
-- Cached `record_json` may use at most 4 KiB fixed runtime-path overhead per record: 1 MiB + 4 KiB per row and 12 MiB aggregate.
+- Cached `record_json` may use at most 4 KiB fixed runtime-path overhead per record: 1 MiB + 4 KiB per row and 12,484,608 bytes (8 MiB + 1,000 × 4 KiB) aggregate.
 - Every hostile-table probe must aggregate over an inner `LIMIT maximum + 1`; a limit applied after `COUNT(*)` is forbidden.
 - Measure complete stored text with `length(CAST(value AS BLOB))`, including bytes after embedded NUL.
 - Probe result rows contain only bounded counts and exact `0 | 1` flags; never return hostile stored integers or byte lengths to JavaScript.
@@ -229,7 +229,7 @@ Add complementary cases for:
 - 1,001 FTS rows: `record-search` probe reports 1,001 and no FTS relationship query runs;
 - one `record_json = CAST(zeroblob(1052673) AS TEXT)`;
 - one FTS `text = CAST(zeroblob(1052673) AS TEXT)`;
-- individually bounded record rows with aggregate `record_json` above `12 * 1024 * 1024`;
+- individually bounded record rows with aggregate `record_json` above 12,484,608 bytes (8 MiB + 1,000 × 4 KiB);
 - `active = 9223372036854775807`, FTS integer ID, and FTS BLOB ID, all rebuilding without exposing `ERR_OUT_OF_RANGE`.
 
 Each test calls `prepare({ root })`, expects one rebuilt canonical record, asserts the numeric probe, and asserts no corrupt-generation text-materialisation hook.

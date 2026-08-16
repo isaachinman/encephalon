@@ -40,7 +40,7 @@ const MAX_CACHE_RECORD_JSON_BYTES =
   CANONICAL_BUDGETS.recordJsonBytes + CANONICAL_BUDGETS.records * MAX_CACHE_RECORD_OVERHEAD_BYTES
 ```
 
-The maximum is 12 MiB for 1,000 cached records. It preserves every valid canonical corpus while remaining fixed and memory-bounded. It is not a new canonical allowance.
+The maximum is 12,484,608 bytes (8 MiB + 1,000 × 4 KiB) for 1,000 cached records. It preserves every valid canonical corpus while remaining fixed and memory-bounded. It is not a new canonical allowance.
 
 ## Numeric probe contract
 
@@ -162,7 +162,7 @@ The smallest complementary behavioural matrix covers:
 
 - seven metadata rows and 1,001 records/FTS rows generated with recursive SQL, proving `maximum + 1` rejection before text iteration;
 - oversized metadata, `record_json`, and FTS text created with `CAST(zeroblob(?) AS TEXT)`, including leading NUL, proving BLOB byte-length probes and avoiding oversized JavaScript fixtures;
-- individually bounded record rows whose aggregate cached JSON exceeds 12 MiB;
+- individually bounded record rows whose aggregate cached JSON exceeds 12,484,608 bytes (8 MiB + 1,000 × 4 KiB);
 - canonical and noncanonical `recordsIndexed` encodings, including negative, fractional, exponent, leading-zero, whitespace, blob, and over-limit values;
 - hostile SQLite integer and blob values in `active` and FTS IDs without leaking `ERR_OUT_OF_RANGE`;
 - a concurrent SQLite writer attempt between probe and text iteration, proving one pinned read snapshot;
