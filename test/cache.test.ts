@@ -2048,6 +2048,74 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('preserves Unicode literal terms across full, compact, and gathered search', () => {
+    const root = createRoot()
+    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
+    const record = addRecord({
+      id: 'unicode-search',
+      kind: 'context',
+      payload: { summary: 'Unicode search marker' },
+      root,
+      searchText: 'Cafe\u0301 Ελληνικά Русский مرحبا שלום 中文 किताब 한글'.normalize('NFD'),
+      source: 'agent',
+      subject: 'search.unicode',
+    })
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    const searchCompactRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+
+    assert.deepEqual(
+      ['Café', 'Cafe\u0301'].map(query => searchRecords({ query, root }).map(result => result.id)),
+      [[record.id], [record.id]],
+    )
+    assert.deepEqual(
+      searchCompactRecords({ query: 'Ελληνικά', root }).map(result => result.id),
+      [record.id],
+    )
+    const gathered = gatherRecords({
+      root,
+      searches: ['Ελληνικά', 'Русский', '* ()', 'مرحبا', 'שלום', '中文', 'किताब', '한글'],
+    }) as {
+      searches: Array<{ results: Array<{ id: string }> }>
+    }
+    assert.deepEqual(
+      gathered.searches.map(search => search.results.map(result => result.id)),
+      [[record.id], [record.id], [], [record.id], [record.id], [record.id], [record.id], [record.id]],
+    )
+  })
+
+  test('returns punctuation-only searches before repository and cache inspection', () => {
+    const root = join(tmpdir(), 'encephalon-search-must-not-resolve')
+    const query = '\u0301 _ __ * " - + ^ : () {} []\u0000'
+    let cacheInspections = 0
+    let repositoryInspections = 0
+    cacheLocationTestHooks.beforeLocationInspection = () => {
+      cacheInspections += 1
+      throw new Error('cache inspection must not run for an empty literal query')
+    }
+    repositoryTestHooks.afterGitMarkerDecision = () => {
+      repositoryInspections += 1
+      throw new Error('repository inspection must not run for an empty literal query')
+    }
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    const searchCompactRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+
+    assert.deepEqual(searchRecords({ query, root }), [])
+    assert.deepEqual(searchCompactRecords({ query, root }), [])
+    assert.deepEqual(gatherRecords({ root, searches: [query] }), {
+      hydrated: null,
+      records: [],
+      searches: [{ kind: null, query, results: [] }],
+    })
+    assert.equal(repositoryInspections, 0)
+    assert.equal(cacheInspections, 0)
+  })
+
   test('serves a valid large-summary record through cache preparation and search', () => {
     const root = createRoot()
     const summary = `large summary marker ${'x'.repeat(600_000)}`

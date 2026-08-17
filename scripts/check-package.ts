@@ -363,7 +363,7 @@ try {
     '--data',
     '{"summary":"Packed CLI record"}',
     '--text',
-    'packed-contract-marker',
+    'packed-contract-marker Ελληνικά'.normalize('NFD'),
   ]) as { id?: unknown }
   if (added.id !== 'packed-cli-record') {
     throw new Error('The packed Node-only CLI add command returned an unexpected result.')
@@ -387,6 +387,10 @@ try {
   const searched = cliJson(['search', '--root', consumer, '--compact', '--', 'packed-contract-marker']) as unknown[]
   if (!searched.some(record => (record as { id?: unknown }).id === 'packed-cli-record')) {
     throw new Error('The packed Node-only CLI search command returned an unexpected result.')
+  }
+  const unicodeSearched = cliJson(['search', '--root', consumer, '--compact', '--', 'Ελληνικά']) as unknown[]
+  if (!unicodeSearched.some(record => (record as { id?: unknown }).id === 'packed-cli-record')) {
+    throw new Error('The packed Node-only CLI Unicode search command returned an unexpected result.')
   }
   const gathered = cliJson([
     'gather',
