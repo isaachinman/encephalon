@@ -24,6 +24,7 @@ import {
 } from './artifact-inspection.ts'
 import { hydrateResolvedRepository } from './cache.ts'
 import { assertCacheLocation, type CacheLocation } from './cache-location.ts'
+import { CANONICAL_BUDGETS } from './canonical-budgets.ts'
 import {
   CanonicalDirectoryChangedError,
   type CanonicalDirectorySnapshot,
@@ -268,9 +269,9 @@ const canonicalRecordBytes = (record: BrainRecord) => {
 const directoryFlag = constants.O_DIRECTORY ?? 0
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
 /** @internal */
-export const MAX_CANONICAL_RECORDS = 1000
+export const MAX_CANONICAL_RECORDS = CANONICAL_BUDGETS.records
 /** @internal */
-export const MAX_CANONICAL_RECORD_BYTES = 8 * 1024 * 1024
+export const MAX_CANONICAL_RECORD_BYTES = CANONICAL_BUDGETS.recordJsonBytes
 /** @internal */
 export const MAX_SUPERSESSION_EDGES = OPERATION_BUDGETS.supersessionEdges.maximum
 /** @internal */
@@ -1792,7 +1793,7 @@ const addRecordFileResolved = (
   if (committedErrorPhase !== 'publicationFlush' && options.hydrate !== false) {
     try {
       fault(options.hooks, 'during-hydration')
-      hydrateResolvedRepository(root, false, options.cacheLocation)
+      hydrateResolvedRepository(root, 'held', options.cacheLocation)
     } catch (error) {
       capturePostCommitError('cacheHydration', error)
     }

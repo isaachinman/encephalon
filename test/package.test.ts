@@ -51,6 +51,10 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-13-operation-budgets-design.md'),
       'utf8',
     )
+    const boundedCacheValidationDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-16-bounded-cache-validation-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -60,11 +64,12 @@ describe('package contract', () => {
     assert.match(contract, /## Canonical Storage/)
     assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
+    assert.match(contract, /## Bounded Disposable Cache Validation/)
     assert.match(contract, /## Package and Release Gates/)
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /Last reviewed: 2026-08-13 for code and behavioural-test snapshot `1e913807c20a332dc49a004be672205fbeabfe15`\./,
+      /Last reviewed: 2026-08-17 for code and behavioural-test snapshot `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`\./,
     )
     assert.match(
       contract,
@@ -74,10 +79,18 @@ describe('package contract', () => {
       contract,
       /MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2874874096bb7d327e084d7e17d5243564244c43`\./,
     )
+    assert.match(
+      contract,
+      /MAR-2549 bounded disposable cache validation and exact-generation recovery: `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`\./,
+    )
     assert.match(contract, /Historical plan's wall-clock-only `createdAt` policy/)
     assert.match(
       operationBudgetsDesign,
       /The exact reviewed code and behavioural-test snapshot implementing this design is `1e913807c20a332dc49a004be672205fbeabfe15`\./,
+    )
+    assert.match(
+      boundedCacheValidationDesign,
+      /The exact reviewed code and behavioural-test snapshot implementing this design is `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),
@@ -85,6 +98,10 @@ describe('package contract', () => {
     )
     assert.doesNotMatch(readFileSync(resolve(root, 'dist', 'api-input.d.ts'), 'utf8'), /ValidatedAddRecordInput/)
     assert.doesNotMatch(readFileSync(resolve(root, 'dist', 'errors.d.ts'), 'utf8'), /failBudget|operation-budgets/)
+    assert.doesNotMatch(
+      readFileSync(resolve(root, 'dist', 'cache-location.d.ts'), 'utf8'),
+      /CacheDatabaseCreationConflict/,
+    )
     assert.doesNotMatch(
       readFileSync(resolve(root, 'dist', 'operation-budgets.d.ts'), 'utf8'),
       /OPERATION_BUDGETS|OperationBudgetKey/,

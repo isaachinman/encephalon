@@ -277,8 +277,8 @@ const initResolved = (
       progress.cacheState = 'disposable'
       const cacheResult =
         validatedAdditions.length > 0
-          ? hydrateResolvedRepository(root, false, location)
-          : prepareResolvedRepository(root, false, location)
+          ? hydrateResolvedRepository(root, 'held', location)
+          : prepareResolvedRepository(root, 'held', location)
       progress.cacheState = 'prepared'
       hooks.hydration?.(cacheResult)
       progress.phase = 'instructionApplication'
