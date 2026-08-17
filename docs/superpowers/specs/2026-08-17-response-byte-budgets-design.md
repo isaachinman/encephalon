@@ -17,7 +17,7 @@ Bound compact-search and complete gather responses to 4 MiB before unbounded Jav
 
 This model deliberately does not use `JSON.stringify`: whitespace, escaping, and property insertion order are transport details rather than API-budget authority. Reordered objects therefore have the same cost. The response values are already schema-validated and JSON-compatible; an unsupported internal value is an `INTERNAL_ERROR`.
 
-One mutable ledger is contained within each database read attempt. Charging a complete fragment either returns the fragment for composition or fails with `INVALID_ARGUMENT` and the existing bounded details `{ field, budget, maximum }`. A total equal to the maximum succeeds; the first fragment that would make the total larger fails before it is retained.
+One mutable ledger is contained within each database read attempt. Charging a complete fragment either returns the fragment for composition or fails with `INVALID_ARGUMENT` and the existing bounded details `{ field, budget, maximum }`. The stable response-budget keys are `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes`; all use `field: 'response'`. A total equal to the maximum succeeds; the first fragment that would make the total larger fails before it is retained.
 
 The helper also centralises raw-byte charging for existing full-record readers. Their accounting remains the exact cached canonical JSON byte count, so this refactor does not change list, show, or full-search limits.
 
@@ -57,3 +57,6 @@ The complete lint, four-project typecheck, full test, benchmark, build, package,
 
 Pagination, silent truncation, query/result-count budgets, CLI transport newlines, JSON serialization formatting, ranking changes, and configurable response ceilings remain out of scope.
 
+## Reviewed implementation provenance
+
+The exact reviewed code and behavioural-test snapshot implementing this design is `71cec5b639c89dd328087546e3053cd72847e1d5`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.
