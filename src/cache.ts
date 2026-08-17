@@ -736,16 +736,16 @@ const assertCacheSchema = (database: DatabaseSync) => {
 
 const createCacheSchema = (database: DatabaseSync) => {
   database.exec(`
-    CREATE TABLE IF NOT EXISTS metadata (
+    CREATE TABLE metadata (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS records ${RECORDS_TABLE_DEFINITION};
-    CREATE INDEX IF NOT EXISTS records_active_order
+    CREATE TABLE records ${RECORDS_TABLE_DEFINITION};
+    CREATE INDEX records_active_order
       ON records(active, created_at DESC, id DESC);
-    CREATE INDEX IF NOT EXISTS records_kind_subject
+    CREATE INDEX records_kind_subject
       ON records(kind, subject);
-    CREATE VIRTUAL TABLE IF NOT EXISTS record_search USING fts5(
+    CREATE VIRTUAL TABLE record_search USING fts5(
       id UNINDEXED,
       text
     );
@@ -761,9 +761,14 @@ const openWriterDatabase = (location: CacheLocation, primary: CacheWriterPrimary
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
   return openVerifiedCacheDatabase({
-    afterVerifiedOpen: database => {
-      database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
-      createCacheSchema(database)
+    afterVerifiedOpen: (database, { primaryCreated }) => {
+      if (primaryCreated) {
+        database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
+        createCacheSchema(database)
+      } else {
+        assertCacheSchema(database)
+        database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
+      }
       assertCacheSchema(database)
       cacheReadTestHooks.duringDatabaseInitialisation?.('writer')
     },
@@ -1439,6 +1444,7 @@ const rebuildCache = (
       assertCacheScope(root, existingMetadata)
       database.exec('BEGIN IMMEDIATE')
       try {
+        assertCacheSchema(database)
         database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
         const insertRecord = database.prepare(`
           INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
