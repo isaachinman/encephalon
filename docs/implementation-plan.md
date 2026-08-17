@@ -866,13 +866,13 @@ Use Node's built-in `util.parseArgs`; do not retain Commander or add another par
 - Optional: `--kind`, `--limit`, `--include-superseded`.
 - Default limit: 20.
 - Full-record result limit: 50.
-- Full-record responses fail before returning more than 4 MiB of aggregate record JSON.
+- Full-record responses use `fullResponseBytes` and fail before returning more than 4 MiB of aggregate cached canonical JSON bytes.
 
 `encephalon show`
 
 - Required: `--id`.
 - Optional: `--active-only`.
-- The single returned record is counted against the full-record response budget.
+- The single returned record is counted against the 4 MiB `fullResponseBytes` budget.
 
 `encephalon search <query...>`
 
@@ -880,8 +880,8 @@ Use Node's built-in `util.parseArgs`; do not retain Commander or add another par
 - Join positional query terms with spaces before tokenisation.
 - Default limit: 20.
 - Query limit: 1,024 UTF-8 bytes and 32 literal terms after tokenisation.
-- Full search result limit: 50 records and the 4 MiB aggregate full-record response budget.
-- Compact search result limit: 100 records.
+- Full search result limit: 50 records and the 4 MiB `fullResponseBytes` budget.
+- Compact search result limit: 100 records and the 4 MiB `compactResponseBytes` logical-response budget. SQLite rows are iterated lazily, validated, charged, and only then retained.
 
 `encephalon gather`
 
@@ -889,8 +889,10 @@ Use Node's built-in `util.parseArgs`; do not retain Commander or add another par
 - Optional: `--kind`, `--limit`, `--include-superseded`, `--hydrate`.
 - Preserve request order and `--hydrate` compatibility.
 - Request limit: 16 searches and 64 shows.
-- Gather searches use compact result limits. Gather shows preserve duplicate order and share the 4 MiB aggregate full-record response budget.
-- Callers should narrow `kind`, reduce `limit`, or use compact search when full-record budgets are exceeded.
+- Gather searches use compact result limits. One 4 MiB `gatherResponseBytes` logical-response ledger covers metadata, envelopes, shown records or nulls, compact result arrays, and compact records; duplicate shows and searches are charged on every occurrence.
+- Compact and gather logical responses count UTF-8 bytes for string values and object keys plus eight bytes for every number, boolean, null, array, and object, recursively. Exact-budget responses succeed; over-budget responses fail without truncation.
+- Response-budget failures use `INVALID_ARGUMENT` with only `{ field: 'response', budget, maximum }`. The budgets do not change public inputs, outputs, or exported TypeScript types.
+- Callers should narrow `kind`, reduce `limit`, or split a gather when a response budget is exceeded.
 
 ### 14.3 Streams and exit codes
 
