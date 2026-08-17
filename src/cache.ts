@@ -132,6 +132,7 @@ type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind
 type CacheIntegrityProbeName =
   | 'metadata'
   | 'metadata-columns'
+  | 'metadata-schema'
   | 'records'
   | 'records-active-order-index'
   | 'records-columns'
@@ -448,7 +449,7 @@ const assertOrdinaryTableSchema = (
                     OR (SELECT COUNT(*) FROM (
                       SELECT 1
                       FROM pragma_table_list
-                      WHERE schema = 'main' AND name = ?1 AND type = 'table' AND wr = 0 AND strict = 0
+                      WHERE schema = 'main' AND name = ?1 AND type = 'table'
                       LIMIT 2
                     )) != 1
                THEN 1 ELSE 0 END AS has_invalid_type,
@@ -529,9 +530,10 @@ const assertOrdinaryTableSchema = (
   }
 }
 
-const assertRecordsActiveConstraint = (database: DatabaseSync) => {
+const assertOrdinaryTableDefinition = (database: DatabaseSync, table: 'metadata' | 'records', definition: string) => {
+  const probeName = `${table}-schema` as CacheIntegrityProbeName
   const probe = readIntegrityProbe(
-    'records-schema',
+    probeName,
     database
       .prepare(
         `SELECT
@@ -542,14 +544,14 @@ const assertRecordsActiveConstraint = (database: DatabaseSync) => {
         FROM (
           SELECT
             CASE WHEN typeof(sql) = 'text' THEN 0 ELSE 1 END AS invalid_type,
-            CASE WHEN typeof(sql) = 'text' AND length(CAST(sql AS BLOB)) <= ?
+            CASE WHEN typeof(sql) = 'text' AND length(CAST(sql AS BLOB)) <= ?1
                  THEN 0 ELSE 1 END AS oversized
           FROM sqlite_schema
-          WHERE type = 'table' AND name = 'records'
+          WHERE type = 'table' AND name = ?2
           LIMIT 2
         )`,
       )
-      .get(MAX_CACHE_SCHEMA_BYTES) as CacheIntegrityProbe | undefined,
+      .get(MAX_CACHE_SCHEMA_BYTES, table) as CacheIntegrityProbe | undefined,
     2,
   )
   if (
@@ -558,14 +560,14 @@ const assertRecordsActiveConstraint = (database: DatabaseSync) => {
     probe.hasInvalidType !== 0 ||
     probe.hasOversizedValue !== 0
   ) {
-    throw new CacheSchemaMismatch('The records cache table has an incompatible schema.')
+    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
   }
-  cacheReadTestHooks.beforeIntegrityTextRead?.('records-schema')
-  const row = database
-    .prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'records' LIMIT 2")
-    .get() as { sql?: unknown } | undefined
-  if (typeof row?.sql !== 'string' || !sameOwnedSchema(row.sql, `CREATE TABLE records ${RECORDS_TABLE_DEFINITION}`)) {
-    throw new CacheSchemaMismatch('The records cache table has an incompatible schema.')
+  cacheReadTestHooks.beforeIntegrityTextRead?.(probeName)
+  const row = database.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ? LIMIT 2").get(table) as
+    | { sql?: unknown }
+    | undefined
+  if (typeof row?.sql !== 'string' || !sameOwnedSchema(row.sql, `CREATE TABLE ${table} ${definition}`)) {
+    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
   }
 }
 
@@ -723,8 +725,9 @@ const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync'])
 
 const assertCacheSchemaUnchecked = (database: DatabaseSync) => {
   assertOrdinaryTableSchema(database, 'metadata', METADATA_COLUMNS)
+  assertOrdinaryTableDefinition(database, 'metadata', METADATA_TABLE_DEFINITION)
   assertOrdinaryTableSchema(database, 'records', RECORD_COLUMNS)
-  assertRecordsActiveConstraint(database)
+  assertOrdinaryTableDefinition(database, 'records', RECORDS_TABLE_DEFINITION)
   assertRecordsIndexes(database)
   assertTableColumns(database, 'record_search', ['id', 'text'])
   const searchSchemaProbe = readIntegrityProbe(
