@@ -86,11 +86,11 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /MAR-2554 bounded full, compact, and gather read responses: `71cec5b639c89dd328087546e3053cd72847e1d5`\./,
+      /MAR-2554 bounded full, compact, and gather read responses: `1252562c636ec663b2ed7e8b29ea3e1a7774c492`\./,
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-17 for code and behavioural-test snapshot `71cec5b639c89dd328087546e3053cd72847e1d5`\./,
+      /Last reviewed: 2026-08-17 for code and behavioural-test snapshot `1252562c636ec663b2ed7e8b29ea3e1a7774c492`\./,
     )
     assert.match(
       contract,
@@ -123,7 +123,7 @@ describe('package contract', () => {
     )
     assert.match(
       responseByteBudgetsDesign,
-      /The exact reviewed code and behavioural-test snapshot implementing this design is `71cec5b639c89dd328087546e3053cd72847e1d5`\./,
+      /The exact reviewed code and behavioural-test snapshot implementing this design is `1252562c636ec663b2ed7e8b29ea3e1a7774c492`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),
