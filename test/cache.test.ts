@@ -2521,7 +2521,7 @@ describe('SQLite cache and reads', () => {
         assert.ok(result.recordsCreated !== undefined && result.recordsCreated.length > 0, name)
       }
       assert.equal(primaryQuarantines, 1, name)
-      assert.equal(writerInitialisations, 2, name)
+      assert.equal(writerInitialisations, 1, name)
       cacheLocationTestHooks.beforeQuarantineRename = undefined
       cacheReadTestHooks.duringDatabaseInitialisation = undefined
     }
@@ -3345,6 +3345,41 @@ describe('SQLite cache and reads', () => {
     assert.notEqual(rebuiltIdentity.ino, incompatibleIdentity.ino)
   })
 
+  test('quarantines an existing metadata-less cache before mutating bounded tables', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    mutateCache(root, database => {
+      database.exec(`
+        DELETE FROM metadata;
+        WITH RECURSIVE generated(value) AS (
+          SELECT 1
+          UNION ALL
+          SELECT value + 1 FROM generated WHERE value < 1001
+        )
+        INSERT INTO record_search(id, text)
+        SELECT printf('metadata-less-%04d', value), 'untrusted search text'
+        FROM generated;
+      `)
+    })
+    const original = lstatSync(databasePath, { bigint: true })
+    let exactQuarantines = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const current = lstatSync(path, { bigint: true })
+        if (current.dev === original.dev && current.ino === original.ino) {
+          exactQuarantines += 1
+        }
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 1,
+    })
+    assert.equal(exactQuarantines, 1)
+  })
+
   test('recovers one exact semantically incompatible cache during a public read', () => {
     const root = createRoot()
     const record = addCacheRecord(root)
@@ -3523,7 +3558,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(queryFailures, 1)
     assert.equal(primaryQuarantines, 1)
     assert.equal(recoveryRebuilds, 1)
-    assert.equal(writerInitialisations, 2)
+    assert.equal(writerInitialisations, 1)
   })
 
   test('reads a fresh cache without touching the database file', () => {
@@ -3946,7 +3981,7 @@ describe('SQLite cache and reads', () => {
     )
     assert.equal(primaryQuarantines, 0)
     assert.equal(recoveryRebuilds, 0)
-    assert.equal(writerInitialisations, 1)
+    assert.equal(writerInitialisations, 0)
     const afterIdentity = lstatSync(databasePath, { bigint: true })
     assert.deepEqual(
       { dev: afterIdentity.dev, ino: afterIdentity.ino },
@@ -4695,12 +4730,19 @@ describe('SQLite cache and reads', () => {
       assert.equal(row.text, canonical)
       assert.equal(row.bytes instanceof Uint8Array, true)
       assert.deepEqual(Buffer.from(row.bytes as Uint8Array), invalidBytes)
+      assert.equal(database.prepare('PRAGMA journal_mode = DELETE').get()?.journal_mode, 'delete')
     })
     let quarantines = 0
     let recoveryRebuilds = 0
     let writerInitialisations = 0
     cacheLocationTestHooks.beforeQuarantineRename = path => {
       if (basename(path) === 'brain.sqlite') {
+        const predecessor = new DatabaseSync(path, { readOnly: true })
+        try {
+          assert.equal(predecessor.prepare('PRAGMA journal_mode').get()?.journal_mode, 'delete')
+        } finally {
+          predecessor.close()
+        }
         quarantines += 1
       }
     }
@@ -4718,7 +4760,7 @@ describe('SQLite cache and reads', () => {
     })
     assert.equal(quarantines, 1)
     assert.equal(recoveryRebuilds, 1)
-    assert.equal(writerInitialisations, 2)
+    assert.equal(writerInitialisations, 1)
     const rebuilt = new DatabaseSync(cacheDatabasePath(root), { readOnly: true })
     try {
       const row = rebuilt.prepare('SELECT CAST(text AS BLOB) AS bytes FROM record_search WHERE id = ?').get(id) as {
@@ -4762,6 +4804,52 @@ describe('SQLite cache and reads', () => {
       assert.deepEqual(
         functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
         { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
+    }
+  })
+
+  test('binds every same-count FTS projection to exactly one cached record ID', () => {
+    const cases = [
+      {
+        mutate: (database: DatabaseSync, first: { id: string; text: string }, second: { id: string; text: string }) => {
+          database.prepare('UPDATE record_search SET text = ? WHERE id = ?').run(second.text, first.id)
+          database.prepare('UPDATE record_search SET text = ? WHERE id = ?').run(first.text, second.id)
+        },
+        name: 'swapped canonical texts',
+      },
+      {
+        mutate: (database: DatabaseSync, first: { id: string; text: string }, second: { id: string; text: string }) => {
+          database.prepare('DELETE FROM record_search WHERE id = ?').run(second.id)
+          database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)').run(first.id, first.text)
+        },
+        name: 'duplicate first ID with second ID missing',
+      },
+    ] as const
+
+    for (const fixture of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')({
+        id: 'cache-record-two',
+        kind: 'context',
+        payload: { summary: 'Second cache record' },
+        root,
+        source: 'agent',
+        subject: 'cache.validation.two',
+      })
+      mutateCache(root, database => {
+        const rows = database.prepare('SELECT id, text FROM record_search ORDER BY id').all() as Array<{
+          id: string
+          text: string
+        }>
+        assert.equal(rows.length, 2)
+        fixture.mutate(database, rows[0] as { id: string; text: string }, rows[1] as { id: string; text: string })
+      })
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 2 },
         fixture.name,
       )
     }

@@ -814,18 +814,30 @@ const assertCacheSchemaTransaction = (database: DatabaseSync) => {
 type CacheWriterPrimary =
   | { kind: 'create-exclusive' }
   | { kind: 'create-if-missing' }
+  | { database: CacheDatabase; kind: 'expected-new' }
   | { database: CacheDatabase; kind: 'expected-owned' }
 
-const openWriterDatabase = (location: CacheLocation, primary: CacheWriterPrimary = { kind: 'create-if-missing' }) => {
+const openWriterDatabase = (
+  location: CacheLocation,
+  primary: CacheWriterPrimary,
+  validateExisting: (database: DatabaseSync) => void,
+) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  return openVerifiedCacheDatabase({
+  const verifiedPrimary =
+    primary.kind === 'expected-new' ? { database: primary.database, kind: 'expected-owned' as const } : primary
+  let openedPrimaryCreated = false
+  const opened = openVerifiedCacheDatabase({
     afterVerifiedOpen: (database, { primaryCreated }) => {
+      openedPrimaryCreated = primaryCreated
       if (primaryCreated) {
         database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
         createCacheSchema(database)
-      } else {
+      } else if (primary.kind === 'expected-new') {
         assertCacheSchemaTransaction(database)
+        database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
+      } else {
+        validateExisting(database)
         database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
       }
       assertCacheSchemaTransaction(database)
@@ -835,8 +847,9 @@ const openWriterDatabase = (location: CacheLocation, primary: CacheWriterPrimary
     location,
     name: 'brain.sqlite',
     openOptions: { timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS },
-    primary,
+    primary: verifiedPrimary,
   })
+  return { ...opened, acceptsEmptyContent: openedPrimaryCreated || primary.kind === 'expected-new' }
 }
 
 const NO_VERIFIED_CACHE_RESULT = Symbol('no-verified-cache-result')
@@ -1372,6 +1385,31 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
   }
 }
 
+const assertExistingCacheContentConsistent = (root: string, database: DatabaseSync): void => {
+  assertCacheSchema(database)
+  const metadata = readMetadata(database)
+  if (metadata === undefined) {
+    throw new CacheSchemaMismatch('The cache metadata is incomplete.')
+  }
+  assertCacheScope(root, metadata)
+  assertCacheContentConsistent(database, metadata)
+}
+
+const assertExistingCacheContentTransaction = (root: string, database: DatabaseSync): void => {
+  database.exec('BEGIN')
+  try {
+    assertExistingCacheContentConsistent(root, database)
+    database.exec('ROLLBACK')
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK')
+    } catch {
+      // Preserve the original cache validation failure.
+    }
+    throw error
+  }
+}
+
 const metadataIsFresh = (
   root: string,
   database: DatabaseSync,
@@ -1486,23 +1524,27 @@ const rebuildCache = (
       continue
     }
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-    const opened = openWriterDatabase(location, nextWriterPrimary)
-    const { database, identity } = opened
-    nextWriterPrimary =
-      nextWriterPrimary.kind === 'create-if-missing'
-        ? { kind: 'create-if-missing' }
-        : { database: identity, kind: 'expected-owned' }
+    const opened = openWriterDatabase(location, nextWriterPrimary, openedDatabase => {
+      assertExistingCacheContentTransaction(root, openedDatabase)
+    })
+    const { acceptsEmptyContent, database, identity } = opened
+    if (acceptsEmptyContent) {
+      nextWriterPrimary = { database: identity, kind: 'expected-new' }
+    } else if (nextWriterPrimary.kind === 'create-if-missing') {
+      nextWriterPrimary = { kind: 'create-if-missing' }
+    } else {
+      nextWriterPrimary = { database: identity, kind: 'expected-owned' }
+    }
     let rebuildResult: PrepareResult | undefined
     let writerFailure: unknown
     let writerFailed = false
     try {
       database.exec('BEGIN IMMEDIATE')
       try {
-        assertCacheSchema(database)
-        const existingMetadata = readMetadata(database)
-        assertCacheScope(root, existingMetadata)
-        if (existingMetadata !== undefined) {
-          assertCacheContentConsistent(database, existingMetadata)
+        if (acceptsEmptyContent) {
+          assertCacheSchema(database)
+        } else {
+          assertExistingCacheContentConsistent(root, database)
         }
         database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
         const insertRecord = database.prepare(`
