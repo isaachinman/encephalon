@@ -1,8 +1,8 @@
 # FTS Text Integrity Design
 
-**Ticket:** MAR-2550  
-**Date:** 2026-08-17  
-**Status:** Approved for implementation
+**Ticket:** MAR-2550
+**Date:** 2026-08-17
+**Status:** Implemented
 
 ## Goal
 
@@ -47,3 +47,6 @@ Any missing, orphaned, duplicated, invalidly encoded, or text-mismatched FTS row
 - Invalid UTF-8 bytes that decode like a valid replacement character are rejected by byte comparison.
 - Existing missing, duplicate, orphan, type, per-row, aggregate, snapshot, retry, and privacy tests remain complementary coverage.
 
+## Reviewed implementation provenance
+
+The exact reviewed code and behavioural-test snapshot implementing this design is `7a3f4ea4b9b092d7447096e97c9fc0a5eee088c9`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.
