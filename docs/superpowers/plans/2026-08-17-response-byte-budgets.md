@@ -76,11 +76,11 @@ Replace `FullResponseBudget` and direct byte mutation with `createResponseByteBu
 
 - [x] **Step 4: Implement compact streaming**
 
-Make `createCompactSearchReader` accept a response ledger, charge the results-array container once per query, consume `statement.iterate(...)`, convert each row with `compactRecordFromRow`, charge the validated compact record, and then retain it. Allocate standalone compact ledgers inside the database callback.
+Make `createCompactSearchReader` accept a response ledger, consume `statement.iterate(...)`, convert each row with `compactRecordFromRow`, charge only the validated compact record, and then retain it. Allocate standalone compact ledgers and charge their complete empty result-array containers inside the database callback before invoking the reader.
 
 - [x] **Step 5: Implement the gather ledger**
 
-Make the show reader return parsed records without owning a budget. Allocate one gather ledger in `readGatherFromDatabase`, charge the root skeleton once, then charge every show envelope and every search envelope while passing the same ledger to compact result iteration. Preserve shows-before-searches and current object shapes.
+Make the show reader return parsed records without owning a budget. Allocate one gather ledger in `readGatherFromDatabase`, charge the root skeleton once, then charge every show envelope and every complete `{ kind, query, results: [] }` search skeleton while passing the same ledger to compact row iteration. Preserve shows-before-searches and current object shapes.
 
 - [x] **Step 6: Run focused, cache, and mutation checks**
 

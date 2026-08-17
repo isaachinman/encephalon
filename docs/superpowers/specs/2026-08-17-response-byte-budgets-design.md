@@ -23,13 +23,13 @@ The helper also centralises raw-byte charging for existing full-record readers. 
 
 ## Compact search
 
-The compact reader receives a response ledger. It charges the result-array container once, prepares one statement, and consumes `statement.iterate(...)` inside the existing read transaction. Every row is first converted through the existing compact cache validators, then charged, then retained. Cache corruption therefore remains disposable-cache recovery rather than being misclassified as a caller budget error.
+The compact reader receives a response ledger, prepares one statement, and consumes `statement.iterate(...)` inside the existing read transaction. It charges only validated compact records: every row is first converted through the existing compact cache validators, then charged, then retained. Cache corruption therefore remains disposable-cache recovery rather than being misclassified as a caller budget error.
 
-A standalone compact search creates a fresh `compactResponseBytes` ledger inside the `withPreparedDatabase` callback. A discarded cache generation and retry cannot leak earlier charges into the successful attempt. The existing post-read hook runs only after the iterator has been consumed successfully.
+A standalone compact search creates a fresh `compactResponseBytes` ledger and charges its complete empty result-array container inside the `withPreparedDatabase` callback before invoking the compact reader. A discarded cache generation and retry cannot leak earlier charges into the successful attempt. The existing post-read hook runs only after the iterator has been consumed successfully.
 
 ## Gather
 
-`readGatherFromDatabase` creates one `gatherResponseBytes` ledger for the complete result. It first charges the root result skeleton containing `hydrated`, `records`, and `searches`. Each requested show then charges its `{ id, record }` envelope and returned full record or null. Each requested search charges its `{ kind, query, results: [] }` envelope, after which the compact reader charges the results array and every compact record against the same ledger.
+`readGatherFromDatabase` creates one `gatherResponseBytes` ledger for the complete result. It first charges the root result skeleton containing `hydrated`, `records`, and `searches`. Each requested show then charges its `{ id, record }` envelope and returned full record or null. Each requested search charges its complete `{ kind, query, results: [] }` skeleton, after which the compact reader charges every validated compact record against the same ledger.
 
 Repeated show IDs and repeated queries are charged on every occurrence. Shows remain evaluated before searches, request order and result shapes remain unchanged, and all reads and accounting stay inside one SQLite transaction snapshot. There is no truncation or partial response.
 
