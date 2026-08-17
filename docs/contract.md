@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-17 for code and behavioural-test snapshot `029775c46f4a07b56bac8985a098e61d27ea20a8`.
+Last reviewed: 2026-08-17 for code and behavioural-test snapshot `fb17790ac01031aa37d903ec9a3feb3a271e9d05`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -148,7 +148,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2553 semantic SQLite schema validation and exact incompatible-generation recovery: `029775c46f4a07b56bac8985a098e61d27ea20a8`.
+- MAR-2553 semantic SQLite schema validation and exact incompatible-generation recovery: `fb17790ac01031aa37d903ec9a3feb3a271e9d05`.
 - MAR-2549 bounded disposable cache validation and exact-generation recovery: `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`.
 - MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2874874096bb7d327e084d7e17d5243564244c43`.
 - MAR-2548 restart-safe partial initialisation progress and convergence: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`.
