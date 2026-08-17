@@ -1682,6 +1682,20 @@ describe('SQLite cache and reads', () => {
       subject: 'backend.database',
       supersedes: [first.id],
     })
+    const databasePath = cacheDatabasePath(root)
+    const databaseIdentity = lstatSync(databasePath, { bigint: true })
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
 
     const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
     assert.deepEqual(
@@ -1748,11 +1762,20 @@ describe('SQLite cache and reads', () => {
         [second.id, second.id],
       ],
     )
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 0)
     assert.deepEqual(gatherRecords({ hydrate: true, root }), {
       hydrated: { recordsIndexed: 2 },
       records: [],
       searches: [],
     })
+    const identityAfterReads = lstatSync(databasePath, { bigint: true })
+    assert.deepEqual(
+      { dev: identityAfterReads.dev, ino: identityAfterReads.ino },
+      { dev: databaseIdentity.dev, ino: databaseIdentity.ino },
+    )
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 1)
 
     functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
       id: 'without-summary',
@@ -3656,6 +3679,48 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('bounds repeated semantic schema recovery without exposing schema names', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const privateSentinel = 'private_schema_sentinel'
+    const installIncompatibleIndex = () => {
+      mutateCache(root, database => {
+        database.exec(`
+          DROP INDEX records_kind_subject;
+          CREATE INDEX ${privateSentinel} ON records(subject, kind);
+        `)
+      })
+    }
+    installIncompatibleIndex()
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
+      installIncompatibleIndex()
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        assert.doesNotMatch(causeChainText(error), new RegExp(privateSentinel, 'u'))
+        return true
+      },
+    )
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 1)
+  })
+
   test('does not quarantine a foreign cache with a valid repository scope', () => {
     const root = createRoot()
     addCacheRecord(root)
@@ -4304,18 +4369,19 @@ describe('SQLite cache and reads', () => {
       source: 'agent',
       subject: 'cache.snapshot',
     })
-    let recordProbes = 0
+    let indexProbes = 0
     let mutations = 0
     cacheReadTestHooks.afterIntegrityProbe = observation => {
-      if (observation.name === 'records') {
-        recordProbes += 1
-        if (recordProbes === 2) {
+      if (observation.name === 'records-indexes') {
+        indexProbes += 1
+        if (indexProbes === 2) {
           mutations += 1
           const successor = JSON.stringify({ ...record, payload: { generation: 'successor' } })
           const database = new DatabaseSync(cacheDatabasePath(root))
           try {
             database.exec('PRAGMA journal_mode = WAL; BEGIN IMMEDIATE;')
             database.prepare('UPDATE records SET record_json = ? WHERE id = ?').run(successor, String(record.id))
+            database.exec('DROP INDEX records_kind_subject;')
             database.exec('COMMIT')
           } finally {
             database.close()
@@ -4330,6 +4396,10 @@ describe('SQLite cache and reads', () => {
     const generation = (returned?.payload as { generation?: unknown } | undefined)?.generation
     assert.equal(mutations, 1)
     assert.deepEqual({ generation, id: returned?.id }, { generation: 'original', id: record.id })
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 1,
+    })
   })
 
   test('requires canonical recordsIndexed metadata', () => {
