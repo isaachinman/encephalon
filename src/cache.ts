@@ -13,9 +13,11 @@ import {
 } from './api-input.ts'
 import { ArtifactChangedError, type ArtifactObservation, inspectArtifactFiles } from './artifact-inspection.ts'
 import {
+  type CacheDatabase,
   CacheDatabaseCreationConflict,
   CacheDatabaseFailure,
   type CacheLocation,
+  failCacheDatabase,
   inspectCacheDatabase,
   inspectCacheLocation,
   openVerifiedCacheDatabase,
@@ -398,9 +400,12 @@ const createCacheSchema = (database: DatabaseSync) => {
   `)
 }
 
-type CacheWriterPrimaryMode = 'create-exclusive' | 'create-if-missing'
+type CacheWriterPrimary =
+  | { kind: 'create-exclusive' }
+  | { kind: 'create-if-missing' }
+  | { database: CacheDatabase; kind: 'expected-owned' }
 
-const openWriterDatabase = (location: CacheLocation, primaryMode: CacheWriterPrimaryMode = 'create-if-missing') => {
+const openWriterDatabase = (location: CacheLocation, primary: CacheWriterPrimary = { kind: 'create-if-missing' }) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
   return openVerifiedCacheDatabase({
@@ -414,7 +419,7 @@ const openWriterDatabase = (location: CacheLocation, primaryMode: CacheWriterPri
     location,
     name: 'brain.sqlite',
     openOptions: { timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS },
-    primaryMode,
+    primary,
   })
 }
 
@@ -427,7 +432,7 @@ const readVerifiedCacheTransaction = <Result>(
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
   let result: Result | typeof NO_VERIFIED_CACHE_RESULT = NO_VERIFIED_CACHE_RESULT
-  const database = openVerifiedCacheDatabase({
+  const { database } = openVerifiedCacheDatabase({
     afterVerifiedOpen: opened => {
       opened.exec('BEGIN')
       try {
@@ -455,7 +460,7 @@ const readVerifiedCacheTransaction = <Result>(
       readOnly: true,
       timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
     },
-    primaryMode: 'existing',
+    primary: { kind: 'existing' },
   })
   database.close()
   if (result === NO_VERIFIED_CACHE_RESULT) {
@@ -1004,11 +1009,11 @@ const readFreshMetadata = (root: string, location: CacheLocation): Metadata | un
 const rebuildCache = (
   root: string,
   location: CacheLocation = inspectCacheLocation(root),
-  primaryMode: CacheWriterPrimaryMode = 'create-if-missing',
+  primary: CacheWriterPrimary = { kind: 'create-if-missing' },
 ): PrepareResult => {
   const attempts = Array.from({ length: MAX_REPOSITORY_CHANGE_RETRIES }, (_, index) => index)
   let repositoryChangeObserved = false
-  let nextWriterPrimaryMode = primaryMode
+  let nextWriterPrimary = primary
   for (const attempt of attempts) {
     const recordManifestBefore = boundedRepositoryManifest(root, [])
     if (recordManifestBefore.kind !== 'stable') {
@@ -1063,16 +1068,21 @@ const rebuildCache = (
       continue
     }
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-    const database = openWriterDatabase(location, nextWriterPrimaryMode)
-    nextWriterPrimaryMode = 'create-if-missing'
+    const opened = openWriterDatabase(location, nextWriterPrimary)
+    const { database, identity } = opened
+    nextWriterPrimary =
+      nextWriterPrimary.kind === 'create-if-missing'
+        ? { kind: 'create-if-missing' }
+        : { database: identity, kind: 'expected-owned' }
     try {
       let existingMetadata: Metadata | undefined
       try {
         existingMetadata = readMetadata(database)
       } catch (error) {
-        if (!(error instanceof CacheSchemaMismatch)) {
-          throw error
+        if (error instanceof CacheSchemaMismatch) {
+          return failCacheDatabase(error, identity)
         }
+        throw error
       }
       assertCacheScope(root, existingMetadata)
       database.exec('BEGIN IMMEDIATE')
@@ -1191,7 +1201,7 @@ const recoverDisposableCacheUnderLock = (
     if (inspectCacheDatabase(location, 'brain.sqlite') === undefined) {
       cacheReadTestHooks.afterMissingPrimaryRecoveryObservation?.()
       try {
-        return completedRecoveryRebuild(rebuildCache(root, location, 'create-exclusive'))
+        return completedRecoveryRebuild(rebuildCache(root, location, { kind: 'create-exclusive' }))
       } catch (error) {
         if (error instanceof CacheDatabaseCreationConflict) {
           return { kind: 'retry' }

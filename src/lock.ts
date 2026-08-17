@@ -316,8 +316,8 @@ export const withOperationLock = <Result>(
       name: 'operation-lock.sqlite',
       openOptions: { timeout: remainingMilliseconds() },
       preserveDatabaseLocksAfterInitialisation: true,
-      primaryMode: 'create-if-missing',
-    })
+      primary: { kind: 'create-if-missing' },
+    }).database
     gateTransaction = true
   }
 

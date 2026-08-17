@@ -70,6 +70,12 @@ type CacheDatabaseConstructor<Database> = new (
   },
 ) => Database
 
+type CacheDatabasePrimary =
+  | { kind: 'create-exclusive' }
+  | { kind: 'create-if-missing' }
+  | { database: CacheDatabase; kind: 'expected-owned' }
+  | { kind: 'existing' }
+
 type VerifiedCacheDatabaseOptions<Database> = {
   afterVerifiedOpen?: ((database: Database) => void) | undefined
   DatabaseConstructor: CacheDatabaseConstructor<Database>
@@ -80,7 +86,7 @@ type VerifiedCacheDatabaseOptions<Database> = {
     readOnly?: boolean
     timeout?: number
   }
-  primaryMode: 'create-exclusive' | 'create-if-missing' | 'existing'
+  primary: CacheDatabasePrimary
   preserveDatabaseLocksAfterInitialisation?: boolean
 }
 
@@ -101,6 +107,7 @@ export class CacheDatabaseFailure extends Error {
   }
 }
 
+/** @internal */
 export class CacheDatabaseCreationConflict extends Error {
   constructor() {
     super('A cache database primary appeared while exclusive creation was attempted.')
@@ -551,6 +558,15 @@ const assertCacheDatabaseMetadata = (location: CacheLocation, database: CacheDat
   return { ...database, sidecars }
 }
 
+const assertOwnedCacheDatabase = (location: CacheLocation, database: CacheDatabase) => {
+  assertCacheLocation(location)
+  const identity = inspectRegularFile(database.path, databaseRelativePath(database.name))
+  if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
+    throw new CacheDatabaseCreationConflict()
+  }
+  return { ...database, sidecars: reconcileSidecars(location, database) }
+}
+
 const closeDatabaseAfterFailure = (database: { close: () => void }) => {
   try {
     database.close()
@@ -559,13 +575,20 @@ const closeDatabaseAfterFailure = (database: { close: () => void }) => {
   }
 }
 
+const initialCacheDatabase = <Database>(options: VerifiedCacheDatabaseOptions<Database>) => {
+  if (options.primary.kind === 'existing') {
+    return inspectCacheDatabase(options.location, options.name)
+  }
+  if (options.primary.kind === 'expected-owned') {
+    return assertOwnedCacheDatabase(options.location, options.primary.database)
+  }
+  return prepareCacheDatabase(options.location, options.name, options.primary.kind)
+}
+
 export const openVerifiedCacheDatabase = <Database extends { close: () => void }>(
   options: VerifiedCacheDatabaseOptions<Database>,
 ) => {
-  const initial =
-    options.primaryMode === 'existing'
-      ? inspectCacheDatabase(options.location, options.name)
-      : prepareCacheDatabase(options.location, options.name, options.primaryMode)
+  const initial = initialCacheDatabase(options)
   if (initial === undefined) {
     if (options.missing !== undefined) {
       return options.missing()
@@ -573,11 +596,15 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
     return fail('INTERNAL_ERROR', 'The requested Encephalon cache database is missing.')
   }
   let snapshot = initial
+  const assertPrimary = (database: CacheDatabase) =>
+    options.primary.kind === 'expected-owned'
+      ? assertOwnedCacheDatabase(options.location, database)
+      : assertCacheDatabase(options.location, database)
   const attempts = Array.from({ length: MAX_CACHE_DATABASE_OPEN_ATTEMPTS }, (_, index) => index)
   for (const attempt of attempts) {
     try {
       cacheLocationTestHooks.beforeDatabaseOpen?.(snapshot)
-      snapshot = assertCacheDatabase(options.location, snapshot)
+      snapshot = assertPrimary(snapshot)
     } catch (error) {
       if (error instanceof CacheDatabaseSidecarChanged) {
         snapshot = error.database
@@ -596,15 +623,15 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
     }
     try {
       cacheLocationTestHooks.afterDatabaseOpen?.(snapshot)
-      snapshot = assertCacheDatabase(options.location, snapshot)
+      snapshot = assertPrimary(snapshot)
       options.afterVerifiedOpen?.(database)
       if (options.preserveDatabaseLocksAfterInitialisation) {
         cacheLocationTestHooks.afterDatabaseLockInitialisation?.(snapshot)
       }
       snapshot = options.preserveDatabaseLocksAfterInitialisation
         ? assertCacheDatabaseMetadata(options.location, snapshot)
-        : assertCacheDatabase(options.location, snapshot)
-      return database
+        : assertPrimary(snapshot)
+      return { database, identity: snapshot }
     } catch (error) {
       if (error instanceof CacheDatabaseSidecarChanged) {
         closeDatabaseAfterFailure(database)
@@ -617,7 +644,7 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
         try {
           snapshot = options.preserveDatabaseLocksAfterInitialisation
             ? assertCacheDatabaseMetadata(options.location, snapshot)
-            : assertCacheDatabase(options.location, snapshot)
+            : assertPrimary(snapshot)
         } catch (candidate) {
           validationError = candidate
         }

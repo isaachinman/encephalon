@@ -99,6 +99,10 @@ describe('package contract', () => {
     assert.doesNotMatch(readFileSync(resolve(root, 'dist', 'api-input.d.ts'), 'utf8'), /ValidatedAddRecordInput/)
     assert.doesNotMatch(readFileSync(resolve(root, 'dist', 'errors.d.ts'), 'utf8'), /failBudget|operation-budgets/)
     assert.doesNotMatch(
+      readFileSync(resolve(root, 'dist', 'cache-location.d.ts'), 'utf8'),
+      /CacheDatabaseCreationConflict/,
+    )
+    assert.doesNotMatch(
       readFileSync(resolve(root, 'dist', 'operation-budgets.d.ts'), 'utf8'),
       /OPERATION_BUDGETS|OperationBudgetKey/,
     )
