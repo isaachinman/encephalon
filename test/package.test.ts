@@ -78,7 +78,7 @@ describe('package contract', () => {
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `69f1ea39674d3638ebee87b36c9b1e6ca1b4d263`\./,
+      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `0e599764d3c38e36f3b722fe8d8c799e0c9d3e32`\./,
     )
     assert.match(
       contract,
@@ -107,7 +107,7 @@ describe('package contract', () => {
     )
     assert.match(
       ftsTextIntegrityDesign,
-      /The exact reviewed code and behavioural-test snapshot implementing this design is `69f1ea39674d3638ebee87b36c9b1e6ca1b4d263`\./,
+      /The exact reviewed code and behavioural-test snapshot implementing this design is `0e599764d3c38e36f3b722fe8d8c799e0c9d3e32`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),
