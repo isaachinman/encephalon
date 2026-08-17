@@ -73,6 +73,8 @@ const MAX_CACHE_RECORD_BYTES = CANONICAL_BUDGETS.recordBytes + MAX_CACHE_RECORD_
 const MAX_CACHE_RECORD_JSON_BYTES =
   CANONICAL_BUDGETS.recordJsonBytes + CANONICAL_BUDGETS.records * MAX_CACHE_RECORD_OVERHEAD_BYTES
 const MAX_CACHE_RECORD_TEXT_BYTES = MAX_CACHE_RECORD_JSON_BYTES * 2
+const MAX_CACHE_SEARCH_DOCUMENT_BYTES = MAX_CACHE_RECORD_BYTES * 2
+const MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES = MAX_CACHE_RECORD_JSON_BYTES * 2
 const MAX_CACHE_FTS_ID_BYTES = CANONICAL_BUDGETS.records * 255
 const METADATA_KEYS = [
   'artifactPaths',
@@ -911,9 +913,13 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
           LIMIT ?5
         )`,
       )
-      .get(MAX_CACHE_FTS_ID_BYTES, MAX_CACHE_RECORD_JSON_BYTES, 255, MAX_CACHE_RECORD_BYTES, maximumRows) as
-      | CacheIntegrityProbe
-      | undefined,
+      .get(
+        MAX_CACHE_FTS_ID_BYTES,
+        MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES,
+        255,
+        MAX_CACHE_SEARCH_DOCUMENT_BYTES,
+        maximumRows,
+      ) as CacheIntegrityProbe | undefined,
     maximumRows,
   )
   if (
@@ -1074,16 +1080,11 @@ const rebuildCache = (
       nextWriterPrimary.kind === 'create-if-missing'
         ? { kind: 'create-if-missing' }
         : { database: identity, kind: 'expected-owned' }
+    let rebuildResult: PrepareResult | undefined
+    let writerFailure: unknown
+    let writerFailed = false
     try {
-      let existingMetadata: Metadata | undefined
-      try {
-        existingMetadata = readMetadata(database)
-      } catch (error) {
-        if (error instanceof CacheSchemaMismatch) {
-          return failCacheDatabase(error, identity)
-        }
-        throw error
-      }
+      const existingMetadata = readMetadata(database)
       assertCacheScope(root, existingMetadata)
       database.exec('BEGIN IMMEDIATE')
       try {
@@ -1118,10 +1119,11 @@ const rebuildCache = (
         const manifestAfter = boundedRepositoryManifest(root, artifactPaths)
         if (manifestAfter.kind === 'stable' && manifestAfter.value === manifestBefore.value) {
           database.exec('COMMIT')
-          return { hydrated: true, recordsIndexed: records.length }
+          rebuildResult = { hydrated: true, recordsIndexed: records.length }
+        } else {
+          repositoryChangeObserved = true
+          database.exec('ROLLBACK')
         }
-        repositoryChangeObserved = true
-        database.exec('ROLLBACK')
       } catch (error) {
         try {
           database.exec('ROLLBACK')
@@ -1130,8 +1132,29 @@ const rebuildCache = (
         }
         throw error
       }
-    } finally {
+    } catch (error) {
+      writerFailure = error
+      writerFailed = true
+    }
+    try {
       database.close()
+    } catch (error) {
+      if (!writerFailed) {
+        writerFailure = error
+        writerFailed = true
+      }
+    }
+    if (writerFailed) {
+      if (writerFailure instanceof EncephalonError || writerFailure instanceof CacheDatabaseFailure) {
+        throw writerFailure
+      }
+      if (isRecoverableCacheFailure(writerFailure)) {
+        return failCacheDatabase(writerFailure, identity)
+      }
+      throw writerFailure
+    }
+    if (rebuildResult !== undefined) {
+      return rebuildResult
     }
     if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {
       return fail('REPOSITORY_CHANGED', 'The repository changed repeatedly while rebuilding the Encephalon cache.')

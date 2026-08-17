@@ -535,13 +535,16 @@ export const inspectCacheDatabase = (location: CacheLocation, name: CacheDatabas
   return identity === undefined ? undefined : { ...identity, name, sidecars }
 }
 
-export const assertCacheDatabase = (location: CacheLocation, database: CacheDatabase) => {
+export const assertCacheDatabase = (location: CacheLocation, database: CacheDatabase, missing?: () => never) => {
   assertCacheLocation(location)
   const identity = inspectRegularFile(database.path, databaseRelativePath(database.name))
-  if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
-    return changedLayout(databaseRelativePath(database.name), 'stable-identity')
+  if (identity !== undefined && sameCacheEntryIdentity(database, identity)) {
+    return { ...database, sidecars: reconcileSidecars(location, database) }
   }
-  return { ...database, sidecars: reconcileSidecars(location, database) }
+  if (identity === undefined && missing !== undefined) {
+    return missing()
+  }
+  return changedLayout(databaseRelativePath(database.name), 'stable-identity')
 }
 
 const assertCacheDatabaseMetadata = (location: CacheLocation, database: CacheDatabase) => {
@@ -596,10 +599,11 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
     return fail('INTERNAL_ERROR', 'The requested Encephalon cache database is missing.')
   }
   let snapshot = initial
+  const ownedPrimary = options.primary.kind === 'create-exclusive' || options.primary.kind === 'expected-owned'
   const assertPrimary = (database: CacheDatabase) =>
-    options.primary.kind === 'expected-owned'
+    ownedPrimary
       ? assertOwnedCacheDatabase(options.location, database)
-      : assertCacheDatabase(options.location, database)
+      : assertCacheDatabase(options.location, database, options.missing)
   const attempts = Array.from({ length: MAX_CACHE_DATABASE_OPEN_ATTEMPTS }, (_, index) => index)
   for (const attempt of attempts) {
     try {

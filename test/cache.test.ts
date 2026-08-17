@@ -1819,6 +1819,23 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('serves a valid large-summary record through cache preparation and search', () => {
+    const root = createRoot()
+    const summary = `large summary marker ${'x'.repeat(600_000)}`
+    const added = api.addRecord({
+      id: 'large-summary-cache-record',
+      kind: 'context',
+      payload: { summary },
+      root,
+      source: 'agent',
+      subject: 'cache.large-summary',
+    })
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+    assert.equal(api.listRecords({ limit: 1, root })[0]?.id, added.id)
+    assert.equal(api.searchRecords({ limit: 1, query: 'large summary marker', root })[0]?.id, added.id)
+  })
+
   test('accepts request budget boundaries and rejects one unit over before cache I/O', () => {
     const validRoot = createRoot()
     const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
@@ -2691,6 +2708,171 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(readFileSync(databasePath), successorBytes)
   })
 
+  test('owns an exclusively created primary before its first SQLite open', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'exclusive-open-predecessor.sqlite')
+    const claimedPath = join(root, 'exclusive-open-claim.sqlite')
+    const successorPath = join(root, 'exclusive-open-successor.sqlite')
+    const sourceDatabase = new DatabaseSync(databasePath, { readOnly: true })
+    sourceDatabase.prepare('VACUUM INTO ?').run(successorPath)
+    sourceDatabase.close()
+    const successorBytes = readFileSync(successorPath)
+    const successorIdentity = lstatSync(successorPath, { bigint: true })
+    let primaryQuarantines = 0
+    let replacements = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheLocationTestHooks.beforeDatabaseOpen = database => {
+      if (database.name === 'brain.sqlite') {
+        cacheLocationTestHooks.beforeDatabaseOpen = undefined
+        renameSync(databasePath, claimedPath)
+        renameSync(successorPath, databasePath)
+        replacements += 1
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+    assert.equal(replacements, 1)
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 0)
+    assert.equal(existsSync(predecessorPath), true)
+    assert.equal(existsSync(claimedPath), true)
+    const currentIdentity = lstatSync(databasePath, { bigint: true })
+    assert.deepEqual(
+      { dev: currentIdentity.dev, ino: currentIdentity.ino },
+      { dev: successorIdentity.dev, ino: successorIdentity.ino },
+    )
+    assert.deepEqual(readFileSync(databasePath), successorBytes)
+  })
+
+  test('recovers a primary that disappears before its first verified open', () => {
+    const cases = [
+      { expectedHydrated: true, name: 'primary remains absent', successor: false },
+      { expectedHydrated: false, name: 'successor appears after missing observation', successor: true },
+    ] as const
+
+    for (const { expectedHydrated, name, successor } of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      const databasePath = cacheDatabasePath(root)
+      const predecessorPath = join(root, `pre-open-missing-${successor ? 'successor' : 'absent'}.sqlite`)
+      const successorPath = join(root, `pre-open-successor-${successor ? 'ready' : 'unused'}.sqlite`)
+      if (successor) {
+        const sourceDatabase = new DatabaseSync(databasePath, { readOnly: true })
+        sourceDatabase.prepare('VACUUM INTO ?').run(successorPath)
+        sourceDatabase.close()
+      }
+      const successorBytes = successor ? readFileSync(successorPath) : undefined
+      const successorIdentity = successor ? lstatSync(successorPath, { bigint: true }) : undefined
+      let missingObservations = 0
+      let primaryQuarantines = 0
+      let writerInitialisations = 0
+      cacheLocationTestHooks.beforeDatabaseOpen = database => {
+        if (database.name === 'brain.sqlite') {
+          cacheLocationTestHooks.beforeDatabaseOpen = undefined
+          renameSync(databasePath, predecessorPath)
+        }
+      }
+      cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+        if (phase === 'reader-missing') {
+          missingObservations += 1
+          cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+          if (successor) {
+            renameSync(successorPath, databasePath)
+          }
+        }
+      }
+      cacheLocationTestHooks.beforeQuarantineRename = path => {
+        if (basename(path) === 'brain.sqlite') {
+          primaryQuarantines += 1
+        }
+      }
+      cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+        if (mode === 'writer') {
+          writerInitialisations += 1
+        }
+      }
+
+      assert.deepEqual(api.prepare({ root }), { hydrated: expectedHydrated, recordsIndexed: 1 }, name)
+      assert.equal(missingObservations, 1, name)
+      assert.equal(primaryQuarantines, 0, name)
+      assert.equal(writerInitialisations, successor ? 0 : 1, name)
+      assert.equal(existsSync(predecessorPath), true, name)
+      if (successorIdentity !== undefined && successorBytes !== undefined) {
+        const currentIdentity = lstatSync(databasePath, { bigint: true })
+        assert.deepEqual(
+          { dev: currentIdentity.dev, ino: currentIdentity.ino },
+          { dev: successorIdentity.dev, ino: successorIdentity.ino },
+          name,
+        )
+        assert.deepEqual(readFileSync(databasePath), successorBytes, name)
+      }
+      cacheLocationTestHooks.beforeDatabaseOpen = undefined
+      cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      cacheLocationTestHooks.beforeQuarantineRename = undefined
+      cacheReadTestHooks.duringDatabaseInitialisation = undefined
+    }
+  })
+
+  test('recovers primary disappearance after SQLite construction before verified read', {
+    skip: process.platform === 'win32' ? 'Windows cannot rename an open SQLite primary.' : false,
+  }, () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'post-construction-missing-primary.sqlite')
+    let missingObservations = 0
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.afterDatabaseOpen = database => {
+      if (database.name === 'brain.sqlite') {
+        cacheLocationTestHooks.afterDatabaseOpen = undefined
+        renameSync(databasePath, predecessorPath)
+      }
+    }
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'reader-missing') {
+        missingObservations += 1
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
+    assert.equal(missingObservations, 1)
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 1)
+    assert.equal(existsSync(predecessorPath), true)
+  })
+
   test('prepare returns its completed recovery rebuild without rebuilding changed canonical inputs again', () => {
     const root = createRoot()
     const record = addCacheRecord(root)
@@ -2770,6 +2952,47 @@ describe('SQLite cache and reads', () => {
       recordsIndexed: 1,
     })
     assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 2)
+  })
+
+  test('quarantines an exact forced-writer cache after a query-time corrupt failure', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const originalIdentity = lstatSync(databasePath, { bigint: true })
+    let primaryQuarantines = 0
+    let queryFailures = 0
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterIntegrityProbe = observation => {
+      if (observation.name === 'metadata' && queryFailures === 0) {
+        queryFailures += 1
+        throw Object.assign(new Error('database disk image is malformed'), { code: 'SQLITE_CORRUPT' })
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const currentIdentity = lstatSync(path, { bigint: true })
+        assert.deepEqual(
+          { dev: currentIdentity.dev, ino: currentIdentity.ino },
+          { dev: originalIdentity.dev, ino: originalIdentity.ino },
+        )
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+    assert.equal(queryFailures, 1)
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(recoveryRebuilds, 1)
     assert.equal(writerInitialisations, 2)
   })
 
@@ -3113,6 +3336,51 @@ describe('SQLite cache and reads', () => {
     )
     assert.equal(primaryQuarantines, 0)
     assert.equal(writerInitialisations, 0)
+  })
+
+  test('forced hydration preserves a valid foreign-scope cache exactly', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const foreignRepository = realpathSync.native(createOutsideDirectory())
+    mutateCache(root, database => {
+      database.prepare("UPDATE metadata SET value = ? WHERE key = 'repositoryRealpath'").run(foreignRepository)
+    })
+    const databasePath = cacheDatabasePath(root)
+    const beforeBytes = readFileSync(databasePath)
+    const beforeIdentity = lstatSync(databasePath, { bigint: true })
+    let primaryQuarantines = 0
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.throws(
+      () => api.hydrate({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'CACHE_SCOPE_MISMATCH')
+        return true
+      },
+    )
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(recoveryRebuilds, 0)
+    assert.equal(writerInitialisations, 1)
+    const afterIdentity = lstatSync(databasePath, { bigint: true })
+    assert.deepEqual(
+      { dev: afterIdentity.dev, ino: afterIdentity.ino },
+      { dev: beforeIdentity.dev, ino: beforeIdentity.ino },
+    )
+    assert.deepEqual(readFileSync(databasePath), beforeBytes)
   })
 
   test('preserves terminal Encephalon cache errors regardless of recoverable causes', () => {
@@ -3459,12 +3727,12 @@ describe('SQLite cache and reads', () => {
       {
         expectedRows: 1,
         mutate: (database: DatabaseSync) => {
-          database.prepare('UPDATE record_search SET text = CAST(zeroblob(?) AS TEXT)').run(1_052_673)
+          database.prepare('UPDATE record_search SET text = CAST(zeroblob(?) AS TEXT)').run(2_105_345)
         },
         name: 'oversized FTS text containing NUL',
       },
       {
-        expectedRows: 13,
+        expectedRows: 24,
         mutate: (database: DatabaseSync) => {
           database.exec(`
             CREATE TABLE replacement_records AS
@@ -3474,7 +3742,7 @@ describe('SQLite cache and reads', () => {
             WITH RECURSIVE generated(value) AS (
               SELECT 1
               UNION ALL
-              SELECT value + 1 FROM generated WHERE value < 13
+              SELECT value + 1 FROM generated WHERE value < 24
             )
             INSERT INTO replacement_records
             SELECT id, kind, subject, source, created_at, path, active, summary, record_json
@@ -3485,15 +3753,15 @@ describe('SQLite cache and reads', () => {
             WITH RECURSIVE generated(value) AS (
               SELECT 1
               UNION ALL
-              SELECT value + 1 FROM generated WHERE value < 13
+              SELECT value + 1 FROM generated WHERE value < 24
             )
             INSERT INTO record_search(id, text)
             SELECT 'cache-record', CAST(zeroblob(1048576) AS TEXT)
             FROM generated;
-            UPDATE metadata SET value = '13' WHERE key = 'recordsIndexed';
+            UPDATE metadata SET value = '24' WHERE key = 'recordsIndexed';
           `)
         },
-        name: 'aggregate FTS text above 12 MiB',
+        name: 'aggregate FTS text above its doubled cache-record bound',
       },
       {
         expectedRows: 1,
