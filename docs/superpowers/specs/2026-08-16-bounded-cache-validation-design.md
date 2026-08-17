@@ -138,9 +138,9 @@ On the first recoverable cache failure it:
 
 1. acquires the existing operation lock or uses the caller's already-held lock, then revalidates the held cache location;
 2. quarantines the exact captured `brain.sqlite` identity and its observed sidecars when the failure carries that identity;
-3. represents disappearance after an existence observation distinctly, rebuilding once if the primary remains absent or retrying without quarantine if a current successor exists;
-4. rebuilds at most once from a newly validated canonical record snapshot;
-5. retries prepare/read work once, while forced hydration consumes the recovery rebuild result directly instead of forcing a second rebuild.
+3. represents disappearance after an existence observation distinctly, rechecks under the lock, and exclusively claims an absent primary; a successor that wins that creation race is preserved and retried without quarantine or writer initialisation;
+4. rebuilds at most once from a newly validated canonical record snapshot, reusing a successfully claimed primary across internal repository-change retries;
+5. returns a completed recovery rebuild directly for prepare and forced hydration, while reads or preserved-successor paths retry once.
 
 A second validation or recovery failure never causes another rebuild. It follows the existing SQLite category and I/O wrapping policies, returning bounded `IO_ERROR` or `INTERNAL_ERROR` without cache keys, values, record JSON, FTS text, paths from corrupt rows, or private sentinels. Malformed cache JSON is normalised without retaining V8's parser cause because that cause can contain excerpts of the untrusted source.
 
@@ -189,4 +189,4 @@ The complete lint, four-project typecheck, full test, benchmark, build, package,
 
 ## Reviewed implementation provenance
 
-The exact reviewed code and behavioural-test snapshot implementing this design is `920d0ae9463c0076943e4576a08e57fd1fb9926a`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.
+The exact reviewed code and behavioural-test snapshot implementing this design is `3f222a2b32c0ae666215303b660cebc85bcd04ab`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.

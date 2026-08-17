@@ -576,6 +576,14 @@ git commit -m "[MAR-2549] Document bounded cache validation"
 - Code and behavioural-test snapshot: `920d0ae9463c0076943e4576a08e57fd1fb9926a` (`[MAR-2549] Complete bounded cache recovery`).
 - Provenance RED: the package contract ran 7 tests with 6 passed and 1 failed while the maintained contract and design still named `d0b4a28020c1394de9c8897436adc794ff865c55`. GREEN passed 7/7 against the exact `920d0ae9463c0076943e4576a08e57fd1fb9926a` snapshot. The final lint, four-project typecheck, 467/469 full test run with two established skips, both benchmark profiles, build, package, expected publish refusal, frozen install, declaration, Bun, package-content, scope, and diff audits passed. The exact `npx` validation attempt hit the root-owned npm-cache limitation; the built CLI confirmed the established `ROOT_INSTALL_REQUIRED` self-root classification without record JSON changes.
 
+### Branch-review wave 1 fix evidence
+
+- Late-successor RED installed a valid successor after the held-lock absence recheck and observed one unintended writer initialisation. GREEN exclusively claims the missing primary, treats `EEXIST` as an internal creation conflict, preserves and retries the successor with zero writer initialisations and zero quarantines, and reuses a successfully claimed primary across repository-change retries.
+- Prepare-completion RED changed canonical bytes after a completed recovery rebuild and observed two writer initialisations. GREEN returns that first rebuild result directly with one writer; named `acquire`/`held` lock modes and `retry-operation`/`complete-from-rebuild` policies replace the ambiguous recovery boolean and optional callback across prepare, hydrate, reads, forced gather, post-commit add hydration, and init.
+- Focused recovery checks passed 5/5. The affected cache/SQLite-policy/errors/records/init suites passed 386/388 with two established capability skips. Lint, all four TypeScript projects, and the full 470/472 test suite with the same two skips passed. Both benchmark profiles, build, package, expected publish refusal, frozen install, declaration, Bun, package-content, and diff audits passed.
+- Code and behavioural-test snapshot: `3f222a2b32c0ae666215303b660cebc85bcd04ab` (`[MAR-2549] Preserve bounded cache recovery`).
+- Provenance RED: the package contract ran 7 tests with 6 passed and 1 failed while the maintained contract and design still named `920d0ae9463c0076943e4576a08e57fd1fb9926a`. GREEN passed 7/7 against the exact `3f222a2b32c0ae666215303b660cebc85bcd04ab` snapshot.
+
 - [ ] **Step 8: Prepare the branch review package without merging**
 
 **Controller handoff:** Step 8 remains pending. No push, PR or Linear mutation, CodeRabbit run, branch-review wave, or merge was performed by Task 4.
