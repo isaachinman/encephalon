@@ -3187,6 +3187,81 @@ describe('SQLite cache and reads', () => {
     })
   })
 
+  test('quarantines an incompatible existing schema instead of repairing it in place', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    mutateCache(root, database => {
+      database.exec('DROP INDEX records_active_order;')
+    })
+    const incompatibleIdentity = lstatSync(databasePath, { bigint: true })
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const current = lstatSync(path, { bigint: true })
+        assert.equal(current.dev, incompatibleIdentity.dev)
+        assert.equal(current.ino, incompatibleIdentity.ino)
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }), {
+      recordsIndexed: 1,
+    })
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 1)
+    const rebuiltIdentity = lstatSync(databasePath, { bigint: true })
+    assert.notEqual(rebuiltIdentity.ino, incompatibleIdentity.ino)
+  })
+
+  test('recovers one exact semantically incompatible cache during a public read', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    mutateCache(root, database => {
+      database.exec(`
+        DROP INDEX records_kind_subject;
+        CREATE INDEX records_kind_subject ON records(subject, kind);
+      `)
+    })
+    const incompatibleIdentity = lstatSync(databasePath, { bigint: true })
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const current = lstatSync(path, { bigint: true })
+        assert.equal(current.dev, incompatibleIdentity.dev)
+        assert.equal(current.ino, incompatibleIdentity.ino)
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const listed = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
+      root,
+    })
+    assert.deepEqual(
+      listed.map(candidate => candidate.id),
+      [record.id],
+    )
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 1)
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: false,
+      recordsIndexed: 1,
+    })
+  })
+
   test('rebuilds an empty read-only cache file through writer preparation', {
     skip: process.platform === 'win32' ? 'Windows read-only file replacement semantics differ.' : false,
   }, () => {
