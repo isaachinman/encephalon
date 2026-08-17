@@ -2681,6 +2681,58 @@ describe('SQLite cache and reads', () => {
     assert.equal(existsSync(predecessorPath), true)
   })
 
+  test('rejects a non-empty exclusively claimed primary before a repository-change retry', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'non-empty-retry-cache-predecessor.sqlite')
+    let canonicalValidations = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      canonicalValidations += 1
+      if (canonicalValidations === 2) {
+        mutateCache(root, database => {
+          database.prepare("INSERT INTO record_search(id, text) VALUES ('injected-retry-row', 'untrusted')").run()
+        })
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (writerInitialisations === 1) {
+          const recordPath = join(root, String(record.path))
+          writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+        }
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        return true
+      },
+    )
+    assert.equal(writerInitialisations, 1)
+    const preserved = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      assert.equal(
+        preserved.prepare("SELECT COUNT(*) AS count FROM record_search WHERE id = 'injected-retry-row'").get()?.count,
+        1,
+      )
+    } finally {
+      preserved.close()
+    }
+  })
+
   test('preserves a successor swapped between exclusively claimed primary retries', () => {
     const root = createRoot()
     addCacheRecord(root)
@@ -3559,6 +3611,41 @@ describe('SQLite cache and reads', () => {
     assert.equal(primaryQuarantines, 1)
     assert.equal(recoveryRebuilds, 1)
     assert.equal(writerInitialisations, 1)
+  })
+
+  test('revalidates exact FTS content after writer initialisation and before rebuild mutation', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const original = lstatSync(databasePath, { bigint: true })
+    let exactQuarantines = 0
+    let mutated = false
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const current = lstatSync(path, { bigint: true })
+        if (current.dev === original.dev && current.ino === original.ino) {
+          exactQuarantines += 1
+        }
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (!mutated) {
+          mutated = true
+          mutateCache(root, database => {
+            database.prepare("UPDATE record_search SET text = 'mutated after writer initialisation'").run()
+          })
+        }
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }), {
+      recordsIndexed: 1,
+    })
+    assert.equal(exactQuarantines, 1)
+    assert.equal(writerInitialisations, 2)
   })
 
   test('reads a fresh cache without touching the database file', () => {

@@ -796,10 +796,10 @@ const createCacheSchema = (database: DatabaseSync) => {
   `)
 }
 
-const assertCacheSchemaTransaction = (database: DatabaseSync) => {
+const assertCacheTransaction = (database: DatabaseSync, validate: (opened: DatabaseSync) => void): void => {
   database.exec('BEGIN')
   try {
-    assertCacheSchema(database)
+    validate(database)
     database.exec('ROLLBACK')
   } catch (error) {
     try {
@@ -809,6 +809,10 @@ const assertCacheSchemaTransaction = (database: DatabaseSync) => {
     }
     throw error
   }
+}
+
+const assertCacheSchemaTransaction = (database: DatabaseSync): void => {
+  assertCacheTransaction(database, assertCacheSchema)
 }
 
 type CacheWriterPrimary =
@@ -834,7 +838,7 @@ const openWriterDatabase = (
         database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
         createCacheSchema(database)
       } else if (primary.kind === 'expected-new') {
-        assertCacheSchemaTransaction(database)
+        assertEmptyCacheContentTransaction(database)
         database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
       } else {
         validateExisting(database)
@@ -1395,19 +1399,29 @@ const assertExistingCacheContentConsistent = (root: string, database: DatabaseSy
   assertCacheContentConsistent(database, metadata)
 }
 
-const assertExistingCacheContentTransaction = (root: string, database: DatabaseSync): void => {
-  database.exec('BEGIN')
-  try {
-    assertExistingCacheContentConsistent(root, database)
-    database.exec('ROLLBACK')
-  } catch (error) {
-    try {
-      database.exec('ROLLBACK')
-    } catch {
-      // Preserve the original cache validation failure.
-    }
-    throw error
+const assertEmptyCacheContent = (database: DatabaseSync): void => {
+  assertCacheSchema(database)
+  const rows = database
+    .prepare(
+      `SELECT
+        EXISTS(SELECT 1 FROM metadata LIMIT 1) AS metadata_rows,
+        EXISTS(SELECT 1 FROM records LIMIT 1) AS record_rows,
+        EXISTS(SELECT 1 FROM record_search LIMIT 1) AS search_rows`,
+    )
+    .get() as { metadata_rows?: unknown; record_rows?: unknown; search_rows?: unknown }
+  if (rows.metadata_rows !== 0 || rows.record_rows !== 0 || rows.search_rows !== 0) {
+    throw new CacheSchemaMismatch('The newly created cache is not empty.')
   }
+}
+
+const assertExistingCacheContentTransaction = (root: string, database: DatabaseSync): void => {
+  assertCacheTransaction(database, opened => {
+    assertExistingCacheContentConsistent(root, opened)
+  })
+}
+
+const assertEmptyCacheContentTransaction = (database: DatabaseSync): void => {
+  assertCacheTransaction(database, assertEmptyCacheContent)
 }
 
 const metadataIsFresh = (
@@ -1542,7 +1556,7 @@ const rebuildCache = (
       database.exec('BEGIN IMMEDIATE')
       try {
         if (acceptsEmptyContent) {
-          assertCacheSchema(database)
+          assertEmptyCacheContent(database)
         } else {
           assertExistingCacheContentConsistent(root, database)
         }
