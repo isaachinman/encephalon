@@ -83,7 +83,7 @@
 - [x] Run lint, all four typechecks, full tests, both benchmarks, build, package, publish-contract, and frozen-install gates.
 - [x] Audit public declarations, package contents, Bun files, diff hygiene, dead hooks, stale assumptions, SoC boundaries, and documentation accuracy.
 
-Implementation and behavioural coverage are captured by `029775c46f4a07b56bac8985a098e61d27ea20a8`. The review-remediated release matrix passed with 491 tests, two established filesystem-capability skips, clean lint and four-project typechecking, both benchmark profiles, build, packed-package and publish-contract checks, frozen dependency installation, unchanged Bun/package configuration, no new public declarations, and clean diff hygiene.
+Implementation and behavioural coverage are captured by `fb17790ac01031aa37d903ec9a3feb3a271e9d05`. The review-remediated release matrix passed with 491 tests, two established filesystem-capability skips, clean lint and four-project typechecking, both benchmark profiles, build, packed-package and publish-contract checks, frozen dependency installation, unchanged Bun/package configuration, no new public declarations, and clean diff hygiene.
 
 ### Task 5: Pull request and branch review
 
