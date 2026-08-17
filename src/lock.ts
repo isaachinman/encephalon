@@ -311,12 +311,12 @@ export const withOperationLock = <Result>(
       afterVerifiedOpen: database => {
         database.exec('BEGIN IMMEDIATE')
       },
-      create: true,
       DatabaseConstructor: DatabaseSync,
       location,
       name: 'operation-lock.sqlite',
       openOptions: { timeout: remainingMilliseconds() },
       preserveDatabaseLocksAfterInitialisation: true,
+      primaryMode: 'create-if-missing',
     })
     gateTransaction = true
   }

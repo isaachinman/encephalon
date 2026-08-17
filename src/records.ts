@@ -1793,7 +1793,7 @@ const addRecordFileResolved = (
   if (committedErrorPhase !== 'publicationFlush' && options.hydrate !== false) {
     try {
       fault(options.hooks, 'during-hydration')
-      hydrateResolvedRepository(root, false, options.cacheLocation)
+      hydrateResolvedRepository(root, 'held', options.cacheLocation)
     } catch (error) {
       capturePostCommitError('cacheHydration', error)
     }

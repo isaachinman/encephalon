@@ -72,7 +72,6 @@ type CacheDatabaseConstructor<Database> = new (
 
 type VerifiedCacheDatabaseOptions<Database> = {
   afterVerifiedOpen?: ((database: Database) => void) | undefined
-  create: boolean
   DatabaseConstructor: CacheDatabaseConstructor<Database>
   location: CacheLocation
   missing?: (() => never) | undefined
@@ -81,6 +80,7 @@ type VerifiedCacheDatabaseOptions<Database> = {
     readOnly?: boolean
     timeout?: number
   }
+  primaryMode: 'create-exclusive' | 'create-if-missing' | 'existing'
   preserveDatabaseLocksAfterInitialisation?: boolean
 }
 
@@ -98,6 +98,13 @@ export class CacheDatabaseFailure extends Error {
     this.name = 'CacheDatabaseFailure'
     this.database = database
     this.failure = failure
+  }
+}
+
+export class CacheDatabaseCreationConflict extends Error {
+  constructor() {
+    super('A cache database primary appeared while exclusive creation was attempted.')
+    this.name = 'CacheDatabaseCreationConflict'
   }
 }
 
@@ -471,7 +478,11 @@ const reconcileSidecars = (location: CacheLocation, database: CacheDatabase) =>
 const reconcileSidecarMetadata = (location: CacheLocation, database: CacheDatabase) =>
   reconcileSidecarSnapshots(database, inspectSidecarMetadata(location, database.name))
 
-const bootstrapPrimary = (location: CacheLocation, name: CacheDatabaseName) => {
+const bootstrapPrimary = (
+  location: CacheLocation,
+  name: CacheDatabaseName,
+  mode: 'create-exclusive' | 'create-if-missing',
+) => {
   const path = resolve(location.directory, name)
   const relativePath = databaseRelativePath(name)
   let created = false
@@ -480,6 +491,10 @@ const bootstrapPrimary = (location: CacheLocation, name: CacheDatabaseName) => {
     closeSync(descriptor)
     created = true
   } catch (error) {
+    if (existingPath(error) && mode === 'create-exclusive') {
+      // biome-ignore lint/style/useErrorCause: this internal control sentinel must not retain a path-bearing EEXIST.
+      throw new CacheDatabaseCreationConflict()
+    }
     if (!existingPath(error)) {
       throw error
     }
@@ -491,12 +506,16 @@ const bootstrapPrimary = (location: CacheLocation, name: CacheDatabaseName) => {
   return identity
 }
 
-const prepareCacheDatabase = (location: CacheLocation, name: CacheDatabaseName): CacheDatabase => {
+const prepareCacheDatabase = (
+  location: CacheLocation,
+  name: CacheDatabaseName,
+  mode: 'create-exclusive' | 'create-if-missing',
+): CacheDatabase => {
   assertCacheLocation(location)
   const sidecars = inspectSidecars(location, name)
   const path = resolve(location.directory, name)
-  const existing = inspectRegularFile(path, databaseRelativePath(name))
-  const identity = existing ?? bootstrapPrimary(location, name)
+  const existing = mode === 'create-if-missing' ? inspectRegularFile(path, databaseRelativePath(name)) : undefined
+  const identity = existing ?? bootstrapPrimary(location, name, mode)
   assertCacheLocation(location)
   return { ...identity, name, sidecars: { ...sidecars, ...inspectSidecars(location, name) } }
 }
@@ -543,9 +562,10 @@ const closeDatabaseAfterFailure = (database: { close: () => void }) => {
 export const openVerifiedCacheDatabase = <Database extends { close: () => void }>(
   options: VerifiedCacheDatabaseOptions<Database>,
 ) => {
-  const initial = options.create
-    ? prepareCacheDatabase(options.location, options.name)
-    : inspectCacheDatabase(options.location, options.name)
+  const initial =
+    options.primaryMode === 'existing'
+      ? inspectCacheDatabase(options.location, options.name)
+      : prepareCacheDatabase(options.location, options.name, options.primaryMode)
   if (initial === undefined) {
     if (options.missing !== undefined) {
       return options.missing()

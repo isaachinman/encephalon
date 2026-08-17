@@ -13,6 +13,7 @@ import {
 } from './api-input.ts'
 import { ArtifactChangedError, type ArtifactObservation, inspectArtifactFiles } from './artifact-inspection.ts'
 import {
+  CacheDatabaseCreationConflict,
   CacheDatabaseFailure,
   type CacheLocation,
   inspectCacheDatabase,
@@ -150,10 +151,12 @@ type CacheIntegrityObservation = {
 
 type CacheReadTestHooks = {
   afterCanonicalValidation?: (() => void) | undefined
+  afterDisposableCacheRecoveryRebuild?: ((result: PrepareResult) => void) | undefined
   afterIntegrityProbe?: ((observation: CacheIntegrityObservation) => void) | undefined
   afterManifestEntryLstat?: ((path: string) => void) | undefined
   afterManifestKindEnumeration?: ((path: string) => void) | undefined
   afterManifestRootEnumeration?: ((path: string) => void) | undefined
+  afterMissingPrimaryRecoveryObservation?: (() => void) | undefined
   afterPrimaryDatabaseObservation?: ((phase: 'prepare-fast-path' | 'reader-missing') => void) | undefined
   afterCompactSearchRead?: ((query: string) => void) | undefined
   afterShowRead?: ((id: string) => void) | undefined
@@ -395,7 +398,9 @@ const createCacheSchema = (database: DatabaseSync) => {
   `)
 }
 
-const openWriterDatabase = (location: CacheLocation) => {
+type CacheWriterPrimaryMode = 'create-exclusive' | 'create-if-missing'
+
+const openWriterDatabase = (location: CacheLocation, primaryMode: CacheWriterPrimaryMode = 'create-if-missing') => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
   return openVerifiedCacheDatabase({
@@ -405,11 +410,11 @@ const openWriterDatabase = (location: CacheLocation) => {
       assertCacheSchema(database)
       cacheReadTestHooks.duringDatabaseInitialisation?.('writer')
     },
-    create: true,
     DatabaseConstructor,
     location,
     name: 'brain.sqlite',
     openOptions: { timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS },
+    primaryMode,
   })
 }
 
@@ -439,7 +444,6 @@ const readVerifiedCacheTransaction = <Result>(
         throw error
       }
     },
-    create: false,
     DatabaseConstructor,
     location,
     missing: () => {
@@ -451,6 +455,7 @@ const readVerifiedCacheTransaction = <Result>(
       readOnly: true,
       timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
     },
+    primaryMode: 'existing',
   })
   database.close()
   if (result === NO_VERIFIED_CACHE_RESULT) {
@@ -996,9 +1001,14 @@ const readFreshMetadata = (root: string, location: CacheLocation): Metadata | un
     return metadataIsFresh(root, database, metadata) ? metadata : undefined
   })
 
-const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocation(root)): PrepareResult => {
+const rebuildCache = (
+  root: string,
+  location: CacheLocation = inspectCacheLocation(root),
+  primaryMode: CacheWriterPrimaryMode = 'create-if-missing',
+): PrepareResult => {
   const attempts = Array.from({ length: MAX_REPOSITORY_CHANGE_RETRIES }, (_, index) => index)
   let repositoryChangeObserved = false
+  let nextWriterPrimaryMode = primaryMode
   for (const attempt of attempts) {
     const recordManifestBefore = boundedRepositoryManifest(root, [])
     if (recordManifestBefore.kind !== 'stable') {
@@ -1053,7 +1063,8 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
       continue
     }
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-    const database = openWriterDatabase(location)
+    const database = openWriterDatabase(location, nextWriterPrimaryMode)
+    nextWriterPrimaryMode = 'create-if-missing'
     try {
       let existingMetadata: Metadata | undefined
       try {
@@ -1152,6 +1163,20 @@ const withCacheOperationLock = <Result>(
 }
 
 type DisposableCacheRecovery = { kind: 'rebuilt'; result: PrepareResult } | { kind: 'retry' }
+type CacheRecoveryLockMode = 'acquire' | 'held'
+type DisposableCacheRecoveryCompletion<Result> =
+  | { kind: 'complete-from-rebuild'; complete: (result: PrepareResult) => Result }
+  | { kind: 'retry-operation' }
+
+type DisposableCacheRecoveryOptions<Result> = {
+  completion: DisposableCacheRecoveryCompletion<Result>
+  lockMode: CacheRecoveryLockMode
+}
+
+const completedRecoveryRebuild = (result: PrepareResult): DisposableCacheRecovery => {
+  cacheReadTestHooks.afterDisposableCacheRecoveryRebuild?.(result)
+  return { kind: 'rebuilt', result }
+}
 
 const recoverDisposableCacheUnderLock = (
   root: string,
@@ -1160,11 +1185,19 @@ const recoverDisposableCacheUnderLock = (
 ): DisposableCacheRecovery => {
   if (failure instanceof CacheDatabaseFailure) {
     quarantineCacheDatabase(location, failure.database)
-    return { kind: 'rebuilt', result: rebuildCache(root, location) }
+    return completedRecoveryRebuild(rebuildCache(root, location))
   }
   if (failure instanceof CacheDatabaseObservedMissing) {
     if (inspectCacheDatabase(location, 'brain.sqlite') === undefined) {
-      return { kind: 'rebuilt', result: rebuildCache(root, location) }
+      cacheReadTestHooks.afterMissingPrimaryRecoveryObservation?.()
+      try {
+        return completedRecoveryRebuild(rebuildCache(root, location, 'create-exclusive'))
+      } catch (error) {
+        if (error instanceof CacheDatabaseCreationConflict) {
+          return { kind: 'retry' }
+        }
+        throw error
+      }
     }
     return { kind: 'retry' }
   }
@@ -1175,10 +1208,10 @@ const recoverDisposableCacheOnce = (
   root: string,
   location: CacheLocation,
   failure: unknown,
-  lock: boolean,
+  lockMode: CacheRecoveryLockMode,
 ): DisposableCacheRecovery => {
   if (isRecoverableCacheFailure(failure)) {
-    return lock
+    return lockMode === 'acquire'
       ? withCacheOperationLock(root, location, captured => recoverDisposableCacheUnderLock(root, captured, failure))
       : recoverDisposableCacheUnderLock(root, location, failure)
   }
@@ -1189,16 +1222,15 @@ const runWithDisposableCacheRecovery = <Result>(
   root: string,
   location: CacheLocation,
   operation: () => Result,
-  lock = true,
-  afterRebuild?: (result: PrepareResult) => Result,
+  options: DisposableCacheRecoveryOptions<Result>,
 ): Result => {
   try {
     return operation()
   } catch (failure) {
     if (!(failure instanceof EncephalonError) && isRecoverableCacheFailure(failure)) {
-      const recovery = recoverDisposableCacheOnce(root, location, failure, lock)
-      if (recovery.kind === 'rebuilt' && afterRebuild !== undefined) {
-        return afterRebuild(recovery.result)
+      const recovery = recoverDisposableCacheOnce(root, location, failure, options.lockMode)
+      if (recovery.kind === 'rebuilt' && options.completion.kind === 'complete-from-rebuild') {
+        return options.completion.complete(recovery.result)
       }
       return operation()
     }
@@ -1209,10 +1241,10 @@ const runWithDisposableCacheRecovery = <Result>(
 const prepareResolvedWithoutCorruptionRecovery = (
   root: string,
   location: CacheLocation,
-  lock = true,
+  lockMode: CacheRecoveryLockMode = 'acquire',
 ): PrepareResult => {
   const serialize = <Result>(operation: (captured: CacheLocation) => Result) => {
-    if (lock) {
+    if (lockMode === 'acquire') {
       return withCacheOperationLock(root, location, operation)
     }
     return operation(location)
@@ -1245,30 +1277,34 @@ const prepareResolvedWithoutCorruptionRecovery = (
 
 const prepareResolved = (
   root: string,
-  lock = true,
+  lockMode: CacheRecoveryLockMode = 'acquire',
   capturedLocation: CacheLocation = inspectCacheLocation(root),
 ): PrepareResult => {
-  const operation = () => prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lock)
-  return runWithDisposableCacheRecovery(root, capturedLocation, operation, lock, () => ({
-    ...operation(),
-    hydrated: true,
-  }))
+  const operation = () => prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lockMode)
+  return runWithDisposableCacheRecovery(root, capturedLocation, operation, {
+    completion: { complete: result => result, kind: 'complete-from-rebuild' },
+    lockMode,
+  })
 }
 
-export const prepareResolvedRepository = (root: string, lock = true, location?: CacheLocation): PrepareResult =>
-  prepareResolved(root, lock, location)
+export const prepareResolvedRepository = (
+  root: string,
+  lockMode: CacheRecoveryLockMode = 'acquire',
+  location?: CacheLocation,
+): PrepareResult => prepareResolved(root, lockMode, location)
 
-export const hydrateResolvedRepository = (root: string, lock = true, location?: CacheLocation): PrepareResult => {
+export const hydrateResolvedRepository = (
+  root: string,
+  lockMode: CacheRecoveryLockMode = 'acquire',
+  location?: CacheLocation,
+): PrepareResult => {
   const captured = location ?? inspectCacheLocation(root)
   const hydrateUnderLock = (heldLocation: CacheLocation) =>
-    runWithDisposableCacheRecovery(
-      root,
-      heldLocation,
-      () => rebuildCache(root, heldLocation),
-      false,
-      result => result,
-    )
-  return lock ? withCacheOperationLock(root, captured, hydrateUnderLock) : hydrateUnderLock(captured)
+    runWithDisposableCacheRecovery(root, heldLocation, () => rebuildCache(root, heldLocation), {
+      completion: { complete: result => result, kind: 'complete-from-rebuild' },
+      lockMode: 'held',
+    })
+  return lockMode === 'acquire' ? withCacheOperationLock(root, captured, hydrateUnderLock) : hydrateUnderLock(captured)
 }
 
 export const prepare = (input: RootInput = {}): PrepareResult => {
@@ -1324,10 +1360,15 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
   const root = resolveRepository(input)
   try {
     const location = inspectCacheLocation(root)
-    return runWithDisposableCacheRecovery(root, location, () => {
-      prepareResolvedWithoutCorruptionRecovery(root, location)
-      return readFreshCache(root, location, read)
-    })
+    return runWithDisposableCacheRecovery(
+      root,
+      location,
+      () => {
+        prepareResolvedWithoutCorruptionRecovery(root, location)
+        return readFreshCache(root, location, read)
+      },
+      { completion: { kind: 'retry-operation' }, lockMode: 'acquire' },
+    )
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -1597,15 +1638,25 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
           root,
           heldLocation,
           () => readAfterHydration(heldLocation, rebuildCache(root, heldLocation)),
-          false,
-          hydration => readAfterHydration(heldLocation, hydration),
+          {
+            completion: {
+              complete: hydration => readAfterHydration(heldLocation, hydration),
+              kind: 'complete-from-rebuild',
+            },
+            lockMode: 'held',
+          },
         ),
       )
     }
-    return runWithDisposableCacheRecovery(root, location, () => {
-      prepareResolvedWithoutCorruptionRecovery(root, location)
-      return readFreshCache(root, location, database => readGatherFromDatabase(database, parsed, null))
-    })
+    return runWithDisposableCacheRecovery(
+      root,
+      location,
+      () => {
+        prepareResolvedWithoutCorruptionRecovery(root, location)
+        return readFreshCache(root, location, database => readGatherFromDatabase(database, parsed, null))
+      },
+      { completion: { kind: 'retry-operation' }, lockMode: 'acquire' },
+    )
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error

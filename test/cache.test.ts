@@ -77,10 +77,12 @@ afterEach(() => {
   cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
   cacheLocationTestHooks.regularFileRealpath = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
+  cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
   cacheReadTestHooks.afterIntegrityProbe = undefined
   cacheReadTestHooks.afterManifestKindEnumeration = undefined
   cacheReadTestHooks.afterManifestEntryLstat = undefined
   cacheReadTestHooks.afterManifestRootEnumeration = undefined
+  cacheReadTestHooks.afterMissingPrimaryRecoveryObservation = undefined
   cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
   cacheReadTestHooks.beforeManifestEntryLstat = undefined
   cacheReadTestHooks.beforeIntegrityTextRead = undefined
@@ -462,10 +464,10 @@ describe('cache filesystem containment', () => {
           afterVerifiedOpen: () => {
             throw primaryFailure
           },
-          create: false,
           DatabaseConstructor: CloseFailingDatabase,
           location,
           name: 'brain.sqlite',
+          primaryMode: 'existing',
         }),
       (error: unknown) => {
         assert.ok(error instanceof CacheDatabaseFailure)
@@ -2415,7 +2417,7 @@ describe('SQLite cache and reads', () => {
       )
       assert.deepEqual(phases, ['prepare-fast-path', 'reader-missing'], name)
       assert.equal(primaryQuarantines, 0, name)
-      assert.equal(readerInitialisations, 1, name)
+      assert.equal(readerInitialisations, successor ? 1 : 0, name)
       assert.equal(writerInitialisations, successor ? 0 : 1, name)
       assert.equal(existsSync(predecessorPath), true, name)
       if (successorIdentity !== undefined) {
@@ -2430,6 +2432,116 @@ describe('SQLite cache and reads', () => {
       cacheLocationTestHooks.beforeQuarantineRename = undefined
       cacheReadTestHooks.duringDatabaseInitialisation = undefined
     }
+  })
+
+  test('does not repopulate a successor installed after missing-primary recovery observes absence', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'late-cache-predecessor.sqlite')
+    const successorPath = join(root, 'late-cache-successor.sqlite')
+    copyFileSync(databasePath, successorPath)
+    const successorIdentity = lstatSync(successorPath, { bigint: true })
+    let missingRecoveryObservations = 0
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheReadTestHooks.afterMissingPrimaryRecoveryObservation = () => {
+      missingRecoveryObservations += 1
+      cacheReadTestHooks.afterMissingPrimaryRecoveryObservation = undefined
+      renameSync(successorPath, databasePath)
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+
+    assert.equal(missingRecoveryObservations, 1)
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 0)
+    assert.deepEqual(result, { hydrated: false, recordsIndexed: 1 })
+    assert.equal(existsSync(predecessorPath), true)
+    const currentIdentity = lstatSync(databasePath, { bigint: true })
+    assert.deepEqual(
+      { dev: currentIdentity.dev, ino: currentIdentity.ino },
+      { dev: successorIdentity.dev, ino: successorIdentity.ino },
+    )
+  })
+
+  test('reuses an exclusively claimed primary across repository-change retries', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'retry-cache-predecessor.sqlite')
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (writerInitialisations === 1) {
+          const recordPath = join(root, String(record.path))
+          writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+        }
+      }
+    }
+
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 2)
+    assert.deepEqual(result, { hydrated: true, recordsIndexed: 1 })
+    assert.equal(existsSync(predecessorPath), true)
+  })
+
+  test('prepare returns its completed recovery rebuild without rebuilding changed canonical inputs again', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    writeFileSync(cacheDatabasePath(root), 'not a sqlite database')
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+      cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
+      const recordPath = join(root, String(record.path))
+      writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 1)
+    assert.deepEqual(result, { hydrated: true, recordsIndexed: 1 })
   })
 
   test('rebuilds a disposable cache with an incompatible table schema', () => {
@@ -3769,11 +3881,11 @@ describe('SQLite cache and reads', () => {
       return actual
     }
     const reopened = openVerifiedCacheDatabase({
-      create: true,
       DatabaseConstructor: DatabaseSync,
       location: transient.location,
       name: 'operation-lock.sqlite',
       openOptions: {},
+      primaryMode: 'create-if-missing',
     })
     reopened.close()
     transient.owner.close()
@@ -3791,11 +3903,11 @@ describe('SQLite cache and reads', () => {
     assert.throws(
       () =>
         openVerifiedCacheDatabase({
-          create: true,
           DatabaseConstructor: DatabaseSync,
           location: persistent.location,
           name: 'operation-lock.sqlite',
           openOptions: {},
+          primaryMode: 'create-if-missing',
         }),
       (error: unknown) => {
         assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
