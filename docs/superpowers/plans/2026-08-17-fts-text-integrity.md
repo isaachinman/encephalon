@@ -35,4 +35,5 @@
 
 - RED: the focused public-read and forced-writer cases failed 0/2 because bounded non-canonical and invalidly encoded FTS text was accepted without recovery.
 - GREEN: the focused semantic cases pass 3/3 and the cache suite passes 144/144.
-- The compact full suite, lint, all four TypeScript projects, build, package and publish-contract checks, frozen install, baseline benchmark, and CI budget benchmark pass at code/test commit `7a3f4ea4b9b092d7447096e97c9fc0a5eee088c9`.
+- Review remediation added one shared existing-generation validation transaction before writer PRAGMAs, reuses the same authority after `BEGIN IMMEDIATE`, preserves exact newly claimed primaries across repository-change retries, and adds complementary metadata-less and two-record ID-binding coverage.
+- The compact full suite, lint, all four TypeScript projects, build, package and publish-contract checks, frozen install, baseline benchmark, and CI budget benchmark pass at code/test commit `b64904738b3cc8c0d71dc345a65fe89ea362585e`.
