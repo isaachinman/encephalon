@@ -41,6 +41,7 @@ import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import { recordWriteTestHooks } from '../src/records.ts'
 import { repositoryTestHooks } from '../src/repository.ts'
+import { responseBudgetTestHooks } from '../src/response-budget.ts'
 import {
   canRenameParentWithOpenChild,
   createTestRepository,
@@ -89,6 +90,7 @@ afterEach(() => {
   cacheReadTestHooks.beforeManifestEntryLstat = undefined
   cacheReadTestHooks.beforeIntegrityTextRead = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
+  responseBudgetTestHooks.afterCharge = undefined
   recordWriteTestHooks.fault = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
   roots.splice(0).forEach(removeTestRepository)
@@ -2269,6 +2271,41 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('charges compact response containers in their composing callers', () => {
+    const root = createRoot()
+    const query = 'structural ownership marker'
+    api.addRecord({
+      id: 'structural-ownership',
+      kind: 'context',
+      payload: { summary: 'Structural ownership result' },
+      root,
+      source: 'agent',
+      subject: query,
+    })
+    const events: Array<{ budgetKey: string; value: unknown } | 'prepare'> = []
+    responseBudgetTestHooks.afterCharge = (budgetKey, value) => {
+      events.push({ budgetKey, value })
+    }
+    cacheReadTestHooks.onCompactSearchPrepare = () => {
+      events.push('prepare')
+    }
+
+    api.searchCompactRecords({ query, root })
+    assert.deepEqual(events.slice(0, 2), [{ budgetKey: 'compactResponseBytes', value: [] }, 'prepare'])
+
+    events.length = 0
+    api.gatherRecords({ root, searches: [query] })
+    const gatherCharges = events.filter(event => event !== 'prepare')
+    assert.deepEqual(gatherCharges.at(0), {
+      budgetKey: 'gatherResponseBytes',
+      value: { hydrated: null, records: [], searches: [] },
+    })
+    assert.deepEqual(gatherCharges.at(1), {
+      budgetKey: 'gatherResponseBytes',
+      value: { kind: null, query, results: [] },
+    })
+  })
+
   test('shares one 4 MiB gather response budget across complete repeated results', () => {
     const root = createRoot()
     const query = 'gatherboundary'
@@ -2521,9 +2558,11 @@ describe('SQLite cache and reads', () => {
     let showPrepareCount = 0
     let searchPrepareCount = 0
     let compactSearchSelectedRecordJson = false
+    let showSelectedRecordBytes = false
 
-    cacheReadTestHooks.onShowPrepare = () => {
+    cacheReadTestHooks.onShowPrepare = source => {
       showPrepareCount += 1
+      showSelectedRecordBytes ||= source.includes('record_bytes')
     }
     cacheReadTestHooks.onCompactSearchPrepare = source => {
       searchPrepareCount += 1
@@ -2565,6 +2604,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(showPrepareCount, 1)
     assert.equal(searchPrepareCount, 1)
     assert.equal(compactSearchSelectedRecordJson, false)
+    assert.equal(showSelectedRecordBytes, false)
   })
 
   test('tracks record and referenced-artifact freshness', () => {

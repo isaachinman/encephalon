@@ -4,7 +4,7 @@ import { EncephalonError } from '../src/errors.ts'
 import { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
 import { createResponseByteBudget, logicalResponseBytes, type ResponseBudgetKey } from '../src/response-budget.ts'
 
-const assertBudgetFailure = (budgetKey: ResponseBudgetKey) => {
+const assertBudgetFailure = (budgetKey: ResponseBudgetKey, expectedMessage: string) => {
   const budget = createResponseByteBudget(budgetKey)
   const { maximum } = OPERATION_BUDGETS[budgetKey]
 
@@ -15,6 +15,7 @@ const assertBudgetFailure = (budgetKey: ResponseBudgetKey) => {
     (error: unknown) => {
       assert.ok(error instanceof EncephalonError)
       assert.equal(error.code, 'INVALID_ARGUMENT')
+      assert.equal(error.message, expectedMessage)
       assert.deepEqual(error.details, {
         budget: budgetKey,
         field: 'response',
@@ -74,12 +75,16 @@ describe('logical response bytes', () => {
 })
 
 describe('response byte budgets', () => {
+  test('preserves the full-record overflow message', () => {
+    assertBudgetFailure('fullResponseBytes', 'full-record responses may contain at most 4194304 UTF-8 bytes.')
+  })
+
   test('accepts the exact compact-response boundary and rejects one byte over', () => {
-    assertBudgetFailure('compactResponseBytes')
+    assertBudgetFailure('compactResponseBytes', 'response may contain at most 4194304 bytes.')
   })
 
   test('accepts the exact gather-response boundary and rejects one byte over', () => {
-    assertBudgetFailure('gatherResponseBytes')
+    assertBudgetFailure('gatherResponseBytes', 'response may contain at most 4194304 bytes.')
   })
 
   test('charges logical values cumulatively and returns the charged value', () => {

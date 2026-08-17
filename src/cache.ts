@@ -2057,7 +2057,6 @@ const createCompactSearchReader = (database: DatabaseSync, input: SearchStatemen
   const statement = database.prepare(source)
   return (query: string) => {
     const match = literalMatchQuery(query)
-    budget.charge([])
     if (match.length === 0) {
       return []
     }
@@ -2082,14 +2081,16 @@ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRec
   const parsed = parseCompactSearchRecordsInput(input)
   literalMatchQuery(parsed.query)
   compactResultLimit(parsed.limit)
-  return withPreparedDatabase(parsed, database =>
-    createCompactSearchReader(database, parsed, createResponseByteBudget('compactResponseBytes'))(parsed.query),
-  )
+  return withPreparedDatabase(parsed, database => {
+    const budget = createResponseByteBudget('compactResponseBytes')
+    budget.charge([])
+    return createCompactSearchReader(database, parsed, budget)(parsed.query)
+  })
 }
 
 const createShowReader = (database: DatabaseSync, includeSuperseded: boolean | undefined) => {
   const activeClause = includeSuperseded === true ? '' : ' AND active = 1'
-  const source = `SELECT record_json, length(cast(record_json AS BLOB)) AS record_bytes FROM records WHERE id = ?${activeClause}`
+  const source = `SELECT record_json FROM records WHERE id = ?${activeClause}`
   cacheReadTestHooks.onShowPrepare?.(source)
   const statement = database.prepare(source)
   return (id: string) => {
@@ -2127,8 +2128,7 @@ const readGatherFromDatabase = (
     hydrated,
     records: shows.map(id => budget.charge({ id, record: showRecordForId(id) })),
     searches: searches.map(query => {
-      const envelope = budget.charge({ kind: input.kind ?? null, query })
-      budget.chargeBytes(Buffer.byteLength('results', 'utf8'))
+      const envelope = budget.charge({ kind: input.kind ?? null, query, results: [] })
       return { ...envelope, results: searchCompactRecordsForQuery(query) }
     }),
   }

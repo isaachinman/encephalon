@@ -12,6 +12,13 @@ export type ResponseByteBudget = {
   chargeBytes: (bytes: number) => void
 }
 
+type ResponseBudgetTestHooks = {
+  afterCharge?: ((budgetKey: ResponseBudgetKey, value: unknown) => void) | undefined
+}
+
+/** @internal */
+export const responseBudgetTestHooks: ResponseBudgetTestHooks = {}
+
 /** @internal */
 export const logicalResponseBytes = (value: unknown): number => {
   if (typeof value === 'string') {
@@ -46,11 +53,16 @@ export const createResponseByteBudget = (budgetKey: ResponseBudgetKey): Response
       chargedBytes = nextBytes
       return
     }
-    return failBudget(budgetKey, `response may contain at most ${budget.maximum} bytes.`)
+    const message =
+      budgetKey === 'fullResponseBytes'
+        ? `full-record responses may contain at most ${budget.maximum} UTF-8 bytes.`
+        : `response may contain at most ${budget.maximum} bytes.`
+    return failBudget(budgetKey, message)
   }
 
   const charge = <Value>(value: Value) => {
     chargeBytes(logicalResponseBytes(value))
+    responseBudgetTestHooks.afterCharge?.(budgetKey, value)
     return value
   }
 
