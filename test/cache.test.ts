@@ -70,6 +70,7 @@ afterEach(() => {
   artifactInspectionTestHooks.open = undefined
   cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
   cacheLocationTestHooks.afterDatabaseOpen = undefined
+  cacheLocationTestHooks.afterPrimaryBootstrapClose = undefined
   cacheLocationTestHooks.afterQuarantineRename = undefined
   cacheLocationTestHooks.beforeDatabaseOpen = undefined
   cacheLocationTestHooks.beforeLocationInspection = undefined
@@ -699,6 +700,40 @@ describe('cache filesystem containment', () => {
       )
       const preserved = statSync(databasePath, { bigint: true })
       assert.equal(sameCacheEntryIdentity(replacement, preserved), true)
+    }
+  })
+
+  test('binds an exclusively created primary before inspecting its pathname', () => {
+    const root = createRoot()
+    const databasePath = cacheDatabasePath(root)
+    const displacedPath = join(root, 'bootstrap-created-primary.sqlite')
+    let replacements = 0
+    cacheLocationTestHooks.afterPrimaryBootstrapClose = path => {
+      if (basename(path) === 'brain.sqlite') {
+        cacheLocationTestHooks.afterPrimaryBootstrapClose = undefined
+        renameSync(path, displacedPath)
+        const successor = new DatabaseSync(path)
+        successor.exec('CREATE TABLE successor_sentinel(value TEXT);')
+        successor.close()
+        replacements += 1
+      }
+    }
+
+    assert.throws(() => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }))
+    assert.equal(replacements, 1)
+    assert.equal(existsSync(displacedPath), true)
+    const successor = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      assert.equal(
+        successor.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'successor_sentinel'").get()?.count,
+        1,
+      )
+      assert.equal(
+        successor.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'metadata'").get()?.count,
+        0,
+      )
+    } finally {
+      successor.close()
     }
   })
 
@@ -3021,7 +3056,42 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
   })
 
-  test('rebuilds same-name cache tables with incompatible semantics', () => {
+  test('rebuilds metadata tables with incompatible semantics', () => {
+    const cases = [
+      { definition: 'key TEXT, value TEXT NOT NULL', name: 'missing primary key' },
+      { definition: 'key TEXT PRIMARY KEY, value TEXT', name: 'nullable value' },
+      { definition: 'key BLOB PRIMARY KEY, value TEXT NOT NULL', name: 'declared key type' },
+      {
+        definition: "key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT 'private-schema-sentinel'",
+        name: 'value default',
+      },
+      {
+        definition: 'key TEXT PRIMARY KEY, value TEXT NOT NULL, diagnostic TEXT GENERATED ALWAYS AS (key) VIRTUAL',
+        name: 'generated column',
+      },
+    ] as const
+
+    for (const fixture of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, database => {
+        database.exec(`
+          CREATE TABLE replacement_metadata(${fixture.definition});
+          INSERT INTO replacement_metadata(key, value) SELECT key, value FROM metadata;
+          DROP TABLE metadata;
+          ALTER TABLE replacement_metadata RENAME TO metadata;
+        `)
+      })
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
+    }
+  })
+
+  test('rebuilds same-name records tables with incompatible semantics', () => {
     const cases = [
       {
         name: 'records primary key',
@@ -3118,7 +3188,7 @@ describe('SQLite cache and reads', () => {
     }
   })
 
-  test('rejects duplicate metadata before accepting metadata text', () => {
+  test('rejects PK-less duplicate metadata before metadata text transfer', () => {
     const root = createRoot()
     addCacheRecord(root)
     mutateCache(root, database => {
@@ -3200,6 +3270,24 @@ describe('SQLite cache and reads', () => {
           database.exec('CREATE INDEX records_extra ON records(source);')
         },
         name: 'additional application index',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_active_order;
+            CREATE UNIQUE INDEX records_active_order ON records(active, created_at DESC, id DESC);
+          `)
+        },
+        name: 'unique active-order index',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_active_order;
+            CREATE INDEX records_active_order ON records(active, created_at DESC, id DESC) WHERE active = 1;
+          `)
+        },
+        name: 'partial active-order index',
       },
     ] as const
 
@@ -3368,6 +3456,62 @@ describe('SQLite cache and reads', () => {
       hydrated: false,
       recordsIndexed: 1,
     })
+  })
+
+  test('pins writer schema probes before rebuild metadata and mutation', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    let mutations = 0
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.beforeIntegrityTextRead = name => {
+      if (name === 'metadata-columns' && mutations === 0) {
+        mutations += 1
+        mutateCache(root, database => {
+          database.exec('DROP INDEX records_kind_subject;')
+        })
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }), {
+      recordsIndexed: 1,
+    })
+    assert.equal(mutations, 1)
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 1)
+  })
+
+  test('normalises repeated SQLite schema failures before public wrapping', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const privateSentinel = 'private_schema_parser_sentinel'
+    let schemaFailures = 0
+    cacheReadTestHooks.afterIntegrityProbe = observation => {
+      if (observation.name === 'metadata-columns') {
+        schemaFailures += 1
+        throw Object.assign(new Error(`malformed database schema (${privateSentinel})`), {
+          code: 'SQLITE_CORRUPT',
+        })
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        assert.doesNotMatch(causeChainText(error), new RegExp(privateSentinel, 'u'))
+        return true
+      },
+    )
+    assert.equal(schemaFailures, 2)
   })
 
   test('rebuilds an empty read-only cache file through writer preparation', {
@@ -4332,7 +4476,7 @@ describe('SQLite cache and reads', () => {
           )`,
         )
         .run(1_052_672)
-      database.prepare("UPDATE record_search SET text = replace(hex(zeroblob(?)), '00', 'x')").run(1_052_672)
+      database.prepare("UPDATE record_search SET text = replace(hex(zeroblob(?)), '00', 'x')").run(2_105_344)
       database
         .prepare("UPDATE metadata SET value = replace(hex(zeroblob(?)), '00', 'x') WHERE key = 'packageVersion'")
         .run(1_048_576)
