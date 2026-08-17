@@ -74,7 +74,7 @@ describe('package contract', () => {
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /Last reviewed: 2026-08-17 for code and behavioural-test snapshot `447e58c8848f9d62aee7f639b30a96a8b6114fdd`\./,
+      /Last reviewed: 2026-08-17 for code and behavioural-test snapshot `029775c46f4a07b56bac8985a098e61d27ea20a8`\./,
     )
     assert.match(
       contract,
@@ -99,7 +99,7 @@ describe('package contract', () => {
     )
     assert.match(
       semanticCacheSchemaDesign,
-      /The exact reviewed code and behavioural-test snapshot implementing this design is `447e58c8848f9d62aee7f639b30a96a8b6114fdd`\./,
+      /The exact reviewed code and behavioural-test snapshot implementing this design is `029775c46f4a07b56bac8985a098e61d27ea20a8`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),
