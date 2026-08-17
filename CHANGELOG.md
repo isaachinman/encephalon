@@ -19,6 +19,7 @@ All notable changes to Encephalon are documented here.
 - Made cache hydration and gather reads transactional, snapshot-consistent, and resilient to malformed disposable state.
 - Validated disposable SQLite table, constraint, index, and FTS5 semantics before reads or writer mutation, with exact one-generation recovery for incompatible caches.
 - Verified each bounded cached FTS row against the exact UTF-8 search projection derived from its cached record before serving reads or mutating an existing cache.
+- Preserved Unicode letter and number terms in literal FTS queries with shared NFC normalization for queries and derived cache search documents.
 - Made compact search avoid materialising full record JSON and removed persistent-style copying from hot scans.
 - Centralised the package version and separated cache schema compatibility from diagnostic package metadata.
 - Improved validation of record graphs, kind directories, artifact paths, Windows filename portability, and locale-independent ordering.

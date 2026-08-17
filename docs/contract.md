@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-17 for code and behavioural-test snapshot `1252562c636ec663b2ed7e8b29ea3e1a7774c492`.
+Last reviewed: 2026-08-18 for code and behavioural-test snapshot `2d6f450783b9cbe0bedd38fd59de3310f5c1a0d4`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -28,6 +28,15 @@ This document is the concise contract maintainers should update when public beha
 - An oversized result limit, gather input count, or supersedes input count fails with `INVALID_ARGUMENT` before item validation, repository discovery, cache-location inspection, SQLite access, hydration, or other repository/cache hooks. Both gather arrays are structurally checked and count-checked before either array's items are validated or mapped. The CLI preflights raw repeated-option counts before option-value normalisation. Cache execution retains matching defensive checks for internal callers and future refactors.
 - Budget failures use `INVALID_ARGUMENT` and contain exactly the bounded details `{ field, budget, maximum }`. Stable budget names are `fullResultLimit`, `compactResultLimit`, `queryBytes`, `queryTerms`, `gatherSearches`, `gatherShows`, `supersessionEdges`, `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes`; details exclude arrays, individual values, queries, paths, and other input content. Stable response-budget names are `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes`.
 - The fixed budget and logical-accounting authorities are internal. They are not exported by `src/index.ts` and do not change public API inputs, outputs, or exported TypeScript types.
+
+## Unicode Literal Search
+
+- Search input is literal text, not raw FTS5 syntax. The original query is limited to 1,024 UTF-8 bytes before normalization; accepted text is normalized to NFC and then limited to 32 extracted terms.
+- A term starts with a Unicode letter or number and retains following Unicode letters, numbers, and combining marks. One or more underscores remain inside a term only when they join such text, preserving established underscore adjacency behaviour while isolated underscores count as punctuation.
+- Every extracted term is independently double-quoted and joined with `AND`; duplicates and input order remain unchanged. Operators, wildcards, quotes, punctuation, symbols, controls, isolated/leading marks, and isolated underscores cannot become FTS syntax.
+- The complete derived cache search document is normalized to NFC before FTS insertion and exact FTS-text integrity comparison. Canonical record bytes are unchanged. An older cache with different derived bytes follows the existing exact-generation recoverable-cache path without a schema migration.
+- Full and compact searches compute the literal expression before repository/cache work and return `[]` when it is empty. Gather computes every expression once before repository resolution; a request containing only empty searches, no shows, and no hydration returns empty envelopes without repository/cache work, while mixed gathers still perform requested work and skip `MATCH` only for empty expressions.
+- SQLite's built-in `unicode61` tokenizer still owns case folding, default diacritic handling, and final token boundaries. Quoted underscore/mark runs may contain multiple adjacent FTS tokens, and contiguous CJK text retains SQLite's existing token boundary. No NFKC folding, transliteration, stemming, locale-specific segmentation, fuzzy matching, user-authored phrase API, raw FTS syntax, ICU dependency, or ranking/order SQL change is introduced.
 
 ## Canonical Storage
 
@@ -120,7 +129,7 @@ This document is the concise contract maintainers should update when public beha
 - The first recoverable cache failure is coordinated across prepare, hydrate, read, post-commit add hydration, and init cache preparation. Recovery acquires the repository operation lock or uses the caller's already-held lock, revalidates the cache location, quarantines only exact captured primary and sidecar identities, and rebuilds once from canonical JSON. Any recoverable SQLite failure during forced-writer metadata reads, transactions, or writes is surfaced with the final verified writer identity; terminal Encephalon errors and repository-change handling remain unchanged. If a previously observed primary disappears at any pre-verification boundary, recovery rechecks the path under the lock and claims an absent primary through exclusive creation. The exclusive claim is owned immediately, so replacement or disappearance before its first SQLite open becomes an internal creation conflict. A successor that wins that creation race is preserved and retried without quarantine or writer initialisation. Repository-change retries after a successful exclusive claim remain bound to that primary's exact device and inode; a replacement or disappearance becomes an internal creation conflict and preserves the current successor. Prepare and forced hydration return a completed recovery rebuild directly; reads retry once. A second validation or recovery failure never starts another quarantine, rebuild, or retry, malformed cached JSON or metadata cannot expose parser source excerpts through the public cause chain, and no stale or partially validated result escapes.
 - `CACHE_SCOPE_MISMATCH` is a terminal valid-foreign-cache classification and never triggers quarantine or rebuild, including during forced hydration. `REPOSITORY_CHANGED`, busy/locked contention, operational I/O, and unknown SQLite failures retain their fail-closed policies. Recovery remains limited to corrupt, not-a-database, schema, read-only, and cannot-open categories; exhausted recovery returns the existing bounded public `IO_ERROR` or `INTERNAL_ERROR` classification without corrupt cache content.
 - After the numeric FTS probe succeeds, validation derives the expected search document from each bounded, parsed cached record and compares raw UTF-8 ID and text bytes for every `record_search` row. IDs must match exactly once, and missing, duplicate, orphaned, invalidly encoded, or non-canonical search rows are recoverable cache incompatibilities. The validated cached `record_json` projection is the authority; equality between cached JSON and canonical files remains MAR-2571.
-- Row-text equality does not claim integrity of FTS posting or shadow indexes. No Unicode, whitespace, JSON, or token normalisation is applied, and bounded posting-index integrity remains outside this contract.
+- Row-text equality does not claim integrity of FTS posting or shadow indexes. Beyond the NFC normalization of derived search documents defined above, no whitespace, JSON, compatibility, or additional token normalization is applied, and bounded posting-index integrity remains outside this contract.
 
 ## Package and Release Gates
 
@@ -156,6 +165,7 @@ When an implementation change intentionally alters this contract:
 
 - MAR-2554 bounded full, compact, and gather read responses: `1252562c636ec663b2ed7e8b29ea3e1a7774c492`.
 - MAR-2550 exact cached FTS row-text projection validation, bounded pre-mutation writer validation, and recovery: `c8587ee36049fd7f9349a75c8b30e6efb24fdf4c`.
+- MAR-2559 Unicode-preserving literal FTS query construction and derived search-document NFC normalization: `2d6f450783b9cbe0bedd38fd59de3310f5c1a0d4`.
 - MAR-2553 semantic SQLite schema validation and exact incompatible-generation recovery: `fb17790ac01031aa37d903ec9a3feb3a271e9d05`.
 - MAR-2549 bounded disposable cache validation and exact-generation recovery: `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`.
 - MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2874874096bb7d327e084d7e17d5243564244c43`.
