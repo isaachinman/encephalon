@@ -2984,6 +2984,20 @@ describe('SQLite cache and reads', () => {
         definition: 'key TEXT PRIMARY KEY, value TEXT NOT NULL, diagnostic TEXT GENERATED ALWAYS AS (key) VIRTUAL',
         name: 'generated column',
       },
+      {
+        definition: 'key TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (length(value) > 0)',
+        name: 'additional table constraint',
+      },
+      {
+        definition: 'key TEXT PRIMARY KEY, value TEXT NOT NULL',
+        name: 'strict table',
+        tableOptions: 'STRICT',
+      },
+      {
+        definition: 'key TEXT PRIMARY KEY, value TEXT NOT NULL',
+        name: 'without-rowid table',
+        tableOptions: 'WITHOUT ROWID',
+      },
     ] as const
 
     for (const fixture of cases) {
@@ -2991,7 +3005,7 @@ describe('SQLite cache and reads', () => {
       addCacheRecord(root)
       mutateCache(root, database => {
         database.exec(`
-          CREATE TABLE replacement_metadata(${fixture.definition});
+          CREATE TABLE replacement_metadata(${fixture.definition}) ${'tableOptions' in fixture ? fixture.tableOptions : ''};
           INSERT INTO replacement_metadata(key, value) SELECT key, value FROM metadata;
           DROP TABLE metadata;
           ALTER TABLE replacement_metadata RENAME TO metadata;
