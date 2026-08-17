@@ -49,4 +49,4 @@ Any missing, orphaned, duplicated, invalidly encoded, or text-mismatched FTS row
 
 ## Reviewed implementation provenance
 
-The exact reviewed code and behavioural-test snapshot implementing this design is `0e599764d3c38e36f3b722fe8d8c799e0c9d3e32`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.
+The exact reviewed code and behavioural-test snapshot implementing this design is `ce00a6095270fe421361b2595d06622c194e7e4b`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.
