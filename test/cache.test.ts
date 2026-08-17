@@ -4387,7 +4387,7 @@ describe('SQLite cache and reads', () => {
     }
   })
 
-  test('accepts exact cache per-value byte boundaries', () => {
+  test('bounds exact cache per-value bytes before semantic FTS recovery', () => {
     const root = createRoot()
     addCacheRecord(root)
     mutateCache(root, database => {
@@ -4413,7 +4413,7 @@ describe('SQLite cache and reads', () => {
     const observations = observeCacheIntegrity()
 
     assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
-      hydrated: false,
+      hydrated: true,
       recordsIndexed: 1,
     })
     for (const probe of [
@@ -4430,7 +4430,7 @@ describe('SQLite cache and reads', () => {
     }
   })
 
-  test('accepts exact aggregate, row-count, and recordsIndexed boundaries', () => {
+  test('bounds exact aggregate, row-count, and recordsIndexed values before semantic recovery', () => {
     const root = createRoot()
     addCacheRecord(root)
     mutateCache(root, database => {
@@ -4493,8 +4493,8 @@ describe('SQLite cache and reads', () => {
     const observations = observeCacheIntegrity()
 
     assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
-      hydrated: false,
-      recordsIndexed: 1000,
+      hydrated: true,
+      recordsIndexed: 1,
     })
     for (const probe of [
       { name: 'metadata', rows: 6 },
@@ -4597,23 +4597,173 @@ describe('SQLite cache and reads', () => {
     }
   })
 
-  test('rebuilds missing and duplicate FTS rows', () => {
-    for (const duplicate of [false, true]) {
+  test('recovers a non-canonical FTS projection during a representative public read', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const original = lstatSync(databasePath, { bigint: true })
+    const expected = Buffer.from(
+      [
+        'context',
+        'cache.validation',
+        'agent',
+        'Cache record',
+        '{"detail":"cache corruption marker","summary":"Cache record"}',
+        'recoverable cache row',
+      ].join('\n'),
+      'utf8',
+    )
+    mutateCache(root, database => {
+      database.prepare("UPDATE record_search SET text = 'x' || substr(text, 2) WHERE id = ?").run(String(record.id))
+    })
+    const observations = observeCacheIntegrity()
+    let exactQuarantines = 0
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const current = lstatSync(path, { bigint: true })
+        if (current.dev === original.dev && current.ino === original.ino) {
+          exactQuarantines += 1
+        }
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const listed = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
+      root,
+    })
+    assert.deepEqual(
+      listed.map(item => item.id),
+      [record.id],
+    )
+    const corruptProbe = observations.findIndex(
+      observation => observation.kind === 'probe' && observation.name === 'record-search' && observation.rows === 1,
+    )
+    assert.notEqual(corruptProbe, -1)
+    assert.deepEqual(observations.at(corruptProbe + 1), { kind: 'text-read', name: 'record-search' })
+    assert.equal(exactQuarantines, 1)
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 1)
+    const rebuilt = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      const row = rebuilt
+        .prepare('SELECT CAST(text AS BLOB) AS bytes FROM record_search WHERE id = ?')
+        .get(String(record.id)) as {
+        bytes?: unknown
+      }
+      assert.equal(row.bytes instanceof Uint8Array, true)
+      assert.deepEqual(Buffer.from(row.bytes as Uint8Array), expected)
+    } finally {
+      rebuilt.close()
+    }
+  })
+
+  test('rejects invalid FTS bytes that decode to the canonical JavaScript string during forced hydrate', () => {
+    const root = createRoot()
+    const id = 'invalid-fts-bytes'
+    functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id,
+      kind: 'context',
+      payload: { marker: '�' },
+      root,
+      source: 'agent',
+      subject: 'cache.invalid-fts-bytes',
+    })
+    const canonical = 'context\ncache.invalid-fts-bytes\nagent\n{"marker":"�"}'
+    const canonicalBytes = Buffer.from(canonical, 'utf8')
+    const replacementBytes = Buffer.from('�', 'utf8')
+    const replacementOffset = canonicalBytes.indexOf(replacementBytes)
+    assert.notEqual(replacementOffset, -1)
+    const invalidBytes = Buffer.concat([
+      canonicalBytes.subarray(0, replacementOffset),
+      Buffer.from([0x80]),
+      canonicalBytes.subarray(replacementOffset + replacementBytes.length),
+    ])
+    mutateCache(root, database => {
+      database.prepare('UPDATE record_search SET text = CAST(? AS TEXT) WHERE id = ?').run(invalidBytes, id)
+      const row = database
+        .prepare('SELECT text, CAST(text AS BLOB) AS bytes FROM record_search WHERE id = ?')
+        .get(id) as { bytes?: unknown; text?: unknown }
+      assert.equal(row.text, canonical)
+      assert.equal(row.bytes instanceof Uint8Array, true)
+      assert.deepEqual(Buffer.from(row.bytes as Uint8Array), invalidBytes)
+    })
+    let quarantines = 0
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        quarantines += 1
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }), {
+      recordsIndexed: 1,
+    })
+    assert.equal(quarantines, 1)
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 2)
+    const rebuilt = new DatabaseSync(cacheDatabasePath(root), { readOnly: true })
+    try {
+      const row = rebuilt.prepare('SELECT CAST(text AS BLOB) AS bytes FROM record_search WHERE id = ?').get(id) as {
+        bytes?: unknown
+      }
+      assert.equal(row.bytes instanceof Uint8Array, true)
+      assert.deepEqual(Buffer.from(row.bytes as Uint8Array), canonicalBytes)
+    } finally {
+      rebuilt.close()
+    }
+  })
+
+  test('rebuilds missing, duplicate, and orphaned FTS rows', () => {
+    const cases = [
+      {
+        mutate: (database: DatabaseSync, id: string) => {
+          database.prepare('DELETE FROM record_search WHERE id = ?').run(id)
+        },
+        name: 'missing row',
+      },
+      {
+        mutate: (database: DatabaseSync, id: string) => {
+          database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)').run(id, 'duplicate search row')
+        },
+        name: 'duplicate ID',
+      },
+      {
+        mutate: (database: DatabaseSync, id: string) => {
+          database.prepare("UPDATE record_search SET id = 'orphan-search-row' WHERE id = ?").run(id)
+        },
+        name: 'same-count orphan',
+      },
+    ] as const
+
+    for (const fixture of cases) {
       const root = createRoot()
       const record = addCacheRecord(root)
       mutateCache(root, database => {
-        if (duplicate) {
-          database
-            .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
-            .run(String(record.id), 'duplicate search row')
-        } else {
-          database.prepare('DELETE FROM record_search WHERE id = ?').run(String(record.id))
-        }
+        fixture.mutate(database, String(record.id))
       })
-      assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
-        hydrated: true,
-        recordsIndexed: 1,
-      })
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
     }
   })
 
