@@ -2998,6 +2998,127 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
   })
 
+  test('rebuilds same-name cache tables with incompatible semantics', () => {
+    const cases = [
+      {
+        name: 'records primary key',
+        recordsDefinition: `
+          id TEXT,
+          kind TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          path TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK (active IN (0, 1)),
+          summary TEXT,
+          record_json TEXT NOT NULL
+        `,
+      },
+      {
+        name: 'records nullability',
+        recordsDefinition: `
+          id TEXT PRIMARY KEY,
+          kind TEXT,
+          subject TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          path TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK (active IN (0, 1)),
+          summary TEXT,
+          record_json TEXT NOT NULL
+        `,
+      },
+      {
+        name: 'records declared type',
+        recordsDefinition: `
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          path TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK (active IN (0, 1)),
+          summary BLOB,
+          record_json TEXT NOT NULL
+        `,
+      },
+      {
+        name: 'records default',
+        recordsDefinition: `
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          path TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK (active IN (0, 1)),
+          summary TEXT DEFAULT 'private-schema-sentinel',
+          record_json TEXT NOT NULL
+        `,
+      },
+      {
+        name: 'records active constraint',
+        recordsDefinition: `
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          path TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK (active IN (0, 1, 2)),
+          summary TEXT,
+          record_json TEXT NOT NULL
+        `,
+      },
+    ] as const
+
+    for (const fixture of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, database => {
+        database.exec(`
+          CREATE TABLE replacement_records (${fixture.recordsDefinition});
+          INSERT INTO replacement_records
+            SELECT id, kind, subject, source, created_at, path, active, summary, record_json FROM records;
+          DROP TABLE records;
+          ALTER TABLE replacement_records RENAME TO records;
+          CREATE INDEX records_active_order ON records(active, created_at DESC, id DESC);
+          CREATE INDEX records_kind_subject ON records(kind, subject);
+        `)
+      })
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
+    }
+  })
+
+  test('rejects duplicate metadata before accepting metadata text', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    mutateCache(root, database => {
+      database.exec(`
+        CREATE TABLE replacement_metadata(key TEXT, value TEXT NOT NULL);
+        INSERT INTO replacement_metadata SELECT key, value FROM metadata WHERE key != 'repositoryRealpath';
+        INSERT INTO replacement_metadata SELECT key, value FROM metadata WHERE key = 'manifest';
+        DROP TABLE metadata;
+        ALTER TABLE replacement_metadata RENAME TO metadata;
+      `)
+    })
+    const observations = observeCacheIntegrity()
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 1,
+    })
+    assert.equal(
+      observations.some(observation => observation.kind === 'text-read' && observation.name === 'metadata'),
+      false,
+    )
+  })
+
   test('rebuilds an empty read-only cache file through writer preparation', {
     skip: process.platform === 'win32' ? 'Windows read-only file replacement semantics differ.' : false,
   }, () => {
@@ -3643,13 +3764,9 @@ describe('SQLite cache and reads', () => {
       {
         expectedProbe: { name: 'metadata', rows: 7 },
         mutate: (database: DatabaseSync) => {
-          database.exec(`
-            CREATE TABLE replacement_metadata(key TEXT, value TEXT);
-            INSERT INTO replacement_metadata SELECT key, value FROM metadata;
-            DROP TABLE metadata;
-            ALTER TABLE replacement_metadata RENAME TO metadata;
-            INSERT INTO metadata(key, value) VALUES ('duplicate', 'private-metadata-sentinel');
-          `)
+          database
+            .prepare('INSERT INTO metadata(key, value) VALUES (?, ?)')
+            .run('unexpected', 'private-metadata-sentinel')
         },
         name: 'seventh metadata row',
       },
@@ -3820,20 +3937,35 @@ describe('SQLite cache and reads', () => {
         expectedRows: 24,
         mutate: (database: DatabaseSync) => {
           database.exec(`
-            CREATE TABLE replacement_records AS
-            SELECT id, kind, subject, source, created_at, path, active, summary, record_json
-            FROM records
-            WHERE 0;
+            CREATE TABLE replacement_records (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              subject TEXT NOT NULL,
+              source TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              path TEXT NOT NULL,
+              active INTEGER NOT NULL CHECK (active IN (0, 1)),
+              summary TEXT,
+              record_json TEXT NOT NULL
+            );
             WITH RECURSIVE generated(value) AS (
               SELECT 1
               UNION ALL
               SELECT value + 1 FROM generated WHERE value < 24
             )
             INSERT INTO replacement_records
-            SELECT id, kind, subject, source, created_at, path, active, summary, record_json
+            SELECT printf('%s-%02d', id, value), kind, subject, source, created_at,
+              printf('encephalon/context/cache-record-%02d.json', value), active, summary,
+              json_set(
+                record_json,
+                '$.id', printf('%s-%02d', id, value),
+                '$.path', printf('encephalon/context/cache-record-%02d.json', value)
+              )
             FROM records CROSS JOIN generated;
             DROP TABLE records;
             ALTER TABLE replacement_records RENAME TO records;
+            CREATE INDEX records_active_order ON records(active, created_at DESC, id DESC);
+            CREATE INDEX records_kind_subject ON records(kind, subject);
             DELETE FROM record_search;
             WITH RECURSIVE generated(value) AS (
               SELECT 1
@@ -3841,7 +3973,7 @@ describe('SQLite cache and reads', () => {
               SELECT value + 1 FROM generated WHERE value < 24
             )
             INSERT INTO record_search(id, text)
-            SELECT 'cache-record', CAST(zeroblob(1048576) AS TEXT)
+            SELECT printf('cache-record-%02d', value), CAST(zeroblob(1048576) AS TEXT)
             FROM generated;
             UPDATE metadata SET value = '24' WHERE key = 'recordsIndexed';
           `)

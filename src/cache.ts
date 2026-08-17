@@ -134,6 +134,7 @@ type CacheIntegrityProbeName =
   | 'metadata-columns'
   | 'records'
   | 'records-columns'
+  | 'records-schema'
   | 'record-search'
   | 'record-search-columns'
   | 'record-search-schema'
@@ -152,6 +153,73 @@ type CacheIntegrityObservation = {
   name: CacheIntegrityProbeName
   rows: number
 }
+
+type ExpectedOrdinaryColumn = Readonly<{
+  name: string
+  notNull: 0 | 1
+  primaryKeyPosition: 0 | 1
+  type: 'INTEGER' | 'TEXT'
+}>
+
+const METADATA_COLUMNS = [
+  { name: 'key', notNull: 0, primaryKeyPosition: 1, type: 'TEXT' },
+  { name: 'value', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
+] as const satisfies readonly ExpectedOrdinaryColumn[]
+
+const RECORD_COLUMNS = [
+  { name: 'id', notNull: 0, primaryKeyPosition: 1, type: 'TEXT' },
+  { name: 'kind', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
+  { name: 'subject', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
+  { name: 'source', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
+  { name: 'created_at', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
+  { name: 'path', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
+  { name: 'active', notNull: 1, primaryKeyPosition: 0, type: 'INTEGER' },
+  { name: 'summary', notNull: 0, primaryKeyPosition: 0, type: 'TEXT' },
+  { name: 'record_json', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
+] as const satisfies readonly ExpectedOrdinaryColumn[]
+
+const RECORDS_TABLE_DEFINITION = `(
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  source TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  path TEXT NOT NULL,
+  active INTEGER NOT NULL CHECK (active IN (0, 1)),
+  summary TEXT,
+  record_json TEXT NOT NULL
+)`
+
+const schemaTokenPattern =
+  /\s+|--[^\r\n]*|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[(?:\]\]|[^\]])*\]|[A-Za-z_][A-Za-z0-9_]*|\d+|[(),]|\S/g
+
+const schemaToken = (token: string) => {
+  if (/^\s+$|^--|^\/\*/.test(token)) {
+    return []
+  }
+  if (token.startsWith('"')) {
+    return [token.slice(1, -1).replaceAll('""', '"').toLowerCase()]
+  }
+  if (token.startsWith('`')) {
+    return [token.slice(1, -1).replaceAll('``', '`').toLowerCase()]
+  }
+  if (token.startsWith('[')) {
+    return [token.slice(1, -1).replaceAll(']]', ']').toLowerCase()]
+  }
+  return [token.toLowerCase()]
+}
+
+const ownedSchemaTokens = (sql: string) => {
+  const tokens = [...sql.matchAll(schemaTokenPattern)].flatMap(match => schemaToken(match[0]))
+  const tableIndex = tokens.indexOf('table')
+  const optionalClause = tokens.slice(tableIndex + 1, tableIndex + 4).join(' ')
+  return optionalClause === 'if not exists'
+    ? [...tokens.slice(0, tableIndex + 1), ...tokens.slice(tableIndex + 4)]
+    : tokens
+}
+
+const sameOwnedSchema = (actual: string, expected: string) =>
+  JSON.stringify(ownedSchemaTokens(actual)) === JSON.stringify(ownedSchemaTokens(expected))
 
 type CacheReadTestHooks = {
   afterCanonicalValidation?: (() => void) | undefined
@@ -249,11 +317,7 @@ const readIntegrityProbe = (
   return observation
 }
 
-const assertTableColumns = (
-  database: DatabaseSync,
-  table: 'metadata' | 'record_search' | 'records',
-  expected: string[],
-) => {
+const assertTableColumns = (database: DatabaseSync, table: 'record_search', expected: readonly string[]) => {
   const maximumRows = expected.length + 1
   const maximumNameBytes = Math.max(...expected.map(name => Buffer.byteLength(name, 'utf8')))
   const probeName = `${table.replace('_', '-')}-columns` as CacheIntegrityProbeName
@@ -297,6 +361,147 @@ const assertTableColumns = (
   }
 }
 
+const assertOrdinaryTableSchema = (
+  database: DatabaseSync,
+  table: 'metadata' | 'records',
+  expected: readonly ExpectedOrdinaryColumn[],
+) => {
+  const maximumRows = expected.length + 1
+  const maximumNameBytes = Math.max(...expected.map(column => Buffer.byteLength(column.name, 'utf8')))
+  const maximumTypeBytes = Math.max(...expected.map(column => Buffer.byteLength(column.type, 'utf8')))
+  const probeName = `${table.replace('_', '-')}-columns` as CacheIntegrityProbeName
+  const probe = readIntegrityProbe(
+    probeName,
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          0 AS exceeds_aggregate_bytes,
+          CASE WHEN TOTAL(invalid_type) > 0
+                    OR (SELECT COUNT(*) FROM (
+                      SELECT 1
+                      FROM pragma_table_list
+                      WHERE schema = 'main' AND name = ?1 AND type = 'table' AND wr = 0 AND strict = 0
+                      LIMIT 2
+                    )) != 1
+               THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+        FROM (
+          SELECT
+            CASE WHEN typeof(cid) = 'integer'
+                       AND typeof(name) = 'text'
+                       AND typeof(type) = 'text'
+                       AND typeof("notnull") = 'integer'
+                       AND "notnull" IN (0, 1)
+                       AND dflt_value IS NULL
+                       AND typeof(pk) = 'integer'
+                       AND pk IN (0, 1)
+                       AND typeof(hidden) = 'integer'
+                       AND hidden = 0
+                 THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(name) = 'text' AND length(CAST(name AS BLOB)) <= ?2
+                       AND typeof(type) = 'text' AND length(CAST(type AS BLOB)) <= ?3
+                 THEN 0 ELSE 1 END AS oversized
+          FROM pragma_table_xinfo(?1)
+          LIMIT ?4
+        )`,
+      )
+      .get(table, maximumNameBytes, maximumTypeBytes, maximumRows) as CacheIntegrityProbe | undefined,
+    maximumRows,
+  )
+  if (
+    probe.rows !== expected.length ||
+    probe.exceedsAggregateBytes !== 0 ||
+    probe.hasInvalidType !== 0 ||
+    probe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.(probeName)
+  const columns = database
+    .prepare(
+      `SELECT
+        cid,
+        name,
+        upper(type) AS type,
+        "notnull" AS not_null,
+        pk,
+        hidden,
+        CASE WHEN dflt_value IS NULL THEN 1 ELSE 0 END AS default_absent
+      FROM pragma_table_xinfo(?)
+      ORDER BY cid
+      LIMIT ?`,
+    )
+    .iterate(table, maximumRows) as Iterable<{
+    cid?: unknown
+    default_absent?: unknown
+    hidden?: unknown
+    name?: unknown
+    not_null?: unknown
+    pk?: unknown
+    type?: unknown
+  }>
+  const descriptors = [...columns].map(column => ({
+    defaultAbsent: column.default_absent,
+    hidden: column.hidden,
+    name: column.name,
+    notNull: column.not_null,
+    primaryKeyPosition: column.pk,
+    type: column.type,
+  }))
+  const expectedDescriptors = expected.map(column => ({
+    defaultAbsent: 1,
+    hidden: 0,
+    name: column.name,
+    notNull: column.notNull,
+    primaryKeyPosition: column.primaryKeyPosition,
+    type: column.type,
+  }))
+  if (JSON.stringify(descriptors) !== JSON.stringify(expectedDescriptors)) {
+    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
+  }
+}
+
+const assertRecordsActiveConstraint = (database: DatabaseSync) => {
+  const probe = readIntegrityProbe(
+    'records-schema',
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          0 AS exceeds_aggregate_bytes,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+        FROM (
+          SELECT
+            CASE WHEN typeof(sql) = 'text' THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(sql) = 'text' AND length(CAST(sql AS BLOB)) <= ?
+                 THEN 0 ELSE 1 END AS oversized
+          FROM sqlite_schema
+          WHERE type = 'table' AND name = 'records'
+          LIMIT 2
+        )`,
+      )
+      .get(MAX_CACHE_SCHEMA_BYTES) as CacheIntegrityProbe | undefined,
+    2,
+  )
+  if (
+    probe.rows !== 1 ||
+    probe.exceedsAggregateBytes !== 0 ||
+    probe.hasInvalidType !== 0 ||
+    probe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch('The records cache table has an incompatible schema.')
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.('records-schema')
+  const row = database
+    .prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'records' LIMIT 2")
+    .get() as { sql?: unknown } | undefined
+  if (typeof row?.sql !== 'string' || !sameOwnedSchema(row.sql, `CREATE TABLE records ${RECORDS_TABLE_DEFINITION}`)) {
+    throw new CacheSchemaMismatch('The records cache table has an incompatible schema.')
+  }
+}
+
 const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync']) => {
   if (sqliteFeaturesVerified) {
     return
@@ -323,18 +528,9 @@ const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync'])
 }
 
 const assertCacheSchema = (database: DatabaseSync) => {
-  assertTableColumns(database, 'metadata', ['key', 'value'])
-  assertTableColumns(database, 'records', [
-    'id',
-    'kind',
-    'subject',
-    'source',
-    'created_at',
-    'path',
-    'active',
-    'summary',
-    'record_json',
-  ])
+  assertOrdinaryTableSchema(database, 'metadata', METADATA_COLUMNS)
+  assertOrdinaryTableSchema(database, 'records', RECORD_COLUMNS)
+  assertRecordsActiveConstraint(database)
   assertTableColumns(database, 'record_search', ['id', 'text'])
   const searchSchemaProbe = readIntegrityProbe(
     'record-search-schema',
@@ -380,17 +576,7 @@ const createCacheSchema = (database: DatabaseSync) => {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS records (
-      id TEXT PRIMARY KEY,
-      kind TEXT NOT NULL,
-      subject TEXT NOT NULL,
-      source TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      path TEXT NOT NULL,
-      active INTEGER NOT NULL CHECK (active IN (0, 1)),
-      summary TEXT,
-      record_json TEXT NOT NULL
-    );
+    CREATE TABLE IF NOT EXISTS records ${RECORDS_TABLE_DEFINITION};
     CREATE INDEX IF NOT EXISTS records_active_order
       ON records(active, created_at DESC, id DESC);
     CREATE INDEX IF NOT EXISTS records_kind_subject
@@ -741,7 +927,8 @@ const readMetadata = (database: DatabaseSync): Metadata | undefined => {
     if (
       typeof row.key !== 'string' ||
       typeof row.value !== 'string' ||
-      !(METADATA_KEYS as readonly string[]).includes(row.key)
+      !(METADATA_KEYS as readonly string[]).includes(row.key) ||
+      values.has(row.key)
     ) {
       throw new CacheSchemaMismatch('The cache metadata contains invalid keys or values.')
     }
