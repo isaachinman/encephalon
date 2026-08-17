@@ -2875,6 +2875,57 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('rejects a non-empty exclusively claimed primary after writer initialisation', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'post-initialisation-retry-cache-predecessor.sqlite')
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (writerInitialisations === 1) {
+          const recordPath = join(root, String(record.path))
+          writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+        }
+        if (writerInitialisations === 2) {
+          mutateCache(root, database => {
+            database
+              .prepare("INSERT INTO record_search(id, text) VALUES ('post-initialisation-row', 'untrusted')")
+              .run()
+          })
+        }
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        return true
+      },
+    )
+    assert.equal(writerInitialisations, 2)
+    const preserved = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      assert.equal(
+        preserved.prepare("SELECT COUNT(*) AS count FROM record_search WHERE id = 'post-initialisation-row'").get()
+          ?.count,
+        1,
+      )
+    } finally {
+      preserved.close()
+    }
+  })
+
   test('preserves a successor swapped between exclusively claimed primary retries', () => {
     const root = createRoot()
     addCacheRecord(root)

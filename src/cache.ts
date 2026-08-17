@@ -805,7 +805,7 @@ const assertCacheTransaction = (database: DatabaseSync, validate: (opened: Datab
     try {
       database.exec('ROLLBACK')
     } catch {
-      // Preserve the original schema validation failure.
+      // Preserve the original cache validation failure.
     }
     throw error
   }
