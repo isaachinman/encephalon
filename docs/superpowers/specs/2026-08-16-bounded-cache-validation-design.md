@@ -116,17 +116,17 @@ The FTS probe reads at most 1,001 `record_search` rows and proves before existin
 - `id` and `text` are SQLite text;
 - each ID is bounded by the existing 255-byte portable path-component maximum;
 - aggregate ID bytes do not exceed `CANONICAL_BUDGETS.records * 255`;
-- each FTS text value is at most `MAX_CACHE_RECORD_BYTES`;
-- aggregate FTS text bytes do not exceed `MAX_CACHE_RECORD_JSON_BYTES`;
+- each FTS text value is at most twice `MAX_CACHE_RECORD_BYTES`;
+- aggregate FTS text bytes do not exceed twice `MAX_CACHE_RECORD_JSON_BYTES`;
 - the row count does not exceed 1,000 and matches metadata.
 
-Only after that probe succeeds may the existing distinct-ID, missing-row, and orphan-row queries execute over the now-bounded table. MAR-2550 owns semantic equality between FTS text and canonical cached records; this ticket bounds type, count, and bytes only.
+The doubled bounds are conservative derived-cache overhead: `searchDocumentForRecord` intentionally duplicates searchable fields already represented in the record JSON, including the payload summary. They admit every valid search document without increasing the canonical record or corpus budgets. Only after that probe succeeds may the existing distinct-ID, missing-row, and orphan-row queries execute over the now-bounded table. MAR-2550 owns semantic equality between FTS text and canonical cached records; this ticket bounds type, count, and bytes only.
 
 ## Snapshot and database identity
 
 Schema probing, metadata validation, record validation, FTS validation, freshness decisions, and the eventual public cache read must share one SQLite transaction. Reader paths begin the transaction before validation and roll it back after producing the complete in-memory result. Preparation paths also validate freshness within an explicit read transaction.
 
-Validation executes through `openVerifiedCacheDatabase`'s verified-open boundary so a schema or content failure retains the exact final-verified `CacheDatabase` primary and observed sidecar identities. Forced writer paths also retain that identity when metadata parsing fails. No detached pre-open or pathname-only inspection substitutes for the captured database generation.
+Validation executes through `openVerifiedCacheDatabase`'s verified-open boundary so a schema or content failure retains the exact final-verified `CacheDatabase` primary and observed sidecar identities. Forced writer paths retain that identity for every recoverable SQLite failure during metadata reads, transactions, and writes; terminal Encephalon errors and repository-change handling remain unchanged. No detached pre-open or pathname-only inspection substitutes for the captured database generation, and a primary error remains authoritative if database close also fails.
 
 The transaction prevents a concurrent writer from changing rows between numeric probes and bounded text iteration. Existing filesystem-location and sidecar verification remains in force around database opening and operation-lock boundaries.
 
@@ -138,7 +138,7 @@ On the first recoverable cache failure it:
 
 1. acquires the existing operation lock or uses the caller's already-held lock, then revalidates the held cache location;
 2. quarantines the exact captured `brain.sqlite` identity and its observed sidecars when the failure carries that identity;
-3. represents disappearance after an existence observation distinctly, rechecks under the lock, and exclusively claims an absent primary; a successor that wins that creation race is preserved and retried without quarantine or writer initialisation;
+3. represents disappearance after an existence observation at any pre-verification boundary distinctly, rechecks under the lock, and exclusively claims an absent primary; the claim is owned immediately, so replacement or disappearance before its first SQLite open becomes a creation conflict, while a successor that wins the initial creation race is preserved and retried without quarantine or writer initialisation;
 4. rebuilds at most once from a newly validated canonical record snapshot, retaining the successfully claimed primary's exact device and inode across internal repository-change retries and preserving any replacement as a creation conflict;
 5. returns a completed recovery rebuild directly for prepare and forced hydration, while reads or preserved-successor paths retry once.
 
@@ -176,6 +176,10 @@ The smallest complementary behavioural matrix covers:
 - repository-change retries retaining an exclusively claimed primary while preserving an exact successor swapped before a later writer open;
 - deterministic SQLite read-only classification at the verified database boundary, plus the truthful capability-gated physical read-only case;
 - exact-boundary controls for metadata rows, 1,000 self-consistent records and FTS rows, exact per-value bytes, exactly 12,484,608 aggregate cached-record JSON bytes, `recordsIndexed = '1000'`, and one public limited read from the accepted generation.
+- a valid large payload summary served through public add, prepare, list, and search at the doubled FTS search-document bounds;
+- query-time SQLite corruption during forced writer work proving exact quarantine, one recovery rebuild, and a completed result;
+- replacement of an exclusive claim before its first SQLite open and disappearance at pre-verification boundaries, proving typed held-lock recovery and successor preservation;
+- forced hydration of a valid foreign-scope cache proving `CACHE_SCOPE_MISMATCH`, zero quarantine or rebuild, and unchanged database identity and bytes.
 
 Existing malformed-record recovery coverage already exercises list, show, full search, compact search, and gather. New corruption mechanics therefore use `prepare` plus one representative read rather than duplicating every API × corruption combination. No CLI tests are needed because the CLI adds no cache-validation boundary.
 
@@ -192,4 +196,4 @@ The complete lint, four-project typecheck, full test, benchmark, build, package,
 
 ## Reviewed implementation provenance
 
-The exact reviewed code and behavioural-test snapshot implementing this design is `0bbb9cb958e196841278aea182f468d316ade0c3`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.
+The exact reviewed code and behavioural-test snapshot implementing this design is `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.

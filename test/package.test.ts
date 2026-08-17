@@ -69,7 +69,7 @@ describe('package contract', () => {
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /Last reviewed: 2026-08-17 for code and behavioural-test snapshot `0bbb9cb958e196841278aea182f468d316ade0c3`\./,
+      /Last reviewed: 2026-08-17 for code and behavioural-test snapshot `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`\./,
     )
     assert.match(
       contract,
@@ -81,7 +81,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /MAR-2549 bounded disposable cache validation and exact-generation recovery: `0bbb9cb958e196841278aea182f468d316ade0c3`\./,
+      /MAR-2549 bounded disposable cache validation and exact-generation recovery: `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`\./,
     )
     assert.match(contract, /Historical plan's wall-clock-only `createdAt` policy/)
     assert.match(
@@ -90,7 +90,7 @@ describe('package contract', () => {
     )
     assert.match(
       boundedCacheValidationDesign,
-      /The exact reviewed code and behavioural-test snapshot implementing this design is `0bbb9cb958e196841278aea182f468d316ade0c3`\./,
+      /The exact reviewed code and behavioural-test snapshot implementing this design is `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),

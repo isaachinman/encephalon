@@ -593,6 +593,16 @@ git commit -m "[MAR-2549] Document bounded cache validation"
 - Code and behavioural-test snapshot: `0bbb9cb958e196841278aea182f468d316ade0c3` (`[MAR-2549] Bind cache rebuilds to verified primaries`).
 - Provenance RED: the package contract ran 7 tests with 6 passed and 1 failed while the maintained contract and design still named `3f222a2b32c0ae666215303b660cebc85bcd04ab`. GREEN passed 7/7 against the exact `0bbb9cb958e196841278aea182f468d316ade0c3` snapshot.
 
+### Final post-wave-3 fix evidence
+
+- Valid-large-summary RED rejected a constructible search document because the FTS probe reused the cached-record ceiling even though the search document duplicates the payload summary. GREEN derives conservative per-row and aggregate FTS ceilings at twice the cached-record bounds and serves the record through public add, prepare, list, and search.
+- Forced-writer corruption RED surfaced an injected query-time `SQLITE_CORRUPT` as `IO_ERROR` without recovery. GREEN binds every recoverable SQLite failure during verified writer metadata, transaction, and write work to that exact database identity, preserves primary failures over close errors, quarantines once, rebuilds once, and returns the completed result.
+- Exclusive-claim and observed-missing REDs produced `REPOSITORY_CHANGED` when the claimed primary was replaced before its first SQLite open or an observed primary disappeared at a pre-verification boundary. GREEN owns an exclusive claim immediately, maps its later replacement or disappearance to the internal creation conflict, and routes ordinary observed disappearance through the held-lock missing/successor recovery without exposing a sentinel.
+- Forced hydration of a valid foreign-scope cache remains the terminal `CACHE_SCOPE_MISMATCH` control with zero quarantine or recovery rebuild and unchanged database identity and bytes.
+- Focused checks passed 5/5 plus the complementary post-construction disappearance case. The cache suite passed 131/131; affected suites passed 406/408 with two established capability skips; lint and all four TypeScript projects passed; the full suite passed 480/482 with the same skips. Both benchmark profiles, build, package, expected publish refusal, frozen install, declaration, Bun/package-file, plaintext-lock, package-content, and diff audits passed.
+- Code and behavioural-test snapshot: `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd` (`[MAR-2549] Complete bounded cache review fixes`).
+- Provenance RED: the package contract ran 7 tests with 6 passed and 1 failed while the maintained contract and design still named `0bbb9cb958e196841278aea182f468d316ade0c3`.
+
 - [ ] **Step 8: Prepare the branch review package without merging**
 
 **Controller handoff:** Step 8 remains pending. No push, PR or Linear mutation, CodeRabbit run, branch-review wave, or merge was performed by Task 4.
