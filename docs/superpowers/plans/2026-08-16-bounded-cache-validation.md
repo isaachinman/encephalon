@@ -584,6 +584,15 @@ git commit -m "[MAR-2549] Document bounded cache validation"
 - Code and behavioural-test snapshot: `3f222a2b32c0ae666215303b660cebc85bcd04ab` (`[MAR-2549] Preserve bounded cache recovery`).
 - Provenance RED: the package contract ran 7 tests with 6 passed and 1 failed while the maintained contract and design still named `920d0ae9463c0076943e4576a08e57fd1fb9926a`. GREEN passed 7/7 against the exact `3f222a2b32c0ae666215303b660cebc85bcd04ab` snapshot.
 
+### Branch-review wave 2 fix evidence
+
+- Malformed-metadata RED proved that forced and already-held writer routes could overwrite invalid metadata in place. GREEN carries the exact final-verified database identity into `CacheDatabaseFailure`, quarantines once, and rebuilds across public hydrate, forced gather, post-commit add, and first-run init under its held lock.
+- Owned-primary RED swapped a valid successor before an internal repository-change retry and observed a writer on the successor. GREEN binds later opens to the claimed primary's exact device and inode, turns mismatch or disappearance into the internal creation-conflict retry, and preserves the successor without writer initialisation, quarantine, or byte mutation.
+- Complementary controls prove a public `listRecords({ limit: 1 })` result at the exact 1,000-row/12,484,608-byte boundary, exclude a private malformed-metadata sentinel from the complete terminal cause chain, and exercise SQLite read-only recovery deterministically at the verified database boundary while retaining the physical capability skip.
+- Focused checks passed 5/5. Affected suites passed 400/402 with two established capability skips. Lint, all four TypeScript projects, and the full 474/476 test suite with the same skips passed. Both benchmark profiles, build, package, expected publish refusal, frozen install, declaration, Bun/package-file, package-content, and diff audits passed.
+- Code and behavioural-test snapshot: `0bbb9cb958e196841278aea182f468d316ade0c3` (`[MAR-2549] Bind cache rebuilds to verified primaries`).
+- Provenance RED: the package contract ran 7 tests with 6 passed and 1 failed while the maintained contract and design still named `3f222a2b32c0ae666215303b660cebc85bcd04ab`. GREEN passed 7/7 against the exact `0bbb9cb958e196841278aea182f468d316ade0c3` snapshot.
+
 - [ ] **Step 8: Prepare the branch review package without merging**
 
 **Controller handoff:** Step 8 remains pending. No push, PR or Linear mutation, CodeRabbit run, branch-review wave, or merge was performed by Task 4.
