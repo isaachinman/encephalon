@@ -132,16 +132,17 @@ The transaction prevents a concurrent writer from changing rows between numeric 
 
 ## Recovery policy
 
-One internal recovery coordinator owns disposable-cache recovery for prepare and every read API.
+One internal recovery coordinator owns disposable-cache recovery for prepare, forced hydration, every read API, and the post-commit add/init paths that already hold the operation lock.
 
 On the first recoverable cache failure it:
 
-1. acquires the existing operation lock and revalidates the held cache location;
-2. quarantines the exact captured `brain.sqlite` identity and its observed sidecars;
-3. rebuilds once from a newly validated canonical record snapshot;
-4. retries the original operation once.
+1. acquires the existing operation lock or uses the caller's already-held lock, then revalidates the held cache location;
+2. quarantines the exact captured `brain.sqlite` identity and its observed sidecars when the failure carries that identity;
+3. represents disappearance after an existence observation distinctly, rebuilding once if the primary remains absent or retrying without quarantine if a current successor exists;
+4. rebuilds at most once from a newly validated canonical record snapshot;
+5. retries prepare/read work once, while forced hydration consumes the recovery rebuild result directly instead of forcing a second rebuild.
 
-A second validation or recovery failure never causes another rebuild. It follows the existing SQLite category and I/O wrapping policies, returning bounded `IO_ERROR` or `INTERNAL_ERROR` without cache keys, values, record JSON, FTS text, paths from corrupt rows, or private sentinels.
+A second validation or recovery failure never causes another rebuild. It follows the existing SQLite category and I/O wrapping policies, returning bounded `IO_ERROR` or `INTERNAL_ERROR` without cache keys, values, record JSON, FTS text, paths from corrupt rows, or private sentinels. Malformed cache JSON is normalised without retaining V8's parser cause because that cause can contain excerpts of the untrusted source.
 
 `CACHE_SCOPE_MISMATCH`, `REPOSITORY_CHANGED`, busy/locked contention, unknown SQLite failures, and operational I/O errors retain their current fail-closed policies. A valid foreign cache is never quarantined as disposable corruption. No stale or partially validated row is returned before, during, or after recovery.
 
@@ -169,7 +170,9 @@ The smallest complementary behavioural matrix covers:
 - one representative public read proving exactly one quarantine/rebuild, one canonical result, and no duplicate serving;
 - injected recovery I/O failure proving one attempt, no stale result, bounded public classification, and no private sentinel in message, cause, or details;
 - valid `CACHE_SCOPE_MISMATCH` proving zero quarantine attempts;
-- exact-boundary controls for metadata rows, 1,000 records, per-value bytes, aggregate bytes, and canonical decimal metadata.
+- public hydrate, forced gather hydration, post-commit add hydration, and init cache preparation recovering real not-a-database writer opens under their correct lock ownership without a second forced rebuild;
+- observed-missing races proving an absent primary rebuilds without quarantine while a current successor is retried and preserved without quarantine;
+- exact-boundary controls for metadata rows, 1,000 self-consistent records and FTS rows, exact per-value bytes, exactly 12,484,608 aggregate cached-record JSON bytes, and `recordsIndexed = '1000'`.
 
 Existing malformed-record recovery coverage already exercises list, show, full search, compact search, and gather. New corruption mechanics therefore use `prepare` plus one representative read rather than duplicating every API × corruption combination. No CLI tests are needed because the CLI adds no cache-validation boundary.
 
@@ -186,4 +189,4 @@ The complete lint, four-project typecheck, full test, benchmark, build, package,
 
 ## Reviewed implementation provenance
 
-The exact reviewed code and behavioural-test snapshot implementing this design is `d0b4a28020c1394de9c8897436adc794ff865c55`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.
+The exact reviewed code and behavioural-test snapshot implementing this design is `920d0ae9463c0076943e4576a08e57fd1fb9926a`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.

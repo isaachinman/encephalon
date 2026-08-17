@@ -566,6 +566,16 @@ git commit -m "[MAR-2549] Document bounded cache validation"
 
 **Task 4 evidence:** RED: the package contract command ran 7 tests with 6 passed and 1 failed on the absent bounded-cache section. GREEN: the same command passed 7/7 after the maintained contract and exact `d0b4a28020c1394de9c8897436adc794ff865c55` provenance were added. The sequential release matrix passed with 462/464 full tests and two established capability skips; both benchmark profiles, build, package, expected publish refusal, frozen install, declaration, Bun, package-content, and diff audits passed. The exact `npx` validation attempt hit the local root-owned npm-cache limitation, while the built CLI confirmed the established `ROOT_INSTALL_REQUIRED` self-root classification. Both Task 4 reports are confirmed ignored.
 
+### Final-review fix wave evidence
+
+- Malformed cache JSON privacy RED exposed a private source excerpt through the terminal public `EncephalonError -> CacheDatabaseFailure -> CacheSchemaMismatch -> SyntaxError` cause chain. GREEN normalises the parser failure without its V8 cause and recursively proves the sentinel absent.
+- Real not-a-database writer-open RED failed public hydrate before the other lock-ownership paths ran. GREEN covers public hydrate, forced gather hydration, post-commit add hydration, and init cache preparation with one exact primary quarantine, one recovery writer initialisation, and no second forced rebuild.
+- The deterministic observed-missing RED surfaced a raw identity-less missing callback. GREEN proves the held-lock absent branch rebuilds once without quarantine and the current-successor branch retries once without rebuild or quarantine while preserving the exact successor identity.
+- SQLite-generated equality controls accept exact metadata, cached-record, and FTS per-value byte limits, plus 1,000 self-consistent record and FTS rows, `recordsIndexed = '1000'`, and exactly 12,484,608 aggregate cached-record JSON bytes.
+- Focused checks passed 8/8; affected cache/SQLite-policy/errors/records/init suites passed 383/385 with two established capability skips; lint and all four typecheck projects passed; the full suite passed 467/469 with the same two skips.
+- Code and behavioural-test snapshot: `920d0ae9463c0076943e4576a08e57fd1fb9926a` (`[MAR-2549] Complete bounded cache recovery`).
+- Provenance RED: the package contract ran 7 tests with 6 passed and 1 failed while the maintained contract and design still named `d0b4a28020c1394de9c8897436adc794ff865c55`. GREEN passed 7/7 against the exact `920d0ae9463c0076943e4576a08e57fd1fb9926a` snapshot. The final lint, four-project typecheck, 467/469 full test run with two established skips, both benchmark profiles, build, package, expected publish refusal, frozen install, declaration, Bun, package-content, scope, and diff audits passed. The exact `npx` validation attempt hit the root-owned npm-cache limitation; the built CLI confirmed the established `ROOT_INSTALL_REQUIRED` self-root classification without record JSON changes.
+
 - [ ] **Step 8: Prepare the branch review package without merging**
 
 **Controller handoff:** Step 8 remains pending. No push, PR or Linear mutation, CodeRabbit run, branch-review wave, or merge was performed by Task 4.
