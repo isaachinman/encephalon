@@ -135,6 +135,7 @@ export const failCacheDatabase = (failure: unknown, database: CacheDatabase): ne
 type CacheLocationTestHooks = {
   afterDatabaseLockInitialisation?: ((database: CacheDatabase) => void) | undefined
   afterDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
+  afterPrimaryBootstrapClose?: ((path: string) => void) | undefined
   afterQuarantineRename?: ((path: string) => void) | undefined
   beforeDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
   beforeLocationInspection?: (() => void) | undefined
@@ -493,9 +494,15 @@ const bootstrapPrimary = (
   const path = resolve(location.directory, name)
   const relativePath = databaseRelativePath(name)
   let created = false
+  let createdIdentity: CacheEntryIdentity | undefined
   try {
     const descriptor = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | NO_FOLLOW, 0o600)
-    closeSync(descriptor)
+    try {
+      createdIdentity = identityFrom(fstatSync(descriptor, { bigint: true }))
+    } finally {
+      closeSync(descriptor)
+    }
+    cacheLocationTestHooks.afterPrimaryBootstrapClose?.(path)
     created = true
   } catch (error) {
     if (existingPath(error) && mode === 'create-exclusive') {
@@ -509,6 +516,9 @@ const bootstrapPrimary = (
   const identity = inspectRegularFile(path, relativePath)
   if (identity === undefined) {
     return changedLayout(relativePath, created ? 'created-file-present' : 'existing-file-present')
+  }
+  if (createdIdentity !== undefined && !sameCacheEntryIdentity(createdIdentity, identity)) {
+    throw new CacheDatabaseCreationConflict()
   }
   return { identity, primaryCreated: created }
 }

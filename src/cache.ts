@@ -158,6 +158,7 @@ type CacheIntegrityObservation = {
 }
 
 type ExpectedOrdinaryColumn = Readonly<{
+  constraint?: string
   name: string
   notNull: 0 | 1
   primaryKeyPosition: 0 | 1
@@ -182,22 +183,36 @@ const RECORD_COLUMNS = [
   { name: 'source', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
   { name: 'created_at', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
   { name: 'path', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
-  { name: 'active', notNull: 1, primaryKeyPosition: 0, type: 'INTEGER' },
+  {
+    constraint: 'CHECK (active IN (0, 1))',
+    name: 'active',
+    notNull: 1,
+    primaryKeyPosition: 0,
+    type: 'INTEGER',
+  },
   { name: 'summary', notNull: 0, primaryKeyPosition: 0, type: 'TEXT' },
   { name: 'record_json', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
 ] as const satisfies readonly ExpectedOrdinaryColumn[]
 
-const RECORDS_TABLE_DEFINITION = `(
-  id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL,
-  subject TEXT NOT NULL,
-  source TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  path TEXT NOT NULL,
-  active INTEGER NOT NULL CHECK (active IN (0, 1)),
-  summary TEXT,
-  record_json TEXT NOT NULL
+const ordinaryTableDefinition = (columns: readonly ExpectedOrdinaryColumn[]) => `(
+${columns
+  .map(
+    column =>
+      `  ${[
+        column.name,
+        column.type,
+        column.primaryKeyPosition === 1 ? 'PRIMARY KEY' : undefined,
+        column.notNull === 1 ? 'NOT NULL' : undefined,
+        column.constraint,
+      ]
+        .filter(part => part !== undefined)
+        .join(' ')}`,
+  )
+  .join(',\n')}
 )`
+
+const METADATA_TABLE_DEFINITION = ordinaryTableDefinition(METADATA_COLUMNS)
+const RECORDS_TABLE_DEFINITION = ordinaryTableDefinition(RECORD_COLUMNS)
 
 const RECORDS_INDEXES = [
   {
@@ -222,6 +237,15 @@ const RECORDS_INDEXES = [
   name: string
   probeName: CacheIntegrityProbeName
 }[]
+
+const RECORDS_INDEX_DEFINITIONS = RECORDS_INDEXES.map(
+  index =>
+    `CREATE INDEX ${index.name} ON records(${index.columns
+      .map(column => `${column.name}${column.descending === 1 ? ' DESC' : ''}`)
+      .join(', ')})`,
+).join(';\n')
+
+const RECORD_SEARCH_DEFINITION = 'fts5(id UNINDEXED, text)'
 
 const schemaTokenPattern =
   /\s+|--[^\r\n]*|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[(?:\]\]|[^\]])*\]|[A-Za-z_][A-Za-z0-9_]*|\d+|[(),]|\S/g
@@ -273,6 +297,16 @@ type CacheReadTestHooks = {
 }
 
 class CacheSchemaMismatch extends Error {}
+
+class NormalizedCacheSchemaFailure extends Error {
+  readonly code: 'SQLITE_CORRUPT' | 'SQLITE_SCHEMA'
+
+  constructor(category: 'corrupt' | 'schema') {
+    super('The SQLite cache schema could not be verified.')
+    this.name = 'NormalizedCacheSchemaFailure'
+    this.code = category === 'corrupt' ? 'SQLITE_CORRUPT' : 'SQLITE_SCHEMA'
+  }
+}
 
 class CacheDatabaseObservedMissing extends Error {}
 
@@ -687,7 +721,7 @@ const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync'])
   }
 }
 
-const assertCacheSchema = (database: DatabaseSync) => {
+const assertCacheSchemaUnchecked = (database: DatabaseSync) => {
   assertOrdinaryTableSchema(database, 'metadata', METADATA_COLUMNS)
   assertOrdinaryTableSchema(database, 'records', RECORD_COLUMNS)
   assertRecordsActiveConstraint(database)
@@ -728,28 +762,50 @@ const assertCacheSchema = (database: DatabaseSync) => {
     .get() as { sql?: unknown } | undefined
   if (
     typeof searchSchema?.sql !== 'string' ||
-    !sameOwnedSchema(searchSchema.sql, 'CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text)')
+    !sameOwnedSchema(searchSchema.sql, `CREATE VIRTUAL TABLE record_search USING ${RECORD_SEARCH_DEFINITION}`)
   ) {
     throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
   }
 }
 
+const assertCacheSchema = (database: DatabaseSync) => {
+  try {
+    assertCacheSchemaUnchecked(database)
+  } catch (error) {
+    if (error instanceof CacheSchemaMismatch || error instanceof NormalizedCacheSchemaFailure) {
+      throw error
+    }
+    const category = classifySQLiteError(error)
+    if (category === 'corrupt' || category === 'schema') {
+      // biome-ignore lint/style/useErrorCause: SQLite schema messages can contain private untrusted object names.
+      throw new NormalizedCacheSchemaFailure(category)
+    }
+    throw error
+  }
+}
+
 const createCacheSchema = (database: DatabaseSync) => {
   database.exec(`
-    CREATE TABLE metadata (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
+    CREATE TABLE metadata ${METADATA_TABLE_DEFINITION};
     CREATE TABLE records ${RECORDS_TABLE_DEFINITION};
-    CREATE INDEX records_active_order
-      ON records(active, created_at DESC, id DESC);
-    CREATE INDEX records_kind_subject
-      ON records(kind, subject);
-    CREATE VIRTUAL TABLE record_search USING fts5(
-      id UNINDEXED,
-      text
-    );
+    ${RECORDS_INDEX_DEFINITIONS};
+    CREATE VIRTUAL TABLE record_search USING ${RECORD_SEARCH_DEFINITION};
   `)
+}
+
+const assertCacheSchemaTransaction = (database: DatabaseSync) => {
+  database.exec('BEGIN')
+  try {
+    assertCacheSchema(database)
+    database.exec('ROLLBACK')
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK')
+    } catch {
+      // Preserve the original schema validation failure.
+    }
+    throw error
+  }
 }
 
 type CacheWriterPrimary =
@@ -766,10 +822,10 @@ const openWriterDatabase = (location: CacheLocation, primary: CacheWriterPrimary
         database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
         createCacheSchema(database)
       } else {
-        assertCacheSchema(database)
+        assertCacheSchemaTransaction(database)
         database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
       }
-      assertCacheSchema(database)
+      assertCacheSchemaTransaction(database)
       cacheReadTestHooks.duringDatabaseInitialisation?.('writer')
     },
     DatabaseConstructor,
@@ -1440,11 +1496,11 @@ const rebuildCache = (
     let writerFailure: unknown
     let writerFailed = false
     try {
-      const existingMetadata = readMetadata(database)
-      assertCacheScope(root, existingMetadata)
       database.exec('BEGIN IMMEDIATE')
       try {
         assertCacheSchema(database)
+        const existingMetadata = readMetadata(database)
+        assertCacheScope(root, existingMetadata)
         database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
         const insertRecord = database.prepare(`
           INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
