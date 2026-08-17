@@ -2,7 +2,7 @@
 
 **Ticket:** MAR-2559
 **Date:** 2026-08-18
-**Status:** Approved
+**Status:** Implemented
 
 ## Goal
 
@@ -58,4 +58,4 @@ No result shape, response budget, limit, supersession, cache-recovery, or error-
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test commit will be recorded after the code stabilises. Documentation does not change the public API, package exports, cache schema, canonical record format, or operation budgets.
+The exact implementation and behavioural-test snapshot is `2d6f450783b9cbe0bedd38fd59de3310f5c1a0d4`. Documentation does not change the public API, package exports, cache schema, canonical record format, or operation budgets.
