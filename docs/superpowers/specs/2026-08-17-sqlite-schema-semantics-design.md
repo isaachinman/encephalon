@@ -113,3 +113,6 @@ The complete lint, four-project typecheck, full test, benchmark, build, package,
 - Per-operation cache-generation memoisation remains MAR-2552.
 - In-place cache migration, user-configurable cache schemas, attached databases, triggers unrelated to the owned schema, and arbitrary same-user mutation inside SQLite's pathname-only open window remain out of scope.
 
+## Reviewed implementation provenance
+
+The exact reviewed code and behavioural-test snapshot implementing this design is `447e58c8848f9d62aee7f639b30a96a8b6114fdd`. Documentation changes do not alter the runtime API, package exports, canonical records, or generated declarations.
