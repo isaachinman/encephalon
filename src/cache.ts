@@ -1305,6 +1305,12 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
       throw new CacheSchemaMismatch('The cache record table does not match its canonical JSON.')
     }
   }
+  const expectedSearchRows = new Map(
+    records.map(({ record }) => [
+      Buffer.from(record.id, 'utf8').toString('hex'),
+      Buffer.from(searchDocumentForRecord(record), 'utf8'),
+    ]),
+  )
   const searchProbe = readIntegrityProbe(
     'record-search',
     database
@@ -1347,30 +1353,21 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
     throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
   }
   cacheReadTestHooks.beforeIntegrityTextRead?.('record-search')
-  const counts = database
-    .prepare(
-      `SELECT
-        (SELECT COUNT(*) FROM records) AS records,
-        (SELECT COUNT(*) FROM record_search) AS searchRows,
-        (SELECT COUNT(DISTINCT id) FROM record_search) AS distinctSearchRows,
-        (SELECT COUNT(*) FROM records LEFT JOIN record_search ON records.id = record_search.id WHERE record_search.id IS NULL) AS missingSearchRows,
-        (SELECT COUNT(*) FROM record_search LEFT JOIN records ON records.id = record_search.id WHERE records.id IS NULL) AS orphanSearchRows
-      `,
-    )
-    .get() as {
-    distinctSearchRows?: unknown
-    missingSearchRows?: unknown
-    orphanSearchRows?: unknown
-    records?: unknown
-    searchRows?: unknown
+  const searchRows = database
+    .prepare('SELECT CAST(id AS BLOB) AS id_bytes, CAST(text AS BLOB) AS text_bytes FROM record_search LIMIT ?')
+    .iterate(maximumRows) as Iterable<{ id_bytes?: unknown; text_bytes?: unknown }>
+  for (const row of searchRows) {
+    if (!(row.id_bytes instanceof Uint8Array && row.text_bytes instanceof Uint8Array)) {
+      throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
+    }
+    const idBytes = Buffer.from(row.id_bytes)
+    const expected = expectedSearchRows.get(idBytes.toString('hex'))
+    if (expected === undefined || !expected.equals(Buffer.from(row.text_bytes))) {
+      throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
+    }
+    expectedSearchRows.delete(idBytes.toString('hex'))
   }
-  if (
-    counts.records !== metadata.recordsIndexed ||
-    counts.searchRows !== metadata.recordsIndexed ||
-    counts.distinctSearchRows !== metadata.recordsIndexed ||
-    counts.missingSearchRows !== 0 ||
-    counts.orphanSearchRows !== 0
-  ) {
+  if (expectedSearchRows.size !== 0) {
     throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
   }
 }
@@ -1512,6 +1509,9 @@ const rebuildCache = (
         assertCacheSchema(database)
         const existingMetadata = readMetadata(database)
         assertCacheScope(root, existingMetadata)
+        if (existingMetadata !== undefined) {
+          assertCacheContentConsistent(database, existingMetadata)
+        }
         database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
         const insertRecord = database.prepare(`
           INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
