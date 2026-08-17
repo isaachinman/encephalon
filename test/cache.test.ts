@@ -3119,6 +3119,159 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('rebuilds caches with incompatible required records indexes', () => {
+    const cases = [
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec('DROP INDEX records_active_order;')
+        },
+        name: 'missing active-order index',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_active_order;
+            CREATE INDEX renamed_active_order ON records(active, created_at DESC, id DESC);
+          `)
+        },
+        name: 'renamed active-order index',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_active_order;
+            CREATE INDEX records_active_order ON records(created_at DESC, active, id DESC);
+          `)
+        },
+        name: 'reordered active-order columns',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_active_order;
+            CREATE INDEX records_active_order ON records(active, created_at, id DESC);
+          `)
+        },
+        name: 'changed active-order direction',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_kind_subject;
+            CREATE INDEX records_kind_subject ON records(subject, kind);
+          `)
+        },
+        name: 'reordered kind-subject columns',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_kind_subject;
+            CREATE INDEX records_kind_subject ON records(kind COLLATE NOCASE, subject);
+          `)
+        },
+        name: 'changed kind-subject collation',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec('CREATE INDEX records_extra ON records(source);')
+        },
+        name: 'additional application index',
+      },
+    ] as const
+
+    for (const fixture of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, fixture.mutate)
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
+    }
+
+    const validRoot = createRoot()
+    addCacheRecord(validRoot)
+    mutateCache(validRoot, database => {
+      database.exec(`
+        DROP INDEX records_active_order;
+        DROP INDEX records_kind_subject;
+        CREATE INDEX records_kind_subject ON records(kind, subject);
+        CREATE INDEX records_active_order ON records(active, created_at DESC, id DESC);
+      `)
+    })
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root: validRoot }), {
+      hydrated: false,
+      recordsIndexed: 1,
+    })
+  })
+
+  test('rebuilds caches with incompatible FTS5 semantics', () => {
+    const cases = [
+      {
+        definition: 'CREATE TABLE record_search(id TEXT, text TEXT)',
+        name: 'ordinary table',
+      },
+      {
+        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(id, text)',
+        name: 'indexed id',
+      },
+      {
+        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text UNINDEXED)',
+        name: 'unindexed text',
+      },
+      {
+        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(text, id UNINDEXED)',
+        name: 'reversed columns',
+      },
+      {
+        definition: "CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text, tokenize='porter')",
+        name: 'changed tokenizer',
+      },
+    ] as const
+
+    for (const fixture of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, database => {
+        database.enableDefensive(false)
+        database.exec(`
+          CREATE TEMP TABLE saved_search AS SELECT id, text FROM record_search;
+          DROP TABLE record_search;
+          ${fixture.definition};
+          INSERT INTO record_search(id, text) SELECT id, text FROM saved_search;
+        `)
+      })
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
+    }
+
+    const validRoot = createRoot()
+    addCacheRecord(validRoot)
+    mutateCache(validRoot, database => {
+      database.enableDefensive(false)
+      database.exec(`
+        CREATE TEMP TABLE saved_search AS SELECT id, text FROM record_search;
+        DROP TABLE record_search;
+        create virtual table "record_search" using FTS5(
+          "id" unindexed,
+          "text"
+        );
+        INSERT INTO record_search(id, text) SELECT id, text FROM saved_search;
+      `)
+    })
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root: validRoot }), {
+      hydrated: false,
+      recordsIndexed: 1,
+    })
+  })
+
   test('rebuilds an empty read-only cache file through writer preparation', {
     skip: process.platform === 'win32' ? 'Windows read-only file replacement semantics differ.' : false,
   }, () => {
