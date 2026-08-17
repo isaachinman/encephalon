@@ -115,4 +115,4 @@ The complete lint, four-project typecheck, full test, benchmark, build, package,
 
 ## Reviewed implementation provenance
 
-The exact reviewed code and behavioural-test snapshot implementing this design is `447e58c8848f9d62aee7f639b30a96a8b6114fdd`. Documentation changes do not alter the runtime API, package exports, canonical records, or generated declarations.
+The exact reviewed code and behavioural-test snapshot implementing this design is `029775c46f4a07b56bac8985a098e61d27ea20a8`. Documentation changes do not alter the runtime API, package exports, canonical records, or generated declarations.
