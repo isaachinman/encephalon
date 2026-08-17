@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-17 for code and behavioural-test snapshot `fb17790ac01031aa37d903ec9a3feb3a271e9d05`.
+Last reviewed: 2026-08-17 for code and behavioural-test snapshot `7a3f4ea4b9b092d7447096e97c9fc0a5eee088c9`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -114,7 +114,8 @@ This document is the concise contract maintainers should update when public beha
 - Writers create DDL only after exclusively creating a new primary. Existing and expected-owned databases validate before any PRAGMA or DDL mutation, and rebuild transactions revalidate after `BEGIN IMMEDIATE` before deleting or inserting rows. An incompatible existing generation is never repaired or migrated in place.
 - The first recoverable cache failure is coordinated across prepare, hydrate, read, post-commit add hydration, and init cache preparation. Recovery acquires the repository operation lock or uses the caller's already-held lock, revalidates the cache location, quarantines only exact captured primary and sidecar identities, and rebuilds once from canonical JSON. Any recoverable SQLite failure during forced-writer metadata reads, transactions, or writes is surfaced with the final verified writer identity; terminal Encephalon errors and repository-change handling remain unchanged. If a previously observed primary disappears at any pre-verification boundary, recovery rechecks the path under the lock and claims an absent primary through exclusive creation. The exclusive claim is owned immediately, so replacement or disappearance before its first SQLite open becomes an internal creation conflict. A successor that wins that creation race is preserved and retried without quarantine or writer initialisation. Repository-change retries after a successful exclusive claim remain bound to that primary's exact device and inode; a replacement or disappearance becomes an internal creation conflict and preserves the current successor. Prepare and forced hydration return a completed recovery rebuild directly; reads retry once. A second validation or recovery failure never starts another quarantine, rebuild, or retry, malformed cached JSON or metadata cannot expose parser source excerpts through the public cause chain, and no stale or partially validated result escapes.
 - `CACHE_SCOPE_MISMATCH` is a terminal valid-foreign-cache classification and never triggers quarantine or rebuild, including during forced hydration. `REPOSITORY_CHANGED`, busy/locked contention, operational I/O, and unknown SQLite failures retain their fail-closed policies. Recovery remains limited to corrupt, not-a-database, schema, read-only, and cannot-open categories; exhausted recovery returns the existing bounded public `IO_ERROR` or `INTERNAL_ERROR` classification without corrupt cache content.
-- This contract bounds cache structure, schema semantics, types, counts, bytes, snapshots, and recovery. Semantic equality between FTS text and canonical cached records remains MAR-2550.
+- After the numeric FTS probe succeeds, validation derives the expected search document from each bounded, parsed cached record and compares raw UTF-8 ID and text bytes for every `record_search` row. IDs must match exactly once, and missing, duplicate, orphaned, invalidly encoded, or non-canonical search rows are recoverable cache incompatibilities. The validated cached `record_json` projection is the authority; equality between cached JSON and canonical files remains MAR-2571.
+- Row-text equality does not claim integrity of FTS posting or shadow indexes. No Unicode, whitespace, JSON, or token normalisation is applied, and bounded posting-index integrity remains outside this contract.
 
 ## Package and Release Gates
 
@@ -148,6 +149,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
+- MAR-2550 exact cached FTS row-text projection validation and recovery: `7a3f4ea4b9b092d7447096e97c9fc0a5eee088c9`.
 - MAR-2553 semantic SQLite schema validation and exact incompatible-generation recovery: `fb17790ac01031aa37d903ec9a3feb3a271e9d05`.
 - MAR-2549 bounded disposable cache validation and exact-generation recovery: `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`.
 - MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2874874096bb7d327e084d7e17d5243564244c43`.
