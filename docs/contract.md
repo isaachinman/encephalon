@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-17 for code and behavioural-test snapshot `71cec5b639c89dd328087546e3053cd72847e1d5`.
+Last reviewed: 2026-08-17 for code and behavioural-test snapshot `1252562c636ec663b2ed7e8b29ea3e1a7774c492`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -154,7 +154,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2554 bounded full, compact, and gather read responses: `71cec5b639c89dd328087546e3053cd72847e1d5`.
+- MAR-2554 bounded full, compact, and gather read responses: `1252562c636ec663b2ed7e8b29ea3e1a7774c492`.
 - MAR-2550 exact cached FTS row-text projection validation, bounded pre-mutation writer validation, and recovery: `c8587ee36049fd7f9349a75c8b30e6efb24fdf4c`.
 - MAR-2553 semantic SQLite schema validation and exact incompatible-generation recovery: `fb17790ac01031aa37d903ec9a3feb3a271e9d05`.
 - MAR-2549 bounded disposable cache validation and exact-generation recovery: `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`.
