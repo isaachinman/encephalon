@@ -27,12 +27,12 @@
 - Modify: `src/cache.ts`
 - Test: `test/cache.test.ts`
 
-- [ ] Add table-driven RED cases for same-name `metadata` and `records` tables with missing primary keys, changed nullability/types/defaults, and missing or widened `active` checks.
-- [ ] Add the six-row duplicate-metadata RED and prove it is rejected before accepted metadata iteration.
-- [ ] Replace name-only column validation with bounded `pragma_table_list` and `pragma_table_xinfo` probes plus exact immutable descriptor comparison.
-- [ ] Add the bounded records-owned-SQL check for the exact active constraint.
-- [ ] Reject duplicate keys before assigning to the metadata map.
-- [ ] Run the focused schema/metadata tests, lint, and all four TypeScript projects.
+- [x] Add table-driven RED cases for same-name `metadata` and `records` tables with missing primary keys, changed nullability/types/defaults, and missing or widened `active` checks.
+- [x] Add the six-row duplicate-metadata RED and prove it is rejected before accepted metadata iteration.
+- [x] Replace name-only column validation with bounded `pragma_table_list` and `pragma_table_xinfo` probes plus exact immutable descriptor comparison.
+- [x] Add the bounded records-owned-SQL check for the exact active constraint.
+- [x] Reject duplicate keys before assigning to the metadata map.
+- [x] Run the focused schema/metadata tests, lint, and all four TypeScript projects.
 
 ### Task 2: Validate required index and FTS5 semantics
 
@@ -41,11 +41,11 @@
 - Modify: `src/cache.ts`
 - Test: `test/cache.test.ts`
 
-- [ ] Add RED index cases for missing/renamed/extra indexes, wrong key order, wrong direction, and wrong collation, plus a different-creation-order positive control.
-- [ ] Add RED FTS cases for an ordinary table, indexed ID, unindexed text, reversed columns, and changed tokenizer/options, plus a harmless-formatting positive control.
-- [ ] Add bounded `pragma_index_list` and `pragma_index_xinfo` probes and exact required-index comparisons.
-- [ ] Replace the broad FTS marker with the bounded strict semantic declaration matcher.
-- [ ] Run focused index/FTS tests, the complete cache suite, lint, and all four TypeScript projects.
+- [x] Add RED index cases for missing/renamed/extra indexes, wrong key order, wrong direction, and wrong collation, plus a different-creation-order positive control.
+- [x] Add RED FTS cases for an ordinary table, indexed ID, unindexed text, reversed columns, and changed tokenizer/options, plus a harmless-formatting positive control.
+- [x] Add bounded `pragma_index_list` and `pragma_index_xinfo` probes and exact required-index comparisons.
+- [x] Replace the broad FTS marker with the bounded strict semantic declaration matcher.
+- [x] Run focused index/FTS tests, the complete cache suite, lint, and all four TypeScript projects.
 
 ### Task 3: Prevent writer repair and prove bounded recovery
 
@@ -56,13 +56,13 @@
 - Test: `test/cache.test.ts`
 - Test: `test/cache-location.test.ts` if a pure verified-open seam is required
 
-- [ ] Add RED coverage proving forced preparation currently repairs an existing malformed schema instead of quarantining it.
-- [ ] Add a representative public-read RED proving exact corrupt-primary quarantine, one rebuild, canonical output, and a later fresh prepare.
-- [ ] Add a second-mismatch/private-schema RED proving no second rebuild and no schema text in the public cause chain.
-- [ ] Carry a `primaryCreated` fact from exclusive bootstrap through the verified-open callback.
-- [ ] Create canonical DDL only for a confirmed-new primary; validate existing/expected-owned primaries before PRAGMAs or DDL.
-- [ ] Revalidate after `BEGIN IMMEDIATE` before rebuild DML.
-- [ ] Run focused recovery tests, affected cache/location/error tests, lint, and all four TypeScript projects.
+- [x] Add RED coverage proving forced preparation currently repairs an existing malformed schema instead of quarantining it.
+- [x] Add a representative public-read RED proving exact corrupt-primary quarantine, one rebuild, canonical output, and a later fresh prepare.
+- [x] Add a second-mismatch/private-schema RED proving no second rebuild and no schema text in the public cause chain.
+- [x] Carry a `primaryCreated` fact from exclusive bootstrap through the verified-open callback.
+- [x] Create canonical DDL only for a confirmed-new primary; validate existing/expected-owned primaries before PRAGMAs or DDL.
+- [x] Revalidate after `BEGIN IMMEDIATE` before rebuild DML.
+- [x] Run focused recovery tests, affected cache/location/error tests, lint, and all four TypeScript projects.
 
 ### Task 4: Snapshot, valid-schema, documentation, and release gates
 
@@ -76,12 +76,14 @@
 - Modify: `test/cache.test.ts`
 - Modify: `test/package.test.ts`
 
-- [ ] Add a mutation-sensitive reader test proving schema probes and subsequent reads use one snapshot.
-- [ ] Add a valid-schema control covering prepare and the public read families without altering the database identity or bytes.
-- [ ] Update maintained cache compatibility documentation with exact semantic checks, recovery behaviour, scope boundaries, and the reviewed code/test SHA.
-- [ ] Run package provenance RED then GREEN.
-- [ ] Run lint, all four typechecks, full tests, both benchmarks, build, package, publish-contract, and frozen-install gates.
-- [ ] Audit public declarations, package contents, Bun files, diff hygiene, dead hooks, stale assumptions, SoC boundaries, and documentation accuracy.
+- [x] Add a mutation-sensitive reader test proving schema probes and subsequent reads use one snapshot.
+- [x] Add a valid-schema control covering prepare and the public read families without altering the database identity or bytes.
+- [x] Update maintained cache compatibility documentation with exact semantic checks, recovery behaviour, scope boundaries, and the reviewed code/test SHA.
+- [x] Run package provenance RED then GREEN.
+- [x] Run lint, all four typechecks, full tests, both benchmarks, build, package, publish-contract, and frozen-install gates.
+- [x] Audit public declarations, package contents, Bun files, diff hygiene, dead hooks, stale assumptions, SoC boundaries, and documentation accuracy.
+
+Implementation and behavioural coverage are captured by `447e58c8848f9d62aee7f639b30a96a8b6114fdd`. The pre-review release matrix passed with 487 tests, two established filesystem-capability skips, clean lint and four-project typechecking, both benchmark profiles, build, packed-package and publish-contract checks, frozen dependency installation, unchanged Bun/package configuration, no new public declarations, and clean diff hygiene.
 
 ### Task 5: Pull request and branch review
 
@@ -91,4 +93,3 @@
 - [ ] Fix every accepted High/Medium-confidence issue with focused RED/GREEN evidence and rerun proportionate gates.
 - [ ] Repeat broad review at most three waves, then run the main-thread SoC/tidy/stale-assumption/dead-code/docs audit.
 - [ ] Run final cross-platform CI and bot review, fix actionable findings, update Linear, and leave the reviewed PR open for the ordered merge.
-

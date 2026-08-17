@@ -55,6 +55,10 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-16-bounded-cache-validation-design.md'),
       'utf8',
     )
+    const semanticCacheSchemaDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-17-sqlite-schema-semantics-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -65,11 +69,12 @@ describe('package contract', () => {
     assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
     assert.match(contract, /## Bounded Disposable Cache Validation/)
+    assert.match(contract, /Cache schema compatibility requires the exact owned ordinary-table semantics/)
     assert.match(contract, /## Package and Release Gates/)
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /Last reviewed: 2026-08-17 for code and behavioural-test snapshot `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`\./,
+      /Last reviewed: 2026-08-17 for code and behavioural-test snapshot `447e58c8848f9d62aee7f639b30a96a8b6114fdd`\./,
     )
     assert.match(
       contract,
@@ -91,6 +96,10 @@ describe('package contract', () => {
     assert.match(
       boundedCacheValidationDesign,
       /The exact reviewed code and behavioural-test snapshot implementing this design is `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`\./,
+    )
+    assert.match(
+      semanticCacheSchemaDesign,
+      /The exact reviewed code and behavioural-test snapshot implementing this design is `447e58c8848f9d62aee7f639b30a96a8b6114fdd`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),
