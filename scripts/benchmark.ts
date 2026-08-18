@@ -287,6 +287,24 @@ export const makePreparedRepositoryStale = (root: string): void => {
   writeFileSync(path, stale, 'utf8')
 }
 
+type BenchmarkRootCleanup = { kind: 'success' } | { error: unknown; kind: 'failure' }
+
+export const removeBenchmarkRoots = (
+  roots: string[],
+  remove: (path: string) => void = path => rmSync(path, { force: true, recursive: true }),
+): BenchmarkRootCleanup =>
+  roots.reduce<BenchmarkRootCleanup>(
+    (result, path) => {
+      try {
+        remove(path)
+        return result
+      } catch (error) {
+        return result.kind === 'failure' ? result : { error, kind: 'failure' }
+      }
+    },
+    { kind: 'success' },
+  )
+
 const createCaseTemplates = (
   records: number,
   temporaryParent: string,
@@ -302,13 +320,7 @@ const createCaseTemplates = (
     prepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation)
     return { corpus, prepared, sampleRoot, unprepared }
   } catch (error) {
-    rmSync(sampleRoot, { force: true, recursive: true })
-    if (unprepared !== undefined) {
-      rmSync(unprepared, { force: true, recursive: true })
-    }
-    if (prepared !== undefined) {
-      rmSync(prepared, { force: true, recursive: true })
-    }
+    removeBenchmarkRoots([sampleRoot, unprepared, prepared].filter((path): path is string => path !== undefined))
     throw error
   }
 }
@@ -352,6 +364,7 @@ const runCase = async (
   options: ResolvedBenchmarkControllerOptions,
 ): Promise<BenchmarkCase> => {
   const templates = createCaseTemplates(records, options.temporaryParent, options.afterTemporaryRepositoryAllocation)
+  let outcome: { kind: 'success'; value: BenchmarkCase } | { error: unknown; kind: 'failure' }
   try {
     const operationEntries: Array<
       readonly [BenchmarkOperation, Awaited<ReturnType<typeof runOperationSamples>> | null]
@@ -364,16 +377,25 @@ const runCase = async (
             await runOperationSamples(operation, records, templates, configuration, options)
       operationEntries.push([operation, distributions])
     }
-    return {
-      ...templates.corpus,
-      cache: cacheMetric(templates.prepared, templates.corpus.canonicalJsonBytes),
-      operations: Object.fromEntries(operationEntries) as BenchmarkCase['operations'],
+    outcome = {
+      kind: 'success',
+      value: {
+        ...templates.corpus,
+        cache: cacheMetric(templates.prepared, templates.corpus.canonicalJsonBytes),
+        operations: Object.fromEntries(operationEntries) as BenchmarkCase['operations'],
+      },
     }
-  } finally {
-    rmSync(templates.prepared, { force: true, recursive: true })
-    rmSync(templates.sampleRoot, { force: true, recursive: true })
-    rmSync(templates.unprepared, { force: true, recursive: true })
+  } catch (error) {
+    outcome = { error, kind: 'failure' }
   }
+  const cleanup = removeBenchmarkRoots([templates.prepared, templates.sampleRoot, templates.unprepared])
+  if (outcome.kind === 'failure') {
+    throw outcome.error
+  }
+  if (cleanup.kind === 'failure') {
+    throw cleanup.error
+  }
+  return outcome.value
 }
 
 const loadBudget = (path: string | undefined, records: number[]): PerformanceBudget | undefined => {
@@ -452,15 +474,22 @@ const outputMode = (destination: string): number => {
 
 const writeAtomic = (path: string, content: string): void => {
   const destination = resolve(path)
-  const temporary = join(dirname(destination), `.${randomUUID()}.benchmark.tmp`)
+  let stagingDirectory: string | undefined
+  let temporary: string | undefined
   let descriptor: number | undefined
+  let published = false
   let failure: Error | undefined
   try {
+    stagingDirectory = mkdtempSync(join(dirname(destination), `.${randomUUID()}.benchmark-output-`))
+    temporary = join(stagingDirectory, 'report.benchmark.tmp')
     descriptor = openSync(temporary, 'wx', 0o600)
     writeFileSync(descriptor, content, { encoding: 'utf8' })
     const mode = outputMode(destination)
-    renameSync(temporary, destination)
     fchmodSync(descriptor, mode)
+    closeSync(descriptor)
+    descriptor = undefined
+    renameSync(temporary, destination)
+    published = true
   } catch (error) {
     failure = new Error('Unable to write the benchmark report.', { cause: error })
   }
@@ -473,11 +502,13 @@ const writeAtomic = (path: string, content: string): void => {
       }
     }
   }
-  try {
-    rmSync(temporary, { force: true })
-  } catch (error) {
-    if (failure === undefined) {
-      failure = new Error('Unable to write the benchmark report.', { cause: error })
+  if (stagingDirectory !== undefined) {
+    try {
+      rmSync(stagingDirectory, { force: true, recursive: true })
+    } catch (error) {
+      if (!published && failure === undefined) {
+        failure = new Error('Unable to write the benchmark report.', { cause: error })
+      }
     }
   }
   if (failure !== undefined) {

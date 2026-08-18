@@ -1,12 +1,27 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { makePreparedRepositoryStale, restoreBenchmarkSample, runBenchmark } from '../scripts/benchmark.ts'
+import {
+  makePreparedRepositoryStale,
+  removeBenchmarkRoots,
+  restoreBenchmarkSample,
+  runBenchmark,
+} from '../scripts/benchmark.ts'
 import {
   assertPerformanceBudget,
   type BenchmarkReport,
@@ -522,6 +537,28 @@ describe('isolated benchmark authority', () => {
     )
   })
 
+  test('attempts every owned-root cleanup and retains the first failure', () => {
+    const firstFailure = new Error('first cleanup failure')
+    const secondFailure = new Error('second cleanup failure')
+    const attempts: string[] = []
+
+    const result = removeBenchmarkRoots(['first', 'second', 'third'], path => {
+      attempts.push(path)
+      if (path === 'first') {
+        throw firstFailure
+      }
+      if (path === 'second') {
+        throw secondFailure
+      }
+    })
+
+    assert.deepEqual(attempts, ['first', 'second', 'third'])
+    assert.equal(result.kind, 'failure')
+    if (result.kind === 'failure') {
+      assert.equal(result.error, firstFailure)
+    }
+  })
+
   test('uses a different-length canonical variant to make a prepared repository stale', () => {
     const root = createTestRepository()
     try {
@@ -607,6 +644,7 @@ describe('isolated benchmark authority', () => {
   test('keeps report bytes private until atomic publication', { skip: !privateFileModesSupported }, () => {
     const root = mkdtempSync(join(tmpdir(), 'encephalon-benchmark-private-output-test-'))
     try {
+      chmodSync(root, 0o755)
       const outputPath = join(root, 'report.json')
       writeFileSync(outputPath, 'previous report\n', { mode: 0o640 })
       const result = spawnSync(
