@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
-import { scanBaselineWithHooks } from '../src/baseline.ts'
+import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
 import { readRecordsResolved, validateRecordsResolved } from '../src/records.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
@@ -49,6 +49,13 @@ const writeRecord = (
 }
 
 describe('hot scan performance regressions', () => {
+  test('leaves unobserved baseline results free of instrumentation wrappers', () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'sample-project' }))
+
+    assert.doesNotThrow(() => structuredClone(scanBaseline(root)))
+  })
+
   test('bounds validation work while preserving dense-history issue order', () => {
     const root = createRoot()
     writeRecord(root, {
