@@ -61,4 +61,4 @@ No result shape, response budget, limit, supersession, cache-recovery, or error-
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test snapshot is `ec1360a8c03e9d9b2ab12562f6ba31dc697c2f09`. Documentation does not change the public API, package exports, cache schema, canonical record format, or operation budgets.
+The exact implementation and behavioural-test snapshot is `ee1e197e53e31f637c807e2621b69b247ae3d855`. Documentation does not change the public API, package exports, cache schema, canonical record format, or operation budgets.
