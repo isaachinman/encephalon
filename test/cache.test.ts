@@ -2151,6 +2151,7 @@ describe('SQLite cache and reads', () => {
     const root = createRoot()
     const query = '\u0301 _ __ * " - + ^ : () {} []\u0000'
     let cacheInspections = 0
+    let integrityProbes = 0
     let repositoryInspections = 0
     cacheLocationTestHooks.beforeLocationInspection = () => {
       cacheInspections += 1
@@ -2158,6 +2159,10 @@ describe('SQLite cache and reads', () => {
     }
     repositoryTestHooks.afterGitMarkerDecision = () => {
       repositoryInspections += 1
+    }
+    cacheReadTestHooks.afterIntegrityProbe = () => {
+      integrityProbes += 1
+      throw new Error('cache integrity validation must not run for an empty literal query')
     }
     const searchRecords =
       functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
@@ -2204,6 +2209,7 @@ describe('SQLite cache and reads', () => {
     assertRootInstallRequired(() => searchCompactRecords({ query, root }))
     assertRootInstallRequired(() => gatherRecords({ root, searches: [query] }))
     assert.equal(cacheInspections, 0)
+    assert.equal(integrityProbes, 0)
   })
 
   test('serves a valid large-summary record through cache preparation and search', () => {
@@ -4254,6 +4260,77 @@ describe('SQLite cache and reads', () => {
     assert.equal(writerInitialisations, 1)
   })
 
+  test('validates each fresh cache generation once per public read', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const cases = [
+      {
+        name: 'list',
+        read: () =>
+          functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root }).map(
+            item => item.id,
+          ),
+        result: [record.id],
+      },
+      {
+        name: 'show',
+        read: () =>
+          functionFromApi<(input: Record<string, unknown>) => Record<string, unknown> | null>('showRecord')({
+            id: record.id,
+            root,
+          })?.id,
+        result: record.id,
+      },
+      {
+        name: 'full search',
+        read: () =>
+          functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')({
+            query: 'recoverable cache row',
+            root,
+          }).map(item => item.id),
+        result: [record.id],
+      },
+      {
+        name: 'compact search',
+        read: () =>
+          functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')({
+            query: 'recoverable cache row',
+            root,
+          }).map(item => item.id),
+        result: [record.id],
+      },
+      {
+        name: 'gather',
+        read: () => {
+          const result = functionFromApi<
+            (input: Record<string, unknown>) => {
+              records: Array<{ record: { id?: unknown } | null }>
+              searches: Array<{ results: Array<{ id?: unknown }> }>
+            }
+          >('gatherRecords')({
+            root,
+            searches: ['recoverable cache row'],
+            shows: [record.id],
+          })
+          return [result.records[0]?.record?.id, result.searches[0]?.results[0]?.id]
+        },
+        result: [record.id, record.id],
+      },
+    ] as const
+
+    for (const entry of cases) {
+      let validationPasses = 0
+      cacheReadTestHooks.afterIntegrityProbe = observation => {
+        if (observation.name === 'record-search') {
+          validationPasses += 1
+        }
+      }
+      const result = entry.read()
+      assert.deepEqual(result, entry.result, entry.name)
+      assert.equal(validationPasses, 1, entry.name)
+    }
+  })
+
   test('normalises repeated SQLite schema failures before public wrapping', () => {
     const root = createRoot()
     addCacheRecord(root)
@@ -5386,11 +5463,16 @@ describe('SQLite cache and reads', () => {
       assert.notEqual(probeIndex, -1, probe.name)
       assert.deepEqual(observations.at(probeIndex + 1), { kind: 'text-read', name: probe.name }, probe.name)
     }
+    observations.splice(0)
     assert.equal(
       functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
         limit: 1,
         root,
       }).length,
+      1,
+    )
+    assert.equal(
+      observations.filter(observation => observation.kind === 'probe' && observation.name === 'record-search').length,
       1,
     )
   })
@@ -5410,7 +5492,7 @@ describe('SQLite cache and reads', () => {
     cacheReadTestHooks.afterIntegrityProbe = observation => {
       if (observation.name === 'records-indexes') {
         indexProbes += 1
-        if (indexProbes === 2) {
+        if (indexProbes === 1) {
           mutations += 1
           const successor = JSON.stringify({ ...record, payload: { generation: 'successor' } })
           const database = new DatabaseSync(cacheDatabasePath(root))
@@ -5431,6 +5513,7 @@ describe('SQLite cache and reads', () => {
     })
     const generation = (returned?.payload as { generation?: unknown } | undefined)?.generation
     assert.equal(mutations, 1)
+    assert.equal(indexProbes, 1)
     assert.deepEqual({ generation, id: returned?.id }, { generation: 'original', id: record.id })
     assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
       hydrated: true,
@@ -5496,6 +5579,7 @@ describe('SQLite cache and reads', () => {
     })
     const observations = observeCacheIntegrity()
     let exactQuarantines = 0
+    let readerInitialisations = 0
     let recoveryRebuilds = 0
     let writerInitialisations = 0
     cacheLocationTestHooks.beforeQuarantineRename = path => {
@@ -5512,6 +5596,8 @@ describe('SQLite cache and reads', () => {
     cacheReadTestHooks.duringDatabaseInitialisation = mode => {
       if (mode === 'writer') {
         writerInitialisations += 1
+      } else {
+        readerInitialisations += 1
       }
     }
 
@@ -5528,6 +5614,7 @@ describe('SQLite cache and reads', () => {
     assert.notEqual(corruptProbe, -1)
     assert.deepEqual(observations.at(corruptProbe + 1), { kind: 'text-read', name: 'record-search' })
     assert.equal(exactQuarantines, 1)
+    assert.equal(readerInitialisations, 2)
     assert.equal(recoveryRebuilds, 1)
     assert.equal(writerInitialisations, 1)
     const rebuilt = new DatabaseSync(databasePath, { readOnly: true })
