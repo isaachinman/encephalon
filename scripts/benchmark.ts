@@ -454,8 +454,9 @@ const writeAtomic = (path: string, content: string): void => {
   try {
     try {
       writeFileSync(temporary, content, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-      chmodSync(temporary, outputMode(destination))
+      const mode = outputMode(destination)
       renameSync(temporary, destination)
+      chmodSync(destination, mode)
     } catch (error) {
       throw new Error('Unable to write the benchmark report.', { cause: error })
     }
