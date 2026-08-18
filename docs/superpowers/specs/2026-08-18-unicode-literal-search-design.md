@@ -29,6 +29,8 @@ One internal, dependency-free literal-query module owns validation, normalizatio
 
 The derived search document is also normalized to NFC before cache insertion and exact FTS-text integrity comparison. This makes canonically equivalent query and indexed text deterministic without changing canonical record bytes. An older cache containing the prior derived bytes fails the existing semantic cache check and follows the existing exact-generation quarantine, one-rebuild, one-retry path.
 
+The bounded FTS projection combines the existing twofold allowance for duplicated searchable fields with NFC's maximum threefold UTF-8 expansion. The resulting sixfold derived-cache ceilings are 6,316,032 bytes per row and 74,907,648 bytes in aggregate; canonical record and corpus budgets remain unchanged.
+
 The produced query remains input to FTS5's own `unicode61` tokenizer. A quoted term may therefore contain more than one adjacent FTS token for scripts that use combining marks or for underscore-joined ASCII text, but users cannot author raw phrase grammar and operators, wildcards, quotes, punctuation, and controls never become syntax.
 
 ## Search orchestration
@@ -53,9 +55,10 @@ No result shape, response budget, limit, supersession, cache-recovery, or error-
 - A pure parser table covers accented Latin, Greek, Cyrillic, Arabic, Hebrew, CJK, combining-mark scripts, composed/decomposed input, underscore compatibility, duplicates, operators, wildcards, quotes, punctuation, controls, and empty normalized output.
 - One integration fixture proves Unicode matches through full search, compact search, and gather without changing ASCII ordering or snippets.
 - One public no-I/O test proves punctuation/control-only input returns empty results before repository/cache hooks.
+- One public add, prepare, list, and search regression proves a valid record using NFC's threefold UTF-8 expansion remains readable after cache rebuilding.
 - Packed CLI validation proves a Unicode query reaches the same public search path.
 - Existing exact byte/term budget tests remain the budget authority and are not duplicated.
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test snapshot is `2d6f450783b9cbe0bedd38fd59de3310f5c1a0d4`. Documentation does not change the public API, package exports, cache schema, canonical record format, or operation budgets.
+The exact implementation and behavioural-test snapshot is `ec1360a8c03e9d9b2ab12562f6ba31dc697c2f09`. Documentation does not change the public API, package exports, cache schema, canonical record format, or operation budgets.
