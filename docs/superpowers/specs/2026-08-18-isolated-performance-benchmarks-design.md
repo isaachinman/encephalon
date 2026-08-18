@@ -29,7 +29,7 @@ The parent uses `child_process.fork` with Node IPC, no shell, an empty `execArgv
 
 Public read operations already perform repository resolution, cache preparation, schema/content integrity validation, freshness validation, and result reading within one call. Measuring a separate `prepare()` and subtracting it would double-run work and would not be additive.
 
-The existing internal `cacheReadTestHooks` therefore gains two stripped, test-only read-boundary callbacks. `readFreshCache` invokes them immediately before and after the private result reader. A benchmark child records four nested, non-negative phases:
+A separate stripped internal `cacheReadInstrumentation` authority owns two read-boundary callbacks. `readFreshCache` invokes them immediately before and after the private result reader, while fault-injection hooks remain test-only. A benchmark child records four nested, non-negative phases:
 
 - `totalMs`: the complete public API call;
 - `preparationIntegrityMs`: call start through the verified/fresh cache boundary;
@@ -58,7 +58,7 @@ The report also records profile, configured warmups/repetitions/timeout, corpus 
 
 ## Budget schema version 2
 
-Budgets select a named statistic explicitly. Operation limits use the shape `operations.<operation>.<metric>.<median|p95|maximum>`. Cache limits use `cache.<metric>.maximum`. Every requested corpus case must contain at least one cache or operation limit. Old, malformed, or vacuous schema versions fail before any benchmark case runs.
+Budgets select a named statistic explicitly. Operation limits use the shape `operations.<operation>.<metric>.<median|p95|maximum>`. Cache limits use `cache.<metric>.maximum`. Every requested corpus case must contain at least one cache or operation limit, and zero-record cases cannot budget unavailable cache amplification. Old, malformed, or vacuous schema versions fail before any benchmark case runs.
 
 A failed check names the corpus size, operation or cache, metric, statistic, actual value, and configured maximum. CI uses generous p95 total-time ceilings and maximum cache-size/amplification ceilings; it does not turn benchmark noise into correctness failure.
 
@@ -72,14 +72,14 @@ A failed check names the corpus size, operation or cache, metric, statistic, act
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test snapshot is `f6f5ea32934227f6e2370e31fd5191c7ec90d404`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
+The exact implementation and behavioural-test snapshot is `8fcc3ff3c82e84a298d8e86225d5ba0db5a0c139`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
 
 ## Acceptance coverage
 
-- Pure tests cover median, nearest-rank p95, raw order/count, and warmup exclusion.
+- Pure tests cover median, nearest-rank p95 distinct from maximum, raw order/count, and warmup exclusion.
 - Budget tests cover explicit statistic selection, fixed failure context, and schema-version rejection.
-- Process tests cover one valid IPC result, wrong/malformed result, child crash, hard timeout, and waiting for close.
+- Process tests cover one valid IPC result, wrong/malformed result, unexpected stdout, child crash, hard timeout, and waiting for close.
 - An actual worker test proves two samples use different process identities, reports additive read phases, and keeps prepare-only query/projection phases at zero.
 - Repository cleanup is tested on success, child failure, cancellation, and setup failure before helper ownership returns.
-- Prepared-template restoration, stale-transition ordering, repeated and equals-form CLI options, non-vacuous budgets, atomic output selection, and permission preservation are covered by focused regressions.
+- Prepared-template restoration, stale-transition ordering, repeated and equals-form CLI options, non-vacuous and availability-aware budgets, exhaustive operation dispatch, atomic output selection, and permission preservation are covered by focused regressions.
 - Normal benchmark, CI budget, full test, build, package, publish-contract, and frozen-install gates remain required.
