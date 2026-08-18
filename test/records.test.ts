@@ -2272,7 +2272,9 @@ describe('canonical records', () => {
       writeCanonicalRecord(root, {
         createdAt: timestampAt(index),
         id: `chain-${index}`,
-        ...(index === 0 ? {} : { supersedes: [`chain-${index - 1}`] }),
+        ...(index === 0
+          ? {}
+          : { supersedes: index === 999 ? [`chain-${index - 1}`, 'chain-0'] : [`chain-${index - 1}`] }),
       })
     }
 
@@ -2289,10 +2291,10 @@ describe('canonical records', () => {
     assert.deepEqual(Object.fromEntries(work), {
       'active-group-write': 1,
       'canonical-entry': 1000,
-      'cycle-edge': 999,
+      'cycle-edge': 1000,
       'duplicate-record': 1000,
-      'edge-validation': 999,
-      'superseded-edge': 999,
+      'edge-validation': 1000,
+      'superseded-edge': 1000,
     })
   })
 

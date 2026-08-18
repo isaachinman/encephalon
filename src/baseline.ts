@@ -177,6 +177,35 @@ type BaselineScanHooks = {
   onWork?: ((operation: BaselineWork) => void) | undefined
 }
 
+const isArrayIndex = (property: string | symbol) => typeof property === 'string' && /^(?:0|[1-9]\d*)$/.test(property)
+
+const observedArray = <Value>(onWrite?: () => void) => {
+  const values: Value[] = []
+  if (onWrite !== undefined) {
+    return new Proxy(values, {
+      set: (target, property, value, receiver) => {
+        if (isArrayIndex(property)) {
+          onWrite()
+        }
+        return Reflect.set(target, property, value, receiver)
+      },
+    })
+  }
+  return values
+}
+
+const observedMap = <Key, Value>(onWrite?: () => void) => {
+  if (onWrite !== undefined) {
+    return new (class extends Map<Key, Value> {
+      override set(key: Key, value: Value) {
+        onWrite()
+        return super.set(key, value)
+      }
+    })()
+  }
+  return new Map<Key, Value>()
+}
+
 type BaselineReason =
   | 'directory-entry-limit'
   | 'directory-limit'
@@ -381,7 +410,7 @@ const readBoundedDirectoryEntries = (
 const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
   const state: ScanState = {
     filesSeen: 0,
-    languageCounts: new Map(),
+    languageCounts: observedMap(() => hooks.onWork?.('language-count-write')),
     truncationReasons: new Set(),
   }
   const maximumDirectories = hooks.maximumScannedDirectories ?? MAX_SCANNED_DIRECTORIES
@@ -418,7 +447,6 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
             state.filesSeen += 1
             const language = LANGUAGE_BY_EXTENSION.get(extname(entry.name).toLowerCase())
             if (language !== undefined) {
-              hooks.onWork?.('language-count-write')
               state.languageCounts.set(language, (state.languageCounts.get(language) ?? 0) + 1)
             }
           }
@@ -487,9 +515,9 @@ const workflowFiles = (root: string, hooks: BaselineScanHooks, expectedGithub: b
   return result
 }
 
-const emptyTopLevelFacts = () => ({
-  directories: [] as string[],
-  recognisedFiles: [] as string[],
+const emptyTopLevelFacts = (hooks?: BaselineScanHooks) => ({
+  directories: observedArray<string>(() => hooks?.onWork?.('top-level-fact-write')),
+  recognisedFiles: observedArray<string>(() => hooks?.onWork?.('top-level-fact-write')),
 })
 
 const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
@@ -509,13 +537,11 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
         .reduce((candidate, entry) => {
           if (entry.isDirectory() && !EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())) {
             candidate.directories.push(entry.name)
-            hooks.onWork?.('top-level-fact-write')
           } else if (entry.isFile() && RECOGNISED_FILES.has(entry.name.toLowerCase())) {
             candidate.recognisedFiles.push(entry.name)
-            hooks.onWork?.('top-level-fact-write')
           }
           return candidate
-        }, emptyTopLevelFacts())
+        }, emptyTopLevelFacts(hooks))
       hooks.beforeTopLevelRevalidation?.()
       revalidateCanonicalDirectory(snapshot)
       result = { reasons: [], value: facts }
