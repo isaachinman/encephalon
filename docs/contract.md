@@ -38,6 +38,13 @@ This document is the concise contract maintainers should update when public beha
 - Full and compact searches compute the literal expression before repository/cache work and return `[]` when it is empty. Gather computes every expression once before repository resolution. Empty-result fast paths retain repository discovery and root-installation validation for backwards-compatible error semantics, but a request containing only empty searches, no shows, and no hydration skips cache inspection and SQLite work; mixed gathers still perform requested work and skip `MATCH` only for empty expressions.
 - SQLite's built-in `unicode61` tokenizer still owns case folding, default diacritic handling, and final token boundaries. Quoted underscore/mark runs may contain multiple adjacent FTS tokens, and contiguous CJK text retains SQLite's existing token boundary. No NFKC folding, transliteration, stemming, locale-specific segmentation, fuzzy matching, user-authored phrase API, raw FTS syntax, ICU dependency, or ranking/order SQL change is introduced.
 
+## Gather Deduplication
+
+- Within one verified SQLite read transaction, gather executes each exact distinct validated show ID and each exact original query string once. Missing IDs and zero-term queries are memoized as results; textually different queries remain distinct work even when they produce the same literal `MATCH` expression.
+- Snapshot-local maps contain only complete parsed shown records or compact-search results. They are created inside the result-reader callback, never survive a cache recovery retry, and never retain SQLite rows, statements, iterators, database handles, or partial results.
+- Public duplicate occurrences preserve caller order and count but do not share mutable records, nested payloads, result arrays, or compact result objects. Every show envelope, search envelope, shown value or null, result array, and compact result remains charged for each emitted occurrence through the one shared `gatherResponseBytes` ledger.
+- Shows still precede searches and first occurrences execute in input order. Ranking, snippets, active filtering, response failure order, the empty-only no-cache path, exact-generation recovery, and the public API and CLI shapes remain unchanged.
+
 ## Canonical Storage
 
 - Canonical knowledge is append-only JSON under `encephalon/<kind>/<id>.json`.
@@ -149,6 +156,8 @@ The exact code and behavioural-test snapshot implementing the MAR-2566 benchmark
 MAR-2568 behavioural hot-scan work bounds: `de66f6ab7e10696fc878e380dd5417d194d60fe8`.
 
 MAR-2552 single-pass cache reads and identity-bound recovery: `9b5821d59999215f975d613edf4a9c252fb6258d`.
+
+MAR-2560 snapshot-local exact-key gather deduplication: `e25d81a3bcdbe92f64c317be5be7c56becc6e485`.
 
 ## Package and Release Gates
 
