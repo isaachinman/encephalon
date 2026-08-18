@@ -79,6 +79,10 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-unicode-literal-search-design.md'),
       'utf8',
     )
+    const singlePassCacheReadDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-single-pass-cache-read-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -106,6 +110,14 @@ describe('package contract', () => {
       /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
+    assert.match(
+      contract,
+      /MAR-2552 single-pass cache reads and identity-bound recovery: `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`\./,
+    )
+    assert.match(
+      singlePassCacheReadDesign,
+      /The exact code and behavioural-test snapshot implementing this design is `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`\./,
+    )
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`\./)
     assert.match(performance, /Correctness tests enforce deterministic output and bounded work counts/)

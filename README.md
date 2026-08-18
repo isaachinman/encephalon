@@ -76,7 +76,7 @@ npx --no-install encephalon gather \
   --show "<record-id>"
 ```
 
-Every `list`, `show`, `search`, and `gather` call prepares the cache automatically. A fresh call validates one cache generation once and materialises its bounded result from that same verified SQLite transaction. `prepare` reuses a valid fresh cache and rebuilds after canonical inputs change or a recoverable cache failure; `hydrate` forces a transactional rebuild.
+Every `list`, `show`, `search`, and `gather` call that needs cached data prepares the cache automatically. A fresh cache-reading call validates one cache generation once and materialises its bounded result from that same verified SQLite transaction. `prepare` reuses a valid fresh cache and rebuilds after canonical inputs change or a recoverable cache failure; `hydrate` forces a transactional rebuild.
 
 ```bash
 npx --no-install encephalon list --kind decision
