@@ -48,8 +48,8 @@ const operationRunners: Record<BenchmarkOperation, OperationRunner> = {
   gather: (records, root) =>
     gatherRecords({
       root,
-      searches: ['benchmark needle', 'large payload'],
-      shows: [shownIdForCase(records), 'missing'],
+      searches: Array.from({ length: 16 }, (_, index) => (index % 2 === 0 ? 'benchmark needle' : 'large payload')),
+      shows: Array.from({ length: 64 }, (_, index) => (index % 2 === 0 ? shownIdForCase(records) : 'missing')),
     }),
   list: (_records, root) => listRecords({ limit: 20, root }),
   show: (records, root) => showRecord({ id: shownIdForCase(records), root }),
@@ -68,9 +68,9 @@ const resultValidators: Record<BenchmarkOperation, ResultValidator> = {
     isObject(result) &&
     result.hydrated === null &&
     Array.isArray(result.searches) &&
-    result.searches.length === 2 &&
+    result.searches.length === 16 &&
     Array.isArray(result.records) &&
-    result.records.length === 2,
+    result.records.length === 64,
   list: hasExpectedResultCardinality,
   show: (records, result) => (records === 0 ? result === null : isObject(result)),
   stalePrepare: (records, result) => isObject(result) && result.recordsIndexed === records && result.hydrated === true,

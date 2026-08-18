@@ -2239,12 +2239,31 @@ const readGatherFromDatabase = (
   const showRecordForId = shows.length === 0 ? () => null : createShowReader(database, input.includeSuperseded)
   const searchCompactRecordsForQuery =
     searches.length === 0 ? () => [] : createCompactSearchReader(database, input, budget)
+  const shownRecords = new Map<string, BrainRecord | null>()
+  const searchResults = new Map<string, readonly CompactBrainRecord[]>()
+  const memoizedShowRecordForId = (id: string) => {
+    if (shownRecords.has(id)) {
+      const record = shownRecords.get(id) ?? null
+      return record === null ? null : structuredClone(record)
+    }
+    const record = showRecordForId(id)
+    shownRecords.set(id, record)
+    return record
+  }
+  const memoizedCompactRecordsForQuery = (search: LiteralSearch) => {
+    if (searchResults.has(search.query)) {
+      return (searchResults.get(search.query) ?? []).map(record => budget.charge({ ...record }))
+    }
+    const records = searchCompactRecordsForQuery(search.query, search.match)
+    searchResults.set(search.query, records)
+    return records
+  }
   return {
     hydrated,
-    records: shows.map(id => budget.charge({ id, record: showRecordForId(id) })),
+    records: shows.map(id => budget.charge({ id, record: memoizedShowRecordForId(id) })),
     searches: searches.map(search => {
       const envelope = budget.charge({ kind: input.kind ?? null, query: search.query, results: [] })
-      return { ...envelope, results: searchCompactRecordsForQuery(search.query, search.match) }
+      return { ...envelope, results: memoizedCompactRecordsForQuery(search) }
     }),
   }
 }
