@@ -2086,6 +2086,34 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('accepts worst-case NFC expansion in valid derived search documents', () => {
+    const root = createRoot()
+    const expandingSummary = '\u{1D160}'.repeat(90_000)
+    const added = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'unicode-expansion',
+      kind: 'context',
+      payload: { summary: expandingSummary },
+      root,
+      searchText: 'normalization expansion marker',
+      source: 'agent',
+      subject: 'search.unicode-expansion',
+    })
+    const prepare = functionFromApi<(input: Record<string, unknown>) => { recordsIndexed: number }>('prepare')
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+
+    assert.equal(prepare({ root }).recordsIndexed, 1)
+    assert.deepEqual(
+      listRecords({ root }).map(record => record.id),
+      [added.id],
+    )
+    assert.deepEqual(
+      searchRecords({ query: 'normalization expansion marker', root }).map(record => record.id),
+      [added.id],
+    )
+  })
+
   test('returns punctuation-only searches before repository and cache inspection', () => {
     const root = join(tmpdir(), 'encephalon-search-must-not-resolve')
     const query = '\u0301 _ __ * " - + ^ : () {} []\u0000'
@@ -3065,6 +3093,41 @@ describe('SQLite cache and reads', () => {
     assert.equal(writerInitialisations, 2)
     assert.deepEqual(result, { hydrated: true, recordsIndexed: 1 })
     assert.equal(existsSync(predecessorPath), true)
+  })
+
+  test('retries an exclusively created primary that disappears before inspection', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'missing-bootstrap-predecessor.sqlite')
+    const disappearedClaimPath = join(root, 'missing-bootstrap-claim.sqlite')
+    let disappearedClaims = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheLocationTestHooks.afterPrimaryBootstrapClose = path => {
+      if (basename(path) === 'brain.sqlite' && disappearedClaims === 0) {
+        renameSync(path, disappearedClaimPath)
+        disappearedClaims += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
+    assert.equal(disappearedClaims, 1)
+    assert.equal(writerInitialisations, 1)
+    assert.equal(existsSync(predecessorPath), true)
+    assert.equal(existsSync(disappearedClaimPath), true)
   })
 
   test('rejects a non-empty exclusively claimed primary before a repository-change retry', () => {
@@ -5041,7 +5104,7 @@ describe('SQLite cache and reads', () => {
       {
         expectedRows: 1,
         mutate: (database: DatabaseSync) => {
-          database.prepare('UPDATE record_search SET text = CAST(zeroblob(?) AS TEXT)').run(2_105_345)
+          database.prepare('UPDATE record_search SET text = CAST(zeroblob(?) AS TEXT)').run(6_316_033)
         },
         name: 'oversized FTS text containing NUL',
       },
@@ -5070,7 +5133,7 @@ describe('SQLite cache and reads', () => {
             WITH RECURSIVE generated(value) AS (
               SELECT 1
               UNION ALL
-              SELECT value + 1 FROM generated WHERE value < 24
+              SELECT value + 1 FROM generated WHERE value < 12
             )
             INSERT INTO replacement_records
             SELECT printf('%s-%02d', id, value), kind, subject, source, created_at,
@@ -5089,15 +5152,15 @@ describe('SQLite cache and reads', () => {
             WITH RECURSIVE generated(value) AS (
               SELECT 1
               UNION ALL
-              SELECT value + 1 FROM generated WHERE value < 24
+              SELECT value + 1 FROM generated WHERE value < 12
             )
             INSERT INTO record_search(id, text)
-            SELECT printf('cache-record-%02d', value), CAST(zeroblob(1048576) AS TEXT)
+            SELECT printf('cache-record-%02d', value), CAST(zeroblob(6242305) AS TEXT)
             FROM generated;
-            UPDATE metadata SET value = '24' WHERE key = 'recordsIndexed';
+            UPDATE metadata SET value = '12' WHERE key = 'recordsIndexed';
           `)
         },
-        name: 'aggregate FTS text above its doubled cache-record bound',
+        name: 'aggregate FTS text above its normalized projection bound',
       },
       {
         expectedRows: 1,
@@ -5158,7 +5221,7 @@ describe('SQLite cache and reads', () => {
           )`,
         )
         .run(1_052_672)
-      database.prepare("UPDATE record_search SET text = replace(hex(zeroblob(?)), '00', 'x')").run(2_105_344)
+      database.prepare("UPDATE record_search SET text = replace(hex(zeroblob(?)), '00', 'x')").run(6_316_032)
       database
         .prepare("UPDATE metadata SET value = replace(hex(zeroblob(?)), '00', 'x') WHERE key = 'packageVersion'")
         .run(1_048_576)

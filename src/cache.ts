@@ -37,7 +37,7 @@ import {
 } from './canonical-layout.ts'
 import { EncephalonError, fail, failBudget, failWithCause, wrapIo } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
-import { literalMatchQuery, normalizeSearchText } from './literal-query.ts'
+import { literalMatchQuery, MAX_NFC_UTF8_EXPANSION_FACTOR, normalizeSearchText } from './literal-query.ts'
 import { withOperationLock } from './lock.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { ordinalStringCompare } from './order.ts'
@@ -72,8 +72,11 @@ const MAX_CACHE_RECORD_BYTES = CANONICAL_BUDGETS.recordBytes + MAX_CACHE_RECORD_
 const MAX_CACHE_RECORD_JSON_BYTES =
   CANONICAL_BUDGETS.recordJsonBytes + CANONICAL_BUDGETS.records * MAX_CACHE_RECORD_OVERHEAD_BYTES
 const MAX_CACHE_RECORD_TEXT_BYTES = MAX_CACHE_RECORD_JSON_BYTES * 2
-const MAX_CACHE_SEARCH_DOCUMENT_BYTES = MAX_CACHE_RECORD_BYTES * 2
-const MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES = MAX_CACHE_RECORD_JSON_BYTES * 2
+const MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR = 2
+const MAX_CACHE_SEARCH_DOCUMENT_BYTES =
+  MAX_CACHE_RECORD_BYTES * MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR * MAX_NFC_UTF8_EXPANSION_FACTOR
+const MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES =
+  MAX_CACHE_RECORD_JSON_BYTES * MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR * MAX_NFC_UTF8_EXPANSION_FACTOR
 const MAX_CACHE_FTS_ID_BYTES = CANONICAL_BUDGETS.records * 255
 const METADATA_KEYS = [
   'artifactPaths',

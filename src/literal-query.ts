@@ -6,6 +6,9 @@ const MAX_QUERY_TERMS = OPERATION_BUDGETS.queryTerms.maximum
 const LITERAL_TERM_PATTERN = /[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}]|_+(?=[\p{L}\p{N}]))*/gu
 
 /** @internal */
+export const MAX_NFC_UTF8_EXPANSION_FACTOR = 3
+
+/** @internal */
 export const normalizeSearchText = (value: string) => value.normalize('NFC')
 
 /** @internal */
