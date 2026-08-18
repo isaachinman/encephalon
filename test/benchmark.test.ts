@@ -21,6 +21,18 @@ import { createTestRepository, removeTestRepository } from './helpers.ts'
 const fixtureWorker = join(import.meta.dirname, 'fixtures', 'benchmark-worker.ts')
 const realWorker = join(import.meta.dirname, '..', 'scripts', 'benchmark-worker.ts')
 const benchmarkScript = join(import.meta.dirname, '..', 'scripts', 'benchmark.ts')
+const privateRenameGuard = join(import.meta.dirname, 'fixtures', 'require-private-benchmark-rename.ts')
+
+const privateFileModesSupported = (() => {
+  const root = mkdtempSync(join(tmpdir(), 'encephalon-private-mode-probe-'))
+  const path = join(root, 'probe')
+  try {
+    writeFileSync(path, '', { mode: 0o600 })
+    return (statSync(path).mode & 0o777) === 0o600
+  } finally {
+    rmSync(root, { force: true, recursive: true })
+  }
+})()
 
 const sample = (totalMs: number) => ({
   overheadMs: 0,
@@ -510,6 +522,32 @@ describe('isolated benchmark authority', () => {
       assert.equal(help.status, 0)
       assert.match(help.stdout, /^Usage: node scripts\/benchmark\.ts/)
       assert.equal(help.stderr, '')
+    } finally {
+      rmSync(root, { force: true, recursive: true })
+    }
+  })
+
+  test('keeps report bytes private until atomic publication', { skip: !privateFileModesSupported }, () => {
+    const root = mkdtempSync(join(tmpdir(), 'encephalon-benchmark-private-output-test-'))
+    try {
+      const outputPath = join(root, 'report.json')
+      writeFileSync(outputPath, 'previous report\n', { mode: 0o640 })
+      const result = spawnSync(
+        process.execPath,
+        [
+          '--import',
+          privateRenameGuard,
+          benchmarkScript,
+          '--records=0',
+          '--warmups=0',
+          '--repetitions=1',
+          `--output=${outputPath}`,
+        ],
+        { encoding: 'utf8' },
+      )
+
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(statSync(outputPath).mode & 0o777, 0o640)
     } finally {
       rmSync(root, { force: true, recursive: true })
     }
