@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-18 for code and behavioural-test snapshot `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`.
+Last reviewed: 2026-08-18 for code and behavioural-test snapshot `e25d81a3bcdbe92f64c317be5be7c56becc6e485`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -37,6 +37,13 @@ This document is the concise contract maintainers should update when public beha
 - The complete derived cache search document is normalized to NFC before FTS insertion and exact FTS-text integrity comparison. Canonical record bytes are unchanged. An older cache with different derived bytes follows the existing exact-generation recoverable-cache path without a schema migration.
 - Full and compact searches compute the literal expression before repository/cache work and return `[]` when it is empty. Gather computes every expression once before repository resolution; a request containing only empty searches, no shows, and no hydration returns empty envelopes without repository/cache work, while mixed gathers still perform requested work and skip `MATCH` only for empty expressions.
 - SQLite's built-in `unicode61` tokenizer still owns case folding, default diacritic handling, and final token boundaries. Quoted underscore/mark runs may contain multiple adjacent FTS tokens, and contiguous CJK text retains SQLite's existing token boundary. No NFKC folding, transliteration, stemming, locale-specific segmentation, fuzzy matching, user-authored phrase API, raw FTS syntax, ICU dependency, or ranking/order SQL change is introduced.
+
+## Gather Deduplication
+
+- Within one verified SQLite read transaction, gather executes each exact distinct validated show ID and each exact original query string once. Missing IDs and zero-term queries are memoized as results; textually different queries remain distinct work even when they produce the same literal `MATCH` expression.
+- Snapshot-local maps contain only complete parsed shown records or compact-search results. They are created inside the result-reader callback, never survive a cache recovery retry, and never retain SQLite rows, statements, iterators, database handles, or partial results.
+- Public duplicate occurrences preserve caller order and count but do not share mutable records, nested payloads, result arrays, or compact result objects. Every show envelope, search envelope, shown value or null, result array, and compact result remains charged for each emitted occurrence through the one shared `gatherResponseBytes` ledger.
+- Shows still precede searches and first occurrences execute in input order. Ranking, snippets, active filtering, response failure order, the empty-only no-cache path, exact-generation recovery, and the public API and CLI shapes remain unchanged.
 
 ## Canonical Storage
 
@@ -149,6 +156,8 @@ The exact code and behavioural-test snapshot implementing these guarantees is `9
 MAR-2568 behavioural hot-scan work bounds: `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`.
 
 MAR-2552 single-pass cache reads and identity-bound recovery: `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`.
+
+MAR-2560 snapshot-local exact-key gather deduplication: `e25d81a3bcdbe92f64c317be5be7c56becc6e485`.
 
 ## Package and Release Gates
 

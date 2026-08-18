@@ -83,6 +83,10 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-single-pass-cache-read-design.md'),
       'utf8',
     )
+    const gatherDeduplicationDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-gather-deduplication-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -94,6 +98,7 @@ describe('package contract', () => {
     assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
     assert.match(contract, /## Bounded Disposable Cache Validation/)
+    assert.match(contract, /## Gather Deduplication/)
     assert.match(contract, /Cache schema compatibility requires the exact owned ordinary-table semantics/)
     assert.match(contract, /## Package and Release Gates/)
     assert.match(contract, /## Historical Plan Divergence Checklist/)
@@ -107,7 +112,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`\./,
+      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `e25d81a3bcdbe92f64c317be5be7c56becc6e485`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
@@ -117,6 +122,14 @@ describe('package contract', () => {
     assert.match(
       singlePassCacheReadDesign,
       /The exact code and behavioural-test snapshot implementing this design is `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`\./,
+    )
+    assert.match(
+      gatherDeduplicationDesign,
+      /The exact implementation and behavioural-test snapshot is `e25d81a3bcdbe92f64c317be5be7c56becc6e485`\./,
+    )
+    assert.match(
+      contract,
+      /MAR-2560 snapshot-local exact-key gather deduplication: `e25d81a3bcdbe92f64c317be5be7c56becc6e485`\./,
     )
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`\./)
