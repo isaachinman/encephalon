@@ -95,7 +95,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `ec1360a8c03e9d9b2ab12562f6ba31dc697c2f09`\./,
+      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `894226cd90dce39d01860550247d887157a686e7`\./,
     )
     assert.match(
       contract,
@@ -132,7 +132,7 @@ describe('package contract', () => {
     )
     assert.match(
       unicodeLiteralSearchDesign,
-      /The exact implementation and behavioural-test snapshot is `ec1360a8c03e9d9b2ab12562f6ba31dc697c2f09`\./,
+      /The exact implementation and behavioural-test snapshot is `894226cd90dce39d01860550247d887157a686e7`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),
