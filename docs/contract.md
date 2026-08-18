@@ -144,7 +144,7 @@ This document is the concise contract maintainers should update when public beha
 
 The exact code and behavioural-test snapshot implementing these guarantees is `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 
-MAR-2568 behavioural hot-scan work bounds: `d8d9ea8f6c7833e0c737c16880abe510f2793529`.
+MAR-2568 behavioural hot-scan work bounds: `589c8d9a4db6e612e22b5a86cc456da6b18d65f4`.
 
 ## Package and Release Gates
 
