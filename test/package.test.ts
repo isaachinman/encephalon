@@ -95,8 +95,9 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `894226cd90dce39d01860550247d887157a686e7`\./,
+      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `3fac5940be66d7e4cc644e216c743fefba24fea5`\./,
     )
+    assert.match(contract, /## Performance Evidence/)
     assert.match(
       contract,
       /MAR-2548 restart-safe partial initialisation progress and convergence: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`\./,

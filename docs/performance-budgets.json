@@ -1,33 +1,36 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "cases": [
     {
       "records": 0,
-      "max": {
-        "coldHydrateMs": 2500,
-        "unchangedPrepareMs": 1500,
-        "stalePrepareMs": 1500,
-        "listMs": 1500,
-        "showMs": 1500,
-        "compactSearchMs": 1500,
-        "fullSearchMs": 1500,
-        "gatherMs": 1500,
-        "totalCacheBytes": 1048576
+      "cache": {
+        "totalBytes": { "maximum": 1048576 }
+      },
+      "operations": {
+        "coldHydrate": { "totalMs": { "p95": 2500 } },
+        "unchangedPrepare": { "totalMs": { "p95": 1500 } },
+        "list": { "totalMs": { "p95": 1500 } },
+        "show": { "totalMs": { "p95": 1500 } },
+        "compactSearch": { "totalMs": { "p95": 1500 } },
+        "fullSearch": { "totalMs": { "p95": 1500 } },
+        "gather": { "totalMs": { "p95": 1500 } }
       }
     },
     {
       "records": 100,
-      "max": {
-        "coldHydrateMs": 15000,
-        "unchangedPrepareMs": 5000,
-        "stalePrepareMs": 15000,
-        "listMs": 5000,
-        "showMs": 5000,
-        "compactSearchMs": 5000,
-        "fullSearchMs": 5000,
-        "gatherMs": 5000,
-        "totalCacheBytes": 20971520,
-        "amplification": 100
+      "cache": {
+        "amplification": { "maximum": 100 },
+        "totalBytes": { "maximum": 20971520 }
+      },
+      "operations": {
+        "coldHydrate": { "totalMs": { "p95": 15000 } },
+        "unchangedPrepare": { "totalMs": { "p95": 5000 } },
+        "stalePrepare": { "totalMs": { "p95": 15000 } },
+        "list": { "totalMs": { "p95": 5000 } },
+        "show": { "totalMs": { "p95": 5000 } },
+        "compactSearch": { "totalMs": { "p95": 5000 } },
+        "fullSearch": { "totalMs": { "p95": 5000 } },
+        "gather": { "totalMs": { "p95": 5000 } }
       }
     }
   ]
