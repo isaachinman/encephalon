@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-18 for code and behavioural-test snapshot `3fac5940be66d7e4cc644e216c743fefba24fea5`.
+Last reviewed: 2026-08-18 for code and behavioural-test snapshot `f6f5ea32934227f6e2370e31fd5191c7ec90d404`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -133,15 +133,15 @@ This document is the concise contract maintainers should update when public beha
 
 ## Performance Evidence
 
-- Benchmark report and budget files use schema version 2. Old versions, unknown fields, malformed finite limits, duplicate corpus cases, and missing requested corpus cases fail before benchmark repository creation.
+- Benchmark report and budget files use schema version 2. Old versions, unknown fields, malformed finite limits, budget cases without at least one cache or operation limit, duplicate corpus cases, and missing requested corpus cases fail before benchmark repository creation.
 - `ci` measures 0 and 100 records with no warmup and one measured sample; default `baseline` uses one warmup and three measured samples for 0 and 100; `full` uses two warmups and five measured samples for 0, 100, and 1,000. Explicit record counts label the report `custom`.
-- Every warmup and measured operation runs in a fresh Node child against a parent-restored repository state. The parent accepts exactly one nonce-bound IPC result followed by a clean close, kills and awaits timed-out or cancelled children, and removes every sample and template repository on success or failure.
+- Every warmup and measured operation runs in a fresh Node child against a parent-restored repository state. Because copying changes canonical filesystem metadata, the parent re-prepares every restored non-cold sample outside the measured child and applies the stale mutation only after that preparation. The parent accepts exactly one nonce-bound IPC result followed by a clean close, kills and awaits timed-out or cancelled children, and removes every sample and template repository on success, cancellation, or setup/worker failure.
 - Measured samples retain invocation order and report count, maximum, median, and nearest-rank p95. Warmups are excluded. Public read totals are split by stripped internal boundaries into preparation/integrity, query/projection, and bounded return overhead; unrounded sample phases add to the total.
 - Peak RSS is the isolated child's lifetime `process.resourceUsage().maxRSS` converted from KiB to bytes. Current-RSS delta is signed and diagnostic. CI budgets p95 total duration and maximum cache size or amplification rather than phase timings or RSS deltas.
 - Zero-record stale preparation is unavailable and represented as `null`. Stale samples use a valid different-length canonical record variant so rapid runs cannot mistake unchanged timestamp/size metadata for a changed corpus.
-- Report file output is a private sibling temporary file atomically renamed only after all samples and budget checks succeed. Signals cancel the active child, await closure, clean temporary repositories, and return a non-zero status without publishing a report.
+- Report file output is a private sibling temporary file atomically renamed only after all samples and budget checks succeed. Replacement preserves an existing regular report's permission mode; a new report uses the normal process umask. Signals cancel the active child, await closure, clean temporary repositories, and return a non-zero status without publishing a report.
 
-The exact code and behavioural-test snapshot implementing these guarantees is `3fac5940be66d7e4cc644e216c743fefba24fea5`.
+The exact code and behavioural-test snapshot implementing these guarantees is `f6f5ea32934227f6e2370e31fd5191c7ec90d404`.
 
 ## Package and Release Gates
 
@@ -175,7 +175,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `3fac5940be66d7e4cc644e216c743fefba24fea5`.
+- MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `f6f5ea32934227f6e2370e31fd5191c7ec90d404`.
 - MAR-2554 bounded full, compact, and gather read responses: `1252562c636ec663b2ed7e8b29ea3e1a7774c492`.
 - MAR-2550 exact cached FTS row-text projection validation, bounded pre-mutation writer validation, and recovery: `c8587ee36049fd7f9349a75c8b30e6efb24fdf4c`.
 - MAR-2559 Unicode-preserving literal FTS query construction, derived search-document NFC normalization and bounded expansion recovery: `894226cd90dce39d01860550247d887157a686e7`.

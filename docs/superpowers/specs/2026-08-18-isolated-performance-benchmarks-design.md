@@ -19,7 +19,7 @@ The committed baseline is generated with `--profile full`. CI continues to use `
 
 ## Isolation and repository state
 
-The parent process creates one deterministic unprepared template and one prepared template for each corpus size. Before every warmup and measured sample it copies the appropriate template into a fresh temporary repository and establishes any stale-cache precondition outside the measured process.
+The parent process creates one deterministic unprepared template and one prepared template for each corpus size. Before every warmup and measured sample it restores the appropriate template into the isolated sample repository. Copying changes canonical filesystem metadata, so every restored non-cold sample is re-prepared outside the measured process; stale preparation then changes one canonical record to a valid different-length variant.
 
 Every sample then runs in a fresh Node child. No child measures more than one operation, so `process.resourceUsage().maxRSS` cannot inherit a previous benchmark operation. The parent discards warmup results, aggregates measured results only, and removes each sample repository after the child has fully closed. Case templates are removed in a final boundary even when setup, child execution, parsing, or budget validation fails.
 
@@ -58,7 +58,7 @@ The report also records profile, configured warmups/repetitions/timeout, corpus 
 
 ## Budget schema version 2
 
-Budgets select a named statistic explicitly. Operation limits use the shape `operations.<operation>.<metric>.<median|p95|maximum>`. Cache limits use `cache.<metric>.maximum`. Old or malformed schema versions fail before any benchmark case runs.
+Budgets select a named statistic explicitly. Operation limits use the shape `operations.<operation>.<metric>.<median|p95|maximum>`. Cache limits use `cache.<metric>.maximum`. Every requested corpus case must contain at least one cache or operation limit. Old, malformed, or vacuous schema versions fail before any benchmark case runs.
 
 A failed check names the corpus size, operation or cache, metric, statistic, actual value, and configured maximum. CI uses generous p95 total-time ceilings and maximum cache-size/amplification ceilings; it does not turn benchmark noise into correctness failure.
 
@@ -72,7 +72,7 @@ A failed check names the corpus size, operation or cache, metric, statistic, act
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test snapshot is `3fac5940be66d7e4cc644e216c743fefba24fea5`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
+The exact implementation and behavioural-test snapshot is `f6f5ea32934227f6e2370e31fd5191c7ec90d404`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
 
 ## Acceptance coverage
 
@@ -80,5 +80,6 @@ The exact implementation and behavioural-test snapshot is `3fac5940be66d7e4cc644
 - Budget tests cover explicit statistic selection, fixed failure context, and schema-version rejection.
 - Process tests cover one valid IPC result, wrong/malformed result, child crash, hard timeout, and waiting for close.
 - An actual worker test proves two samples use different process identities, reports additive read phases, and keeps prepare-only query/projection phases at zero.
-- Repository cleanup is tested on both success and child failure.
+- Repository cleanup is tested on success, child failure, cancellation, and setup failure before helper ownership returns.
+- Prepared-template restoration, stale-transition ordering, repeated and equals-form CLI options, non-vacuous budgets, atomic output selection, and permission preservation are covered by focused regressions.
 - Normal benchmark, CI budget, full test, build, package, publish-contract, and frozen-install gates remain required.
