@@ -81,6 +81,7 @@ afterEach(() => {
   cacheLocationTestHooks.regularFileRealpath = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
+  cacheReadTestHooks.afterGatherSearchEvaluation = undefined
   cacheReadTestHooks.afterIntegrityProbe = undefined
   cacheReadTestHooks.afterManifestKindEnumeration = undefined
   cacheReadTestHooks.afterManifestEntryLstat = undefined
@@ -2544,17 +2545,26 @@ describe('SQLite cache and reads', () => {
       payload: { summary: 'Snapshot generation one' },
       root,
       source: 'agent',
-      subject: 'cache.snapshot',
+      subject: 'cache.snapshot.first',
+    })
+    const secondId = 'snapshot-v2'
+    addRecord({
+      id: secondId,
+      kind: 'context',
+      payload: { summary: 'Snapshot generation two' },
+      root,
+      source: 'agent',
+      subject: 'cache.snapshot.second',
     })
     const replacement = {
       createdAt: '2026-08-08T00:00:01.000Z',
-      id: 'snapshot-v2',
+      id: 'snapshot-v3',
       kind: 'context',
-      path: 'encephalon/context/snapshot-v2.json',
-      payload: { summary: 'Snapshot generation two' },
+      path: 'encephalon/context/snapshot-v3.json',
+      payload: { summary: 'Snapshot generation three' },
       source: 'agent',
-      subject: 'cache.snapshot',
-      supersedes: [firstId],
+      subject: 'cache.snapshot.second',
+      supersedes: [secondId],
     }
     let mutatedBetweenItems = false
 
@@ -2564,7 +2574,7 @@ describe('SQLite cache and reads', () => {
         const database = new DatabaseSync(cacheDatabasePath(root))
         try {
           database.exec('BEGIN IMMEDIATE')
-          database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
+          database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(secondId)
           database
             .prepare(`
               INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
@@ -2578,12 +2588,12 @@ describe('SQLite cache and reads', () => {
               replacement.createdAt,
               replacement.path,
               1,
-              'Snapshot generation two',
+              'Snapshot generation three',
               JSON.stringify(replacement),
             )
           database
             .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
-            .run(replacement.id, 'Snapshot generation two')
+            .run(replacement.id, 'Snapshot generation three')
           database.exec('COMMIT')
         } catch (error) {
           try {
@@ -2599,7 +2609,7 @@ describe('SQLite cache and reads', () => {
     try {
       const gatherRecords =
         functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
-      const gathered = gatherRecords({ root, shows: [firstId, firstId] }) as {
+      const gathered = gatherRecords({ root, shows: [firstId, secondId] }) as {
         records: Array<{ id: string; record: { id: string } | null }>
       }
       assert.equal(mutatedBetweenItems, true)
@@ -2607,7 +2617,7 @@ describe('SQLite cache and reads', () => {
         gathered.records.map(entry => [entry.id, entry.record?.id ?? null]),
         [
           [firstId, firstId],
-          [firstId, firstId],
+          [secondId, secondId],
         ],
       )
     } finally {
@@ -2684,7 +2694,7 @@ describe('SQLite cache and reads', () => {
         functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
       const gathered = gatherRecords({
         root,
-        searches: ['snapshot searchable', 'snapshot searchable'],
+        searches: ['snapshot searchable', 'snapshot   searchable'],
       }) as {
         searches: Array<{ results: Array<{ id: string }> }>
       }
@@ -2723,6 +2733,7 @@ describe('SQLite cache and reads', () => {
     let searchPrepareCount = 0
     let compactSearchSelectedRecordJson = false
     let showSelectedRecordBytes = false
+    const searchEvaluationCounts = new Map<string, number>()
     const searchReadCounts = new Map<string, number>()
     const showReadCounts = new Map<string, number>()
     const count = (counts: Map<string, number>, key: string) => counts.set(key, (counts.get(key) ?? 0) + 1)
@@ -2735,6 +2746,7 @@ describe('SQLite cache and reads', () => {
       searchPrepareCount += 1
       compactSearchSelectedRecordJson ||= source.includes('records.record_json')
     }
+    cacheReadTestHooks.afterGatherSearchEvaluation = query => count(searchEvaluationCounts, query)
     cacheReadTestHooks.afterCompactSearchRead = query => count(searchReadCounts, query)
     cacheReadTestHooks.afterShowRead = id => count(showReadCounts, id)
 
@@ -2791,6 +2803,14 @@ describe('SQLite cache and reads', () => {
           [equivalentQuery, 1],
         ]),
       )
+      assert.deepEqual(
+        searchEvaluationCounts,
+        new Map([
+          [exactQuery, 1],
+          [equivalentQuery, 1],
+          ['   ', 1],
+        ]),
+      )
 
       const [firstShownEntry, , repeatedShownEntry] = gathered.records
       const [firstSearch, , repeatedSearch, firstEmptySearch, , repeatedEmptySearch] = gathered.searches
@@ -2820,6 +2840,7 @@ describe('SQLite cache and reads', () => {
     } finally {
       cacheReadTestHooks.onShowPrepare = undefined
       cacheReadTestHooks.onCompactSearchPrepare = undefined
+      cacheReadTestHooks.afterGatherSearchEvaluation = undefined
       cacheReadTestHooks.afterCompactSearchRead = undefined
       cacheReadTestHooks.afterShowRead = undefined
     }

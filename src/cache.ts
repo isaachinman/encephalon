@@ -285,6 +285,7 @@ type CacheReadTestHooks = {
   afterCanonicalValidation?: (() => void) | undefined
   afterDisposableCacheRecoveryRebuild?: ((result: PrepareResult) => void) | undefined
   afterIntegrityProbe?: ((observation: CacheIntegrityObservation) => void) | undefined
+  afterGatherSearchEvaluation?: ((query: string) => void) | undefined
   afterManifestEntryLstat?: ((path: string) => void) | undefined
   afterManifestKindEnumeration?: ((path: string) => void) | undefined
   afterManifestRootEnumeration?: ((path: string) => void) | undefined
@@ -324,6 +325,7 @@ const isIntegrityFlag = (value: unknown): value is 0 | 1 => value === 0 || value
 let sqliteModule: SQLiteModule | undefined
 let sqliteFeaturesVerified = false
 
+/** @internal */
 export const cacheReadTestHooks: CacheReadTestHooks = {}
 
 /** @internal */
@@ -2255,6 +2257,7 @@ const readGatherFromDatabase = (
       return (searchResults.get(search.query) ?? []).map(record => budget.charge({ ...record }))
     }
     const records = searchCompactRecordsForQuery(search.query, search.match)
+    cacheReadTestHooks.afterGatherSearchEvaluation?.(search.query)
     searchResults.set(search.query, records)
     return records
   }
