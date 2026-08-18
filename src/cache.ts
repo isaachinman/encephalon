@@ -297,6 +297,8 @@ type CacheReadTestHooks = {
   duringDatabaseInitialisation?: ((mode: 'reader' | 'writer') => void) | undefined
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
+  afterResultRead?: (() => void) | undefined
+  beforeResultRead?: (() => void) | undefined
 }
 
 class CacheSchemaMismatch extends Error {}
@@ -1862,7 +1864,10 @@ const readFreshCache = <Result>(root: string, location: CacheLocation, read: (da
     if (!metadataIsFresh(root, database, metadata)) {
       throw new CacheSchemaMismatch('The cache is stale before read.')
     }
-    return read(database)
+    cacheReadTestHooks.beforeResultRead?.()
+    const result = read(database)
+    cacheReadTestHooks.afterResultRead?.()
+    return result
   })
 
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
