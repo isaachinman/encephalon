@@ -200,7 +200,7 @@ const readOptionValue = (arguments_: string[], index: number, option: string): s
   throw new Error(`Missing value for ${option}.`)
 }
 
-const splitLongOption = (argument: string): { name: string; value?: string } => {
+const splitOptionArgument = (argument: string): { name: string; value?: string } => {
   if (argument.startsWith('-o') && argument.length > 2) {
     return { name: '-o', value: argument.slice(2) }
   }
@@ -222,7 +222,7 @@ export const parseBenchmarkArguments = (arguments_: string[]): BenchmarkArgument
 
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index] as string
-    const { name: option, value: inlineValue } = splitLongOption(argument)
+    const { name: option, value: inlineValue } = splitOptionArgument(argument)
     const optionValue = (): string => {
       if (inlineValue !== undefined) {
         return inlineValue
