@@ -206,6 +206,13 @@ const observedMap = <Key, Value>(onWrite?: () => void) => {
   return new Map<Key, Value>()
 }
 
+const observeWork = (hooks: BaselineScanHooks | undefined, operation: BaselineWork) => {
+  const onWork = hooks?.onWork
+  if (onWork !== undefined) {
+    return () => onWork(operation)
+  }
+}
+
 type BaselineReason =
   | 'directory-entry-limit'
   | 'directory-limit'
@@ -410,7 +417,7 @@ const readBoundedDirectoryEntries = (
 const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
   const state: ScanState = {
     filesSeen: 0,
-    languageCounts: observedMap(() => hooks.onWork?.('language-count-write')),
+    languageCounts: observedMap(observeWork(hooks, 'language-count-write')),
     truncationReasons: new Set(),
   }
   const maximumDirectories = hooks.maximumScannedDirectories ?? MAX_SCANNED_DIRECTORIES
@@ -516,8 +523,8 @@ const workflowFiles = (root: string, hooks: BaselineScanHooks, expectedGithub: b
 }
 
 const emptyTopLevelFacts = (hooks?: BaselineScanHooks) => ({
-  directories: observedArray<string>(() => hooks?.onWork?.('top-level-fact-write')),
-  recognisedFiles: observedArray<string>(() => hooks?.onWork?.('top-level-fact-write')),
+  directories: observedArray<string>(observeWork(hooks, 'top-level-fact-write')),
+  recognisedFiles: observedArray<string>(observeWork(hooks, 'top-level-fact-write')),
 })
 
 const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
