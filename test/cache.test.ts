@@ -509,6 +509,39 @@ describe('cache filesystem containment', () => {
     assert.equal(closeAttempts, 1)
   })
 
+  test('reclassifies primary disappearance during database construction', () => {
+    const root = createRoot()
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const location = inspectCacheLocation(root)
+    const databasePath = cacheDatabasePath(root)
+    const displacedPath = join(root, 'constructor-disappeared-primary.sqlite')
+    const missingFailure = new Error('verified primary disappeared during construction')
+    class DisappearingDatabase {
+      constructor(path: string) {
+        renameSync(path, displacedPath)
+        throw new Error('database constructor could not open the missing primary')
+      }
+
+      close() {}
+    }
+
+    assert.throws(
+      () =>
+        openVerifiedCacheDatabase({
+          DatabaseConstructor: DisappearingDatabase,
+          location,
+          missing: () => {
+            throw missingFailure
+          },
+          name: 'brain.sqlite',
+          primary: { kind: 'existing' },
+        }),
+      error => error === missingFailure,
+    )
+    assert.equal(existsSync(displacedPath), true)
+    assert.equal(existsSync(databasePath), false)
+  })
+
   test('rejects cache ancestor redirects without changing the redirect target', () => {
     const cases = [
       {
