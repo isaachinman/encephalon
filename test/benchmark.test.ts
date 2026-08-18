@@ -308,6 +308,7 @@ describe('isolated benchmark authority', () => {
         warmups: 2,
       },
     )
+    assert.equal(parseBenchmarkArguments(['-oreport.json']).output, 'report.json')
   })
 
   test('accepts only one nonce-matched worker result followed by a clean close', async () => {

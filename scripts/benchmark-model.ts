@@ -201,6 +201,9 @@ const readOptionValue = (arguments_: string[], index: number, option: string): s
 }
 
 const splitLongOption = (argument: string): { name: string; value?: string } => {
+  if (argument.startsWith('-o') && argument.length > 2) {
+    return { name: '-o', value: argument.slice(2) }
+  }
   const separator = argument.startsWith('--') ? argument.indexOf('=') : -1
   if (separator > 2) {
     return { name: argument.slice(0, separator), value: argument.slice(separator + 1) }
