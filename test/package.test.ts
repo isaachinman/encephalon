@@ -103,8 +103,9 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`\./,
+      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `a408ccc61346cfeb788399bf016dffbcb95bd8c1`\./,
     )
+    assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`\./)
     assert.match(performance, /Correctness tests enforce deterministic output and bounded work counts/)
