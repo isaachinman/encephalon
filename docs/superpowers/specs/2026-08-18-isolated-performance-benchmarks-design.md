@@ -72,7 +72,7 @@ A failed check names the corpus size, operation or cache, metric, statistic, act
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test snapshot is `de1d9ea2925c329a4385f37d2cccc91d058925a2`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
+The exact implementation and behavioural-test snapshot is `6c408c48152eb7ecaa122a0772134d0d52d7a364`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
 
 ## Acceptance coverage
 
