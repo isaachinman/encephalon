@@ -103,10 +103,10 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `589c8d9a4db6e612e22b5a86cc456da6b18d65f4`\./,
+      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`\./,
     )
     assert.match(contract, /## Performance Evidence/)
-    assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `589c8d9a4db6e612e22b5a86cc456da6b18d65f4`\./)
+    assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`\./)
     assert.match(performance, /Correctness tests enforce deterministic output and bounded work counts/)
     assert.match(
       contract,
