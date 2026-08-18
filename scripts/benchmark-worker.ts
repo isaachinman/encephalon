@@ -74,10 +74,11 @@ const assertResultCardinality = (value: unknown, records: number, operation: str
 
 const assertOperationResult = (operation: BenchmarkOperation, records: number, result: unknown): void => {
   if (operation === 'coldHydrate' || operation.endsWith('Prepare')) {
+    const expectedHydrated = operation === 'stalePrepare'
     const valid =
       isObject(result) &&
       result.recordsIndexed === records &&
-      (operation === 'coldHydrate' || typeof result.hydrated === 'boolean')
+      (operation === 'coldHydrate' || result.hydrated === expectedHydrated)
     if (!valid) {
       throw new Error(`The ${operation} benchmark returned an unexpected result.`)
     }

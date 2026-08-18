@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import {
+  chmodSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -14,7 +16,7 @@ import {
 import { cpus, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { hydrate } from '../src/index.ts'
+import { hydrate, prepare } from '../src/index.ts'
 import { formatRecordFile } from '../src/schema.ts'
 import type { BrainRecordFile } from '../src/types.ts'
 import {
@@ -49,12 +51,14 @@ type CaseTemplates = {
 }
 
 type BenchmarkControllerOptions = {
+  afterTemporaryRepositoryAllocation?: ((phase: 'repository' | 'snapshot') => void) | undefined
   signal?: AbortSignal
   temporaryParent?: string
   workerPath?: string
 }
 
 type ResolvedBenchmarkControllerOptions = {
+  afterTemporaryRepositoryAllocation: ((phase: 'repository' | 'snapshot') => void) | undefined
   signal: AbortSignal | undefined
   temporaryParent: string
   workerPath: string
@@ -81,23 +85,57 @@ const round = (value: number, digits = 3) => Number(value.toFixed(digits))
 const byteSize = (path: string) => (existsSync(path) ? statSync(path).size : 0)
 const timestamp = (index: number) => new Date(deterministicStart + index).toISOString()
 
-const createRepository = (temporaryParent: string, prefix: string) => {
+const createRepository = (
+  temporaryParent: string,
+  prefix: string,
+  afterAllocation: BenchmarkControllerOptions['afterTemporaryRepositoryAllocation'],
+) => {
   const root = mkdtempSync(join(temporaryParent, prefix))
-  mkdirSync(join(root, '.git'))
-  mkdirSync(join(root, 'node_modules'))
-  symlinkSync(packageRoot, join(root, 'node_modules', 'encephalon'), process.platform === 'win32' ? 'junction' : 'dir')
-  return root
+  try {
+    afterAllocation?.('repository')
+    mkdirSync(join(root, '.git'))
+    mkdirSync(join(root, 'node_modules'))
+    symlinkSync(
+      packageRoot,
+      join(root, 'node_modules', 'encephalon'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    )
+    return root
+  } catch (error) {
+    rmSync(root, { force: true, recursive: true })
+    throw error
+  }
 }
 
-const snapshotRepository = (template: string, temporaryParent: string) => {
+const snapshotRepository = (
+  template: string,
+  temporaryParent: string,
+  afterAllocation: BenchmarkControllerOptions['afterTemporaryRepositoryAllocation'],
+) => {
   const root = mkdtempSync(join(temporaryParent, 'encephalon-benchmark-template-'))
-  cpSync(template, root, { recursive: true, verbatimSymlinks: true })
-  return root
+  try {
+    afterAllocation?.('snapshot')
+    cpSync(template, root, { recursive: true, verbatimSymlinks: true })
+    return root
+  } catch (error) {
+    rmSync(root, { force: true, recursive: true })
+    throw error
+  }
 }
 
 const restoreRepository = (template: string, root: string): void => {
   rmSync(root, { force: true, recursive: true })
   cpSync(template, root, { recursive: true, verbatimSymlinks: true })
+}
+
+export const restoreBenchmarkSample = (template: string, root: string, operation: BenchmarkOperation): void => {
+  restoreRepository(template, root)
+  if (operation !== 'coldHydrate') {
+    prepare({ root })
+    if (operation === 'stalePrepare') {
+      makePreparedRepositoryStale(root)
+    }
+  }
 }
 
 const writeRecord = (root: string, record: BrainRecordFile) => {
@@ -247,15 +285,19 @@ export const makePreparedRepositoryStale = (root: string): void => {
   writeFileSync(path, stale, 'utf8')
 }
 
-const createCaseTemplates = (records: number, temporaryParent: string): CaseTemplates => {
-  const sampleRoot = createRepository(temporaryParent, 'encephalon-benchmark-sample-')
+const createCaseTemplates = (
+  records: number,
+  temporaryParent: string,
+  afterAllocation: BenchmarkControllerOptions['afterTemporaryRepositoryAllocation'],
+): CaseTemplates => {
+  const sampleRoot = createRepository(temporaryParent, 'encephalon-benchmark-sample-', afterAllocation)
   let unprepared: string | undefined
   let prepared: string | undefined
   try {
     const corpus = createCorpus(sampleRoot, records)
-    unprepared = snapshotRepository(sampleRoot, temporaryParent)
+    unprepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation)
     hydrate({ root: sampleRoot })
-    prepared = snapshotRepository(sampleRoot, temporaryParent)
+    prepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation)
     return { corpus, prepared, sampleRoot, unprepared }
   } catch (error) {
     rmSync(sampleRoot, { force: true, recursive: true })
@@ -284,11 +326,8 @@ const runOperationSamples = async (
       throw new Error(`Benchmark ${operation} for ${records} records was aborted.`)
     }
     const root = templates.sampleRoot
-    restoreRepository(templateForOperation(operation, templates), root)
+    restoreBenchmarkSample(templateForOperation(operation, templates), root, operation)
     try {
-      if (operation === 'stalePrepare') {
-        makePreparedRepositoryStale(root)
-      }
       const result = await runBenchmarkWorker({
         operation,
         records,
@@ -310,7 +349,7 @@ const runCase = async (
   configuration: BenchmarkArguments,
   options: ResolvedBenchmarkControllerOptions,
 ): Promise<BenchmarkCase> => {
-  const templates = createCaseTemplates(records, options.temporaryParent)
+  const templates = createCaseTemplates(records, options.temporaryParent, options.afterTemporaryRepositoryAllocation)
   try {
     const operationEntries: Array<
       readonly [BenchmarkOperation, Awaited<ReturnType<typeof runOperationSamples>> | null]
@@ -347,13 +386,13 @@ const loadBudget = (path: string | undefined, records: number[]): PerformanceBud
   }
 }
 
-export const runBenchmark = async (
-  arguments_: string[],
+const runConfiguredBenchmark = async (
+  configuration: BenchmarkArguments,
   controllerOptions: BenchmarkControllerOptions = {},
 ): Promise<BenchmarkReport> => {
-  const configuration = parseBenchmarkArguments(arguments_)
   const budget = loadBudget(configuration.budget, configuration.records)
   const options = {
+    afterTemporaryRepositoryAllocation: controllerOptions.afterTemporaryRepositoryAllocation,
     signal: controllerOptions.signal,
     temporaryParent: controllerOptions.temporaryParent ?? tmpdir(),
     workerPath: controllerOptions.workerPath ?? defaultWorkerPath,
@@ -390,12 +429,32 @@ export const runBenchmark = async (
   return report
 }
 
+export const runBenchmark = async (
+  arguments_: string[],
+  controllerOptions: BenchmarkControllerOptions = {},
+): Promise<BenchmarkReport> => runConfiguredBenchmark(parseBenchmarkArguments(arguments_), controllerOptions)
+
+const outputMode = (destination: string): number => {
+  try {
+    const metadata = lstatSync(destination)
+    if (metadata.isFile()) {
+      return metadata.mode & 0o777
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error
+    }
+  }
+  return 0o666 & ~process.umask()
+}
+
 const writeAtomic = (path: string, content: string): void => {
   const destination = resolve(path)
   const temporary = join(dirname(destination), `.${randomUUID()}.benchmark.tmp`)
   try {
     try {
       writeFileSync(temporary, content, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+      chmodSync(temporary, outputMode(destination))
       renameSync(temporary, destination)
     } catch (error) {
       throw new Error('Unable to write the benchmark report.', { cause: error })
@@ -438,13 +497,13 @@ const main = async (): Promise<void> => {
   process.once('SIGINT', interrupt)
   process.once('SIGTERM', terminate)
   try {
-    const report = await runBenchmark(arguments_, { signal: controller.signal })
+    const configuration = parseBenchmarkArguments(arguments_)
+    const report = await runConfiguredBenchmark(configuration, { signal: controller.signal })
     if (controller.signal.aborted) {
       throw new Error('Benchmark was aborted.')
     }
     const output = `${JSON.stringify(report, null, 2)}\n`
-    const outputArgumentIndex = arguments_.findIndex(argument => argument === '--output' || argument === '-o')
-    const outputPath = outputArgumentIndex === -1 ? undefined : arguments_[outputArgumentIndex + 1]
+    const outputPath = configuration.output
     if (outputPath === undefined) {
       process.stdout.write(output)
     } else {

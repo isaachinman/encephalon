@@ -200,6 +200,14 @@ const readOptionValue = (arguments_: string[], index: number, option: string): s
   throw new Error(`Missing value for ${option}.`)
 }
 
+const splitLongOption = (argument: string): { name: string; value?: string } => {
+  const separator = argument.startsWith('--') ? argument.indexOf('=') : -1
+  if (separator > 2) {
+    return { name: argument.slice(0, separator), value: argument.slice(separator + 1) }
+  }
+  return { name: argument }
+}
+
 export const parseBenchmarkArguments = (arguments_: string[]): BenchmarkArguments => {
   let budget: string | undefined
   let output: string | undefined
@@ -210,33 +218,35 @@ export const parseBenchmarkArguments = (arguments_: string[]): BenchmarkArgument
   const records: number[] = []
 
   for (let index = 0; index < arguments_.length; index += 1) {
-    const option = arguments_[index] as string
-    if (option === '--budget') {
-      budget = readOptionValue(arguments_, index, option)
-      index += 1
-    } else if (option === '--output' || option === '-o') {
-      output = readOptionValue(arguments_, index, option)
-      index += 1
-    } else if (option === '--profile') {
-      selectedProfile = parseProfile(readOptionValue(arguments_, index, option))
-      index += 1
-    } else if (option === '--records') {
+    const argument = arguments_[index] as string
+    const { name: option, value: inlineValue } = splitLongOption(argument)
+    const optionValue = (): string => {
+      if (inlineValue !== undefined) {
+        return inlineValue
+      }
       const value = readOptionValue(arguments_, index, option)
+      index += 1
+      return value
+    }
+    if (option === '--budget') {
+      budget = optionValue()
+    } else if (option === '--output' || option === '-o') {
+      output = optionValue()
+    } else if (option === '--profile') {
+      selectedProfile = parseProfile(optionValue())
+    } else if (option === '--records') {
+      const value = optionValue()
       const parsed = parseInteger(option, value, true)
       if (records.includes(parsed)) {
         throw new Error(`Duplicate --records value: ${parsed}.`)
       }
       records.push(parsed)
-      index += 1
     } else if (option === '--repetitions') {
-      repetitions = parseInteger(option, readOptionValue(arguments_, index, option), false)
-      index += 1
+      repetitions = parseInteger(option, optionValue(), false)
     } else if (option === '--timeout-ms') {
-      timeoutMilliseconds = parseInteger(option, readOptionValue(arguments_, index, option), false)
-      index += 1
+      timeoutMilliseconds = parseInteger(option, optionValue(), false)
     } else if (option === '--warmups') {
-      warmups = parseInteger(option, readOptionValue(arguments_, index, option), true)
-      index += 1
+      warmups = parseInteger(option, optionValue(), true)
     } else {
       throw new Error(`Unknown benchmark option: ${option}.`)
     }
@@ -345,12 +355,18 @@ export const parsePerformanceBudget = (value: unknown, records: number[]): Perfo
     if (entry.operations !== undefined) {
       const operations = objectValue(entry.operations, 'Benchmark operation budgets')
       assertKnownKeys(operations, benchmarkOperations, 'benchmark budget operation')
+      if (Object.keys(operations).length === 0) {
+        throw new Error('Benchmark operation budgets must configure an operation.')
+      }
       for (const [operation, operationBudget] of Object.entries(operations)) {
         if (caseRecords === 0 && operation === 'stalePrepare') {
           throw new Error('Benchmark budget configures unavailable stalePrepare for 0 records.')
         }
         assertOperationBudget(operationBudget, operation)
       }
+    }
+    if (entry.cache === undefined && entry.operations === undefined) {
+      throw new Error(`Benchmark budget case for ${caseRecords} records must configure a limit.`)
     }
   }
   for (const requestedRecords of records) {

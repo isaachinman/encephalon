@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { makePreparedRepositoryStale, runBenchmark } from '../scripts/benchmark.ts'
+import { makePreparedRepositoryStale, restoreBenchmarkSample, runBenchmark } from '../scripts/benchmark.ts'
 import {
   assertPerformanceBudget,
   type BenchmarkReport,
@@ -15,7 +15,7 @@ import {
   summarizeDistribution,
 } from '../scripts/benchmark-model.ts'
 import { runBenchmarkWorker } from '../scripts/benchmark-process.ts'
-import { hydrate } from '../src/index.ts'
+import { hydrate, prepare } from '../src/index.ts'
 import { createTestRepository, removeTestRepository } from './helpers.ts'
 
 const fixtureWorker = join(import.meta.dirname, 'fixtures', 'benchmark-worker.ts')
@@ -134,6 +134,14 @@ describe('isolated benchmark authority', () => {
       /Performance budget has no case for 0 records\./,
     )
     assert.throws(
+      () => assertPerformanceBudget(report, { cases: [{ records: 0 }], schemaVersion: 2 }),
+      /Benchmark budget case for 0 records must configure a limit\./,
+    )
+    assert.throws(
+      () => assertPerformanceBudget(report, { cases: [{ operations: {}, records: 0 }], schemaVersion: 2 }),
+      /Benchmark operation budgets must configure an operation\./,
+    )
+    assert.throws(
       () =>
         assertPerformanceBudget(report, {
           cases: [{ operations: { unknown: { totalMs: { p95: 10 } } }, records: 0 }, { records: 0 }],
@@ -203,6 +211,27 @@ describe('isolated benchmark authority', () => {
       timeoutMilliseconds: 30_000,
       warmups: 2,
     })
+    assert.deepEqual(
+      parseBenchmarkArguments([
+        '--profile=ci',
+        '--records=100',
+        '--warmups=2',
+        '--repetitions=5',
+        '--timeout-ms=4000',
+        '--budget=budget.json',
+        '--output=first.json',
+        '--output=second.json',
+      ]),
+      {
+        budget: 'budget.json',
+        output: 'second.json',
+        profile: 'custom',
+        records: [100],
+        repetitions: 5,
+        timeoutMilliseconds: 4000,
+        warmups: 2,
+      },
+    )
   })
 
   test('accepts only one nonce-matched worker result followed by a clean close', async () => {
@@ -379,6 +408,31 @@ describe('isolated benchmark authority', () => {
     }
   })
 
+  test('removes a temporary repository when setup fails before returning its path', async () => {
+    await Promise.all(
+      (['repository', 'snapshot'] as const).map(async phase => {
+        const temporaryParent = mkdtempSync(join(tmpdir(), `encephalon-benchmark-${phase}-setup-test-`))
+        const failure = new Error(`${phase} setup failure`)
+        try {
+          await assert.rejects(
+            runBenchmark(['--records', '0', '--warmups', '0', '--repetitions', '1'], {
+              afterTemporaryRepositoryAllocation: currentPhase => {
+                if (currentPhase === phase) {
+                  throw failure
+                }
+              },
+              temporaryParent,
+            }),
+            candidate => candidate === failure,
+          )
+          assert.deepEqual(readdirSync(temporaryParent), [])
+        } finally {
+          rmSync(temporaryParent, { force: true, recursive: true })
+        }
+      }),
+    )
+  })
+
   test('uses a different-length canonical variant to make a prepared repository stale', () => {
     const root = createTestRepository()
     try {
@@ -391,6 +445,24 @@ describe('isolated benchmark authority', () => {
       assert.match(readFileSync(path, 'utf8'), /benchmark stale needle chain 0/)
     } finally {
       removeTestRepository(root)
+    }
+  })
+
+  test('re-establishes a prepared cache after restoring its template', () => {
+    const temporaryParent = mkdtempSync(join(tmpdir(), 'encephalon-benchmark-restore-test-'))
+    const root = createTestRepository()
+    const template = join(temporaryParent, 'template')
+    try {
+      mkdirSync(join(root, 'encephalon'))
+      hydrate({ root })
+      cpSync(root, template, { recursive: true, verbatimSymlinks: true })
+
+      restoreBenchmarkSample(template, root, 'unchangedPrepare')
+
+      assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
+    } finally {
+      removeTestRepository(root)
+      rmSync(temporaryParent, { force: true, recursive: true })
     }
   })
 
@@ -409,9 +481,20 @@ describe('isolated benchmark authority', () => {
       assert.equal(rejected.stderr, 'Performance budget has no case for 0 records.\n')
 
       const outputPath = join(root, 'report.json')
+      writeFileSync(outputPath, 'previous report\n', { mode: 0o640 })
+      const expectedMode = statSync(outputPath).mode & 0o777
+      const ignoredOutputPath = join(root, 'ignored-report.json')
       const accepted = spawnSync(
         process.execPath,
-        [benchmarkScript, '--records', '0', '--warmups', '0', '--repetitions', '1', '--output', outputPath],
+        [
+          benchmarkScript,
+          '--records=0',
+          '--warmups=0',
+          '--repetitions=1',
+          '--output',
+          ignoredOutputPath,
+          `--output=${outputPath}`,
+        ],
         { encoding: 'utf8' },
       )
       assert.equal(accepted.status, 0, accepted.stderr)
@@ -420,6 +503,7 @@ describe('isolated benchmark authority', () => {
       const report = JSON.parse(readFileSync(outputPath, 'utf8')) as BenchmarkReport
       assert.equal(report.schemaVersion, 2)
       assert.equal(report.profile, 'custom')
+      assert.equal(statSync(outputPath).mode & 0o777, expectedMode)
       assert.deepEqual(readdirSync(root).toSorted(), ['budget.json', 'report.json'])
 
       const help = spawnSync(process.execPath, [benchmarkScript, '--help'], { encoding: 'utf8' })
