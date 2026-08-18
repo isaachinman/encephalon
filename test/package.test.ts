@@ -26,9 +26,12 @@ describe('package contract', () => {
 
   test('has a side-effect-free TypeScript API entrypoint', () => {
     assert.equal(existsSync(resolve(root, 'src/index.ts')), true)
+    const declarations = ['index.d.ts', 'baseline.d.ts', 'canonical-layout.d.ts', 'records.d.ts']
+      .map(file => readFileSync(resolve(root, 'dist', file), 'utf8'))
+      .join('\n')
     assert.doesNotMatch(
-      readFileSync(resolve(root, 'dist', 'index.d.ts'), 'utf8'),
-      /BaselineWork|RecordWork|onWork|scanBaselineWithHooks|validateRecordsResolved/,
+      declarations,
+      /BaselineWork|RecordWork|onEntry|onWork|scanBaselineWithHooks|validateRecordsResolved/,
     )
   })
 

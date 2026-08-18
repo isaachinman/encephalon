@@ -39,6 +39,7 @@ type DirectoryReader<Entry> = {
 
 type OpenDirectory<Entry> = (path: string) => DirectoryReader<Entry>
 
+/** @internal */
 export const collectBoundedDirectoryEntries = <Entry extends { name: string } = Dirent>(
   directory: string,
   maximum: number,
@@ -96,6 +97,7 @@ export type CanonicalDirectorySnapshot = {
   witness: DirectoryWitness
 }
 
+/** @internal */
 export const captureCanonicalDirectory = (
   path: string,
   maximum: number,

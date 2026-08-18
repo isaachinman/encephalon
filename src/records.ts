@@ -157,12 +157,16 @@ export const recordWriteTestHooks: AddRecordTestHooks = {}
 type RecordReadFault = 'after-record-fstat' | 'after-record-lstat' | 'after-record-open'
 
 type RecordWork =
+  | 'active-group-read'
   | 'active-group-write'
+  | 'active-issue-read'
   | 'active-issue-write'
   | 'allowed-group-write'
   | 'allowed-id-write'
   | 'canonical-entry'
   | 'cycle-edge'
+  | 'duplicate-issue-read'
+  | 'duplicate-issue-write'
   | 'duplicate-record'
   | 'edge-validation'
   | 'superseded-edge'
@@ -194,6 +198,41 @@ type PlannedRecord = {
 
 type ValidateRecordsOptions = {
   hooks?: RecordReadHooks
+}
+
+const isArrayIndex = (property: string | symbol) => typeof property === 'string' && /^(?:0|[1-9]\d*)$/.test(property)
+
+const observedArray = <Value>(onRead?: () => void, onWrite?: () => void) => {
+  const values: Value[] = []
+  if (onRead !== undefined || onWrite !== undefined) {
+    return new Proxy(values, {
+      get: (target, property, receiver) => {
+        if (isArrayIndex(property)) {
+          onRead?.()
+        }
+        return Reflect.get(target, property, receiver) as unknown
+      },
+      set: (target, property, value, receiver) => {
+        if (isArrayIndex(property)) {
+          onWrite?.()
+        }
+        return Reflect.set(target, property, value, receiver)
+      },
+    })
+  }
+  return values
+}
+
+const observedSet = <Value>(onWrite?: () => void) => {
+  if (onWrite !== undefined) {
+    return new (class extends Set<Value> {
+      override add(value: Value) {
+        onWrite()
+        return super.add(value)
+      }
+    })()
+  }
+  return new Set<Value>()
 }
 
 type AllowedMultiHead = {
@@ -749,7 +788,10 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
 const duplicateAndCaseIssues = (records: BrainRecord[], hooks: RecordReadHooks) => {
   const ids = new Map<string, BrainRecord>()
   const paths = new Map<string, BrainRecord>()
-  const errors: ValidationIssue[] = []
+  const errors = observedArray<ValidationIssue>(
+    () => hooks.onWork?.('duplicate-issue-read'),
+    () => hooks.onWork?.('duplicate-issue-write'),
+  )
   for (const record of records) {
     hooks.onWork?.('duplicate-record')
     const idCollision = ids.get(record.id)
@@ -854,21 +896,27 @@ const supersessionIssues = (records: BrainRecord[], hooks: RecordReadHooks) => {
   const activeGroups = new Map<string, BrainRecord[]>()
   for (const record of records) {
     if (!superseded.has(record.id)) {
-      hooks.onWork?.('active-group-write')
       const key = `${record.kind}\0${record.subject}`
       const group = activeGroups.get(key)
       if (group === undefined) {
-        activeGroups.set(key, [record])
+        const firstGroup = observedArray<BrainRecord>(
+          () => hooks.onWork?.('active-group-read'),
+          () => hooks.onWork?.('active-group-write'),
+        )
+        firstGroup.push(record)
+        activeGroups.set(key, firstGroup)
       } else {
         group.push(record)
       }
     }
   }
-  const activeIssues: ValidationIssue[] = []
+  const activeIssues = observedArray<ValidationIssue>(
+    () => hooks.onWork?.('active-issue-read'),
+    () => hooks.onWork?.('active-issue-write'),
+  )
   for (const group of activeGroups.values()) {
     if (group.length > 1) {
       for (const record of group) {
-        hooks.onWork?.('active-issue-write')
         activeIssues.push(
           issue(
             'MULTIPLE_ACTIVE_HEADS',
@@ -1024,17 +1072,18 @@ const allowedMultiHeadRecordIds = (records: BrainRecord[], allowed: AllowedMulti
   const activeGroups = new Map<string, BrainRecord[]>()
   for (const record of records) {
     if (!superseded.has(record.id)) {
-      hooks.onWork?.('allowed-group-write')
       const key = `${record.kind} ${record.subject}`
       const group = activeGroups.get(key)
       if (group === undefined) {
-        activeGroups.set(key, [record])
+        const firstGroup = observedArray<BrainRecord>(undefined, () => hooks.onWork?.('allowed-group-write'))
+        firstGroup.push(record)
+        activeGroups.set(key, firstGroup)
       } else {
         group.push(record)
       }
     }
   }
-  const ids = new Set<string>()
+  const ids = observedSet<string>(() => hooks.onWork?.('allowed-id-write'))
   for (const group of activeGroups.values()) {
     const [first] = group
     if (
@@ -1043,7 +1092,6 @@ const allowedMultiHeadRecordIds = (records: BrainRecord[], allowed: AllowedMulti
       group.every(record => allowedKeys.has(`${record.kind} ${record.subject} ${record.source}`))
     ) {
       for (const record of group) {
-        hooks.onWork?.('allowed-id-write')
         ids.add(record.id)
       }
     }

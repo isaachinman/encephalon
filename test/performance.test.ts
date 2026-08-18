@@ -23,10 +23,12 @@ const writeRecord = (
   record: {
     createdAt: string
     id: string
+    kind?: string
     supersedes?: string[]
   },
 ) => {
-  const directory = join(root, 'encephalon', 'context')
+  const kind = record.kind ?? 'context'
+  const directory = join(root, 'encephalon', kind)
   mkdirSync(directory, { recursive: true })
   writeFileSync(
     join(directory, `${record.id}.json`),
@@ -34,7 +36,7 @@ const writeRecord = (
       {
         createdAt: record.createdAt,
         id: record.id,
-        kind: 'context',
+        kind,
         payload: { summary: record.id },
         source: 'test',
         subject: 'dense.history',
@@ -97,7 +99,9 @@ describe('hot scan performance regressions', () => {
     })
 
     assert.deepEqual(Object.fromEntries(validationWork), {
+      'active-group-read': 2,
       'active-group-write': 2,
+      'active-issue-read': 2,
       'active-issue-write': 2,
       'canonical-entry': 4,
       'cycle-edge': 3,
@@ -121,6 +125,31 @@ describe('hot scan performance regressions', () => {
     assert.equal(allowedWork.get('allowed-id-write'), 2, 'allowed id work exceeded accepted active records')
   })
 
+  test('counts duplicate issue accumulator work from collection operations', () => {
+    const root = createRoot()
+    writeRecord(root, {
+      createdAt: '2026-08-08T00:00:00.000Z',
+      id: 'duplicate-record',
+      kind: 'context',
+    })
+    writeRecord(root, {
+      createdAt: '2026-08-08T00:00:01.000Z',
+      id: 'duplicate-record',
+      kind: 'decision',
+    })
+
+    const work = new Map<string, number>()
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        onWork: operation => work.set(operation, (work.get(operation) ?? 0) + 1),
+      },
+    })
+
+    assert.equal(result.errors[0]?.code, 'DUPLICATE_RECORD_ID')
+    assert.equal(work.get('duplicate-issue-read'), 1)
+    assert.equal(work.get('duplicate-issue-write'), 1)
+  })
+
   test('bounds baseline accumulator work while preserving output order', () => {
     const root = createRoot()
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'sample-project' }))
@@ -129,6 +158,8 @@ describe('hot scan performance regressions', () => {
     writeFileSync(join(root, 'src', 'beta.js'), 'export const beta = 2')
     ensureParent(join(root, 'scripts', 'build.sh'))
     writeFileSync(join(root, 'scripts', 'build.sh'), 'echo build')
+    ensureParent(join(root, '.github', 'workflows', 'ci.yml'))
+    writeFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'name: CI')
 
     const work = new Map<string, number>()
     assert.deepEqual(
@@ -152,7 +183,7 @@ describe('hot scan performance regressions', () => {
           ],
           recognisedFiles: ['package.json'],
           subject: 'encephalon:init/repository-overview',
-          topLevelDirectories: ['scripts', 'src'],
+          topLevelDirectories: ['.github', 'scripts', 'src'],
         },
         {
           languageCounts: undefined,
@@ -170,9 +201,10 @@ describe('hot scan performance regressions', () => {
     )
     assert.deepEqual(Object.fromEntries(work), {
       'language-count-write': 3,
-      'language-entry': 8,
-      'top-level-entry': 5,
-      'top-level-fact-write': 3,
+      'language-entry': 11,
+      'top-level-entry': 6,
+      'top-level-fact-write': 4,
+      'workflow-entry': 1,
     })
   })
 })
