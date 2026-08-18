@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import {
-  chmodSync,
+  closeSync,
   cpSync,
   existsSync,
+  fchmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -451,17 +453,35 @@ const outputMode = (destination: string): number => {
 const writeAtomic = (path: string, content: string): void => {
   const destination = resolve(path)
   const temporary = join(dirname(destination), `.${randomUUID()}.benchmark.tmp`)
+  let descriptor: number | undefined
+  let failure: Error | undefined
   try {
+    descriptor = openSync(temporary, 'wx', 0o600)
+    writeFileSync(descriptor, content, { encoding: 'utf8' })
+    const mode = outputMode(destination)
+    renameSync(temporary, destination)
+    fchmodSync(descriptor, mode)
+  } catch (error) {
+    failure = new Error('Unable to write the benchmark report.', { cause: error })
+  }
+  if (descriptor !== undefined) {
     try {
-      writeFileSync(temporary, content, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-      const mode = outputMode(destination)
-      renameSync(temporary, destination)
-      chmodSync(destination, mode)
+      closeSync(descriptor)
     } catch (error) {
-      throw new Error('Unable to write the benchmark report.', { cause: error })
+      if (failure === undefined) {
+        failure = new Error('Unable to write the benchmark report.', { cause: error })
+      }
     }
-  } finally {
+  }
+  try {
     rmSync(temporary, { force: true })
+  } catch (error) {
+    if (failure === undefined) {
+      failure = new Error('Unable to write the benchmark report.', { cause: error })
+    }
+  }
+  if (failure !== undefined) {
+    throw failure
   }
 }
 
