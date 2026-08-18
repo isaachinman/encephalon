@@ -300,6 +300,7 @@ type CacheReadTestHooks = {
 }
 
 type CacheReadInstrumentation = {
+  afterIntegrityValidation?: (() => void) | undefined
   afterResultRead?: (() => void) | undefined
   beforeResultRead?: (() => void) | undefined
 }
@@ -1482,12 +1483,6 @@ const writeMetadata = (database: DatabaseSync, metadata: Metadata) => {
   }
 }
 
-const readFreshMetadata = (root: string, location: CacheLocation): Metadata | undefined =>
-  readVerifiedCacheTransaction(location, database => {
-    const metadata = readMetadata(database)
-    return metadataIsFresh(root, database, metadata) ? metadata : undefined
-  })
-
 const rebuildCache = (
   root: string,
   location: CacheLocation = inspectCacheLocation(root),
@@ -1755,42 +1750,116 @@ const runWithDisposableCacheRecovery = <Result>(
   }
 }
 
-const prepareResolvedWithoutCorruptionRecovery = (
+type CachePreparationCompletion<Result> =
+  | { kind: 'prepare' }
+  | { kind: 'read'; read: (database: DatabaseSync) => Result }
+
+type FreshCacheResult<Result> = { kind: 'fresh'; result: Result } | { kind: 'stale' }
+
+const readFreshCacheResult = <Result>(
   root: string,
   location: CacheLocation,
+  completion: CachePreparationCompletion<Result>,
+): FreshCacheResult<PrepareResult | Result> =>
+  readVerifiedCacheTransaction(location, database => {
+    const metadata = readMetadata(database)
+    if (metadataIsFresh(root, database, metadata)) {
+      cacheReadInstrumentation.afterIntegrityValidation?.()
+      if (completion.kind === 'read') {
+        cacheReadInstrumentation.beforeResultRead?.()
+        const result = completion.read(database)
+        cacheReadInstrumentation.afterResultRead?.()
+        return { kind: 'fresh', result }
+      }
+      return {
+        kind: 'fresh',
+        result: { hydrated: false, recordsIndexed: metadata.recordsIndexed },
+      }
+    }
+    return { kind: 'stale' }
+  })
+
+function requireFreshCacheResult(root: string, location: CacheLocation, completion: { kind: 'prepare' }): PrepareResult
+function requireFreshCacheResult<Result>(
+  root: string,
+  location: CacheLocation,
+  completion: { kind: 'read'; read: (database: DatabaseSync) => Result },
+): Result
+function requireFreshCacheResult<Result>(
+  root: string,
+  location: CacheLocation,
+  completion: CachePreparationCompletion<Result>,
+): PrepareResult | Result {
+  const completed = readFreshCacheResult(root, location, completion)
+  if (completed.kind === 'fresh') {
+    return completed.result
+  }
+  throw new CacheSchemaMismatch('The cache is stale before read.')
+}
+
+function resolvePreparedCacheWithoutCorruptionRecovery(
+  root: string,
+  location: CacheLocation,
+  completion: { kind: 'prepare' },
+  lockMode?: CacheRecoveryLockMode,
+): PrepareResult
+function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
+  root: string,
+  location: CacheLocation,
+  completion: { kind: 'read'; read: (database: DatabaseSync) => Result },
+  lockMode?: CacheRecoveryLockMode,
+): Result
+function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
+  root: string,
+  location: CacheLocation,
+  completion: CachePreparationCompletion<Result>,
   lockMode: CacheRecoveryLockMode = 'acquire',
-): PrepareResult => {
-  const serialize = <Result>(operation: (captured: CacheLocation) => Result) => {
+): PrepareResult | Result {
+  const serialize = <Serialized>(operation: (captured: CacheLocation) => Serialized) => {
     if (lockMode === 'acquire') {
       return withCacheOperationLock(root, location, operation)
     }
     return operation(location)
   }
+  const completeRebuild = (captured: CacheLocation) => {
+    const hydration = rebuildCache(root, captured)
+    if (completion.kind === 'read') {
+      return requireFreshCacheResult(root, captured, completion)
+    }
+    return hydration
+  }
+  const completeFresh = (captured: CacheLocation) => readFreshCacheResult(root, captured, completion)
   const existingDatabase = inspectCacheDatabase(location, 'brain.sqlite')
   if (existingDatabase === undefined) {
     return serialize(captured => {
       if (inspectCacheDatabase(captured, 'brain.sqlite') !== undefined) {
-        const metadata = readFreshMetadata(root, captured)
-        if (metadata !== undefined) {
-          return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
+        const completed = completeFresh(captured)
+        if (completed.kind === 'fresh') {
+          return completed.result
         }
       }
-      return rebuildCache(root, captured)
+      return completeRebuild(captured)
     })
   }
   cacheReadTestHooks.afterPrimaryDatabaseObservation?.('prepare-fast-path')
-  const cachedMetadata = readFreshMetadata(root, location)
-  if (cachedMetadata !== undefined) {
-    return { hydrated: false, recordsIndexed: cachedMetadata.recordsIndexed }
+  const completed = completeFresh(location)
+  if (completed.kind === 'fresh') {
+    return completed.result
   }
   return serialize(captured => {
-    const metadata = readFreshMetadata(root, captured)
-    if (metadata !== undefined) {
-      return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
+    const lockedCompletion = completeFresh(captured)
+    if (lockedCompletion.kind === 'fresh') {
+      return lockedCompletion.result
     }
-    return rebuildCache(root, captured)
+    return completeRebuild(captured)
   })
 }
+
+const prepareResolvedWithoutCorruptionRecovery = (
+  root: string,
+  location: CacheLocation,
+  lockMode: CacheRecoveryLockMode = 'acquire',
+): PrepareResult => resolvePreparedCacheWithoutCorruptionRecovery(root, location, { kind: 'prepare' }, lockMode)
 
 const prepareResolved = (
   root: string,
@@ -1865,16 +1934,7 @@ const fullResultLimit = (value: unknown) => positiveLimit(value, 'fullResultLimi
 const compactResultLimit = (value: unknown) => positiveLimit(value, 'compactResultLimit')
 
 const readFreshCache = <Result>(root: string, location: CacheLocation, read: (database: DatabaseSync) => Result) =>
-  readVerifiedCacheTransaction(location, database => {
-    const metadata = readMetadata(database)
-    if (!metadataIsFresh(root, database, metadata)) {
-      throw new CacheSchemaMismatch('The cache is stale before read.')
-    }
-    cacheReadInstrumentation.beforeResultRead?.()
-    const result = read(database)
-    cacheReadInstrumentation.afterResultRead?.()
-    return result
-  })
+  requireFreshCacheResult(root, location, { kind: 'read', read })
 
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
   const root = resolveRepository(input)
@@ -1883,10 +1943,7 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
     return runWithDisposableCacheRecovery(
       root,
       location,
-      () => {
-        prepareResolvedWithoutCorruptionRecovery(root, location)
-        return readFreshCache(root, location, read)
-      },
+      () => resolvePreparedCacheWithoutCorruptionRecovery(root, location, { kind: 'read', read }),
       { completion: { kind: 'retry-operation' }, lockMode: 'acquire' },
     )
   } catch (error) {
@@ -2166,10 +2223,11 @@ const gatherRecordsFromDatabase = (input: GatherInput, searches: readonly Litera
     return runWithDisposableCacheRecovery(
       root,
       location,
-      () => {
-        prepareResolvedWithoutCorruptionRecovery(root, location)
-        return readFreshCache(root, location, database => readGatherFromDatabase(database, input, null, searches))
-      },
+      () =>
+        resolvePreparedCacheWithoutCorruptionRecovery(root, location, {
+          kind: 'read',
+          read: database => readGatherFromDatabase(database, input, null, searches),
+        }),
       { completion: { kind: 'retry-operation' }, lockMode: 'acquire' },
     )
   } catch (error) {
