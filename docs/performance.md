@@ -40,9 +40,9 @@ The committed schema-version 2 baseline was measured on Node.js v26.5.0 on darwi
 
 | Records | Cold hydrate | Unchanged prepare | Stale prepare | Compact search | Full search | Gather | Cache amplification |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 11.4 / 11.7 ms | 4.6 / 4.6 ms | n/a | 5.1 / 5.2 ms | 5.1 / 5.1 ms | 5.4 / 6.0 ms | n/a |
-| 100 | 35.5 / 35.7 ms | 15.8 / 16.0 ms | 56.6 / 57.4 ms | 17.4 / 17.6 ms | 16.8 / 16.9 ms | 311.1 / 312.2 ms | 2.46x |
-| 1,000 | 213.0 / 234.9 ms | 85.0 / 86.4 ms | 386.3 / 435.6 ms | 94.5 / 96.2 ms | 88.5 / 89.3 ms | 3.08 / 3.13 s | 2.32x |
+| 0 | 11.2 / 11.5 ms | 4.5 / 4.8 ms | n/a | 5.0 / 5.1 ms | 5.0 / 5.1 ms | 5.5 / 5.6 ms | n/a |
+| 100 | 35.4 / 35.5 ms | 15.7 / 16.2 ms | 56.1 / 56.5 ms | 17.4 / 17.8 ms | 16.7 / 16.9 ms | 308.0 / 310.8 ms | 2.46x |
+| 1,000 | 208.7 / 210.5 ms | 85.0 / 85.9 ms | 377.3 / 380.5 ms | 94.7 / 94.9 ms | 88.5 / 102.0 ms | 3.08 / 3.20 s | 2.32x |
 
 The CI profile intentionally runs only 0 and 100 records with one measured process and generous ceilings. It catches runaway cache rebuild, automatic preparation, search, gather, and cache-size regressions without treating noisy cross-platform timings as precise performance claims. Stable comparisons should use the full profile and its distributions.
 

@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-23 for code and behavioural-test snapshot `9b5821d59999215f975d613edf4a9c252fb6258d`.
+Last reviewed: 2026-08-23 for code and behavioural-test snapshot `5421abe15ac21189675e2ad88e944803915f272e`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -40,7 +40,7 @@ This document is the concise contract maintainers should update when public beha
 
 ## Gather Deduplication
 
-- Within one verified SQLite read transaction, gather executes each exact distinct validated show ID and each exact original query string once. Missing IDs and zero-term queries are memoized as results; textually different queries remain distinct work even when they produce the same literal `MATCH` expression.
+- Within one verified SQLite read transaction, gather evaluates each exact distinct validated show ID and each exact original query string once. Each distinct non-empty query executes its bounded SQLite search at most once, while zero-term queries never execute `MATCH`. Missing IDs and zero-term results are memoized; textually different queries remain distinct work even when they produce the same literal `MATCH` expression.
 - Snapshot-local maps contain only complete parsed shown records or compact-search results. They are created inside the result-reader callback, never survive a cache recovery retry, and never retain SQLite rows, statements, iterators, database handles, or partial results.
 - Public duplicate occurrences preserve caller order and count but do not share mutable records, nested payloads, result arrays, or compact result objects. Every show envelope, search envelope, shown value or null, result array, and compact result remains charged for each emitted occurrence through the one shared `gatherResponseBytes` ledger.
 - Shows still precede searches and first occurrences execute in input order. Ranking, snippets, active filtering, response failure order, the empty-only no-cache path, exact-generation recovery, and the public API and CLI shapes remain unchanged.
@@ -157,7 +157,7 @@ MAR-2568 behavioural hot-scan work bounds: `de66f6ab7e10696fc878e380dd5417d194d6
 
 MAR-2552 single-pass cache reads and identity-bound recovery: `9b5821d59999215f975d613edf4a9c252fb6258d`.
 
-MAR-2560 snapshot-local exact-key gather deduplication: `e25d81a3bcdbe92f64c317be5be7c56becc6e485`.
+MAR-2560 snapshot-local exact-key gather deduplication: `5421abe15ac21189675e2ad88e944803915f272e`.
 
 ## Package and Release Gates
 

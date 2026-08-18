@@ -6,7 +6,7 @@
 
 ## Goal
 
-Execute each exact distinct gather show ID and search query once per accepted SQLite snapshot while preserving every public output occurrence, ordering rule, response-budget charge, and recovery boundary.
+Evaluate each exact distinct gather show ID and original search query once per accepted SQLite snapshot while preserving every public output occurrence, ordering rule, response-budget charge, and recovery boundary. Each distinct non-empty query executes against SQLite at most once; zero-term queries perform no `MATCH` work.
 
 ## Snapshot-local memoisation
 
@@ -42,11 +42,11 @@ The existing gather benchmark becomes duplicate-heavy without changing the repor
 
 ## Acceptance coverage
 
-- One dense gather case proves exact-key execution counts for present, missing, non-empty, textually distinct equivalent, and zero-term duplicates while preserving order and independent mutable results.
+- One dense gather case proves exact-key evaluation counts for present, missing, non-empty, textually distinct equivalent, and zero-term duplicates, plus SQLite execution counts for non-empty queries, while preserving order and independent mutable results.
 - One recovery case fails after partial memo population and proves the rebuilt retry re-executes each exact distinct key from a fresh map.
 - Existing exact response-boundary tests prove duplicate memo hits are charged for every output occurrence.
 - Existing WAL snapshot, corruption recovery, statement reuse, zero-I/O, ranking, snippet, and missing-result tests remain complementary.
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test snapshot is `e25d81a3bcdbe92f64c317be5be7c56becc6e485`. Documentation does not change the public API, package exports, cache schema, canonical records, or operation budgets.
+The exact implementation and behavioural-test snapshot is `5421abe15ac21189675e2ad88e944803915f272e`. Documentation does not change the public API, package exports, cache schema, canonical records, or operation budgets.
