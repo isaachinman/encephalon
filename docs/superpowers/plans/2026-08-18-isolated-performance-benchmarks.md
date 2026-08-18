@@ -34,11 +34,13 @@
 
 - [x] Run focused tests, lint, all four TypeScript projects, and the complete suite.
 - [x] Run baseline, full/manual, CI-budget, build, package, publish-contract, and frozen-install gates.
-- [ ] Audit declarations, package/Bun/config drift, diff hygiene, branch/upstream, and tracked status.
+- [x] Audit declarations, package/Bun/config drift, diff hygiene, branch/upstream, and tracked status.
 - [ ] Open the stacked PR, run Pullfrog, run all six review roles, fix accepted high/medium-confidence findings, and leave the PR unmerged.
 
 ## Implementation evidence
 
 - RED: `node --test test/benchmark.test.ts` failed before production with `ERR_MODULE_NOT_FOUND` for the absent benchmark model authority.
-- GREEN at code/test commit `3fac5940be66d7e4cc644e216c743fefba24fea5`: focused benchmark 12/12; cache 157/157; full suite 527 pass, 0 fail, 2 established capability skips; lint 112 files; all four TypeScript projects.
-- Release gates: schema-version 2 CI budget, full 0/100/1,000 baseline with two warmups and five measured samples, build, isolated-cache package check, expected already-published publish refusal, frozen install, and diff check all passed.
+- Initial GREEN at code/test commit `3fac5940be66d7e4cc644e216c743fefba24fea5`: focused benchmark 12/12; cache 157/157; full suite 527 pass, 0 fail, 2 established capability skips; lint 112 files; all four TypeScript projects.
+- Review RED proved copied prepared templates were stale, vacuous budgets passed, setup allocation could leak, equals-form CLI options regressed, repeated output flags selected inconsistently, and atomic replacement changed report permissions.
+- Review GREEN at code/test commit `f6f5ea32934227f6e2370e31fd5191c7ec90d404`: focused benchmark 14/14; cache 157/157; full suite 529 pass, 0 fail, 2 established capability skips; lint 112 files; all four TypeScript projects; corrected schema-version 2 CI budget and full 0/100/1,000 baseline passed.
+- Final release gates: build, isolated-cache package validation, expected already-published publish refusal, frozen install with no changes, package/declaration/Bun/config audits, and diff hygiene all passed.
