@@ -2,7 +2,7 @@
 
 ## Goal
 
-Each successful list, show, full-search, compact-search, or gather operation must fully validate one cache generation once and materialise its bounded result from the same verified SQLite transaction. This removes redundant work without weakening exact-generation recovery, repository freshness, or snapshot consistency.
+Each successful list, show, full-search, compact-search, or gather operation that reads cached data must fully validate one cache generation once and materialise its bounded result from the same verified SQLite transaction. Zero-term operations that deliberately return before cache preparation remain the explicit exception. This removes redundant work without weakening exact-generation recovery, repository freshness, or snapshot consistency.
 
 ## Boundaries
 
