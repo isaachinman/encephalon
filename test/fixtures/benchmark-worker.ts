@@ -33,6 +33,9 @@ process.once('message', value => {
     process.disconnect()
     return
   }
+  if (request.root === '/stdout') {
+    process.stdout.write('unexpected benchmark stdout')
+  }
 
   switch (request.operation) {
     case 'coldHydrate': {

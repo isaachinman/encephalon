@@ -302,7 +302,7 @@ const assertOperationBudget = (value: unknown, operation: string): void => {
   }
 }
 
-const assertCacheBudget = (value: unknown): void => {
+const assertCacheBudget = (value: unknown): Record<string, unknown> => {
   const metrics = objectValue(value, 'Benchmark cache budget')
   assertKnownKeys(metrics, cacheMetrics, 'benchmark cache budget metric')
   if (Object.keys(metrics).length === 0) {
@@ -316,6 +316,7 @@ const assertCacheBudget = (value: unknown): void => {
     }
     assertMaximum(limit.maximum, `Benchmark cache budget ${metric}.maximum`)
   }
+  return metrics
 }
 
 const assertBudgetShape = (budget: unknown): Record<string, unknown> => {
@@ -350,7 +351,10 @@ export const parsePerformanceBudget = (value: unknown, records: number[]): Perfo
     }
     seenRecords.add(caseRecords)
     if (entry.cache !== undefined) {
-      assertCacheBudget(entry.cache)
+      const cache = assertCacheBudget(entry.cache)
+      if (caseRecords === 0 && 'amplification' in cache) {
+        throw new Error('Benchmark budget configures unavailable cache.amplification for 0 records.')
+      }
     }
     if (entry.operations !== undefined) {
       const operations = objectValue(entry.operations, 'Benchmark operation budgets')

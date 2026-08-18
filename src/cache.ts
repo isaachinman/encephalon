@@ -297,6 +297,9 @@ type CacheReadTestHooks = {
   duringDatabaseInitialisation?: ((mode: 'reader' | 'writer') => void) | undefined
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
+}
+
+type CacheReadInstrumentation = {
   afterResultRead?: (() => void) | undefined
   beforeResultRead?: (() => void) | undefined
 }
@@ -321,6 +324,9 @@ let sqliteModule: SQLiteModule | undefined
 let sqliteFeaturesVerified = false
 
 export const cacheReadTestHooks: CacheReadTestHooks = {}
+
+/** @internal */
+export const cacheReadInstrumentation: CacheReadInstrumentation = {}
 
 const loadSQLite = () => {
   if (sqliteModule === undefined) {
@@ -1864,9 +1870,9 @@ const readFreshCache = <Result>(root: string, location: CacheLocation, read: (da
     if (!metadataIsFresh(root, database, metadata)) {
       throw new CacheSchemaMismatch('The cache is stale before read.')
     }
-    cacheReadTestHooks.beforeResultRead?.()
+    cacheReadInstrumentation.beforeResultRead?.()
     const result = read(database)
-    cacheReadTestHooks.afterResultRead?.()
+    cacheReadInstrumentation.afterResultRead?.()
     return result
   })
 
