@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-18 for code and behavioural-test snapshot `de1d9ea2925c329a4385f37d2cccc91d058925a2`.
+Last reviewed: 2026-08-18 for code and behavioural-test snapshot `6c408c48152eb7ecaa122a0772134d0d52d7a364`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -141,7 +141,7 @@ This document is the concise contract maintainers should update when public beha
 - Zero-record stale preparation is unavailable and represented as `null`. Stale samples use a valid different-length canonical record variant so rapid runs cannot mistake unchanged timestamp/size metadata for a changed corpus.
 - Report output is written at mode `0600` inside a private `0700` staging directory beside the destination. The retained descriptor, rather than the replaceable destination pathname, applies an existing regular report's permission mode or the normal process-umask mode for a new report before close and atomic rename. Rename is the publication commit; later best-effort removal of the now-empty private staging directory cannot turn a successful publication into a reported failure. On platforms that deliver handled `SIGINT` and `SIGTERM`, signals cancel the active child, await closure, clean temporary repositories, and return a non-zero status without publishing a report. Windows force-terminates Node children for `SIGTERM`, so that CLI signal-cleanup guarantee does not apply there; platform-neutral `AbortController` cancellation cleanup remains covered everywhere.
 
-The exact code and behavioural-test snapshot implementing these guarantees is `de1d9ea2925c329a4385f37d2cccc91d058925a2`.
+The exact code and behavioural-test snapshot implementing these guarantees is `6c408c48152eb7ecaa122a0772134d0d52d7a364`.
 
 ## Package and Release Gates
 
@@ -175,7 +175,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `de1d9ea2925c329a4385f37d2cccc91d058925a2`.
+- MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `6c408c48152eb7ecaa122a0772134d0d52d7a364`.
 - MAR-2554 bounded full, compact, and gather read responses: `b43daf795de35d34602d1018ad509f68e494fe3d`.
 - MAR-2550 exact cached FTS row-text projection validation, bounded pre-mutation writer validation, and recovery: `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`.
 - MAR-2559 Unicode-preserving literal FTS query construction, derived search-document NFC normalization and bounded expansion recovery: `aa1a2596f4ca5be42b8896beedc802040eb57161`.
