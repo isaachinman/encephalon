@@ -190,7 +190,7 @@ The complete lint, four-project typecheck, full test, benchmark, build, package,
 - Semantic SQLite schema validation remains MAR-2553.
 - FTS text equality remains MAR-2550.
 - Cached JSON equality with canonical files remains MAR-2571.
-- Per-operation cache-generation memoisation remains MAR-2552.
+- MAR-2552 now retains one verified read transaction per public operation and binds any post-rebuild read to that exact primary; cross-operation cache-generation memoisation remains out of scope.
 - Compact and gather response-byte budgets remain MAR-2554.
 - Incremental hydration, pagination, streaming, schema migration, configurable budgets, and new canonical storage remain out of scope.
 
