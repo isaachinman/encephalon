@@ -26,6 +26,10 @@ describe('package contract', () => {
 
   test('has a side-effect-free TypeScript API entrypoint', () => {
     assert.equal(existsSync(resolve(root, 'src/index.ts')), true)
+    assert.doesNotMatch(
+      readFileSync(resolve(root, 'dist', 'index.d.ts'), 'utf8'),
+      /BaselineWork|RecordWork|onWork|scanBaselineWithHooks|validateRecordsResolved/,
+    )
   })
 
   test('keeps generated runtime version metadata in sync with the manifest', () => {

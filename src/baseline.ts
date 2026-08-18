@@ -154,6 +154,13 @@ type PackageManagerEvidence =
       status: 'unknown'
     }
 
+type BaselineWork =
+  | 'language-count-write'
+  | 'language-entry'
+  | 'top-level-entry'
+  | 'top-level-fact-write'
+  | 'workflow-entry'
+
 type BaselineScanHooks = {
   afterBaselineSources?: (() => void) | undefined
   afterLanguageDirectoryCapture?: ((path: string) => void) | undefined
@@ -167,6 +174,7 @@ type BaselineScanHooks = {
   maximumScannedDirectories?: number | undefined
   maximumScannedFiles?: number | undefined
   onLanguageDirectoryScheduled?: (() => void) | undefined
+  onWork?: ((operation: BaselineWork) => void) | undefined
 }
 
 type BaselineReason =
@@ -349,7 +357,9 @@ const readBoundedDirectoryEntries = (
   if (parent !== undefined) {
     revalidateCanonicalDirectory(parent)
   }
-  const snapshot = captureCanonicalDirectory(directory, MAX_LANGUAGE_DIRECTORY_ENTRIES)
+  const snapshot = captureCanonicalDirectory(directory, MAX_LANGUAGE_DIRECTORY_ENTRIES, undefined, () =>
+    hooks.onWork?.('language-entry'),
+  )
   hooks.afterLanguageDirectoryCapture?.(directory)
   if (parent !== undefined) {
     revalidateCanonicalDirectory(parent)
@@ -408,6 +418,7 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
             state.filesSeen += 1
             const language = LANGUAGE_BY_EXTENSION.get(extname(entry.name).toLowerCase())
             if (language !== undefined) {
+              hooks.onWork?.('language-count-write')
               state.languageCounts.set(language, (state.languageCounts.get(language) ?? 0) + 1)
             }
           }
@@ -446,7 +457,12 @@ const workflowFiles = (root: string, hooks: BaselineScanHooks, expectedGithub: b
       if (workflowsWitness === undefined) {
         revalidateDirectoryWitness(githubWitness)
       } else {
-        const collected = collectBoundedDirectoryEntries(workflowsWitness.canonicalPath, MAX_WORKFLOW_ENTRIES)
+        const collected = collectBoundedDirectoryEntries(
+          workflowsWitness.canonicalPath,
+          MAX_WORKFLOW_ENTRIES,
+          undefined,
+          () => hooks.onWork?.('workflow-entry'),
+        )
         hooks.afterWorkflowEnumeration?.()
         revalidateDirectoryWitness(workflowsWitness)
         revalidateDirectoryWitness(githubWitness)
@@ -482,7 +498,9 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
     value: emptyTopLevelFacts(),
   }
   try {
-    const snapshot = captureCanonicalDirectory(root, MAX_TOP_LEVEL_ENTRIES)
+    const snapshot = captureCanonicalDirectory(root, MAX_TOP_LEVEL_ENTRIES, undefined, () =>
+      hooks.onWork?.('top-level-entry'),
+    )
     if (snapshot.overflow) {
       result = { reasons: ['top-level-entry-limit'], value: emptyTopLevelFacts() }
     } else {
@@ -491,8 +509,10 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
         .reduce((candidate, entry) => {
           if (entry.isDirectory() && !EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())) {
             candidate.directories.push(entry.name)
+            hooks.onWork?.('top-level-fact-write')
           } else if (entry.isFile() && RECOGNISED_FILES.has(entry.name.toLowerCase())) {
             candidate.recognisedFiles.push(entry.name)
+            hooks.onWork?.('top-level-fact-write')
           }
           return candidate
         }, emptyTopLevelFacts())

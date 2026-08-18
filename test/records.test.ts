@@ -2266,7 +2266,7 @@ describe('canonical records', () => {
     assert.equal(api.validateRecords({ root }).valid, true)
   })
 
-  test('validates a corpus at the record limit with an iterative supersession chain', () => {
+  test('bounds graph work for a corpus-limit supersession chain', () => {
     const root = createRoot()
     for (const index of Array.from({ length: 1000 }, (_, value) => value)) {
       writeCanonicalRecord(root, {
@@ -2276,11 +2276,24 @@ describe('canonical records', () => {
       })
     }
 
-    const result = api.validateRecords({ root }) as { truncated?: boolean } & ReturnType<typeof api.validateRecords>
+    const work = new Map<string, number>()
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        onWork: operation => work.set(operation, (work.get(operation) ?? 0) + 1),
+      },
+    }) as { truncated?: boolean } & ReturnType<typeof api.validateRecords>
     assert.equal(result.valid, true)
     assert.equal(result.recordsChecked, 1000)
     assert.equal(result.errors.length, 0)
     assert.equal(result.truncated, false)
+    assert.deepEqual(Object.fromEntries(work), {
+      'active-group-write': 1,
+      'canonical-entry': 1000,
+      'cycle-edge': 999,
+      'duplicate-record': 1000,
+      'edge-validation': 999,
+      'superseded-edge': 999,
+    })
   })
 
   test('preflights exact and overflowing planned kind directory entries', () => {
@@ -2335,9 +2348,19 @@ describe('canonical records', () => {
       id: 'edge-budget-overflow',
       supersedes: ['one-more-missing-edge'],
     })
-    const edgeResult = api.validateRecords({ root: edgeRoot })
+    let traversedOverflowEdges = 0
+    const edgeResult = validateRecordsResolved(edgeRoot, {
+      hooks: {
+        onWork: operation => {
+          if (operation === 'cycle-edge' || operation === 'edge-validation' || operation === 'superseded-edge') {
+            traversedOverflowEdges += 1
+          }
+        },
+      },
+    })
     assert.equal(edgeResult.valid, false)
     assert.equal(edgeResult.errors[0]?.code, 'CORPUS_SUPERSEDES_LIMIT')
+    assert.equal(traversedOverflowEdges, 0, 'supersession traversal continued after the edge budget failed')
 
     const artifactRoot = createRoot()
     for (const recordIndex of Array.from({ length: 201 }, (_, value) => value)) {
