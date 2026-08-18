@@ -72,7 +72,7 @@ A failed check names the corpus size, operation or cache, metric, statistic, act
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test snapshot is `c5d97b7141a3f52c1a16320e73db7d1e9ddf4f9b`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
+The exact implementation and behavioural-test snapshot is `de1d9ea2925c329a4385f37d2cccc91d058925a2`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
 
 ## Acceptance coverage
 
@@ -80,6 +80,6 @@ The exact implementation and behavioural-test snapshot is `c5d97b7141a3f52c1a163
 - Budget tests cover explicit statistic selection, fixed failure context, and schema-version rejection.
 - Process tests cover one valid IPC result, wrong/malformed result, unexpected stdout, child crash, hard timeout, and waiting for close.
 - An actual worker test proves two samples use different process identities, reports additive read phases, and keeps prepare-only query/projection phases at zero.
-- Repository cleanup is tested on success, child failure, cancellation, and setup failure before helper ownership returns.
-- Prepared-template restoration, stale-transition ordering, repeated and equals-form CLI options, non-vacuous and availability-aware budgets, exhaustive operation dispatch, atomic output selection, and permission preservation are covered by focused regressions.
+- Repository cleanup is tested on success, child failure, cancellation, setup failure before helper ownership returns, and multiple simultaneous cleanup failures without abandoning later owned roots.
+- Prepared-template restoration, stale-transition ordering, repeated and equals-form CLI options, non-vacuous and availability-aware budgets, exhaustive operation dispatch, atomic output selection, private staging, and descriptor-bound pre-publication permission finalisation are covered by focused regressions.
 - Normal benchmark, CI budget, full test, build, package, publish-contract, and frozen-install gates remain required.
