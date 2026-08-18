@@ -112,7 +112,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `e25d81a3bcdbe92f64c317be5be7c56becc6e485`\./,
+      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `45cd8e649781151fb359bdc82343a12a11c50597`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
@@ -125,11 +125,11 @@ describe('package contract', () => {
     )
     assert.match(
       gatherDeduplicationDesign,
-      /The exact implementation and behavioural-test snapshot is `e25d81a3bcdbe92f64c317be5be7c56becc6e485`\./,
+      /The exact implementation and behavioural-test snapshot is `45cd8e649781151fb359bdc82343a12a11c50597`\./,
     )
     assert.match(
       contract,
-      /MAR-2560 snapshot-local exact-key gather deduplication: `e25d81a3bcdbe92f64c317be5be7c56becc6e485`\./,
+      /MAR-2560 snapshot-local exact-key gather deduplication: `45cd8e649781151fb359bdc82343a12a11c50597`\./,
     )
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`\./)
