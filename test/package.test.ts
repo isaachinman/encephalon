@@ -51,6 +51,7 @@ describe('package contract', () => {
   test('marks the old implementation plan historical and maintains a concise contract', () => {
     const implementationPlan = readFileSync(resolve(root, 'docs', 'implementation-plan.md'), 'utf8')
     const contract = readFileSync(resolve(root, 'docs', 'contract.md'), 'utf8')
+    const performance = readFileSync(resolve(root, 'docs', 'performance.md'), 'utf8')
     const operationBudgetsDesign = readFileSync(
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-13-operation-budgets-design.md'),
       'utf8',
@@ -99,9 +100,11 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `948aa416405a23bd730543015bbcb3c55a1e6546`\./,
+      /Last reviewed: 2026-08-18 for code and behavioural-test snapshot `d8d9ea8f6c7833e0c737c16880abe510f2793529`\./,
     )
     assert.match(contract, /## Performance Evidence/)
+    assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `d8d9ea8f6c7833e0c737c16880abe510f2793529`\./)
+    assert.match(performance, /Correctness tests enforce deterministic output and bounded work counts/)
     assert.match(
       contract,
       /MAR-2548 restart-safe partial initialisation progress and convergence: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`\./,
