@@ -1,4 +1,4 @@
-import { cacheReadTestHooks } from '../src/cache.ts'
+import { cacheReadInstrumentation } from '../src/cache.ts'
 import {
   gatherRecords,
   hydrate,
@@ -38,68 +38,52 @@ const shownIdForCase = (records: number) => {
   return `chain-${String(activeChainIndex).padStart(5, '0')}`
 }
 
-const runOperation = (operation: BenchmarkOperation, records: number, root: string): unknown => {
-  const shownId = shownIdForCase(records)
-  if (operation === 'coldHydrate') {
-    return hydrate({ root })
-  }
-  if (operation === 'unchangedPrepare' || operation === 'stalePrepare') {
-    return prepare({ root })
-  }
-  if (operation === 'list') {
-    return listRecords({ limit: 20, root })
-  }
-  if (operation === 'show') {
-    return showRecord({ id: shownId, root })
-  }
-  if (operation === 'compactSearch') {
-    return searchCompactRecords({ limit: 20, query: 'benchmark needle', root })
-  }
-  if (operation === 'fullSearch') {
-    return searchRecords({ limit: 20, query: 'benchmark needle', root })
-  }
-  return gatherRecords({
-    root,
-    searches: ['benchmark needle', 'large payload'],
-    shows: [shownId, 'missing'],
-  })
+type OperationRunner = (records: number, root: string) => unknown
+type ResultValidator = (records: number, result: unknown) => boolean
+
+const operationRunners: Record<BenchmarkOperation, OperationRunner> = {
+  coldHydrate: (_records, root) => hydrate({ root }),
+  compactSearch: (_records, root) => searchCompactRecords({ limit: 20, query: 'benchmark needle', root }),
+  fullSearch: (_records, root) => searchRecords({ limit: 20, query: 'benchmark needle', root }),
+  gather: (records, root) =>
+    gatherRecords({
+      root,
+      searches: ['benchmark needle', 'large payload'],
+      shows: [shownIdForCase(records), 'missing'],
+    }),
+  list: (_records, root) => listRecords({ limit: 20, root }),
+  show: (records, root) => showRecord({ id: shownIdForCase(records), root }),
+  stalePrepare: (_records, root) => prepare({ root }),
+  unchangedPrepare: (_records, root) => prepare({ root }),
 }
 
-const assertResultCardinality = (value: unknown, records: number, operation: string): void => {
-  const valid = Array.isArray(value) && (records === 0 ? value.length === 0 : value.length > 0)
-  if (!valid) {
-    throw new Error(`The ${operation} benchmark returned an unexpected result.`)
-  }
+const hasExpectedResultCardinality = (records: number, result: unknown): boolean =>
+  Array.isArray(result) && (records === 0 ? result.length === 0 : result.length > 0)
+
+const resultValidators: Record<BenchmarkOperation, ResultValidator> = {
+  coldHydrate: (records, result) => isObject(result) && result.recordsIndexed === records,
+  compactSearch: hasExpectedResultCardinality,
+  fullSearch: hasExpectedResultCardinality,
+  gather: (_records, result) =>
+    isObject(result) &&
+    result.hydrated === null &&
+    Array.isArray(result.searches) &&
+    result.searches.length === 2 &&
+    Array.isArray(result.records) &&
+    result.records.length === 2,
+  list: hasExpectedResultCardinality,
+  show: (records, result) => (records === 0 ? result === null : isObject(result)),
+  stalePrepare: (records, result) => isObject(result) && result.recordsIndexed === records && result.hydrated === true,
+  unchangedPrepare: (records, result) =>
+    isObject(result) && result.recordsIndexed === records && result.hydrated === false,
 }
+
+const runOperation = (operation: BenchmarkOperation, records: number, root: string): unknown =>
+  operationRunners[operation](records, root)
 
 const assertOperationResult = (operation: BenchmarkOperation, records: number, result: unknown): void => {
-  if (operation === 'coldHydrate' || operation.endsWith('Prepare')) {
-    const expectedHydrated = operation === 'stalePrepare'
-    const valid =
-      isObject(result) &&
-      result.recordsIndexed === records &&
-      (operation === 'coldHydrate' || result.hydrated === expectedHydrated)
-    if (!valid) {
-      throw new Error(`The ${operation} benchmark returned an unexpected result.`)
-    }
-  } else if (operation === 'list' || operation === 'compactSearch' || operation === 'fullSearch') {
-    assertResultCardinality(result, records, operation)
-  } else if (operation === 'show') {
-    const valid = records === 0 ? result === null : isObject(result)
-    if (!valid) {
-      throw new Error('The show benchmark returned an unexpected result.')
-    }
-  } else {
-    const valid =
-      isObject(result) &&
-      result.hydrated === null &&
-      Array.isArray(result.searches) &&
-      result.searches.length === 2 &&
-      Array.isArray(result.records) &&
-      result.records.length === 2
-    if (!valid) {
-      throw new Error('The gather benchmark returned an unexpected result.')
-    }
+  if (!resultValidators[operation](records, result)) {
+    throw new Error(`The ${operation} benchmark returned an unexpected result.`)
   }
 }
 
@@ -113,14 +97,14 @@ const measure = (operation: BenchmarkOperation, records: number, root: string): 
   let resultReadStart: number | undefined
   let resultReadEnd: number | undefined
   if (!preparationOnly) {
-    cacheReadTestHooks.beforeResultRead = () => {
+    cacheReadInstrumentation.beforeResultRead = () => {
       if (boundary.state !== 'awaiting-before') {
         throw new Error(`The ${operation} benchmark repeated its read boundary.`)
       }
       resultReadStart = performance.now()
       boundary.state = 'reading'
     }
-    cacheReadTestHooks.afterResultRead = () => {
+    cacheReadInstrumentation.afterResultRead = () => {
       if (boundary.state !== 'reading') {
         throw new Error(`The ${operation} benchmark reported read boundaries out of order.`)
       }
@@ -134,8 +118,8 @@ const measure = (operation: BenchmarkOperation, records: number, root: string): 
     result = runOperation(operation, records, root)
     end = performance.now()
   } finally {
-    cacheReadTestHooks.beforeResultRead = undefined
-    cacheReadTestHooks.afterResultRead = undefined
+    cacheReadInstrumentation.beforeResultRead = undefined
+    cacheReadInstrumentation.afterResultRead = undefined
   }
   if (boundary.state !== 'complete' && boundary.state !== 'not-applicable') {
     throw new Error(`The ${operation} benchmark did not report a complete read boundary.`)

@@ -43,6 +43,14 @@ const sample = (totalMs: number) => ({
   totalMs,
 })
 
+const separatedP95Distribution = {
+  count: 20,
+  maximum: 20,
+  median: 10.5,
+  p95: 19,
+  samples: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+}
+
 const emptyCache = {
   amplification: null,
   databaseBytes: 1,
@@ -89,6 +97,7 @@ describe('isolated benchmark authority', () => {
       p95: 40,
       samples: [40, 10, 30, 20],
     })
+    assert.deepEqual(summarizeDistribution(separatedP95Distribution.samples), separatedP95Distribution)
     assert.deepEqual(invocations, [999, 998, 40, 10, 30, 20])
   })
 
@@ -117,6 +126,8 @@ describe('isolated benchmark authority', () => {
       ],
       schemaVersion: 2,
     } as BenchmarkReport
+    const [reportCase] = report.cases
+    assert.ok(reportCase)
 
     assert.throws(
       () =>
@@ -141,6 +152,32 @@ describe('isolated benchmark authority', () => {
         }),
       /0 records coldHydrate\.totalMs\.p95: actual 100 exceeds budget 50\./,
     )
+    assert.doesNotThrow(() =>
+      assertPerformanceBudget(
+        {
+          ...report,
+          cases: [
+            {
+              ...reportCase,
+              operations: operations({
+                coldHydrate: {
+                  overheadMs: summarizeDistribution([0]),
+                  peakRssBytes: summarizeDistribution([100]),
+                  preparationIntegrityMs: separatedP95Distribution,
+                  queryProjectionMs: summarizeDistribution([0]),
+                  rssDeltaBytes: summarizeDistribution([-1]),
+                  totalMs: separatedP95Distribution,
+                },
+              }),
+            },
+          ],
+        },
+        {
+          cases: [{ operations: { coldHydrate: { totalMs: { p95: 19 } } }, records: 0 }],
+          schemaVersion: 2,
+        },
+      ),
+    )
     assert.throws(
       () => assertPerformanceBudget(report, { cases: [], schemaVersion: 2 }),
       /Performance budget has no case for 0 records\./,
@@ -150,8 +187,20 @@ describe('isolated benchmark authority', () => {
       /Benchmark budget case for 0 records must configure a limit\./,
     )
     assert.throws(
-      () => assertPerformanceBudget(report, { cases: [{ operations: {}, records: 0 }], schemaVersion: 2 }),
+      () =>
+        assertPerformanceBudget(report, {
+          cases: [{ operations: {}, records: 0 }],
+          schemaVersion: 2,
+        }),
       /Benchmark operation budgets must configure an operation\./,
+    )
+    assert.throws(
+      () =>
+        assertPerformanceBudget(report, {
+          cases: [{ cache: { amplification: { maximum: 1 } }, records: 0 }],
+          schemaVersion: 2,
+        }),
+      /Benchmark budget configures unavailable cache\.amplification for 0 records\./,
     )
     assert.throws(
       () =>
@@ -289,6 +338,16 @@ describe('isolated benchmark authority', () => {
       }),
       /Benchmark fullSearch for 0 records exited with code 23 before producing a result\./,
     )
+    await assert.rejects(
+      runBenchmarkWorker({
+        operation: 'fullSearch',
+        records: 0,
+        root: '/stdout',
+        timeoutMilliseconds: 2000,
+        workerPath: fixtureWorker,
+      }),
+      /Benchmark fullSearch for 0 records wrote unexpected stdout\./,
+    )
   })
 
   test('kills an aborted worker and waits for its close', async () => {
@@ -328,7 +387,25 @@ describe('isolated benchmark authority', () => {
     const root = createTestRepository()
     try {
       mkdirSync(join(root, 'encephalon'))
-      hydrate({ root })
+      const cold = await runBenchmarkWorker({
+        operation: 'coldHydrate',
+        records: 0,
+        root,
+        timeoutMilliseconds: 5000,
+        workerPath: realWorker,
+      })
+      const unchanged = await runBenchmarkWorker({
+        operation: 'unchangedPrepare',
+        records: 0,
+        root,
+        timeoutMilliseconds: 5000,
+        workerPath: realWorker,
+      })
+      for (const result of [cold, unchanged]) {
+        assert.equal(result.sample.queryProjectionMs, 0)
+        assert.equal(result.sample.overheadMs, 0)
+        assert.equal(result.sample.preparationIntegrityMs, result.sample.totalMs)
+      }
       const first = await runBenchmarkWorker({
         operation: 'fullSearch',
         records: 0,
@@ -553,7 +630,9 @@ describe('isolated benchmark authority', () => {
     }
   })
 
-  test('aborts the active CLI child and cleans repositories on termination', async () => {
+  test('aborts the active CLI child and cleans repositories on termination', {
+    skip: process.platform === 'win32' ? 'Windows does not deliver SIGTERM to Node handlers.' : false,
+  }, async () => {
     const root = mkdtempSync(join(tmpdir(), 'encephalon-benchmark-signal-test-'))
     const temporaryParent = join(root, 'temporary')
     mkdirSync(temporaryParent)
