@@ -559,6 +559,57 @@ describe('isolated benchmark authority', () => {
     }
   })
 
+  test('preserves setup and worker failures when cleanup also fails', async () => {
+    await Promise.all(
+      (['repository', 'snapshot'] as const).map(async phase => {
+        const temporaryParent = mkdtempSync(join(tmpdir(), `encephalon-benchmark-${phase}-cleanup-priority-test-`))
+        const primaryFailure = new Error(`${phase} primary failure`)
+        let cleanupAttempts = 0
+        try {
+          await assert.rejects(
+            runBenchmark(['--records', '0', '--warmups', '0', '--repetitions', '1'], {
+              afterTemporaryRepositoryAllocation: currentPhase => {
+                if (currentPhase === phase) {
+                  throw primaryFailure
+                }
+              },
+              removeRoot: () => {
+                cleanupAttempts += 1
+                throw new Error(`${phase} cleanup failure`)
+              },
+              temporaryParent,
+            }),
+            error => error === primaryFailure,
+          )
+          assert.equal(cleanupAttempts > 0, true)
+        } finally {
+          rmSync(temporaryParent, { force: true, recursive: true })
+        }
+      }),
+    )
+
+    const temporaryParent = mkdtempSync(join(tmpdir(), 'encephalon-benchmark-worker-cleanup-priority-test-'))
+    let cleanupAttempts = 0
+    try {
+      await assert.rejects(
+        runBenchmark(['--records', '0', '--warmups', '0', '--repetitions', '1'], {
+          removeRoot: () => {
+            cleanupAttempts += 1
+            if (cleanupAttempts === 2) {
+              throw new Error('worker cleanup failure')
+            }
+          },
+          temporaryParent,
+          workerPath: fixtureWorker,
+        }),
+        /Benchmark unchangedPrepare for 0 records returned an invalid worker result/,
+      )
+      assert.equal(cleanupAttempts >= 5, true)
+    } finally {
+      rmSync(temporaryParent, { force: true, recursive: true })
+    }
+  })
+
   test('uses a different-length canonical variant to make a prepared repository stale', () => {
     const root = createTestRepository()
     try {

@@ -27,6 +27,7 @@ import {
   type BenchmarkCase,
   type BenchmarkOperation,
   type BenchmarkReport,
+  type BenchmarkSample,
   benchmarkOperations,
   type CacheMetric,
   collectMeasuredSamples,
@@ -54,6 +55,7 @@ type CaseTemplates = {
 
 type BenchmarkControllerOptions = {
   afterTemporaryRepositoryAllocation?: ((phase: 'repository' | 'snapshot') => void) | undefined
+  removeRoot?: ((path: string) => void) | undefined
   signal?: AbortSignal
   temporaryParent?: string
   workerPath?: string
@@ -61,6 +63,7 @@ type BenchmarkControllerOptions = {
 
 type ResolvedBenchmarkControllerOptions = {
   afterTemporaryRepositoryAllocation: ((phase: 'repository' | 'snapshot') => void) | undefined
+  removeRoot: (path: string) => void
   signal: AbortSignal | undefined
   temporaryParent: string
   workerPath: string
@@ -87,10 +90,45 @@ const round = (value: number, digits = 3) => Number(value.toFixed(digits))
 const byteSize = (path: string) => (existsSync(path) ? statSync(path).size : 0)
 const timestamp = (index: number) => new Date(deterministicStart + index).toISOString()
 
+type BenchmarkOutcome<Value> = { kind: 'success'; value: Value } | { error: unknown; kind: 'failure' }
+type BenchmarkRootCleanup = { kind: 'success' } | { error: unknown; kind: 'failure' }
+
+export const removeBenchmarkRoots = (
+  roots: string[],
+  remove: (path: string) => void = path => rmSync(path, { force: true, recursive: true }),
+): BenchmarkRootCleanup =>
+  roots.reduce<BenchmarkRootCleanup>(
+    (result, path) => {
+      try {
+        remove(path)
+        return result
+      } catch (error) {
+        return result.kind === 'failure' ? result : { error, kind: 'failure' }
+      }
+    },
+    { kind: 'success' },
+  )
+
+const completeBenchmarkCleanup = <Value>(
+  outcome: BenchmarkOutcome<Value>,
+  roots: string[],
+  remove?: (path: string) => void,
+): Value => {
+  const cleanup = removeBenchmarkRoots(roots, remove)
+  if (outcome.kind === 'failure') {
+    throw outcome.error
+  }
+  if (cleanup.kind === 'failure') {
+    throw cleanup.error
+  }
+  return outcome.value
+}
+
 const createRepository = (
   temporaryParent: string,
   prefix: string,
   afterAllocation: BenchmarkControllerOptions['afterTemporaryRepositoryAllocation'],
+  removeRoot: (path: string) => void,
 ) => {
   const root = mkdtempSync(join(temporaryParent, prefix))
   try {
@@ -104,8 +142,7 @@ const createRepository = (
     )
     return root
   } catch (error) {
-    rmSync(root, { force: true, recursive: true })
-    throw error
+    return completeBenchmarkCleanup<string>({ error, kind: 'failure' }, [root], removeRoot)
   }
 }
 
@@ -113,6 +150,7 @@ const snapshotRepository = (
   template: string,
   temporaryParent: string,
   afterAllocation: BenchmarkControllerOptions['afterTemporaryRepositoryAllocation'],
+  removeRoot: (path: string) => void,
 ) => {
   const root = mkdtempSync(join(temporaryParent, 'encephalon-benchmark-template-'))
   try {
@@ -120,8 +158,7 @@ const snapshotRepository = (
     cpSync(template, root, { recursive: true, verbatimSymlinks: true })
     return root
   } catch (error) {
-    rmSync(root, { force: true, recursive: true })
-    throw error
+    return completeBenchmarkCleanup<string>({ error, kind: 'failure' }, [root], removeRoot)
   }
 }
 
@@ -287,41 +324,27 @@ export const makePreparedRepositoryStale = (root: string): void => {
   writeFileSync(path, stale, 'utf8')
 }
 
-type BenchmarkRootCleanup = { kind: 'success' } | { error: unknown; kind: 'failure' }
-
-export const removeBenchmarkRoots = (
-  roots: string[],
-  remove: (path: string) => void = path => rmSync(path, { force: true, recursive: true }),
-): BenchmarkRootCleanup =>
-  roots.reduce<BenchmarkRootCleanup>(
-    (result, path) => {
-      try {
-        remove(path)
-        return result
-      } catch (error) {
-        return result.kind === 'failure' ? result : { error, kind: 'failure' }
-      }
-    },
-    { kind: 'success' },
-  )
-
 const createCaseTemplates = (
   records: number,
   temporaryParent: string,
   afterAllocation: BenchmarkControllerOptions['afterTemporaryRepositoryAllocation'],
+  removeRoot: (path: string) => void,
 ): CaseTemplates => {
-  const sampleRoot = createRepository(temporaryParent, 'encephalon-benchmark-sample-', afterAllocation)
+  const sampleRoot = createRepository(temporaryParent, 'encephalon-benchmark-sample-', afterAllocation, removeRoot)
   let unprepared: string | undefined
   let prepared: string | undefined
   try {
     const corpus = createCorpus(sampleRoot, records)
-    unprepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation)
+    unprepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation, removeRoot)
     hydrate({ root: sampleRoot })
-    prepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation)
+    prepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation, removeRoot)
     return { corpus, prepared, sampleRoot, unprepared }
   } catch (error) {
-    removeBenchmarkRoots([sampleRoot, unprepared, prepared].filter((path): path is string => path !== undefined))
-    throw error
+    return completeBenchmarkCleanup<CaseTemplates>(
+      { error, kind: 'failure' },
+      [sampleRoot, unprepared, prepared].filter((path): path is string => path !== undefined),
+      removeRoot,
+    )
   }
 }
 
@@ -341,6 +364,7 @@ const runOperationSamples = async (
     }
     const root = templates.sampleRoot
     restoreBenchmarkSample(templateForOperation(operation, templates), root, operation)
+    let outcome: BenchmarkOutcome<BenchmarkSample>
     try {
       const result = await runBenchmarkWorker({
         operation,
@@ -350,10 +374,11 @@ const runOperationSamples = async (
         timeoutMilliseconds: configuration.timeoutMilliseconds,
         workerPath: options.workerPath,
       })
-      return result.sample
-    } finally {
-      rmSync(root, { force: true, recursive: true })
+      outcome = { kind: 'success', value: result.sample }
+    } catch (error) {
+      outcome = { error, kind: 'failure' }
     }
+    return completeBenchmarkCleanup(outcome, [root], options.removeRoot)
   })
   return summarizeSamples(samples)
 }
@@ -363,7 +388,12 @@ const runCase = async (
   configuration: BenchmarkArguments,
   options: ResolvedBenchmarkControllerOptions,
 ): Promise<BenchmarkCase> => {
-  const templates = createCaseTemplates(records, options.temporaryParent, options.afterTemporaryRepositoryAllocation)
+  const templates = createCaseTemplates(
+    records,
+    options.temporaryParent,
+    options.afterTemporaryRepositoryAllocation,
+    options.removeRoot,
+  )
   let outcome: { kind: 'success'; value: BenchmarkCase } | { error: unknown; kind: 'failure' }
   try {
     const operationEntries: Array<
@@ -388,14 +418,11 @@ const runCase = async (
   } catch (error) {
     outcome = { error, kind: 'failure' }
   }
-  const cleanup = removeBenchmarkRoots([templates.prepared, templates.sampleRoot, templates.unprepared])
-  if (outcome.kind === 'failure') {
-    throw outcome.error
-  }
-  if (cleanup.kind === 'failure') {
-    throw cleanup.error
-  }
-  return outcome.value
+  return completeBenchmarkCleanup(
+    outcome,
+    [templates.prepared, templates.sampleRoot, templates.unprepared],
+    options.removeRoot,
+  )
 }
 
 const loadBudget = (path: string | undefined, records: number[]): PerformanceBudget | undefined => {
@@ -417,6 +444,7 @@ const runConfiguredBenchmark = async (
   const budget = loadBudget(configuration.budget, configuration.records)
   const options = {
     afterTemporaryRepositoryAllocation: controllerOptions.afterTemporaryRepositoryAllocation,
+    removeRoot: controllerOptions.removeRoot ?? (path => rmSync(path, { force: true, recursive: true })),
     signal: controllerOptions.signal,
     temporaryParent: controllerOptions.temporaryParent ?? tmpdir(),
     workerPath: controllerOptions.workerPath ?? defaultWorkerPath,
