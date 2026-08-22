@@ -108,9 +108,12 @@ export class CacheDatabaseFailure extends Error {
 }
 
 /** @internal */
-export class CacheDatabaseCreationConflict extends Error {
-  constructor() {
-    super('A cache database primary appeared while exclusive creation was attempted.')
+export class CacheDatabaseCreationConflict extends EncephalonError {
+  constructor(relativePath: string) {
+    super('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
+      entry: relativePath,
+      invariant: 'stable-identity',
+    })
     this.name = 'CacheDatabaseCreationConflict'
   }
 }
@@ -507,7 +510,7 @@ const bootstrapPrimary = (
   } catch (error) {
     if (existingPath(error) && mode === 'create-exclusive') {
       // biome-ignore lint/style/useErrorCause: this internal control sentinel must not retain a path-bearing EEXIST.
-      throw new CacheDatabaseCreationConflict()
+      throw new CacheDatabaseCreationConflict(relativePath)
     }
     if (!existingPath(error)) {
       throw error
@@ -515,10 +518,13 @@ const bootstrapPrimary = (
   }
   const identity = inspectRegularFile(path, relativePath)
   if (identity === undefined) {
-    return changedLayout(relativePath, created ? 'created-file-present' : 'existing-file-present')
+    if (createdIdentity !== undefined) {
+      throw new CacheDatabaseCreationConflict(relativePath)
+    }
+    return changedLayout(relativePath, 'existing-file-present')
   }
   if (createdIdentity !== undefined && !sameCacheEntryIdentity(createdIdentity, identity)) {
-    throw new CacheDatabaseCreationConflict()
+    throw new CacheDatabaseCreationConflict(relativePath)
   }
   return { identity, primaryCreated: created }
 }
@@ -579,7 +585,7 @@ const assertOwnedCacheDatabase = (location: CacheLocation, database: CacheDataba
   assertCacheLocation(location)
   const identity = inspectRegularFile(database.path, databaseRelativePath(database.name))
   if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
-    throw new CacheDatabaseCreationConflict()
+    throw new CacheDatabaseCreationConflict(database.relativePath)
   }
   return { ...database, sidecars: reconcileSidecars(location, database) }
 }

@@ -729,7 +729,6 @@ const assertCacheSchemaUnchecked = (database: DatabaseSync) => {
   assertOrdinaryTableSchema(database, 'records', RECORD_COLUMNS)
   assertOrdinaryTableDefinition(database, 'records', RECORDS_TABLE_DEFINITION)
   assertRecordsIndexes(database)
-  assertTableColumns(database, 'record_search', ['id', 'text'])
   const searchSchemaProbe = readIntegrityProbe(
     'record-search-schema',
     database
@@ -769,6 +768,7 @@ const assertCacheSchemaUnchecked = (database: DatabaseSync) => {
   ) {
     throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
   }
+  assertTableColumns(database, 'record_search', ['id', 'text'])
 }
 
 const assertCacheSchema = (database: DatabaseSync) => {
@@ -1491,10 +1491,7 @@ const rebuildCache = (
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
     const opened = openWriterDatabase(location, nextWriterPrimary)
     const { database, identity } = opened
-    nextWriterPrimary =
-      nextWriterPrimary.kind === 'create-if-missing'
-        ? { kind: 'create-if-missing' }
-        : { database: identity, kind: 'expected-owned' }
+    nextWriterPrimary = { database: identity, kind: 'expected-owned' }
     let rebuildResult: PrepareResult | undefined
     let writerFailure: unknown
     let writerFailed = false

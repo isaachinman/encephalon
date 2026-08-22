@@ -719,7 +719,17 @@ describe('cache filesystem containment', () => {
       }
     }
 
-    assert.throws(() => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }))
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          invariant: 'stable-identity',
+        })
+        return true
+      },
+    )
     assert.equal(replacements, 1)
     assert.equal(existsSync(displacedPath), true)
     const successor = new DatabaseSync(databasePath, { readOnly: true })
@@ -735,6 +745,53 @@ describe('cache filesystem containment', () => {
     } finally {
       successor.close()
     }
+  })
+
+  test('retries when an exclusive primary disappears immediately after creation', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'post-bootstrap-predecessor.sqlite')
+    const disappearedClaimPath = join(root, 'post-bootstrap-disappeared-claim.sqlite')
+    let claimsDisappeared = 0
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheLocationTestHooks.afterPrimaryBootstrapClose = path => {
+      if (basename(path) === 'brain.sqlite') {
+        cacheLocationTestHooks.afterPrimaryBootstrapClose = undefined
+        renameSync(path, disappearedClaimPath)
+        claimsDisappeared += 1
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 1,
+    })
+    assert.equal(claimsDisappeared, 1)
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 1)
+    assert.equal(existsSync(predecessorPath), true)
+    assert.equal(existsSync(disappearedClaimPath), true)
+    assert.equal(existsSync(databasePath), true)
   })
 
   test('rejects primary replacements immediately after SQLite opens where open-file rename is supported', {
@@ -2851,6 +2908,94 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(readFileSync(databasePath), successorBytes)
   })
 
+  test('binds a create-if-missing claim across repository-change retries', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'create-if-missing-predecessor.sqlite')
+    const claimedPath = join(root, 'create-if-missing-claim.sqlite')
+    const successorPath = join(root, 'create-if-missing-successor.sqlite')
+    const sourceDatabase = new DatabaseSync(databasePath, { readOnly: true })
+    sourceDatabase.prepare('VACUUM INTO ?').run(successorPath)
+    sourceDatabase.close()
+    const successorBytes = readFileSync(successorPath)
+    const successorIdentity = lstatSync(successorPath, { bigint: true })
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const sourcePath = `${databasePath}${suffix}`
+      if (existsSync(sourcePath)) {
+        renameSync(sourcePath, `${predecessorPath}${suffix}`)
+      }
+    }
+    let canonicalValidations = 0
+    let primaryQuarantines = 0
+    let repositoryRetryInjected = false
+    let successorInstalled = false
+    let successorWriterInitialisations = 0
+    let writerOpened = false
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      canonicalValidations += 1
+      if (canonicalValidations === 2) {
+        for (const suffix of ['-wal', '-shm', '-journal']) {
+          const sidecarPath = `${databasePath}${suffix}`
+          if (existsSync(sidecarPath)) {
+            renameSync(sidecarPath, `${claimedPath}${suffix}`)
+          }
+        }
+        renameSync(databasePath, claimedPath)
+        renameSync(successorPath, databasePath)
+        successorInstalled = true
+      }
+    }
+    cacheReadTestHooks.afterManifestRootEnumeration = () => {
+      if (writerOpened && !repositoryRetryInjected) {
+        repositoryRetryInjected = true
+        throw new CanonicalDirectoryChangedError(root)
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        writerOpened = true
+        const currentIdentity = lstatSync(databasePath, { bigint: true })
+        if (
+          successorInstalled &&
+          currentIdentity.dev === successorIdentity.dev &&
+          currentIdentity.ino === successorIdentity.ino
+        ) {
+          successorWriterInitialisations += 1
+        }
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          invariant: 'stable-identity',
+        })
+        return true
+      },
+    )
+    assert.equal(canonicalValidations, 2)
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(repositoryRetryInjected, true)
+    assert.equal(writerInitialisations, 1)
+    assert.equal(successorWriterInitialisations, 0)
+    assert.equal(existsSync(predecessorPath), true)
+    assert.equal(existsSync(claimedPath), true)
+    const currentIdentity = lstatSync(databasePath, { bigint: true })
+    assert.equal(sameCacheEntryIdentity(successorIdentity, currentIdentity), true)
+    assert.deepEqual(readFileSync(databasePath), successorBytes)
+  })
+
   test('owns an exclusively created primary before its first SQLite open', () => {
     const root = createRoot()
     addCacheRecord(root)
@@ -3397,6 +3542,43 @@ describe('SQLite cache and reads', () => {
     })
   })
 
+  test('recovers an unavailable private FTS module before introspecting columns', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const privateSentinel = 'private_customer_module_sentinel'
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    mutateCache(root, database => {
+      database.enableDefensive(false)
+      database.exec('PRAGMA writable_schema = ON;')
+      database
+        .prepare("UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'record_search'")
+        .run(`CREATE VIRTUAL TABLE record_search USING ${privateSentinel}(id UNINDEXED, text)`)
+      database.exec('PRAGMA writable_schema = OFF;')
+    })
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const listed = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
+      root,
+    })
+
+    assert.deepEqual(
+      listed.map(entry => entry.id),
+      [record.id],
+    )
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 1)
+  })
+
   test('quarantines an incompatible existing schema instead of repairing it in place', () => {
     const root = createRoot()
     addCacheRecord(root)
@@ -3406,6 +3588,7 @@ describe('SQLite cache and reads', () => {
     })
     const incompatibleIdentity = lstatSync(databasePath, { bigint: true })
     let primaryQuarantines = 0
+    let quarantinedIncompatiblePrimaries = 0
     let writerInitialisations = 0
     cacheLocationTestHooks.beforeQuarantineRename = path => {
       if (basename(path) === 'brain.sqlite') {
@@ -3413,6 +3596,13 @@ describe('SQLite cache and reads', () => {
         assert.equal(current.dev, incompatibleIdentity.dev)
         assert.equal(current.ino, incompatibleIdentity.ino)
         primaryQuarantines += 1
+      }
+    }
+    cacheLocationTestHooks.afterQuarantineRename = path => {
+      if (path.includes('.brain.sqlite.')) {
+        const quarantined = lstatSync(path, { bigint: true })
+        assert.equal(sameCacheEntryIdentity(incompatibleIdentity, quarantined), true)
+        quarantinedIncompatiblePrimaries += 1
       }
     }
     cacheReadTestHooks.duringDatabaseInitialisation = mode => {
@@ -3425,9 +3615,19 @@ describe('SQLite cache and reads', () => {
       recordsIndexed: 1,
     })
     assert.equal(primaryQuarantines, 1)
+    assert.equal(quarantinedIncompatiblePrimaries, 1)
     assert.equal(writerInitialisations, 1)
-    const rebuiltIdentity = lstatSync(databasePath, { bigint: true })
-    assert.notEqual(rebuiltIdentity.ino, incompatibleIdentity.ino)
+    const rebuilt = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      assert.equal(
+        rebuilt
+          .prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE type = 'index' AND name = 'records_active_order'")
+          .get()?.count,
+        1,
+      )
+    } finally {
+      rebuilt.close()
+    }
   })
 
   test('recovers one exact semantically incompatible cache during a public read', () => {
