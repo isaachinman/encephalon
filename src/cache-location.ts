@@ -515,6 +515,9 @@ const bootstrapPrimary = (
   }
   const identity = inspectRegularFile(path, relativePath)
   if (identity === undefined) {
+    if (created && mode === 'create-exclusive') {
+      throw new CacheDatabaseCreationConflict()
+    }
     return changedLayout(relativePath, created ? 'created-file-present' : 'existing-file-present')
   }
   if (createdIdentity !== undefined && !sameCacheEntryIdentity(createdIdentity, identity)) {
@@ -639,6 +642,7 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
     try {
       database = new options.DatabaseConstructor(snapshot.path, options.openOptions)
     } catch (error) {
+      snapshot = assertPrimary(snapshot)
       return failCacheDatabase(error, snapshot)
     }
     try {
