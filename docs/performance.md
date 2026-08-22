@@ -46,6 +46,20 @@ The committed schema-version 2 baseline was measured on Node.js v26.5.0 on darwi
 
 The CI profile intentionally runs only 0 and 100 records with one measured process and generous ceilings. It catches runaway cache rebuild, automatic preparation, search, gather, and cache-size regressions without treating noisy cross-platform timings as precise performance claims. Stable comparisons should use the full profile and its distributions.
 
+## Single-pass read comparison
+
+MAR-2552 removes the second successful integrity pass that previously followed automatic preparation. On the same Node.js v26.5.0 darwin arm64 machine, the 100-record custom profile used one discarded warmup and three measured fresh processes before and after the change. The table reports median preparation/integrity and total milliseconds; it is diagnostic evidence, not a new CI threshold.
+
+| Operation | Previous integrity | Single-pass integrity | Previous total | Single-pass total |
+| --- | ---: | ---: | ---: | ---: |
+| List | 25.7 | 17.3 | 26.1 | 17.9 |
+| Show | 25.9 | 17.1 | 26.3 | 17.5 |
+| Compact search | 26.3 | 16.8 | 27.7 | 18.5 |
+| Full search | 25.9 | 15.8 | 26.7 | 16.8 |
+| Gather | 26.2 | 16.2 | 319.0 | 314.4 |
+
+The committed schema-version 2 baseline remains the pre-optimisation reference. Benchmark workers now also reject any public-read sample that does not report exactly one successful cache-generation validation before result materialisation.
+
 ## Scale guidance
 
 The current full-rebuild cache is suitable for repository knowledge bases up to the product limit of 1,000 canonical records. On the baseline machine, cold hydration remained near a quarter second at that limit; unchanged prepare, list, show, and search remained near or below two tenths of a second, stale rebuilding remained below half a second, and the deliberately broad two-search gather remained the expensive path.
