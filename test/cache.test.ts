@@ -4947,6 +4947,58 @@ describe('SQLite cache and reads', () => {
     assert.equal(replacementObservations, 1)
   })
 
+  test('rejects a successor inserted after gate quarantine and recovery ownership loss', () => {
+    const root = createRoot()
+    const cachePath = cacheDirectoryPath(root)
+    const gatePath = join(cachePath, 'operation-lock.sqlite')
+    const recoveryPath = join(cachePath, 'operation-lock.recovery')
+    mkdirSync(cachePath, { recursive: true })
+    writeFileSync(gatePath, 'not a sqlite database')
+    let operationEntered = false
+    let replacementObservations = 0
+    let successorIdentity: { dev: bigint; ino: bigint } | undefined
+    cacheLocationTestHooks.afterQuarantineRename = path => {
+      if (successorIdentity === undefined && basename(path).includes('.operation-lock.sqlite.')) {
+        const successor = new DatabaseSync(gatePath)
+        successor.close()
+        successorIdentity = statSync(gatePath, { bigint: true })
+        writeFileSync(
+          join(recoveryPath, 'owner.json'),
+          `${JSON.stringify({ acquiredAt: new Date().toISOString(), pid: process.pid, token: 'gate-successor' })}\n`,
+        )
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(
+          root,
+          () => {
+            operationEntered = true
+            return 'entered'
+          },
+          {
+            duringRecoveryObservation: () => {
+              replacementObservations += 1
+              rmSync(recoveryPath, { recursive: true })
+            },
+          },
+        ),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+          invariant: 'stable-identity',
+        })
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.equal(replacementObservations, 1)
+    assert.ok(successorIdentity !== undefined)
+    assert.equal(sameCacheEntryIdentity(successorIdentity, statSync(gatePath, { bigint: true })), true)
+  })
+
   test('reacquires recovery ownership lost after the recovered gate begins', () => {
     const root = createRoot()
     const cachePath = cacheDirectoryPath(root)
