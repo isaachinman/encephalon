@@ -95,6 +95,7 @@ const assertPackageMetadataErrorReasons = (value: unknown) => {
 type InitCounts = {
   baselineScans: number
   canonicalScans: number
+  diskCacheValidations: number
   graphValidations: number
   hydrations: number
 }
@@ -108,27 +109,35 @@ const initWithCounts = (
   const counts: InitCounts = {
     baselineScans: 0,
     canonicalScans: 0,
+    diskCacheValidations: 0,
     graphValidations: 0,
     hydrations: 0,
   }
-  const result = initEncephalonWithHooks(input, {
-    baselineScan: () => {
-      counts.baselineScans += 1
-    },
-    canonicalScan: () => {
-      counts.canonicalScans += 1
-    },
-    graphValidation: () => {
-      counts.graphValidations += 1
-    },
-    hydration: cacheResult => {
-      if (cacheResult.hydrated) {
-        counts.hydrations += 1
-      }
-    },
-    ...(fault === undefined ? {} : { recordWriteHooks: { fault } }),
-  })
-  return { counts, result }
+  cacheReadTestHooks.afterCanonicalValidation = () => {
+    counts.diskCacheValidations += 1
+  }
+  try {
+    const result = initEncephalonWithHooks(input, {
+      baselineScan: () => {
+        counts.baselineScans += 1
+      },
+      canonicalScan: () => {
+        counts.canonicalScans += 1
+      },
+      graphValidation: () => {
+        counts.graphValidations += 1
+      },
+      hydration: cacheResult => {
+        if (cacheResult.hydrated) {
+          counts.hydrations += 1
+        }
+      },
+      ...(fault === undefined ? {} : { recordWriteHooks: { fault } }),
+    })
+    return { counts, result }
+  } finally {
+    cacheReadTestHooks.afterCanonicalValidation = undefined
+  }
 }
 
 const createRoot = () => {
@@ -212,6 +221,7 @@ afterEach(() => {
   artifactInspectionTestHooks.close = undefined
   artifactInspectionTestHooks.fault = undefined
   artifactInspectionTestHooks.open = undefined
+  cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
@@ -1692,7 +1702,8 @@ describe('initialisation', () => {
     assert.deepEqual(first.counts, {
       baselineScans: 1,
       canonicalScans: 1,
-      graphValidations: 2,
+      diskCacheValidations: 0,
+      graphValidations: 1,
       hydrations: 1,
     })
 
@@ -1701,6 +1712,7 @@ describe('initialisation', () => {
     assert.deepEqual(second.counts, {
       baselineScans: 1,
       canonicalScans: 1,
+      diskCacheValidations: 0,
       graphValidations: 1,
       hydrations: 0,
     })
@@ -1730,7 +1742,8 @@ describe('initialisation', () => {
     assert.deepEqual(oneChanged.counts, {
       baselineScans: 1,
       canonicalScans: 1,
-      graphValidations: 2,
+      diskCacheValidations: 0,
+      graphValidations: 1,
       hydrations: 1,
     })
 
@@ -1748,7 +1761,8 @@ describe('initialisation', () => {
     assert.deepEqual(threeChanged.counts, {
       baselineScans: 1,
       canonicalScans: 1,
-      graphValidations: 2,
+      diskCacheValidations: 0,
+      graphValidations: 1,
       hydrations: 1,
     })
     assert.equal(api.validateRecords({ root }).valid, true)
