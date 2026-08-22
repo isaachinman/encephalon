@@ -221,6 +221,8 @@ bun run benchmark -- --profile full --output docs/performance-baseline.json
 bun run benchmark:check
 ```
 
+Correctness tests enforce deterministic bounded-work counts without reading production source. `benchmark:check` independently owns timing, memory, and cache-size ceilings.
+
 The full profile runs every operation in fresh child processes with two discarded warmups and five measured samples at 0, 100, and 1,000 records. `benchmark:check` keeps CI to a single 0/100 sample with generous schema-version 2 p95 and cache-size ceilings. See [docs/performance.md](./docs/performance.md) for phase semantics, memory sources, profiles, budgets, baseline distributions, and scale guidance.
 
 `check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything. CI runs four verification lanes: Node 24.15.0 on Ubuntu, macOS, and Windows, plus Node 26 on Ubuntu. Only trusted pushes to `main` run the separate release-equivalent package gate, which validates the publish dry run before uploading the generated `npm pack` tarball for inspection.

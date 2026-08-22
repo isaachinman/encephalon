@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-18 for code and behavioural-test snapshot `948aa416405a23bd730543015bbcb3c55a1e6546`.
+Last reviewed: 2026-08-18 for code and behavioural-test snapshot `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -133,6 +133,7 @@ This document is the concise contract maintainers should update when public beha
 
 ## Performance Evidence
 
+- Correctness performance guards use per-invocation internal observers to assert deterministic canonical scans, supersession-edge visits, active-group and issue insertion, bounded directory consumption, and baseline accumulator writes. They do not read production source text or set latency, memory, or cache-size thresholds; `benchmark:check` owns those measured ceilings.
 - Benchmark report and budget files use schema version 2. Old versions, unknown fields, malformed finite limits, budget cases without at least one cache or operation limit, zero-record amplification limits, duplicate corpus cases, and missing requested corpus cases fail before benchmark repository creation.
 - `ci` measures 0 and 100 records with no warmup and one measured sample; default `baseline` uses one warmup and three measured samples for 0 and 100; `full` uses two warmups and five measured samples for 0, 100, and 1,000. Explicit record counts label the report `custom`.
 - Every warmup and measured operation runs in a fresh Node child against a parent-restored repository state. Because copying changes canonical filesystem metadata, the parent re-prepares every restored non-cold sample outside the measured child and applies the stale mutation only after that preparation. The parent accepts exactly one nonce-bound IPC result followed by a clean close, kills and awaits timed-out or cancelled children, and attempts every owned sample and template repository cleanup on success, cancellation, or setup/worker failure while retaining the primary or first cleanup failure.
@@ -142,6 +143,8 @@ This document is the concise contract maintainers should update when public beha
 - Report output is written at mode `0600` inside a private `0700` staging directory beside the destination. The retained descriptor, rather than the replaceable destination pathname, applies an existing regular report's permission mode or the normal process-umask mode for a new report before close and atomic rename. Rename is the publication commit; later best-effort removal of the now-empty private staging directory cannot turn a successful publication into a reported failure. On platforms that deliver handled `SIGINT` and `SIGTERM`, signals cancel the active child, await closure, clean temporary repositories, and return a non-zero status without publishing a report. Windows force-terminates Node children for `SIGTERM`, so that CLI signal-cleanup guarantee does not apply there; platform-neutral `AbortController` cancellation cleanup remains covered everywhere.
 
 The exact code and behavioural-test snapshot implementing these guarantees is `948aa416405a23bd730543015bbcb3c55a1e6546`.
+
+MAR-2568 behavioural hot-scan work bounds: `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`.
 
 ## Package and Release Gates
 
