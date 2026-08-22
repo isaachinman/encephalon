@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-18 for code and behavioural-test snapshot `45cd8e649781151fb359bdc82343a12a11c50597`.
+Last reviewed: 2026-08-22 for code and behavioural-test snapshot `4fcc7a4d1b76d1ca05c8f2d94d01d590fd3d237d`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -115,6 +115,7 @@ This document is the concise contract maintainers should update when public beha
 - Recovery-marker exclusion begins with atomic directory creation. An owner file that is briefly absent is age-reclaimed rather than published by candidate-directory rename because Node has no cross-platform no-replace directory rename, and replacement semantics could displace an empty live marker.
 - Every `list`, `show`, `search`, and `gather` operation prepares the cache before reading.
 - Cache rebuilds are transactional and repository-scoped. Recoverable corrupt or incompatible cache state is quarantined by exact captured identity and rebuilt once rather than treated as canonical data.
+- A successful record addition or record-producing initialisation may write the disposable cache from its strictly validated, publication-bound record and artifact snapshot. An idempotent non-refresh initialisation may use its strictly validated snapshot if cache preparation requires a rebuild. Record-producing initialisation remains eligible only when the actual scanned canonical bytes plus the exact published bytes remain within the existing corpus limit; an ineligible snapshot uses ordinary disk hydration so established validation and post-commit errors remain authoritative. Acceptance rechecks canonical authority, complete artifact identities, repository realpath, and the full manifest before and during the shared cache transaction. Any mismatch permanently discards that snapshot for the operation and enters the ordinary bounded disk rebuild without mixing generations. Snapshot reuse is disabled after a committed publication or staging-cleanup error; the existing post-commit error code, details, priority, and deterministic recovery action remain authoritative.
 - SQLite result classification normalises extended numeric codes to their primary result, gives structured numeric and symbolic codes precedence over messages, and uses bounded message fallback only for generic SQLite runtime errors.
 - Disposable cache recovery is limited to corrupt, not-a-database, schema, read-only, and cannot-open failures. Busy, locked, general I/O, and unknown failures are terminal for the operation; the operation gate separately reports busy or locked contention and recovers only corrupt or not-a-database state.
 - Public I/O wrapping recognises busy, locked, corrupt, not-a-database, read-only, cannot-open, and general I/O categories as environmental failures. Schema and unknown SQLite failures remain internal errors after any cache recovery is exhausted.
@@ -158,6 +159,8 @@ MAR-2568 behavioural hot-scan work bounds: `dbe77b5742d9891ee1d6de1bd0676ae166a0
 MAR-2552 single-pass cache reads and identity-bound recovery: `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`.
 
 MAR-2560 snapshot-local exact-key gather deduplication: `45cd8e649781151fb359bdc82343a12a11c50597`.
+
+MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `4fcc7a4d1b76d1ca05c8f2d94d01d590fd3d237d`.
 
 ## Package and Release Gates
 
