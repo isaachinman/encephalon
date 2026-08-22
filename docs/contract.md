@@ -115,6 +115,7 @@ This document is the concise contract maintainers should update when public beha
 - Recovery-marker exclusion begins with atomic directory creation. An owner file that is briefly absent is age-reclaimed rather than published by candidate-directory rename because Node has no cross-platform no-replace directory rename, and replacement semantics could displace an empty live marker.
 - Every `list` and `show` operation, and every `search` or `gather` operation that needs records, prepares the cache before reading. A literal search with no extracted terms still validates the repository and root installation but skips cache preparation.
 - Cache rebuilds are transactional and repository-scoped. Recoverable corrupt or incompatible cache state is quarantined by exact captured identity and rebuilt once rather than treated as canonical data.
+- A successful record addition or record-producing initialisation may write the disposable cache from its strictly validated, publication-bound record and artifact snapshot. An idempotent non-refresh initialisation may use its strictly validated snapshot if cache preparation requires a rebuild. Acceptance rechecks canonical authority, complete artifact identities, repository realpath, and the full manifest before and during the shared cache transaction. Any mismatch permanently discards that snapshot for the operation and enters the ordinary bounded disk rebuild without mixing generations. Snapshot reuse is disabled after a committed publication or staging-cleanup error; the existing post-commit error code, details, priority, and deterministic recovery action remain authoritative.
 - SQLite result classification normalises extended numeric codes to their primary result, gives structured numeric and symbolic codes precedence over messages, and uses bounded message fallback only for generic SQLite runtime errors.
 - Disposable cache recovery is limited to corrupt, not-a-database, schema, read-only, and cannot-open failures. Busy, locked, general I/O, and unknown failures are terminal for the operation; the operation gate separately reports busy or locked contention and recovers only corrupt or not-a-database state.
 - Public I/O wrapping recognises busy, locked, corrupt, not-a-database, read-only, cannot-open, and general I/O categories as environmental failures. Schema and unknown SQLite failures remain internal errors after any cache recovery is exhausted.
@@ -158,6 +159,8 @@ MAR-2568 behavioural hot-scan work bounds: `de66f6ab7e10696fc878e380dd5417d194d6
 MAR-2552 single-pass cache reads and identity-bound recovery: `9b5821d59999215f975d613edf4a9c252fb6258d`.
 
 MAR-2560 snapshot-local exact-key gather deduplication: `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`.
+
+MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `906d6d7710fe511982a81ad0deb9ecff7e36f7d0`.
 
 ## Package and Release Gates
 
