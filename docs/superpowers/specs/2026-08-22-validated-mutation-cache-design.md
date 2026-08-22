@@ -55,6 +55,8 @@ Mutating add and init use forced snapshot hydration. Idempotent non-refresh init
 
 No public API, CLI result, cache schema, canonical JSON, manifest format, operation budget, ranking, active-head, or package export changes.
 
+Backwards compatibility is a release invariant: existing valid repositories, records, instruction files, caches, and clients must continue to work without migration or data loss. This ticket may change only the explicitly specified cache-construction performance path; it must not remove or rename public fields or codes, narrow documented valid inputs, or change successful output semantics. Any conflict discovered during implementation blocks release until the plan is amended and reviewed.
+
 - Add still skips cache work only after `publicationFlush` failure and preserves `publicationVerification > publicationFlush > cacheHydration > stagingCleanup`.
 - Every snapshot, writer, fallback, or recovery failure after add publication remains inside `capturePostCommitError('cacheHydration', error)` with the same committed record ID, path, code, cause, and recovery action.
 - Init sets `phase: cachePreparation` and `cacheState: disposable` before snapshot cache work, retains committed IDs in publication order, and preserves the failing subsystem's code and details.
