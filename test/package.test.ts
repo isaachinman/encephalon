@@ -87,6 +87,10 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-gather-deduplication-design.md'),
       'utf8',
     )
+    const validatedMutationCacheDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-22-validated-mutation-cache-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -128,10 +132,19 @@ describe('package contract', () => {
       /The exact implementation and behavioural-test snapshot is `45cd8e649781151fb359bdc82343a12a11c50597`\./,
     )
     assert.match(
+      validatedMutationCacheDesign,
+      /The exact implementation and behavioural-test snapshot is `906d6d7710fe511982a81ad0deb9ecff7e36f7d0`\./,
+    )
+    assert.match(
       contract,
       /MAR-2560 snapshot-local exact-key gather deduplication: `45cd8e649781151fb359bdc82343a12a11c50597`\./,
     )
+    assert.match(
+      contract,
+      /MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `906d6d7710fe511982a81ad0deb9ecff7e36f7d0`\./,
+    )
     assert.match(contract, /## Performance Evidence/)
+    assert.match(performance, /## Validated mutation snapshot comparison/)
     assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`\./)
     assert.match(performance, /Correctness tests enforce deterministic output and bounded work counts/)
     assert.match(

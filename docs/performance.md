@@ -71,6 +71,17 @@ MAR-2560 compares the same 100-record duplicate-heavy workload with and without 
 
 Deterministic behavioural hooks, not wall-clock thresholds, enforce one show read and one search execution per exact distinct key. The identical benchmark workload demonstrates the resulting reduction while retaining all 80 output envelopes and per-occurrence response accounting.
 
+## Validated mutation snapshot comparison
+
+MAR-2565 removes the second canonical JSON parse and graph validation from stable record additions and record-producing initialisation. Three measured fresh Node processes used the same lightweight valid corpus with no warmup at the MAR-2560 base (`15e3b037e5d710fa4743168798d5e3d8f752ee4c`) and the implementation snapshot (`906d6d7710fe511982a81ad0deb9ecff7e36f7d0`). Timings are diagnostic median / nearest-rank p95 milliseconds, not new CI thresholds.
+
+| Records after add | MAR-2560 base | Validated snapshot | Disk cache validations | Canonical scan / graph validation | Next prepare |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 100 | 50.6 / 69.2 ms | 41.6 / 43.0 ms | 1 → 0 | 1 / 1 | Fresh, 100 indexed |
+| 1,000 | 142.4 / 152.7 ms | 140.3 / 142.3 ms | 1 → 0 | 1 / 1 | Fresh, 1,000 indexed |
+
+The deterministic work counts are the regression authority: every measured snapshot run visited each pre-existing canonical entry once, performed one strict graph validation, performed no disk cache validation, and left the next `prepare` fresh. Behavioural tests separately prove logical metadata, record-row, and FTS equivalence with a forced disk hydrate. The permanent schema-version 2 benchmark remains unchanged because it measures public hydrate, prepare, and read operations rather than mutation orchestration.
+
 ## Scale guidance
 
 The current full-rebuild cache is suitable for repository knowledge bases up to the product limit of 1,000 canonical records. On the baseline machine, cold hydration remained near a quarter second at that limit; unchanged prepare, list, show, and search remained near or below two tenths of a second, stale rebuilding remained below half a second, and the maximum-envelope duplicate-heavy gather remained the expensive path because it still constructs and charges every requested output occurrence.

@@ -34,7 +34,7 @@
 - Consumes: existing `recordWriteTestHooks`, `cacheReadTestHooks`, add/init APIs, and cache inspection helpers.
 - Produces: mutation-sensitive RED coverage for stable scan counts, logical projection equivalence, record/artifact mismatch fallback, corrupt recovery, and committed writer failure.
 
-- [ ] **Step 1: Write the stable add and init assertions**
+- [x] **Step 1: Write the stable add and init assertions**
 
 ```ts
 assert.deepEqual(counts, {
@@ -45,17 +45,17 @@ assert.deepEqual(counts, {
 })
 ```
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `node --test --test-name-pattern='validated mutation snapshot|canonical snapshot' test/records.test.ts test/init.test.ts test/cache.test.ts`
 
 Expected: stable mutations report a disk cache validation or the current extra graph pass.
 
-- [ ] **Step 3: Add fallback and logical-equivalence cases**
+- [x] **Step 3: Add fallback and logical-equivalence cases**
 
 Replace a valid canonical record and a referenced artifact at the existing `during-hydration` boundary. Assert one disk fallback validation, current canonical output, a fresh next prepare, and logical metadata/records/FTS equality before and after forced hydrate.
 
-- [ ] **Step 4: Commit RED tests**
+- [x] **Step 4: Commit RED tests**
 
 ```bash
 git add test/records.test.ts test/init.test.ts test/cache.test.ts
@@ -72,7 +72,7 @@ git commit -m "[MAR-2565] Prove validated mutation cache reuse"
 - Produces: `readRecordPlanningSnapshotResolved(...)`, whose final validator returns `readonly ArtifactObservation[]`; internal add `readHooks`; actual timestamped `ValidatedMutationCacheSnapshot` inputs.
 - Consumes: existing canonical scan observations, `canonicalPublicationAuthority`, planned records, and captured `CacheLocation.repository`.
 
-- [ ] **Step 1: Separate planning acquisition from final validation**
+- [x] **Step 1: Separate planning acquisition from final validation**
 
 ```ts
 type RecordPlanningSnapshot = Readonly<{
@@ -87,17 +87,17 @@ type RecordPlanningSnapshot = Readonly<{
 }>
 ```
 
-- [ ] **Step 2: Route add and init through one strict final validation**
+- [x] **Step 2: Route add and init through one strict final validation**
 
 Add retains its invalid-history-before-timestamp-ceiling ordering, then seals actual published records. Mutating init validates the complete planned graph once; idempotent non-refresh init validates the scanned graph once.
 
-- [ ] **Step 3: Run focused records/init tests and verify GREEN**
+- [x] **Step 3: Run focused records/init tests and verify GREEN**
 
 Run: `node --test test/records.test.ts test/init.test.ts`
 
 Expected: all focused tests pass with one stable canonical scan and graph validation.
 
-- [ ] **Step 4: Commit planning-snapshot changes**
+- [x] **Step 4: Commit planning-snapshot changes**
 
 ```bash
 git add src/records.ts src/init.ts test/records.test.ts test/init.test.ts
@@ -117,7 +117,7 @@ git commit -m "[MAR-2565] Reuse the validated mutation snapshot"
 - Consumes: provenance-bound `ValidatedMutationCacheSnapshot` values.
 - Produces: private `writeCacheSnapshot(...)`, invocation-scoped `CacheRebuilder`, `hydrateResolvedMutationSnapshot(...)`, and `prepareResolvedMutationSnapshot(...)`.
 
-- [ ] **Step 1: Extract the current transactional writer unchanged**
+- [x] **Step 1: Extract the current transactional writer unchanged**
 
 ```ts
 type CacheSnapshotWrite =
@@ -125,21 +125,21 @@ type CacheSnapshotWrite =
   | { kind: 'repository-changed'; retryPrimary: CacheWriterPrimary }
 ```
 
-- [ ] **Step 2: Add one-shot mutation verification and fallback**
+- [x] **Step 2: Add one-shot mutation verification and fallback**
 
 Revalidate canonical authority, complete artifact identities, repository realpath, and the expected manifest. On mismatch, mark the snapshot discarded and call ordinary `rebuildCache` with the returned primary; propagate operational failures.
 
-- [ ] **Step 3: Inject the rebuilder through preparation and disposable recovery**
+- [x] **Step 3: Inject the rebuilder through preparation and disposable recovery**
 
 Use the supplied rebuilder after missing-cache claims and corrupt-cache quarantine. Revalidate a retained snapshot after quarantine; never return to it once discarded.
 
-- [ ] **Step 4: Run focused tests and mutation witnesses**
+- [x] **Step 4: Run focused tests and mutation witnesses**
 
 Run: `node --test test/cache.test.ts test/records.test.ts test/init.test.ts`
 
 Expected: stable reuse, logical equivalence, record/artifact fallback, corrupt recovery, and post-commit details all pass. Mutations that trust stale rows, skip artifact identity comparison, lose the retry primary, or use disk rebuild after stable quarantine must fail.
 
-- [ ] **Step 5: Commit the shared writer**
+- [x] **Step 5: Commit the shared writer**
 
 ```bash
 git add src/cache.ts src/records.ts src/init.ts test/cache.test.ts test/records.test.ts test/init.test.ts
@@ -153,15 +153,16 @@ git commit -m "[MAR-2565] Share validated cache rebuilds"
 - Modify: `README.md`
 - Modify: `docs/contract.md`
 - Modify: `docs/performance.md`
-- Modify: `docs/performance-baseline.json`
 - Modify: `docs/superpowers/specs/2026-08-22-validated-mutation-cache-design.md`
 - Modify: `docs/superpowers/plans/2026-08-22-validated-mutation-cache.md`
+- Modify: `test/package.test.ts`
+- Inspect, unchanged: `docs/performance-baseline.json`
 
 **Interfaces:**
 - Consumes: the final code/test commit SHA and benchmark evidence.
 - Produces: maintained contract/performance documentation, exact provenance, six-role review evidence, stacked PR, and Linear handoff.
 
-- [ ] **Step 1: Update maintained documentation and exact provenance**
+- [x] **Step 1: Update maintained documentation and exact provenance**
 
 Document one-pass mutation cache construction, deterministic fallback, unchanged public semantics, and measured 100/1,000-record diagnostics without adding a new benchmark schema.
 

@@ -2,7 +2,7 @@
 
 **Ticket:** MAR-2565
 **Date:** 2026-08-22
-**Status:** Approved
+**Status:** Implemented
 
 ## Goal
 
@@ -69,3 +69,9 @@ Backwards compatibility is a release invariant: existing valid repositories, rec
 - Record and byte-identical artifact replacements at the post-publication boundary discard the snapshot and rebuild from current disk state exactly once.
 - Corrupt-cache recovery revalidates and reuses a stable snapshot after quarantine.
 - A real shared-writer failure preserves committed add details and later `prepare` recovery.
+- Committed publication-verification and staging-cleanup failures use ordinary disk hydration while preserving the original post-commit error; a publication-flush failure still skips hydration.
+- A snapshot mismatch becomes deterministic fallback only after rollback and database close succeed, so operational cleanup failures remain visible.
+
+## Implementation provenance
+
+The exact implementation and behavioural-test snapshot is `906d6d7710fe511982a81ad0deb9ecff7e36f7d0`. Stable 100- and 1,000-record diagnostic additions each performed one canonical scan, one strict graph validation, zero disk cache validations, and left the next `prepare` fresh. The public API, CLI framing, canonical record format, cache schema and manifest, error codes/details, package exports, and runtime dependencies are unchanged.
