@@ -303,7 +303,7 @@ export const withOperationLock = <Result>(
 
   const beginGateTransaction = (primary: GatePrimary) => {
     try {
-      gate = openVerifiedCacheDatabase({
+      const opened = openVerifiedCacheDatabase({
         afterVerifiedOpen: database => {
           database.exec('BEGIN IMMEDIATE')
         },
@@ -313,14 +313,16 @@ export const withOperationLock = <Result>(
         openOptions: { timeout: remainingMilliseconds() },
         preserveDatabaseLocksAfterInitialisation: true,
         primary,
-      }).database
+      })
+      gate = opened.database
+      gateTransaction = true
+      return opened.identity
     } catch (error) {
       if (error instanceof CacheDatabaseCreationConflict) {
         return operationGateChanged()
       }
       throw error
     }
-    gateTransaction = true
   }
 
   const releaseGate = () => {
@@ -342,18 +344,18 @@ export const withOperationLock = <Result>(
 
   const beginGateWhileRecoveryOwned = (ownedMarker: OwnedRecoveryMarker, primary: GatePrimary) => {
     let owned = false
-    beginGateTransaction(primary)
+    const database = beginGateTransaction(primary)
     if (recoveryMarkerIsOwned(ownedMarker)) {
       owned = true
     } else {
       releaseGate()
     }
-    return owned
+    return { acquired: owned, database }
   }
 
   const attemptGateWhileOwned = (ownedMarker: OwnedRecoveryMarker, primary: GatePrimary) => {
     try {
-      return { acquired: beginGateWhileRecoveryOwned(ownedMarker, primary), category: undefined }
+      return { ...beginGateWhileRecoveryOwned(ownedMarker, primary), category: undefined }
     } catch (error) {
       const category = sqliteFailureCategory(error)
       if (category === 'busy' || category === 'locked') {
@@ -364,6 +366,8 @@ export const withOperationLock = <Result>(
       return { acquired: false, category, error }
     }
   }
+
+  let nextGatePrimary: GatePrimary = { kind: 'create-if-missing' }
 
   const acquireRecoveryMarker = (): OwnedRecoveryMarker => {
     let ownedMarker: OwnedRecoveryMarker | undefined
@@ -420,8 +424,9 @@ export const withOperationLock = <Result>(
   const acquireGateWhileOwned = (ownedMarker: OwnedRecoveryMarker) => {
     let acquired = false
     if (recoveryMarkerIsOwned(ownedMarker)) {
-      const initial = attemptGateWhileOwned(ownedMarker, { kind: 'create-if-missing' })
-      if (initial.error === undefined) {
+      const initial = attemptGateWhileOwned(ownedMarker, nextGatePrimary)
+      if ('database' in initial) {
+        nextGatePrimary = { database: initial.database, kind: 'expected-owned' }
         ;({ acquired } = initial)
       } else {
         const recoverable = initial.category === 'corrupt' || initial.category === 'notadb'
@@ -431,16 +436,19 @@ export const withOperationLock = <Result>(
               database: initial.error.database,
               kind: 'expected-owned',
             })
-            if (confirmed.error === undefined) {
+            if ('database' in confirmed) {
+              nextGatePrimary = { database: confirmed.database, kind: 'expected-owned' }
               ;({ acquired } = confirmed)
             } else {
               const confirmedRecoverable = confirmed.category === 'corrupt' || confirmed.category === 'notadb'
               if (confirmedRecoverable) {
                 if (recoveryMarkerIsOwned(ownedMarker)) {
                   quarantineCorruptGate(confirmed.error)
+                  nextGatePrimary = { kind: 'create-exclusive' }
                   if (recoveryMarkerIsOwned(ownedMarker)) {
-                    const retried = attemptGateWhileOwned(ownedMarker, { kind: 'create-exclusive' })
-                    if (retried.error === undefined) {
+                    const retried = attemptGateWhileOwned(ownedMarker, nextGatePrimary)
+                    if ('database' in retried) {
+                      nextGatePrimary = { database: retried.database, kind: 'expected-owned' }
                       ;({ acquired } = retried)
                     } else {
                       throw retried.error
