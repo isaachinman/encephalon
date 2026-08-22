@@ -12,7 +12,7 @@ Replace the name-only table checks with three complementary validators:
 
 1. structured, bounded PRAGMA validation for ordinary tables and their columns;
 2. structured, bounded PRAGMA validation for the required records indexes;
-3. bounded owned-object SQL checks only for semantics that SQLite PRAGMAs do not expose: the records `active` check and the exact FTS5 declaration.
+3. bounded owned-object SQL checks for the exact package-owned `metadata`, `records`, and FTS5 table definitions, including semantics that SQLite PRAGMAs do not expose.
 
 The SQL text is an internal validation input, not a public formatting contract. Checks accept harmless whitespace, keyword casing, optional identifier quoting, and the historical `IF NOT EXISTS` spelling while rejecting semantic changes.
 
@@ -30,13 +30,13 @@ The SQL text is an internal validation input, not a public formatting contract. 
 - absence of a default;
 - ordinary visible-column state.
 
-Validation first runs a numeric-only probe over `pragma_table_list` and a nested, bounded `pragma_table_xinfo` selection. The probe transfers only a bounded row count and exact flags. It requires a single `main` rowid, non-strict ordinary table, exactly the expected number of visible columns, bounded text fields, no hidden or generated columns, and no defaults. Only after the probe succeeds may a bounded iterator read the expected descriptor rows ordered by `cid` and compare exact tuples.
+Validation first runs a numeric-only probe over `pragma_table_list` and a nested, bounded `pragma_table_xinfo` selection. The probe transfers only a bounded row count and exact flags. It requires a single ordinary table in `main`, exactly the expected number of visible columns, bounded text fields, no hidden or generated columns, and no defaults. Only after the probe succeeds may a bounded iterator read the expected descriptor rows ordered by `cid` and compare exact tuples. A separate bounded owned-SQL token comparison rejects table-level additions such as `STRICT`, `WITHOUT ROWID`, extra constraints, and any other definition that differs from the same canonical definition used to create the table.
 
 The expected tuples match the schema that this package already creates. In particular, SQLite reports the current `TEXT PRIMARY KEY` columns with `notnull = 0`; the validator does not silently strengthen the DDL.
 
-## Records constraint and indexes
+## Ordinary table definitions and records indexes
 
-Column PRAGMAs do not expose `CHECK` clauses. The records table therefore receives a separate bounded `sqlite_schema.sql` probe followed by a narrow check for `CHECK (active IN (0, 1))`. The check tolerates whitespace, casing, and identifier quoting but not a widened set, additional disjunct, or missing constraint. Existing row-content validation continues to require every stored `active` value to be the SQLite integer zero or one.
+Column PRAGMAs do not expose every table-level semantic. Both `metadata` and `records` therefore receive a separate bounded `sqlite_schema.sql` probe followed by an exact token comparison with the package-owned table definition. The comparison tolerates comments, whitespace, keyword casing, identifier quoting, and the historical `IF NOT EXISTS` spelling while rejecting added, removed, reordered, or changed tokens. This covers the records `CHECK (active IN (0, 1))` constraint as well as table modifiers and extra constraints. Existing row-content validation continues to require every stored `active` value to be the SQLite integer zero or one.
 
 Required records indexes are validated structurally:
 
@@ -92,7 +92,7 @@ No new public export, package dependency, cache migration API, CLI option, or ca
 
 The smallest complementary behavioural matrix covers:
 
-- same-name ordinary tables with missing primary keys, changed nullability, types, defaults, hidden/generated columns, or a widened/missing `active` constraint;
+- same-name ordinary tables with missing primary keys, changed nullability, types, defaults, hidden/generated columns, `STRICT`, `WITHOUT ROWID`, extra constraints, or a widened/missing `active` constraint;
 - required indexes missing, renamed, reordered, direction-changed, or otherwise structurally incompatible, plus a positive control created in a different order;
 - an ordinary `record_search` table and FTS5 declarations with indexed IDs, reversed columns, changed unindexed columns, or custom options, plus harmless formatting controls;
 - six metadata rows with one required key missing and a duplicate key, rejected before metadata text is accepted into the map;
