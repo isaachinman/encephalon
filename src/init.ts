@@ -2,6 +2,7 @@ import { parseInitInput } from './api-input.ts'
 import { canonicalPayload, scanBaseline } from './baseline.ts'
 import {
   hydrateResolvedMutationSnapshot,
+  hydrateResolvedRepository,
   prepareResolvedMutationSnapshot,
   prepareResolvedRepository,
   type ValidatedMutationCacheSnapshot,
@@ -13,6 +14,7 @@ import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import {
   assertCanonicalLayoutAdditions,
+  MAX_CANONICAL_RECORD_BYTES,
   nextRecordCreatedAt,
   planRecordAddition,
   publishPlannedRecordOutcome,
@@ -239,13 +241,22 @@ const initResolved = (
         const validationPlans = validatedAdditions.map(addition =>
           planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
         )
-        const artifacts = planning.validateFinal(
-          [...records, ...validationPlans.map(plan => plan.record)],
-          'The generated baseline would make canonical records invalid.',
-        )
+        const artifacts = (() => {
+          try {
+            return planning.validateFinal(
+              [...records, ...validationPlans.map(plan => plan.record)],
+              'The generated baseline would make canonical records invalid.',
+            )
+          } catch (error) {
+            if (error instanceof EncephalonError && error.code === 'VALIDATION_FAILED') {
+              planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
+            }
+            throw error
+          }
+        })()
         const { plans } = validatedAdditions.reduce<{
-          cursor: BrainRecord[]
-          plans: ReturnType<typeof planRecordAddition>[]
+          cursor: readonly BrainRecord[]
+          plans: readonly ReturnType<typeof planRecordAddition>[]
         }>(
           (result, addition) => {
             const plan = planRecordAddition(root, createRecordFile(addition, nextRecordCreatedAt(result.cursor)))
@@ -271,17 +282,21 @@ const initResolved = (
             throw publication.committedError
           }
         }
-        cacheSnapshot = Object.freeze({
-          artifacts,
-          assertCurrent: authority.assertCurrent,
-          records: Object.freeze([...records, ...recordsCreated]),
-          repositoryRealpath: location.repository,
-        })
+        const mutationBytes =
+          planning.bytes + plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted), 0)
+        if (mutationBytes <= MAX_CANONICAL_RECORD_BYTES) {
+          cacheSnapshot = Object.freeze({
+            artifacts,
+            assertCurrent: authority.assertCurrent,
+            records: Object.freeze([...records, ...recordsCreated]),
+            repositoryRealpath: location.repository,
+          })
+        }
       } else {
         const artifacts = planning.validateFinal(
           records,
           'Canonical records are invalid.',
-          undefined,
+          planning.bytes,
           allowedGeneratedHeads,
         )
         const authority = planning.authority()
@@ -297,10 +312,13 @@ const initResolved = (
       progress.phase = 'cachePreparation'
       progress.cacheState = 'disposable'
       const cacheResult = (() => {
+        if (validatedAdditions.length > 0) {
+          return cacheSnapshot === undefined
+            ? hydrateResolvedRepository(root, 'held', location)
+            : hydrateResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
+        }
         if (cacheSnapshot !== undefined) {
-          return validatedAdditions.length > 0
-            ? hydrateResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
-            : prepareResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
+          return prepareResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
         }
         return prepareResolvedRepository(root, 'held', location)
       })()

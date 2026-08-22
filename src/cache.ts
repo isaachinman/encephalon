@@ -45,7 +45,7 @@ import { ordinalStringCompare } from './order.ts'
 import { canonicalRecordPath, readRecords, readValidatedRecordSnapshotResolved } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import { createResponseByteBudget, type ResponseByteBudget } from './response-budget.ts'
-import { parseRecordFile, validateArtifactPath } from './schema.ts'
+import { parseRecordFile, projectParsedRecordFile, validateArtifactPath } from './schema.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type {
   BrainRecord,
@@ -1474,16 +1474,7 @@ const searchDocumentForRecord = (record: BrainRecord) =>
   )
 
 const projectedCacheRecord = (record: BrainRecord): BrainRecord => ({
-  createdAt: record.createdAt,
-  id: record.id,
-  kind: record.kind,
-  payload: record.payload,
-  source: record.source,
-  subject: record.subject,
-  ...(record.artifacts === undefined ? {} : { artifacts: record.artifacts }),
-  ...(record.confidence === undefined ? {} : { confidence: record.confidence }),
-  ...(record.searchText === undefined ? {} : { searchText: record.searchText }),
-  ...(record.supersedes === undefined ? {} : { supersedes: record.supersedes }),
+  ...projectParsedRecordFile(record),
   path: record.path,
 })
 

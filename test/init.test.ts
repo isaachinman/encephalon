@@ -32,7 +32,7 @@ import * as api from '../src/index.ts'
 import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { ordinalStringCompare } from '../src/order.ts'
-import type { RecordWriteHooks } from '../src/records.ts'
+import { MAX_CANONICAL_RECORD_BYTES, type RecordWriteHooks } from '../src/records.ts'
 import { createOwnedStagingName } from '../src/staging.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
 import {
@@ -1706,6 +1706,113 @@ describe('initialisation', () => {
       graphValidations: 1,
       hydrations: 0,
     })
+  })
+
+  test('preserves the canonical-history error before baseline candidate errors', () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'invalid-history' }))
+    for (const [index, id] of ['parallel-history-a', 'parallel-history-b'].entries()) {
+      writeRecordFile(root, {
+        createdAt: `2026-01-01T00:00:0${index}.000Z`,
+        id,
+        kind: 'decision',
+        payload: {},
+        source: 'test',
+        subject: 'parallel.history',
+      })
+    }
+
+    assert.throws(
+      () => api.initEncephalon({ root }),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; message?: unknown }
+        assert.equal(actual.code, 'VALIDATION_FAILED')
+        assert.equal(actual.message, 'Canonical records are invalid.')
+        return true
+      },
+    )
+  })
+
+  test('rebuilds an idempotent init snapshot using actual canonical bytes', () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'actual-byte-snapshot' }))
+    api.initEncephalon({ root })
+    const payload = {
+      padding: 'x'.repeat(700_000),
+      ...Object.fromEntries(Array.from({ length: 9000 }, (_, index) => [`key-${index}`, 0])),
+    }
+    const directory = join(root, 'encephalon', 'context')
+    for (const index of Array.from({ length: 10 }, (_, value) => value)) {
+      const id = `minified-${index}`
+      writeFileSync(
+        join(directory, `${id}.json`),
+        JSON.stringify({
+          createdAt: `2026-01-01T00:00:${String(index).padStart(2, '0')}.000Z`,
+          id,
+          kind: 'context',
+          payload,
+          source: 'test',
+          subject: `minified.${index}`,
+        }),
+      )
+    }
+    assert.equal(api.validateRecords({ root }).valid, true)
+
+    const resumed = initWithCounts({ root })
+    assert.deepEqual(resumed.result.recordsCreated, [])
+    assert.deepEqual(resumed.counts, {
+      baselineScans: 1,
+      canonicalScans: 1,
+      diskCacheValidations: 0,
+      graphValidations: 1,
+      hydrations: 1,
+    })
+  })
+
+  test('uses disk hydration when baseline additions exceed actual corpus bytes', () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'actual-byte-overflow' }))
+    const directory = join(root, 'encephalon', 'context')
+    mkdirSync(directory, { recursive: true })
+    const bytesPerRecord = 1_048_500
+    for (const index of Array.from({ length: 8 }, (_, value) => value)) {
+      const id = `padding-${index}`
+      const json = JSON.stringify({
+        createdAt: `2026-01-01T00:00:0${index}.000Z`,
+        id,
+        kind: 'context',
+        payload: {},
+        source: 'test',
+        subject: `padding.${index}`,
+      })
+      assert.equal(Buffer.byteLength(json, 'utf8') < bytesPerRecord, true)
+      writeFileSync(join(directory, `${id}.json`), `${json}${' '.repeat(bytesPerRecord - Buffer.byteLength(json))}`)
+    }
+    assert.equal(bytesPerRecord * 8, MAX_CANONICAL_RECORD_BYTES - 608)
+    assert.equal(api.validateRecords({ root }).valid, true)
+
+    assert.throws(
+      () => api.initEncephalon({ root }),
+      (error: unknown) => {
+        const actual = error as {
+          code?: unknown
+          details?: { initProgress?: { cacheState?: unknown; committedRecordIds?: unknown; phase?: unknown } }
+          message?: unknown
+        }
+        assert.equal(actual.code, 'VALIDATION_FAILED')
+        assert.equal(actual.message, 'Canonical records are invalid.')
+        assert.equal(actual.details?.initProgress?.phase, 'cachePreparation')
+        assert.equal(actual.details?.initProgress?.cacheState, 'disposable')
+        assert.equal(
+          Array.isArray(actual.details?.initProgress?.committedRecordIds) &&
+            actual.details.initProgress.committedRecordIds.length,
+          3,
+        )
+        return true
+      },
+    )
+    assert.equal(api.validateRecords({ root }).valid, false)
+    assertErrorCode(() => api.prepare({ root }), 'VALIDATION_FAILED')
   })
 
   test('refreshes one or three changed generated subjects with one planning scan', () => {
