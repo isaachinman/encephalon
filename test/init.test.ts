@@ -1305,7 +1305,6 @@ describe('initialisation', () => {
     mkdirSync(join(root, 'encephalon', 'decision'), { recursive: true })
     const brainDirectory = join(root, 'encephalon')
     const displaced = join(root, 'displaced-encephalon-before-init')
-    let graphValidations = 0
     let replaced = false
 
     assertErrorCode(
@@ -1313,13 +1312,14 @@ describe('initialisation', () => {
         initEncephalonWithHooks(
           { root },
           {
-            graphValidation: () => {
-              graphValidations += 1
-              if (graphValidations === 2) {
-                replaced = true
-                renameSync(brainDirectory, displaced)
-                mkdirSync(join(brainDirectory, 'decision'), { recursive: true })
-              }
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'before-directory-preparation' && !replaced) {
+                  replaced = true
+                  renameSync(brainDirectory, displaced)
+                  mkdirSync(join(brainDirectory, 'decision'), { recursive: true })
+                }
+              },
             },
           },
         ),
