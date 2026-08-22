@@ -166,7 +166,7 @@ git commit -m "[MAR-2565] Share validated cache rebuilds"
 
 Document one-pass mutation cache construction, deterministic fallback, unchanged public semantics, and measured 100/1,000-record diagnostics without adding a new benchmark schema.
 
-- [ ] **Step 2: Run the full release matrix**
+- [x] **Step 2: Run the full release matrix**
 
 Run: `bun run lint`, `bun run typecheck`, `bun run test`, `bun run benchmark`, `bun run benchmark:check`, `bun run build`, `bun run check:package`, `bun run check:publish`, and `bun install --frozen-lockfile`.
 
