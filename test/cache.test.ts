@@ -211,6 +211,7 @@ const addCacheRecord = (root: string) =>
 test('writes validated mutation snapshots equivalently and falls back after identity changes', () => {
   const cases = [
     { kind: 'stable', name: 'stable snapshot' },
+    { kind: 'corrupt', name: 'corrupt cache recovery' },
     { kind: 'record', name: 'canonical record replacement' },
     { kind: 'artifact', name: 'artifact replacement' },
   ] as const
@@ -233,6 +234,9 @@ test('writes validated mutation snapshots equivalently and falls back after iden
       subject: `cache.snapshot.${entry.kind}`,
     })
     const seedPath = join(root, ...seed.path.split('/'))
+    if (entry.kind === 'corrupt') {
+      writeFileSync(cacheDatabasePath(root), 'not a sqlite database')
+    }
     let diskCacheValidations = 0
     cacheReadTestHooks.afterCanonicalValidation = () => {
       diskCacheValidations += 1
@@ -241,7 +245,7 @@ test('writes validated mutation snapshots equivalently and falls back after iden
       if (point === 'during-hydration') {
         recordWriteTestHooks.fault = undefined
         if (entry.kind === 'record') {
-          const displacedPath = `${seedPath}.displaced`
+          const displacedPath = join(root, `${seedId}.displaced`)
           renameSync(seedPath, displacedPath)
           const record = JSON.parse(readFileSync(displacedPath, 'utf8')) as Record<string, unknown>
           writeFileSync(
@@ -274,7 +278,7 @@ test('writes validated mutation snapshots equivalently and falls back after iden
       supersedes: [seedId],
     })
 
-    assert.equal(diskCacheValidations, entry.kind === 'stable' ? 0 : 1, entry.name)
+    assert.equal(diskCacheValidations, entry.kind === 'record' || entry.kind === 'artifact' ? 1 : 0, entry.name)
     if (entry.kind === 'record') {
       const shown = api.showRecord({ activeOnly: false, id: seedId, root })
       assert.ok(shown)

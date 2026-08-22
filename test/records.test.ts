@@ -195,6 +195,7 @@ afterEach(() => {
   artifactInspectionTestHooks.open = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
+  cacheReadTestHooks.duringDatabaseInitialisation = undefined
   recordWriteTestHooks.afterOperationLock = undefined
   recordWriteTestHooks.beforeOperationLock = undefined
   recordWriteTestHooks.fault = undefined
@@ -2139,27 +2140,38 @@ describe('canonical records', () => {
 
   test('reports cache hydration failure after canonical publication as committed', () => {
     const root = createRoot()
+    const counts = {
+      canonicalScans: 0,
+      diskCacheValidations: 0,
+      graphValidations: 0,
+    }
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        counts.canonicalScans += 1
+      },
+      graphValidation: () => {
+        counts.graphValidations += 1
+      },
+    }
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      counts.diskCacheValidations += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        cacheReadTestHooks.duringDatabaseInitialisation = undefined
+        throw Object.assign(new Error('Injected hydration failure'), { code: 'EIO' })
+      }
+    }
     assertPostCommitError(
       () =>
-        addRecordResolved(
+        api.addRecord({
+          id: 'hydration-failure',
+          kind: 'decision',
+          payload: { summary: 'Published' },
           root,
-          {
-            id: 'hydration-failure',
-            kind: 'decision',
-            payload: { summary: 'Published' },
-            source: 'agent',
-            subject: 'hydration.failure',
-          },
-          {
-            hooks: {
-              fault: point => {
-                if (point === 'during-hydration') {
-                  throw Object.assign(new Error('Injected hydration failure'), { code: 'EIO' })
-                }
-              },
-            },
-          },
-        ),
+          source: 'agent',
+          subject: 'hydration.failure',
+        }),
       {
         path: 'encephalon/decision/hydration-failure.json',
         phase: 'cacheHydration',
@@ -2167,7 +2179,13 @@ describe('canonical records', () => {
       },
     )
 
+    assert.deepEqual(counts, {
+      canonicalScans: 1,
+      diskCacheValidations: 0,
+      graphValidations: 1,
+    })
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'hydration-failure.json')), true)
+    cacheReadTestHooks.afterCanonicalValidation = undefined
     assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
     assertErrorCode(
       () =>
@@ -2181,6 +2199,48 @@ describe('canonical records', () => {
         }),
       'RECORD_EXISTS',
     )
+  })
+
+  test('rebuilds from disk after committed publication failures', () => {
+    const cases = [
+      { id: 'verification-failure-disk-cache', phase: 'publicationVerification', point: 'after-publication-accept' },
+      { id: 'cleanup-failure-disk-cache', phase: 'stagingCleanup', point: 'during-cleanup' },
+    ] as const
+
+    for (const entry of cases) {
+      const root = createRoot()
+      let diskCacheValidations = 0
+      cacheReadTestHooks.afterCanonicalValidation = () => {
+        diskCacheValidations += 1
+      }
+      recordWriteTestHooks.fault = point => {
+        if (point === entry.point) {
+          recordWriteTestHooks.fault = undefined
+          throw Object.assign(new Error(`Injected ${entry.point}`), { code: 'EIO' })
+        }
+      }
+
+      assertPostCommitError(
+        () =>
+          api.addRecord({
+            id: entry.id,
+            kind: 'decision',
+            payload: { summary: 'Published before recovery' },
+            root,
+            source: 'agent',
+            subject: `cache.${entry.id}`,
+          }),
+        {
+          path: `encephalon/decision/${entry.id}.json`,
+          phase: entry.phase,
+          recordId: entry.id,
+        },
+      )
+
+      assert.equal(diskCacheValidations, 1, entry.phase)
+      cacheReadTestHooks.afterCanonicalValidation = undefined
+      assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+    }
   })
 
   test('reports publication flush failure after canonical publication as committed', () => {

@@ -22,7 +22,11 @@ import {
   type ArtifactObservation,
   inspectArtifactFiles,
 } from './artifact-inspection.ts'
-import { hydrateResolvedRepository } from './cache.ts'
+import {
+  hydrateResolvedMutationSnapshot,
+  hydrateResolvedRepository,
+  type ValidatedMutationCacheSnapshot,
+} from './cache.ts'
 import { assertCacheLocation, type CacheLocation } from './cache-location.ts'
 import { CANONICAL_BUDGETS } from './canonical-budgets.ts'
 import {
@@ -149,6 +153,7 @@ export type RecordWriteHooks = {
 type AddRecordTestHooks = RecordWriteHooks & {
   afterOperationLock?: (() => void) | undefined
   beforeOperationLock?: (() => void) | undefined
+  readHooks?: RecordReadHooks | undefined
 }
 
 /** @internal */
@@ -186,6 +191,7 @@ type AddRecordOptions = {
   cacheLocation?: CacheLocation
   hooks?: RecordWriteHooks
   hydrate?: boolean
+  readHooks?: RecordReadHooks | undefined
 }
 
 type PlannedRecord = {
@@ -1330,6 +1336,64 @@ const canonicalPublicationAuthority = (
 }
 
 /** @internal */
+export const readRecordPlanningSnapshotResolved = (
+  root: string,
+  hooks: RecordReadHooks = {},
+  cacheLocation?: CacheLocation,
+) => {
+  hooks.canonicalScan?.()
+  const scan = scanCanonicalRecords(root, { hooks })
+  const authority = () => {
+    if (scan.layout === undefined) {
+      return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')
+    }
+    return canonicalPublicationAuthority(root, scan.layout, scan.observations, cacheLocation)
+  }
+  const validateFinal = (
+    records: BrainRecord[],
+    message = 'Canonical records are invalid.',
+    bytes?: number,
+    allowed?: AllowedMultiHead[],
+  ) => {
+    const validation = validateScannedSnapshot(
+      root,
+      {
+        ...scan,
+        bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
+        records,
+      },
+      hooks,
+    )
+    const blockingErrors = (() => {
+      if (allowed === undefined) {
+        return validation.result.errors
+      }
+      const allowedIds = allowedMultiHeadRecordIds(records, allowed, hooks)
+      return validation.result.errors.filter(
+        error =>
+          !(error.code === 'MULTIPLE_ACTIVE_HEADS' && error.recordId !== undefined && allowedIds.has(error.recordId)),
+      )
+    })()
+    if (blockingErrors.length === 0) {
+      return validation.artifacts
+    }
+    return fail('VALIDATION_FAILED', message, {
+      errors: blockingErrors.map(error => ({
+        code: error.code,
+        message: error.message,
+      })),
+    })
+  }
+  return {
+    authority,
+    bytes: scan.bytes,
+    errors: scan.errors,
+    records: scan.records,
+    validateFinal,
+  }
+}
+
+/** @internal */
 export const readRecordsResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
   readRecordScanResolved(root, hooks, allowed).scan.records
 
@@ -1820,10 +1884,10 @@ const addRecordFileResolved = (
     })
   }
 
-  const scan = scanCanonicalRecords(root)
-  if (scan.errors.length > 0) {
+  const planning = readRecordPlanningSnapshotResolved(root, options.readHooks, options.cacheLocation)
+  if (planning.errors.length > 0) {
     return fail('VALIDATION_FAILED', 'Existing canonical records are invalid.', {
-      errors: scan.errors.map(error => ({
+      errors: planning.errors.map(error => ({
         code: error.code,
         message: error.message,
       })),
@@ -1831,28 +1895,20 @@ const addRecordFileResolved = (
   }
   const validationRecordFile = createRecordFile(recordDraft, '2000-01-01T00:00:00.000Z')
   const validationRecord: BrainRecord = { ...validationRecordFile, path: relativePath }
-  assertRecordGraph(
-    root,
-    [...scan.records, validationRecord],
+  const artifacts = planning.validateFinal(
+    [...planning.records, validationRecord],
     'The new record would make canonical records invalid.',
-    {},
-    scan.bytes + Buffer.byteLength(formatRecordFile(validationRecordFile), 'utf8'),
+    planning.bytes + Buffer.byteLength(formatRecordFile(validationRecordFile), 'utf8'),
   )
   if (options.cacheLocation !== undefined) {
     assertCacheLocation(options.cacheLocation)
   }
-  const recordFile = createRecordFile(recordDraft, nextRecordCreatedAt(scan.records))
+  const recordFile = createRecordFile(recordDraft, nextRecordCreatedAt(planning.records))
   const record: BrainRecord = { ...recordFile, path: relativePath }
   const formatted = formatRecordFile(recordFile)
   const plan: PlannedRecord = { formatted, path, record, recordFile, relativePath }
   fault(options.hooks, 'after-scan-validation')
-  if (scan.layout === undefined) {
-    return repositoryChangedBeforePublication()
-  }
-  const authority = assertCanonicalLayoutAdditions(
-    [plan.record.kind],
-    canonicalPublicationAuthority(root, scan.layout, scan.observations, options.cacheLocation),
-  )
+  const authority = assertCanonicalLayoutAdditions([plan.record.kind], planning.authority())
 
   const publishOptions = {
     authority,
@@ -1869,7 +1925,17 @@ const addRecordFileResolved = (
   if (committedErrorPhase !== 'publicationFlush' && options.hydrate !== false) {
     try {
       fault(options.hooks, 'during-hydration')
-      hydrateResolvedRepository(root, 'held', options.cacheLocation)
+      if (options.cacheLocation === undefined || committedErrorPhase !== undefined) {
+        hydrateResolvedRepository(root, 'held', options.cacheLocation)
+      } else {
+        const snapshot: ValidatedMutationCacheSnapshot = Object.freeze({
+          artifacts,
+          assertCurrent: authority.assertCurrent,
+          records: Object.freeze([...planning.records, published.record]),
+          repositoryRealpath: options.cacheLocation.repository,
+        })
+        hydrateResolvedMutationSnapshot(root, snapshot, 'held', options.cacheLocation)
+      }
     } catch (error) {
       capturePostCommitError('cacheHydration', error)
     }
@@ -1894,6 +1960,7 @@ export const addRecord = (input: AddRecordInput): BrainRecord => {
       return addRecordFileResolved(root, parsed.recordDraft, {
         cacheLocation,
         hooks: recordWriteTestHooks,
+        readHooks: recordWriteTestHooks.readHooks,
       })
     })
   } catch (error) {
