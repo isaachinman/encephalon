@@ -170,9 +170,11 @@ Document one-pass mutation cache construction, deterministic fallback, unchanged
 
 Run: `bun run lint`, `bun run typecheck`, `bun run test`, `bun run benchmark`, `bun run benchmark:check`, `bun run build`, `bun run check:package`, `bun run check:publish`, and `bun install --frozen-lockfile`.
 
-- [ ] **Step 3: Run the required reviews and root audit**
+- [x] **Step 3: Run the required reviews and root audit**
 
 Dispatch security, correctness, data/race, test, maintainability, and UX/API reviewers against base `15e3b037e5d710fa4743168798d5e3d8f752ee4c`; fix every accepted high/medium-confidence issue and repeat exact-head review.
+
+The review wave found and fixed actual-byte eligibility, legacy canonical-error precedence and details, transaction-time identity replacement, operational artifact I/O propagation, cache projection ownership, planning-snapshot immutability, authority-factory documentation, and maintained provenance. Focused remediation passed 3/3; the init, records, and package suites passed 265 with zero failures and two established capability skips. Security, data/race, and UX/API reviewers reported no remaining findings before the final exact-head confirmation.
 
 - [ ] **Step 4: Publish without merging**
 
