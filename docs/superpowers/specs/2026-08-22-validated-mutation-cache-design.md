@@ -49,7 +49,7 @@ The writer returns either a committed rebuild or a repository-change result carr
 
 Disposable-cache recovery and preparation receive one invocation-scoped rebuilder instead of hard-coding disk `rebuildCache`. Stable corrupt or missing cache recovery therefore quarantines or claims the exact cache and revalidates the mutation snapshot before writing it. Once discarded, the same closure uses only disk rebuilds.
 
-Mutating add and init use forced snapshot hydration. Idempotent non-refresh init supplies its strictly validated snapshot to prepare, allowing a missing, stale, or corrupt cache to rebuild without another canonical parse while preserving the fresh-cache fast path. Refresh cases with no additions retain the existing allowed-generated-multihead preparation path rather than treating a relaxed planning graph as cacheable.
+Mutating add and init use forced snapshot hydration. Record-producing init does so only when the actual scanned canonical bytes plus the exact published formatted bytes remain within the existing corpus limit; otherwise it uses ordinary disk hydration so the established validation result and post-commit progress remain authoritative. Idempotent non-refresh init supplies its strictly validated snapshot to prepare, allowing a missing, stale, or corrupt cache to rebuild without another canonical parse while preserving the fresh-cache fast path. Refresh cases with no additions retain the existing allowed-generated-multihead preparation path rather than treating a relaxed planning graph as cacheable.
 
 ## Error and compatibility boundaries
 
@@ -60,6 +60,7 @@ Backwards compatibility is a release invariant: existing valid repositories, rec
 - Add still skips cache work only after `publicationFlush` failure and preserves `publicationVerification > publicationFlush > cacheHydration > stagingCleanup`.
 - Every snapshot, writer, fallback, or recovery failure after add publication remains inside `capturePostCommitError('cacheHydration', error)` with the same committed record ID, path, code, cause, and recovery action.
 - Init sets `phase: cachePreparation` and `cacheState: disposable` before snapshot cache work, retains committed IDs in publication order, and preserves the failing subsystem's code and details.
+- Existing invalid canonical history retains its previous validation message and issues rather than being reclassified as an invalid generated-baseline candidate.
 - The existing bounded disk rebuild remains the sole fallback authority for changed or invalid current canonical state.
 
 ## Acceptance evidence
@@ -71,7 +72,8 @@ Backwards compatibility is a release invariant: existing valid repositories, rec
 - A real shared-writer failure preserves committed add details and later `prepare` recovery.
 - Committed publication-verification and staging-cleanup failures use ordinary disk hydration while preserving the original post-commit error; a publication-flush failure still skips hydration.
 - A snapshot mismatch becomes deterministic fallback only after rollback and database close succeed, so operational cleanup failures remain visible.
+- Actual-byte boundary tests prove valid minified idempotent corpora remain accepted and post-publication overflow retains the established disk-validation failure and recovery details.
 
 ## Implementation provenance
 
-The exact implementation and behavioural-test snapshot is `906d6d7710fe511982a81ad0deb9ecff7e36f7d0`. Stable 100- and 1,000-record diagnostic additions each performed one canonical scan, one strict graph validation, zero disk cache validations, and left the next `prepare` fresh. The public API, CLI framing, canonical record format, cache schema and manifest, error codes/details, package exports, and runtime dependencies are unchanged.
+The exact implementation and behavioural-test snapshot is `2a0d8d1be89cbdb4bef766fc4f5db90de2fab888`. Stable 100- and 1,000-record diagnostic additions measured at implementation checkpoint `906d6d7710fe511982a81ad0deb9ecff7e36f7d0` each performed one canonical scan, one strict graph validation, zero disk cache validations, and left the next `prepare` fresh. The final compatibility checkpoint adds actual-byte and legacy-error guards without changing that stable path. The public API, CLI framing, canonical record format, cache schema and manifest, error codes/details, package exports, and runtime dependencies are unchanged.
