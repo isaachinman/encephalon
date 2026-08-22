@@ -14,6 +14,7 @@ All notable changes to Encephalon are documented here.
 
 ### Changed
 
+- Isolated every benchmark operation sample in a fresh child process and replaced single timings with schema-versioned latency, phase, and memory distributions.
 - Assigned record creation timestamps under the repository operation lock so new records and generated baseline batches remain strictly ordered after canonical history.
 - Made canonical record staging, publication, instruction-file writes, and post-commit recovery safer across filesystem failures.
 - Made cache hydration and gather reads transactional, snapshot-consistent, and resilient to malformed disposable state.

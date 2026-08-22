@@ -299,6 +299,11 @@ type CacheReadTestHooks = {
   onShowPrepare?: ((source: string) => void) | undefined
 }
 
+type CacheReadInstrumentation = {
+  afterResultRead?: (() => void) | undefined
+  beforeResultRead?: (() => void) | undefined
+}
+
 class CacheSchemaMismatch extends Error {}
 
 class NormalizedCacheSchemaFailure extends Error {
@@ -319,6 +324,9 @@ let sqliteModule: SQLiteModule | undefined
 let sqliteFeaturesVerified = false
 
 export const cacheReadTestHooks: CacheReadTestHooks = {}
+
+/** @internal */
+export const cacheReadInstrumentation: CacheReadInstrumentation = {}
 
 const loadSQLite = () => {
   if (sqliteModule === undefined) {
@@ -1862,7 +1870,10 @@ const readFreshCache = <Result>(root: string, location: CacheLocation, read: (da
     if (!metadataIsFresh(root, database, metadata)) {
       throw new CacheSchemaMismatch('The cache is stale before read.')
     }
-    return read(database)
+    cacheReadInstrumentation.beforeResultRead?.()
+    const result = read(database)
+    cacheReadInstrumentation.afterResultRead?.()
+    return result
   })
 
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
