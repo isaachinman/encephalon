@@ -116,7 +116,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-22 for code and behavioural-test snapshot `2a0d8d1be89cbdb4bef766fc4f5db90de2fab888`\./,
+      /Last reviewed: 2026-08-22 for code and behavioural-test snapshot `4fcc7a4d1b76d1ca05c8f2d94d01d590fd3d237d`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
@@ -133,7 +133,7 @@ describe('package contract', () => {
     )
     assert.match(
       validatedMutationCacheDesign,
-      /The exact implementation and behavioural-test snapshot is `2a0d8d1be89cbdb4bef766fc4f5db90de2fab888`\./,
+      /The exact implementation and behavioural-test snapshot is `4fcc7a4d1b76d1ca05c8f2d94d01d590fd3d237d`\./,
     )
     assert.match(
       contract,
@@ -141,7 +141,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `2a0d8d1be89cbdb4bef766fc4f5db90de2fab888`\./,
+      /MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `4fcc7a4d1b76d1ca05c8f2d94d01d590fd3d237d`\./,
     )
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /implementing the MAR-2566 benchmark guarantees above/)
