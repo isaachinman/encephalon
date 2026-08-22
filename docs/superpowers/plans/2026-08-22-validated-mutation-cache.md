@@ -12,6 +12,8 @@
 
 ## Global Constraints
 
+- Backwards compatibility is a release invariant: preserve every documented valid input, public result/error shape and code, persisted record format, cache/schema compatibility, and successful output semantics. Existing repositories, records, instruction files, caches, and clients must require no migration and suffer no data loss.
+- The validated-snapshot performance path is the only permitted observable change. If implementation reveals any compatibility conflict, stop and amend/review the plan before release.
 - Preserve the public synchronous API, CLI framing, cache schema version `1`, canonical JSON, and manifest format.
 - Stable add/init must perform one canonical scan and one strict graph validation.
 - Never combine supplied records with newly adopted artifact observations or a fallback manifest.
