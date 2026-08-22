@@ -2201,6 +2201,46 @@ describe('canonical records', () => {
     )
   })
 
+  test('preserves operational artifact I/O during mutation-snapshot hydration', () => {
+    const root = createRoot()
+    const id = 'snapshot-artifact-io'
+    const artifact = `_artifacts/decision/${id}/evidence.txt`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, 'stable evidence')
+    recordWriteTestHooks.fault = point => {
+      if (point === 'during-hydration') {
+        recordWriteTestHooks.fault = undefined
+        artifactInspectionTestHooks.fault = (artifactPoint, path) => {
+          if (artifactPoint === 'after-artifact-fstat' && path === artifact) {
+            throw Object.assign(new Error('Injected artifact I/O failure'), { code: 'EIO' })
+          }
+        }
+      }
+    }
+
+    assertPostCommitError(
+      () =>
+        api.addRecord({
+          artifacts: [artifact],
+          id,
+          kind: 'decision',
+          payload: { summary: 'Published before artifact I/O' },
+          root,
+          source: 'agent',
+          subject: 'snapshot.artifact-io',
+        }),
+      {
+        path: `encephalon/decision/${id}.json`,
+        phase: 'cacheHydration',
+        recordId: id,
+      },
+    )
+
+    artifactInspectionTestHooks.fault = undefined
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
+  })
+
   test('rebuilds from disk after committed publication failures', () => {
     const cases = [
       { id: 'verification-failure-disk-cache', phase: 'publicationVerification', point: 'after-publication-accept' },
@@ -2245,30 +2285,29 @@ describe('canonical records', () => {
 
   test('reports publication flush failure after canonical publication as committed', () => {
     const root = createRoot()
+    let writerInitialisations = 0
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'during-publication-flush') {
+        throw Object.assign(new Error('Injected directory flush failure'), {
+          code: 'EIO',
+        })
+      }
+    }
     assertPostCommitError(
       () =>
-        addRecordResolved(
+        api.addRecord({
+          id: 'flush-failure',
+          kind: 'decision',
+          payload: { summary: 'Published' },
           root,
-          {
-            id: 'flush-failure',
-            kind: 'decision',
-            payload: { summary: 'Published' },
-            source: 'agent',
-            subject: 'flush.failure',
-          },
-          {
-            hooks: {
-              fault: point => {
-                if (point === 'during-publication-flush') {
-                  throw Object.assign(new Error('Injected directory flush failure'), {
-                    code: 'EIO',
-                  })
-                }
-              },
-            },
-            hydrate: false,
-          },
-        ),
+          source: 'agent',
+          subject: 'flush.failure',
+        }),
       {
         path: 'encephalon/decision/flush-failure.json',
         phase: 'publicationFlush',
@@ -2278,6 +2317,8 @@ describe('canonical records', () => {
 
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'flush-failure.json')), true)
     assert.deepEqual(readdirSync(join(root, 'encephalon', '_staging')), [])
+    assert.equal(writerInitialisations, 0)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
   })
 
   test('does not let cleanup failure replace publication flush failure after commit', () => {

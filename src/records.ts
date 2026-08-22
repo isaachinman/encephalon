@@ -222,6 +222,19 @@ type AllowedMultiHead = {
   subject: string
 }
 
+type RecordPlanningSnapshot = Readonly<{
+  authority: () => CanonicalPublicationAuthority
+  bytes: number
+  errors: readonly ValidationIssue[]
+  records: readonly BrainRecord[]
+  validateFinal: (
+    records: readonly BrainRecord[],
+    message?: string,
+    bytes?: number,
+    allowed?: readonly AllowedMultiHead[],
+  ) => readonly ArtifactObservation[]
+}>
+
 type PostCommitPhase = 'cacheHydration' | 'publicationFlush' | 'publicationVerification' | 'stagingCleanup'
 
 const postCommitRecoveryAction = {
@@ -1055,7 +1068,11 @@ const validateScannedSnapshot = (root: string, scan: RecordScan, hooks: RecordRe
 const validateScanned = (root: string, scan: RecordScan, hooks: RecordReadHooks = {}): ValidateResult =>
   validateScannedSnapshot(root, scan, hooks).result
 
-const allowedMultiHeadRecordIds = (records: BrainRecord[], allowed: AllowedMultiHead[], hooks: RecordReadHooks) => {
+const allowedMultiHeadRecordIds = (
+  records: readonly BrainRecord[],
+  allowed: readonly AllowedMultiHead[],
+  hooks: RecordReadHooks,
+) => {
   const allowedKeys = new Set(allowed.map(candidate => `${candidate.kind} ${candidate.subject} ${candidate.source}`))
   const superseded = new Set<string>()
   for (const record of records) {
@@ -1325,7 +1342,7 @@ export const readRecordPlanningSnapshotResolved = (
   root: string,
   hooks: RecordReadHooks = {},
   cacheLocation?: CacheLocation,
-) => {
+): RecordPlanningSnapshot => {
   hooks.canonicalScan?.()
   const scan = scanCanonicalRecords(root, { hooks })
   const authority = () => {
@@ -1335,17 +1352,17 @@ export const readRecordPlanningSnapshotResolved = (
     return canonicalPublicationAuthority(root, scan.layout, scan.observations, cacheLocation)
   }
   const validateFinal = (
-    records: BrainRecord[],
+    records: readonly BrainRecord[],
     message = 'Canonical records are invalid.',
     bytes?: number,
-    allowed?: AllowedMultiHead[],
+    allowed?: readonly AllowedMultiHead[],
   ) => {
     const validation = validateScannedSnapshot(
       root,
       {
         ...scan,
         bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
-        records,
+        records: [...records],
       },
       hooks,
     )
@@ -1369,13 +1386,13 @@ export const readRecordPlanningSnapshotResolved = (
       })),
     })
   }
-  return {
+  return Object.freeze({
     authority,
     bytes: scan.bytes,
-    errors: scan.errors,
-    records: scan.records,
+    errors: Object.freeze([...scan.errors]),
+    records: Object.freeze([...scan.records]),
     validateFinal,
-  }
+  })
 }
 
 /** @internal */
