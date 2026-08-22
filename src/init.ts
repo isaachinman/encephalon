@@ -233,8 +233,18 @@ const initResolved = (
       const planning = readRecordPlanningSnapshotResolved(root, hooks, location)
       const { records } = planning
       assertCacheLocation(location)
-      const actions = baselineActions(records, baseline, refresh)
-      const validatedAdditions = actions.additions.map(addition => validateAddRecordInput({ ...addition, root }))
+      const { actions, validatedAdditions } = (() => {
+        try {
+          const plannedActions = baselineActions(records, baseline, refresh)
+          return {
+            actions: plannedActions,
+            validatedAdditions: plannedActions.additions.map(addition => validateAddRecordInput({ ...addition, root })),
+          }
+        } catch (error) {
+          planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
+          throw error
+        }
+      })()
       let recordsCreated: BrainRecord[] = []
       let cacheSnapshot: ValidatedMutationCacheSnapshot | undefined
       if (validatedAdditions.length > 0) {

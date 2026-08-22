@@ -2208,11 +2208,13 @@ describe('canonical records', () => {
     const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
     ensureParent(artifactPath)
     writeFileSync(artifactPath, 'stable evidence')
+    let matchingArtifactInspections = 0
     recordWriteTestHooks.fault = point => {
       if (point === 'during-hydration') {
         recordWriteTestHooks.fault = undefined
         artifactInspectionTestHooks.fault = (artifactPoint, path) => {
           if (artifactPoint === 'after-artifact-fstat' && path === artifact) {
+            matchingArtifactInspections += 1
             throw Object.assign(new Error('Injected artifact I/O failure'), { code: 'EIO' })
           }
         }
@@ -2237,6 +2239,7 @@ describe('canonical records', () => {
       },
     )
 
+    assert.equal(matchingArtifactInspections, 1)
     artifactInspectionTestHooks.fault = undefined
     assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
   })
