@@ -86,6 +86,8 @@ npx --no-install encephalon validate
 
 Active records are returned by default. Add `--include-superseded` to `list`, `search`, or `gather` when historical records are needed. Missing `show` results are `null`, and empty searches are `[]`.
 
+Within one accepted gather cache snapshot, each exact repeated show ID and original query string is evaluated once. Each distinct non-empty query executes against SQLite at most once, while zero-term queries never execute `MATCH`. Missing IDs and zero-term results are memoized too, and textually different queries remain distinct even when they compile to the same literal match. Every duplicate keeps its input position, no duplicated mutable result is shared, and every emitted occurrence still consumes the full gather response budget.
+
 Search text is literal rather than raw FTS syntax. Encephalon checks the original UTF-8 byte limit, normalizes the query and derived cached search document to NFC, preserves Unicode letter/number terms with attached combining marks, quotes every term, and combines terms with `AND`. Accented Latin, Greek, Cyrillic, Arabic, Hebrew, CJK, and combining-mark scripts therefore remain searchable without exposing FTS operators, wildcards, quotes, punctuation, or controls. Standalone punctuation-only searches, and gather calls containing only such searches with no shows or hydration, return empty results before repository or cache access.
 
 ### Operation budgets

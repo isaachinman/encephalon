@@ -14,6 +14,7 @@ import {
   type BenchmarkWorkerResult,
   benchmarkOperations,
 } from './benchmark-model.ts'
+import { gatherBenchmarkInput, shownIdForBenchmarkCase } from './benchmark-workload.ts'
 
 type WorkerRequest = {
   nonce?: unknown
@@ -30,14 +31,6 @@ const isOperation = (value: unknown): value is BenchmarkOperation =>
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-const shownIdForCase = (records: number) => {
-  if (records === 0) {
-    return 'missing'
-  }
-  const activeChainIndex = Math.max(0, Math.floor(records * 0.1) - 1)
-  return `chain-${String(activeChainIndex).padStart(5, '0')}`
-}
-
 type OperationRunner = (records: number, root: string) => unknown
 type ResultValidator = (records: number, result: unknown) => boolean
 
@@ -45,14 +38,9 @@ const operationRunners: Record<BenchmarkOperation, OperationRunner> = {
   coldHydrate: (_records, root) => hydrate({ root }),
   compactSearch: (_records, root) => searchCompactRecords({ limit: 20, query: 'benchmark needle', root }),
   fullSearch: (_records, root) => searchRecords({ limit: 20, query: 'benchmark needle', root }),
-  gather: (records, root) =>
-    gatherRecords({
-      root,
-      searches: ['benchmark needle', 'large payload'],
-      shows: [shownIdForCase(records), 'missing'],
-    }),
+  gather: (records, root) => gatherRecords({ root, ...gatherBenchmarkInput(records) }),
   list: (_records, root) => listRecords({ limit: 20, root }),
-  show: (records, root) => showRecord({ id: shownIdForCase(records), root }),
+  show: (records, root) => showRecord({ id: shownIdForBenchmarkCase(records), root }),
   stalePrepare: (_records, root) => prepare({ root }),
   unchangedPrepare: (_records, root) => prepare({ root }),
 }
@@ -60,17 +48,25 @@ const operationRunners: Record<BenchmarkOperation, OperationRunner> = {
 const hasExpectedResultCardinality = (records: number, result: unknown): boolean =>
   Array.isArray(result) && (records === 0 ? result.length === 0 : result.length > 0)
 
+const hasExpectedGatherResult = (records: number, result: unknown): boolean => {
+  const input = gatherBenchmarkInput(records)
+  return (
+    isObject(result) &&
+    result.hydrated === null &&
+    Array.isArray(result.searches) &&
+    result.searches.length === input.searches.length &&
+    result.searches.every((entry, index) => isObject(entry) && entry.query === input.searches[index]) &&
+    Array.isArray(result.records) &&
+    result.records.length === input.shows.length &&
+    result.records.every((entry, index) => isObject(entry) && entry.id === input.shows[index])
+  )
+}
+
 const resultValidators: Record<BenchmarkOperation, ResultValidator> = {
   coldHydrate: (records, result) => isObject(result) && result.recordsIndexed === records,
   compactSearch: hasExpectedResultCardinality,
   fullSearch: hasExpectedResultCardinality,
-  gather: (_records, result) =>
-    isObject(result) &&
-    result.hydrated === null &&
-    Array.isArray(result.searches) &&
-    result.searches.length === 2 &&
-    Array.isArray(result.records) &&
-    result.records.length === 2,
+  gather: hasExpectedGatherResult,
   list: hasExpectedResultCardinality,
   show: (records, result) => (records === 0 ? result === null : isObject(result)),
   stalePrepare: (records, result) => isObject(result) && result.recordsIndexed === records && result.hydrated === true,
