@@ -13,13 +13,17 @@ import {
 } from './api-input.ts'
 import { ArtifactChangedError, type ArtifactObservation, inspectArtifactFiles } from './artifact-inspection.ts'
 import {
+  type CacheDatabase,
+  CacheDatabaseCreationConflict,
   CacheDatabaseFailure,
   type CacheLocation,
+  failCacheDatabase,
   inspectCacheDatabase,
   inspectCacheLocation,
   openVerifiedCacheDatabase,
   quarantineCacheDatabase,
 } from './cache-location.ts'
+import { CANONICAL_BUDGETS } from './canonical-budgets.ts'
 import {
   CanonicalDirectoryChangedError,
   CanonicalDirectoryEntryLimitError,
@@ -38,7 +42,7 @@ import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { ordinalStringCompare } from './order.ts'
 import { canonicalRecordPath, readRecords, readValidatedRecordSnapshotResolved } from './records.ts'
 import { resolveRepository } from './repository.ts'
-import { MAX_RECORD_BYTES, parseRecordFile, validateArtifactPath } from './schema.ts'
+import { parseRecordFile, validateArtifactPath } from './schema.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type {
   BrainRecord,
@@ -62,8 +66,16 @@ const MAX_GATHER_SHOWS = OPERATION_BUDGETS.gatherShows.maximum
 const MAX_FULL_RESPONSE_BYTES = OPERATION_BUDGETS.fullResponseBytes.maximum
 const SQLITE_BUSY_TIMEOUT_MILLISECONDS = 1000
 const MAX_CACHE_METADATA_BYTES = 1024 * 1024
-const MAX_CACHE_RECORD_BYTES = MAX_RECORD_BYTES + 4096
-const MAX_CACHE_RECORDS = 100_000
+const MAX_CACHE_METADATA_AGGREGATE_BYTES = 6 * MAX_CACHE_METADATA_BYTES
+const MAX_CACHE_SCHEMA_BYTES = 4 * 1024
+const MAX_CACHE_RECORD_OVERHEAD_BYTES = 4096
+const MAX_CACHE_RECORD_BYTES = CANONICAL_BUDGETS.recordBytes + MAX_CACHE_RECORD_OVERHEAD_BYTES
+const MAX_CACHE_RECORD_JSON_BYTES =
+  CANONICAL_BUDGETS.recordJsonBytes + CANONICAL_BUDGETS.records * MAX_CACHE_RECORD_OVERHEAD_BYTES
+const MAX_CACHE_RECORD_TEXT_BYTES = MAX_CACHE_RECORD_JSON_BYTES * 2
+const MAX_CACHE_SEARCH_DOCUMENT_BYTES = MAX_CACHE_RECORD_BYTES * 2
+const MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES = MAX_CACHE_RECORD_JSON_BYTES * 2
+const MAX_CACHE_FTS_ID_BYTES = CANONICAL_BUDGETS.records * 255
 const METADATA_KEYS = [
   'artifactPaths',
   'manifest',
@@ -117,20 +129,53 @@ type CompactRow = {
 
 type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind' | 'limit'>
 
+type CacheIntegrityProbeName =
+  | 'metadata'
+  | 'metadata-columns'
+  | 'records'
+  | 'records-columns'
+  | 'record-search'
+  | 'record-search-columns'
+  | 'record-search-schema'
+
+type CacheIntegrityProbe = {
+  exceeds_aggregate_bytes?: unknown
+  has_invalid_type?: unknown
+  has_oversized_value?: unknown
+  row_count?: unknown
+}
+
+type CacheIntegrityObservation = {
+  exceedsAggregateBytes: 0 | 1
+  hasInvalidType: 0 | 1
+  hasOversizedValue: 0 | 1
+  name: CacheIntegrityProbeName
+  rows: number
+}
+
 type CacheReadTestHooks = {
   afterCanonicalValidation?: (() => void) | undefined
+  afterDisposableCacheRecoveryRebuild?: ((result: PrepareResult) => void) | undefined
+  afterIntegrityProbe?: ((observation: CacheIntegrityObservation) => void) | undefined
   afterManifestEntryLstat?: ((path: string) => void) | undefined
   afterManifestKindEnumeration?: ((path: string) => void) | undefined
   afterManifestRootEnumeration?: ((path: string) => void) | undefined
+  afterMissingPrimaryRecoveryObservation?: (() => void) | undefined
+  afterPrimaryDatabaseObservation?: ((phase: 'prepare-fast-path' | 'reader-missing') => void) | undefined
   afterCompactSearchRead?: ((query: string) => void) | undefined
   afterShowRead?: ((id: string) => void) | undefined
   beforeManifestEntryLstat?: ((path: string) => void) | undefined
+  beforeIntegrityTextRead?: ((name: CacheIntegrityProbeName) => void) | undefined
   duringDatabaseInitialisation?: ((mode: 'reader' | 'writer') => void) | undefined
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
 }
 
 class CacheSchemaMismatch extends Error {}
+
+class CacheDatabaseObservedMissing extends Error {}
+
+const isIntegrityFlag = (value: unknown): value is 0 | 1 => value === 0 || value === 1
 
 let sqliteModule: SQLiteModule | undefined
 let sqliteFeaturesVerified = false
@@ -164,6 +209,7 @@ const isRecoverableCacheFailure = (error: unknown) => {
   const category = classifySQLiteError(failure)
   return (
     failure instanceof CacheSchemaMismatch ||
+    failure instanceof CacheDatabaseObservedMissing ||
     category === 'cantopen' ||
     category === 'corrupt' ||
     category === 'notadb' ||
@@ -172,21 +218,83 @@ const isRecoverableCacheFailure = (error: unknown) => {
   )
 }
 
-const assertTableColumns = (database: DatabaseSync, table: string, expected: string[]) => {
-  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+const readIntegrityProbe = (
+  name: CacheIntegrityProbeName,
+  row: CacheIntegrityProbe | undefined,
+  maximumRows: number,
+): CacheIntegrityObservation => {
+  const rows = row?.row_count
+  const exceedsAggregateBytes = row?.exceeds_aggregate_bytes
+  const hasInvalidType = row?.has_invalid_type
+  const hasOversizedValue = row?.has_oversized_value
+  if (
+    typeof rows !== 'number' ||
+    !Number.isSafeInteger(rows) ||
+    rows < 0 ||
+    rows > maximumRows ||
+    !isIntegrityFlag(exceedsAggregateBytes) ||
+    !isIntegrityFlag(hasInvalidType) ||
+    !isIntegrityFlag(hasOversizedValue)
+  ) {
+    throw new CacheSchemaMismatch('The cache integrity probe returned an invalid result.')
+  }
+  const observation = {
+    exceedsAggregateBytes,
+    hasInvalidType,
+    hasOversizedValue,
+    name,
+    rows,
+  }
+  cacheReadTestHooks.afterIntegrityProbe?.(observation)
+  return observation
+}
+
+const assertTableColumns = (
+  database: DatabaseSync,
+  table: 'metadata' | 'record_search' | 'records',
+  expected: string[],
+) => {
+  const maximumRows = expected.length + 1
+  const maximumNameBytes = Math.max(...expected.map(name => Buffer.byteLength(name, 'utf8')))
+  const probeName = `${table.replace('_', '-')}-columns` as CacheIntegrityProbeName
+  const probe = readIntegrityProbe(
+    probeName,
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          0 AS exceeds_aggregate_bytes,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+        FROM (
+          SELECT
+            CASE WHEN typeof(name) = 'text' THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(name) = 'text' AND length(CAST(name AS BLOB)) <= ? THEN 0 ELSE 1 END AS oversized
+          FROM pragma_table_info(?)
+          LIMIT ?
+        )`,
+      )
+      .get(maximumNameBytes, table, maximumRows) as CacheIntegrityProbe | undefined,
+    maximumRows,
+  )
+  if (
+    probe.rows !== expected.length ||
+    probe.exceedsAggregateBytes !== 0 ||
+    probe.hasInvalidType !== 0 ||
+    probe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.(probeName)
+  const columns = database
+    .prepare('SELECT name FROM pragma_table_info(?) LIMIT ?')
+    .iterate(table, maximumRows) as Iterable<{
     name?: unknown
   }>
-  const names = columns.map(column => column.name)
+  const names = [...columns].map(column => column.name)
   if (JSON.stringify(names) !== JSON.stringify(expected)) {
     throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
   }
-}
-
-const removeCorruptCache = (location: CacheLocation, error: unknown) => {
-  if (error instanceof CacheDatabaseFailure) {
-    return quarantineCacheDatabase(location, error.database)
-  }
-  throw error
 }
 
 const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync']) => {
@@ -228,8 +336,38 @@ const assertCacheSchema = (database: DatabaseSync) => {
     'record_json',
   ])
   assertTableColumns(database, 'record_search', ['id', 'text'])
+  const searchSchemaProbe = readIntegrityProbe(
+    'record-search-schema',
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          0 AS exceeds_aggregate_bytes,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+        FROM (
+          SELECT
+            CASE WHEN typeof(sql) = 'text' THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(sql) = 'text' AND length(CAST(sql AS BLOB)) <= ? THEN 0 ELSE 1 END AS oversized
+          FROM sqlite_master
+          WHERE type = 'table' AND name = 'record_search'
+          LIMIT 2
+        )`,
+      )
+      .get(MAX_CACHE_SCHEMA_BYTES) as CacheIntegrityProbe | undefined,
+    2,
+  )
+  if (
+    searchSchemaProbe.rows !== 1 ||
+    searchSchemaProbe.exceedsAggregateBytes !== 0 ||
+    searchSchemaProbe.hasInvalidType !== 0 ||
+    searchSchemaProbe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.('record-search-schema')
   const searchSchema = database
-    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'record_search'")
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'record_search' LIMIT 2")
     .get() as { sql?: unknown } | undefined
   if (typeof searchSchema?.sql !== 'string' || !/\bUSING\s+fts5\b/i.test(searchSchema.sql)) {
     throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
@@ -264,7 +402,12 @@ const createCacheSchema = (database: DatabaseSync) => {
   `)
 }
 
-const openWriterDatabase = (location: CacheLocation) => {
+type CacheWriterPrimary =
+  | { kind: 'create-exclusive' }
+  | { kind: 'create-if-missing' }
+  | { database: CacheDatabase; kind: 'expected-owned' }
+
+const openWriterDatabase = (location: CacheLocation, primary: CacheWriterPrimary = { kind: 'create-if-missing' }) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
   return openVerifiedCacheDatabase({
@@ -274,34 +417,58 @@ const openWriterDatabase = (location: CacheLocation) => {
       assertCacheSchema(database)
       cacheReadTestHooks.duringDatabaseInitialisation?.('writer')
     },
-    create: true,
     DatabaseConstructor,
     location,
     name: 'brain.sqlite',
     openOptions: { timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS },
+    primary,
   })
 }
 
-const openReaderDatabase = (location: CacheLocation) => {
+const NO_VERIFIED_CACHE_RESULT = Symbol('no-verified-cache-result')
+
+const readVerifiedCacheTransaction = <Result>(
+  location: CacheLocation,
+  read: (database: DatabaseSync) => Result,
+): Result => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  return openVerifiedCacheDatabase({
-    afterVerifiedOpen: database => {
-      assertCacheSchema(database)
-      cacheReadTestHooks.duringDatabaseInitialisation?.('reader')
+  let result: Result | typeof NO_VERIFIED_CACHE_RESULT = NO_VERIFIED_CACHE_RESULT
+  const { database } = openVerifiedCacheDatabase({
+    afterVerifiedOpen: opened => {
+      opened.exec('BEGIN')
+      try {
+        assertCacheSchema(opened)
+        cacheReadTestHooks.duringDatabaseInitialisation?.('reader')
+        result = read(opened)
+        opened.exec('ROLLBACK')
+      } catch (error) {
+        try {
+          opened.exec('ROLLBACK')
+        } catch {
+          // Preserve the original validation/read error.
+        }
+        throw error
+      }
     },
-    create: false,
     DatabaseConstructor,
     location,
     missing: () => {
-      throw new CacheSchemaMismatch('The cache database disappeared before it was opened.')
+      cacheReadTestHooks.afterPrimaryDatabaseObservation?.('reader-missing')
+      throw new CacheDatabaseObservedMissing('The cache database disappeared before it was opened.')
     },
     name: 'brain.sqlite',
     openOptions: {
       readOnly: true,
       timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS,
     },
+    primary: { kind: 'existing' },
   })
+  database.close()
+  if (result === NO_VERIFIED_CACHE_RESULT) {
+    return fail('INTERNAL_ERROR', 'The verified cache read returned no result.')
+  }
+  return result
 }
 
 const posixRelative = (root: string, path: string) =>
@@ -467,8 +634,9 @@ const parseCacheJson = (value: unknown, maximum: number) => {
   assertCacheValueSize(value, maximum)
   try {
     return JSON.parse(value) as unknown
-  } catch (error) {
-    throw new CacheSchemaMismatch('The cache contains malformed JSON.', { cause: error })
+  } catch {
+    // biome-ignore lint/style/useErrorCause: V8 parser errors can retain private untrusted cache source text.
+    throw new CacheSchemaMismatch('The cache contains malformed JSON.')
   }
 }
 
@@ -520,13 +688,54 @@ const summaryForRecord = (record: BrainRecord) => {
 }
 
 const readMetadata = (database: DatabaseSync): Metadata | undefined => {
-  const rows = database.prepare('SELECT key, value FROM metadata').all() as Array<{
+  const maximumRows = METADATA_KEYS.length + 1
+  const maximumKeyBytes = Math.max(...METADATA_KEYS.map(key => Buffer.byteLength(key, 'utf8')))
+  const probe = readIntegrityProbe(
+    'metadata',
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value,
+          CASE WHEN TOTAL(value_bytes) > ? THEN 1 ELSE 0 END AS exceeds_aggregate_bytes
+        FROM (
+          SELECT
+            CASE WHEN typeof(key) = 'text' AND typeof(value) = 'text' THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(key) = 'text' AND length(CAST(key AS BLOB)) <= ?
+                       AND typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= ?
+                 THEN 0 ELSE 1 END AS oversized,
+            CASE WHEN typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= ?
+                 THEN length(CAST(value AS BLOB)) ELSE 0 END AS value_bytes
+          FROM metadata
+          LIMIT ?
+        )`,
+      )
+      .get(
+        MAX_CACHE_METADATA_AGGREGATE_BYTES,
+        maximumKeyBytes,
+        MAX_CACHE_METADATA_BYTES,
+        MAX_CACHE_METADATA_BYTES,
+        maximumRows,
+      ) as CacheIntegrityProbe | undefined,
+    maximumRows,
+  )
+  if (probe.rows === 0) {
+    return
+  }
+  if (
+    probe.rows >= maximumRows ||
+    probe.exceedsAggregateBytes !== 0 ||
+    probe.hasInvalidType !== 0 ||
+    probe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch('The cache metadata contains invalid keys or values.')
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.('metadata')
+  const rows = database.prepare('SELECT key, value FROM metadata LIMIT ?').iterate(maximumRows) as Iterable<{
     key?: unknown
     value?: unknown
   }>
-  if (rows.length === 0) {
-    return
-  }
   const values = new Map<string, string>()
   for (const row of rows) {
     if (
@@ -548,13 +757,13 @@ const readMetadata = (database: DatabaseSync): Metadata | undefined => {
     throw new CacheSchemaMismatch('The cache metadata key set is incomplete.')
   }
   const artifactPaths = parseCacheJson(artifactPathsValue, MAX_CACHE_METADATA_BYTES)
-  const recordsIndexed = Number(recordsIndexedValue)
+  const recordsIndexed = /^(?:0|[1-9]\d*)$/.test(recordsIndexedValue) ? Number(recordsIndexedValue) : Number.NaN
   if (
     !Array.isArray(artifactPaths) ||
-    artifactPaths.length > MAX_CACHE_RECORDS ||
+    artifactPaths.length > CANONICAL_BUDGETS.records ||
     !Number.isSafeInteger(recordsIndexed) ||
     recordsIndexed < 0 ||
-    recordsIndexed > MAX_CACHE_RECORDS
+    recordsIndexed > CANONICAL_BUDGETS.records
   ) {
     throw new CacheSchemaMismatch('The cache metadata contains invalid values.')
   }
@@ -587,9 +796,72 @@ const assertCacheScope = (root: string, metadata: Metadata | undefined) => {
 }
 
 const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata) => {
+  const maximumRows = CANONICAL_BUDGETS.records + 1
+  const recordsProbe = readIntegrityProbe(
+    'records',
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          CASE WHEN TOTAL(record_json_bytes) > ?1 OR TOTAL(record_text_bytes) > ?2
+            THEN 1 ELSE 0 END AS exceeds_aggregate_bytes,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+        FROM (
+          SELECT
+            CASE WHEN typeof(id) = 'text'
+                       AND typeof(kind) = 'text'
+                       AND typeof(subject) = 'text'
+                       AND typeof(source) = 'text'
+                       AND typeof(created_at) = 'text'
+                       AND typeof(path) = 'text'
+                       AND typeof(active) = 'integer'
+                       AND active IN (0, 1)
+                       AND typeof(summary) IN ('null', 'text')
+                       AND typeof(record_json) = 'text'
+                 THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= ?3
+                       AND typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?3
+                       AND typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= ?3
+                       AND typeof(source) = 'text' AND length(CAST(source AS BLOB)) <= ?3
+                       AND typeof(created_at) = 'text' AND length(CAST(created_at AS BLOB)) <= ?3
+                       AND typeof(path) = 'text' AND length(CAST(path AS BLOB)) <= ?3
+                       AND (typeof(summary) = 'null'
+                         OR (typeof(summary) = 'text' AND length(CAST(summary AS BLOB)) <= ?3))
+                       AND typeof(record_json) = 'text' AND length(CAST(record_json AS BLOB)) <= ?3
+                 THEN 0 ELSE 1 END AS oversized,
+            CASE WHEN typeof(record_json) = 'text'
+                 THEN length(CAST(record_json AS BLOB)) ELSE 0 END AS record_json_bytes,
+            (CASE WHEN typeof(id) = 'text' THEN length(CAST(id AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(kind) = 'text' THEN length(CAST(kind AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(subject) = 'text' THEN length(CAST(subject AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(source) = 'text' THEN length(CAST(source AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(created_at) = 'text' THEN length(CAST(created_at AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(path) = 'text' THEN length(CAST(path AS BLOB)) ELSE 0 END
+              + CASE WHEN typeof(summary) = 'text' THEN length(CAST(summary AS BLOB)) ELSE 0 END
+            ) AS record_text_bytes
+          FROM records
+          LIMIT ?4
+        )`,
+      )
+      .get(MAX_CACHE_RECORD_JSON_BYTES, MAX_CACHE_RECORD_TEXT_BYTES, MAX_CACHE_RECORD_BYTES, maximumRows) as
+      | CacheIntegrityProbe
+      | undefined,
+    maximumRows,
+  )
+  if (
+    recordsProbe.rows !== metadata.recordsIndexed ||
+    recordsProbe.rows >= maximumRows ||
+    recordsProbe.exceedsAggregateBytes !== 0 ||
+    recordsProbe.hasInvalidType !== 0 ||
+    recordsProbe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch('The cache record table does not match its metadata.')
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.('records')
   const recordRows = database
-    .prepare('SELECT id, kind, subject, source, created_at, path, active, summary, record_json FROM records')
-    .all() as Array<
+    .prepare('SELECT id, kind, subject, source, created_at, path, active, summary, record_json FROM records LIMIT ?')
+    .iterate(maximumRows) as Iterable<
     RecordRow & {
       active?: unknown
       created_at?: unknown
@@ -601,10 +873,7 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
       summary?: unknown
     }
   >
-  if (recordRows.length !== metadata.recordsIndexed || recordRows.length > MAX_CACHE_RECORDS) {
-    throw new CacheSchemaMismatch('The cache record table does not match its metadata.')
-  }
-  const records = recordRows.map(row => ({ record: parseCachedRecord(row.record_json), row }))
+  const records = Array.from(recordRows, row => ({ record: parseCachedRecord(row.record_json), row }))
   const superseded = new Set(records.flatMap(({ record }) => record.supersedes ?? []))
   for (const { record, row } of records) {
     const active = superseded.has(record.id) ? 0 : 1
@@ -621,6 +890,48 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
       throw new CacheSchemaMismatch('The cache record table does not match its canonical JSON.')
     }
   }
+  const searchProbe = readIntegrityProbe(
+    'record-search',
+    database
+      .prepare(
+        `SELECT
+          COUNT(*) AS row_count,
+          CASE WHEN TOTAL(id_bytes) > ?1 OR TOTAL(text_bytes) > ?2
+            THEN 1 ELSE 0 END AS exceeds_aggregate_bytes,
+          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+        FROM (
+          SELECT
+            CASE WHEN typeof(id) = 'text' AND typeof(text) = 'text'
+                 THEN 0 ELSE 1 END AS invalid_type,
+            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= ?3
+                       AND typeof(text) = 'text' AND length(CAST(text AS BLOB)) <= ?4
+                 THEN 0 ELSE 1 END AS oversized,
+            CASE WHEN typeof(id) = 'text' THEN length(CAST(id AS BLOB)) ELSE 0 END AS id_bytes,
+            CASE WHEN typeof(text) = 'text' THEN length(CAST(text AS BLOB)) ELSE 0 END AS text_bytes
+          FROM record_search
+          LIMIT ?5
+        )`,
+      )
+      .get(
+        MAX_CACHE_FTS_ID_BYTES,
+        MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES,
+        255,
+        MAX_CACHE_SEARCH_DOCUMENT_BYTES,
+        maximumRows,
+      ) as CacheIntegrityProbe | undefined,
+    maximumRows,
+  )
+  if (
+    searchProbe.rows !== metadata.recordsIndexed ||
+    searchProbe.rows >= maximumRows ||
+    searchProbe.exceedsAggregateBytes !== 0 ||
+    searchProbe.hasInvalidType !== 0 ||
+    searchProbe.hasOversizedValue !== 0
+  ) {
+    throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead?.('record-search')
   const counts = database
     .prepare(
       `SELECT
@@ -695,19 +1006,20 @@ const writeMetadata = (database: DatabaseSync, metadata: Metadata) => {
   }
 }
 
-const readFreshMetadata = (root: string, location: CacheLocation): Metadata | undefined => {
-  const database = openReaderDatabase(location)
-  try {
+const readFreshMetadata = (root: string, location: CacheLocation): Metadata | undefined =>
+  readVerifiedCacheTransaction(location, database => {
     const metadata = readMetadata(database)
     return metadataIsFresh(root, database, metadata) ? metadata : undefined
-  } finally {
-    database.close()
-  }
-}
+  })
 
-const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocation(root)): PrepareResult => {
+const rebuildCache = (
+  root: string,
+  location: CacheLocation = inspectCacheLocation(root),
+  primary: CacheWriterPrimary = { kind: 'create-if-missing' },
+): PrepareResult => {
   const attempts = Array.from({ length: MAX_REPOSITORY_CHANGE_RETRIES }, (_, index) => index)
   let repositoryChangeObserved = false
+  let nextWriterPrimary = primary
   for (const attempt of attempts) {
     const recordManifestBefore = boundedRepositoryManifest(root, [])
     if (recordManifestBefore.kind !== 'stable') {
@@ -762,25 +1074,17 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
       continue
     }
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-    let database: DatabaseSync
+    const opened = openWriterDatabase(location, nextWriterPrimary)
+    const { database, identity } = opened
+    nextWriterPrimary =
+      nextWriterPrimary.kind === 'create-if-missing'
+        ? { kind: 'create-if-missing' }
+        : { database: identity, kind: 'expected-owned' }
+    let rebuildResult: PrepareResult | undefined
+    let writerFailure: unknown
+    let writerFailed = false
     try {
-      database = openWriterDatabase(location)
-    } catch (error) {
-      if (!isRecoverableCacheFailure(error)) {
-        throw error
-      }
-      removeCorruptCache(location, error)
-      database = openWriterDatabase(location)
-    }
-    try {
-      let existingMetadata: Metadata | undefined
-      try {
-        existingMetadata = readMetadata(database)
-      } catch (error) {
-        if (!(error instanceof CacheSchemaMismatch)) {
-          throw error
-        }
-      }
+      const existingMetadata = readMetadata(database)
       assertCacheScope(root, existingMetadata)
       database.exec('BEGIN IMMEDIATE')
       try {
@@ -815,10 +1119,11 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
         const manifestAfter = boundedRepositoryManifest(root, artifactPaths)
         if (manifestAfter.kind === 'stable' && manifestAfter.value === manifestBefore.value) {
           database.exec('COMMIT')
-          return { hydrated: true, recordsIndexed: records.length }
+          rebuildResult = { hydrated: true, recordsIndexed: records.length }
+        } else {
+          repositoryChangeObserved = true
+          database.exec('ROLLBACK')
         }
-        repositoryChangeObserved = true
-        database.exec('ROLLBACK')
       } catch (error) {
         try {
           database.exec('ROLLBACK')
@@ -827,8 +1132,29 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
         }
         throw error
       }
-    } finally {
+    } catch (error) {
+      writerFailure = error
+      writerFailed = true
+    }
+    try {
       database.close()
+    } catch (error) {
+      if (!writerFailed) {
+        writerFailure = error
+        writerFailed = true
+      }
+    }
+    if (writerFailed) {
+      if (writerFailure instanceof EncephalonError || writerFailure instanceof CacheDatabaseFailure) {
+        throw writerFailure
+      }
+      if (isRecoverableCacheFailure(writerFailure)) {
+        return failCacheDatabase(writerFailure, identity)
+      }
+      throw writerFailure
+    }
+    if (rebuildResult !== undefined) {
+      return rebuildResult
     }
     if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {
       return fail('REPOSITORY_CHANGED', 'The repository changed repeatedly while rebuilding the Encephalon cache.')
@@ -837,44 +1163,146 @@ const rebuildCache = (root: string, location: CacheLocation = inspectCacheLocati
   return fail('INTERNAL_ERROR', 'The Encephalon cache rebuild ended unexpectedly.')
 }
 
+const withCacheOperationLock = <Result>(
+  root: string,
+  location: CacheLocation,
+  operation: (captured: CacheLocation) => Result,
+): Result => {
+  let capturedFailure: unknown
+  let hasCapturedFailure = false
+  try {
+    return withOperationLock(
+      root,
+      captured => {
+        try {
+          return operation(captured)
+        } catch (failure) {
+          if (!(failure instanceof EncephalonError) && isRecoverableCacheFailure(failure)) {
+            capturedFailure = failure
+            hasCapturedFailure = true
+          }
+          throw failure
+        }
+      },
+      {},
+      location,
+    )
+  } catch (failure) {
+    if (hasCapturedFailure) {
+      throw capturedFailure
+    }
+    throw failure
+  }
+}
+
+type DisposableCacheRecovery = { kind: 'rebuilt'; result: PrepareResult } | { kind: 'retry' }
+type CacheRecoveryLockMode = 'acquire' | 'held'
+type DisposableCacheRecoveryCompletion<Result> =
+  | { kind: 'complete-from-rebuild'; complete: (result: PrepareResult) => Result }
+  | { kind: 'retry-operation' }
+
+type DisposableCacheRecoveryOptions<Result> = {
+  completion: DisposableCacheRecoveryCompletion<Result>
+  lockMode: CacheRecoveryLockMode
+}
+
+const completedRecoveryRebuild = (result: PrepareResult): DisposableCacheRecovery => {
+  cacheReadTestHooks.afterDisposableCacheRecoveryRebuild?.(result)
+  return { kind: 'rebuilt', result }
+}
+
+const recoverDisposableCacheUnderLock = (
+  root: string,
+  location: CacheLocation,
+  failure: unknown,
+): DisposableCacheRecovery => {
+  if (failure instanceof CacheDatabaseFailure) {
+    quarantineCacheDatabase(location, failure.database)
+    return completedRecoveryRebuild(rebuildCache(root, location))
+  }
+  if (failure instanceof CacheDatabaseObservedMissing) {
+    if (inspectCacheDatabase(location, 'brain.sqlite') === undefined) {
+      cacheReadTestHooks.afterMissingPrimaryRecoveryObservation?.()
+      try {
+        return completedRecoveryRebuild(rebuildCache(root, location, { kind: 'create-exclusive' }))
+      } catch (error) {
+        if (error instanceof CacheDatabaseCreationConflict) {
+          return { kind: 'retry' }
+        }
+        throw error
+      }
+    }
+    return { kind: 'retry' }
+  }
+  throw failure
+}
+
+const recoverDisposableCacheOnce = (
+  root: string,
+  location: CacheLocation,
+  failure: unknown,
+  lockMode: CacheRecoveryLockMode,
+): DisposableCacheRecovery => {
+  if (isRecoverableCacheFailure(failure)) {
+    return lockMode === 'acquire'
+      ? withCacheOperationLock(root, location, captured => recoverDisposableCacheUnderLock(root, captured, failure))
+      : recoverDisposableCacheUnderLock(root, location, failure)
+  }
+  throw failure
+}
+
+const runWithDisposableCacheRecovery = <Result>(
+  root: string,
+  location: CacheLocation,
+  operation: () => Result,
+  options: DisposableCacheRecoveryOptions<Result>,
+): Result => {
+  try {
+    return operation()
+  } catch (failure) {
+    if (!(failure instanceof EncephalonError) && isRecoverableCacheFailure(failure)) {
+      const recovery = recoverDisposableCacheOnce(root, location, failure, options.lockMode)
+      if (recovery.kind === 'rebuilt' && options.completion.kind === 'complete-from-rebuild') {
+        return options.completion.complete(recovery.result)
+      }
+      return operation()
+    }
+    throw failure
+  }
+}
+
 const prepareResolvedWithoutCorruptionRecovery = (
   root: string,
   location: CacheLocation,
-  lock = true,
+  lockMode: CacheRecoveryLockMode = 'acquire',
 ): PrepareResult => {
-  const serialize = <Result>(operation: (captured: CacheLocation) => Result) =>
-    lock ? withOperationLock(root, operation, {}, location) : operation(location)
-  if (inspectCacheDatabase(location, 'brain.sqlite') === undefined) {
+  const serialize = <Result>(operation: (captured: CacheLocation) => Result) => {
+    if (lockMode === 'acquire') {
+      return withCacheOperationLock(root, location, operation)
+    }
+    return operation(location)
+  }
+  const existingDatabase = inspectCacheDatabase(location, 'brain.sqlite')
+  if (existingDatabase === undefined) {
     return serialize(captured => {
       if (inspectCacheDatabase(captured, 'brain.sqlite') !== undefined) {
-        try {
-          const metadata = readFreshMetadata(root, captured)
-          if (metadata !== undefined) {
-            return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
-          }
-        } catch (error) {
-          if (!isRecoverableCacheFailure(error)) {
-            throw error
-          }
+        const metadata = readFreshMetadata(root, captured)
+        if (metadata !== undefined) {
+          return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
         }
       }
       return rebuildCache(root, captured)
     })
   }
+  cacheReadTestHooks.afterPrimaryDatabaseObservation?.('prepare-fast-path')
   const cachedMetadata = readFreshMetadata(root, location)
   if (cachedMetadata !== undefined) {
     return { hydrated: false, recordsIndexed: cachedMetadata.recordsIndexed }
   }
   return serialize(captured => {
-    try {
-      const metadata = readFreshMetadata(root, captured)
-      if (metadata !== undefined) {
-        return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
-      }
-    } catch (error) {
-      if (!isRecoverableCacheFailure(error)) {
-        throw error
-      }
+    const metadata = readFreshMetadata(root, captured)
+    if (metadata !== undefined) {
+      return { hydrated: false, recordsIndexed: metadata.recordsIndexed }
     }
     return rebuildCache(root, captured)
   })
@@ -882,29 +1310,34 @@ const prepareResolvedWithoutCorruptionRecovery = (
 
 const prepareResolved = (
   root: string,
-  lock = true,
+  lockMode: CacheRecoveryLockMode = 'acquire',
   capturedLocation: CacheLocation = inspectCacheLocation(root),
 ): PrepareResult => {
-  try {
-    return prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lock)
-  } catch (error) {
-    if (!isRecoverableCacheFailure(error)) {
-      throw error
-    }
-    return lock
-      ? withOperationLock(root, location => rebuildCache(root, location), {}, capturedLocation)
-      : rebuildCache(root, capturedLocation)
-  }
+  const operation = () => prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lockMode)
+  return runWithDisposableCacheRecovery(root, capturedLocation, operation, {
+    completion: { complete: result => result, kind: 'complete-from-rebuild' },
+    lockMode,
+  })
 }
 
-export const prepareResolvedRepository = (root: string, lock = true, location?: CacheLocation): PrepareResult =>
-  prepareResolved(root, lock, location)
+export const prepareResolvedRepository = (
+  root: string,
+  lockMode: CacheRecoveryLockMode = 'acquire',
+  location?: CacheLocation,
+): PrepareResult => prepareResolved(root, lockMode, location)
 
-export const hydrateResolvedRepository = (root: string, lock = true, location?: CacheLocation): PrepareResult => {
+export const hydrateResolvedRepository = (
+  root: string,
+  lockMode: CacheRecoveryLockMode = 'acquire',
+  location?: CacheLocation,
+): PrepareResult => {
   const captured = location ?? inspectCacheLocation(root)
-  return lock
-    ? withOperationLock(root, heldLocation => rebuildCache(root, heldLocation), {}, captured)
-    : rebuildCache(root, captured)
+  const hydrateUnderLock = (heldLocation: CacheLocation) =>
+    runWithDisposableCacheRecovery(root, heldLocation, () => rebuildCache(root, heldLocation), {
+      completion: { complete: result => result, kind: 'complete-from-rebuild' },
+      lockMode: 'held',
+    })
+  return lockMode === 'acquire' ? withCacheOperationLock(root, captured, hydrateUnderLock) : hydrateUnderLock(captured)
 }
 
 export const prepare = (input: RootInput = {}): PrepareResult => {
@@ -947,40 +1380,31 @@ const fullResultLimit = (value: unknown) => positiveLimit(value, 'fullResultLimi
 
 const compactResultLimit = (value: unknown) => positiveLimit(value, 'compactResultLimit')
 
-const readFreshDatabase = <Result>(root: string, location: CacheLocation, read: (database: DatabaseSync) => Result) => {
-  const database = openReaderDatabase(location)
-  try {
+const readFreshCache = <Result>(root: string, location: CacheLocation, read: (database: DatabaseSync) => Result) =>
+  readVerifiedCacheTransaction(location, database => {
     const metadata = readMetadata(database)
     if (!metadataIsFresh(root, database, metadata)) {
       throw new CacheSchemaMismatch('The cache is stale before read.')
     }
     return read(database)
-  } finally {
-    database.close()
-  }
-}
+  })
 
 const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
   const root = resolveRepository(input)
-  let location: CacheLocation | undefined
   try {
-    location = inspectCacheLocation(root)
-    prepareResolved(root, true, location)
-    return readFreshDatabase(root, location, read)
+    const location = inspectCacheLocation(root)
+    return runWithDisposableCacheRecovery(
+      root,
+      location,
+      () => {
+        prepareResolvedWithoutCorruptionRecovery(root, location)
+        return readFreshCache(root, location, read)
+      },
+      { completion: { kind: 'retry-operation' }, lockMode: 'acquire' },
+    )
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
-    }
-    if (isRecoverableCacheFailure(error) && location !== undefined) {
-      withOperationLock(root, captured => rebuildCache(root, captured), {}, location)
-      try {
-        return readFreshDatabase(root, location, read)
-      } catch (retryError) {
-        if (retryError instanceof EncephalonError) {
-          throw retryError
-        }
-        return wrapIo('Unable to read the Encephalon cache.', retryError)
-      }
     }
     return wrapIo('Unable to read the Encephalon cache.', error)
   }
@@ -1210,33 +1634,6 @@ const assertGatherBudgets = (input: GatherInput) => {
   searches.forEach(literalMatchQuery)
 }
 
-const readFreshTransaction = <Result>(
-  root: string,
-  location: CacheLocation,
-  read: (database: DatabaseSync) => Result,
-) => {
-  const database = openReaderDatabase(location)
-  try {
-    database.exec('BEGIN')
-    const metadata = readMetadata(database)
-    if (!metadataIsFresh(root, database, metadata)) {
-      throw new CacheSchemaMismatch('The cache is stale before read.')
-    }
-    const result = read(database)
-    database.exec('ROLLBACK')
-    return result
-  } catch (error) {
-    try {
-      database.exec('ROLLBACK')
-    } catch {
-      // The original read failure is more useful than a secondary rollback failure.
-    }
-    throw error
-  } finally {
-    database.close()
-  }
-}
-
 const readGatherFromDatabase = (
   database: DatabaseSync,
   input: GatherInput,
@@ -1262,38 +1659,40 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
   assertGatherBudgets(parsed)
   compactResultLimit(parsed.limit)
   const root = resolveRepository(parsed)
-  let location: CacheLocation | undefined
   try {
-    location = inspectCacheLocation(root)
-    let hydrated: HydrateResult | null = null
+    const location = inspectCacheLocation(root)
     if (parsed.hydrate === true) {
-      hydrated = {
-        recordsIndexed: hydrateResolvedRepository(root, true, location).recordsIndexed,
-      }
-    } else {
-      prepareResolved(root, true, location)
+      const readAfterHydration = (heldLocation: CacheLocation, hydration: PrepareResult) =>
+        readFreshCache(root, heldLocation, database =>
+          readGatherFromDatabase(database, parsed, { recordsIndexed: hydration.recordsIndexed }),
+        )
+      return withCacheOperationLock(root, location, heldLocation =>
+        runWithDisposableCacheRecovery(
+          root,
+          heldLocation,
+          () => readAfterHydration(heldLocation, rebuildCache(root, heldLocation)),
+          {
+            completion: {
+              complete: hydration => readAfterHydration(heldLocation, hydration),
+              kind: 'complete-from-rebuild',
+            },
+            lockMode: 'held',
+          },
+        ),
+      )
     }
-    return readFreshTransaction(root, location, database => readGatherFromDatabase(database, parsed, hydrated))
+    return runWithDisposableCacheRecovery(
+      root,
+      location,
+      () => {
+        prepareResolvedWithoutCorruptionRecovery(root, location)
+        return readFreshCache(root, location, database => readGatherFromDatabase(database, parsed, null))
+      },
+      { completion: { kind: 'retry-operation' }, lockMode: 'acquire' },
+    )
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
-    }
-    if (isRecoverableCacheFailure(error) && location !== undefined) {
-      const recovered = withOperationLock(root, captured => rebuildCache(root, captured), {}, location)
-      try {
-        return readFreshTransaction(root, location, database =>
-          readGatherFromDatabase(
-            database,
-            parsed,
-            parsed.hydrate === true ? { recordsIndexed: recovered.recordsIndexed } : null,
-          ),
-        )
-      } catch (retryError) {
-        if (retryError instanceof EncephalonError) {
-          throw retryError
-        }
-        return wrapIo('Unable to gather Encephalon records.', retryError)
-      }
     }
     return wrapIo('Unable to gather Encephalon records.', error)
   }

@@ -26,12 +26,15 @@ import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
 import {
+  CacheDatabaseFailure,
   cacheLocationTestHooks,
+  inspectCacheDatabase,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
   openVerifiedCacheDatabase,
   sameCacheEntryIdentity,
 } from '../src/cache-location.ts'
+import { CanonicalDirectoryChangedError } from '../src/canonical-layout.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
@@ -75,10 +78,15 @@ afterEach(() => {
   cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
   cacheLocationTestHooks.regularFileRealpath = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
+  cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
+  cacheReadTestHooks.afterIntegrityProbe = undefined
   cacheReadTestHooks.afterManifestKindEnumeration = undefined
   cacheReadTestHooks.afterManifestEntryLstat = undefined
   cacheReadTestHooks.afterManifestRootEnumeration = undefined
+  cacheReadTestHooks.afterMissingPrimaryRecoveryObservation = undefined
+  cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
   cacheReadTestHooks.beforeManifestEntryLstat = undefined
+  cacheReadTestHooks.beforeIntegrityTextRead = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   recordWriteTestHooks.fault = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
@@ -86,6 +94,19 @@ afterEach(() => {
 })
 
 const functionFromApi = <T>(name: string) => (api as unknown as Record<string, T>)[name] as T
+
+const completeCauseChain = (value: unknown, seen = new Set<object>()): unknown[] => {
+  if (value !== null && typeof value === 'object' && !seen.has(value)) {
+    seen.add(value)
+    return [value, ...completeCauseChain((value as { cause?: unknown }).cause, seen)]
+  }
+  return [value]
+}
+
+const causeChainText = (value: unknown) =>
+  completeCauseChain(value)
+    .map(entry => (entry instanceof Error ? `${entry.name}: ${entry.message}` : String(entry)))
+    .join('\n')
 
 const assertBudgetError = (operation: () => unknown, expected: { budget: string; field: string; maximum: number }) => {
   assert.throws(operation, (error: unknown) => {
@@ -101,6 +122,21 @@ const waitForPath = (path: string, process: ReturnType<typeof spawn>) => {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
   }
   assert.equal(existsSync(path), true)
+}
+
+const waitForChild = async (child: ReturnType<typeof spawn>) => {
+  if (child.exitCode === null && child.signalCode === null) {
+    await once(child, 'exit')
+  }
+}
+
+const stopChild = async (child: ReturnType<typeof spawn>) => {
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill()
+  }
+  if (child.exitCode === null && child.signalCode === null) {
+    await once(child, 'exit')
+  }
 }
 
 const cacheDirectoryPath = (root: string) => join(root, 'node_modules', '.cache', 'encephalon')
@@ -373,6 +409,17 @@ const mutateCache = (root: string, mutation: (database: DatabaseSync) => void) =
   }
 }
 
+const observeCacheIntegrity = () => {
+  const observations: Array<{ kind: 'probe'; name: string; rows: number } | { kind: 'text-read'; name: string }> = []
+  cacheReadTestHooks.afterIntegrityProbe = ({ name, rows }) => {
+    observations.push({ kind: 'probe', name, rows })
+  }
+  cacheReadTestHooks.beforeIntegrityTextRead = name => {
+    observations.push({ kind: 'text-read', name })
+  }
+  return observations
+}
+
 const assertCacheLayoutRejected = (operation: () => unknown) => {
   assert.throws(operation, (error: unknown) => {
     assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
@@ -404,6 +451,47 @@ describe('cache filesystem containment', () => {
       ),
       false,
     )
+  })
+
+  test('preserves a verified database failure when close also fails', () => {
+    const root = createRoot()
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const location = inspectCacheLocation(root)
+    const primaryFailure = new Error('verified read failure')
+    const closeFailure = new Error('database close failure')
+    let closeAttempts = 0
+    class CloseFailingDatabase {
+      readonly database: DatabaseSync
+
+      constructor(path: string) {
+        this.database = new DatabaseSync(path)
+      }
+
+      close() {
+        closeAttempts += 1
+        this.database.close()
+        throw closeFailure
+      }
+    }
+
+    assert.throws(
+      () =>
+        openVerifiedCacheDatabase({
+          afterVerifiedOpen: () => {
+            throw primaryFailure
+          },
+          DatabaseConstructor: CloseFailingDatabase,
+          location,
+          name: 'brain.sqlite',
+          primary: { kind: 'existing' },
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof CacheDatabaseFailure)
+        assert.equal(error.failure, primaryFailure)
+        return true
+      },
+    )
+    assert.equal(closeAttempts, 1)
   })
 
   test('rejects cache ancestor redirects without changing the redirect target', () => {
@@ -871,6 +959,76 @@ describe('cache filesystem containment', () => {
 
     assertCacheLayoutRejected(() => withOperationLock(root, () => 'entered'))
     assert.equal(readFileSync(targetPath, 'utf8'), 'outside gate journal')
+  })
+
+  test('rejects an uncoordinated gate replacement while acquisition is serialised', {
+    skip: process.platform === 'win32' ? 'Windows does not permit renaming an open SQLite database.' : false,
+  }, () => {
+    const root = createRoot()
+    withOperationLock(root, () => 'prepared')
+    const gatePath = join(cacheDirectoryPath(root), 'operation-lock.sqlite')
+    const displacedPath = join(root, 'displaced-operation-lock.sqlite')
+    const replacementPath = join(root, 'replacement-operation-lock.sqlite')
+    const replacement = new DatabaseSync(replacementPath)
+    replacement.close()
+    const replacementIdentity = statSync(replacementPath, { bigint: true })
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        renameSync(gatePath, displacedPath)
+        renameSync(replacementPath, gatePath)
+      }
+    }
+
+    assert.throws(
+      () => withOperationLock(root, () => 'entered'),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+          invariant: 'stable-identity',
+        })
+        return true
+      },
+    )
+    assert.equal(sameCacheEntryIdentity(replacementIdentity, statSync(gatePath, { bigint: true })), true)
+    assert.equal(statSync(displacedPath).isFile(), true)
+  })
+
+  test('rejects an uncoordinated gate successor after exact corrupt quarantine', () => {
+    const root = createRoot()
+    const cachePath = cacheDirectoryPath(root)
+    const gatePath = join(cachePath, 'operation-lock.sqlite')
+    const replacementPath = join(root, 'replacement-operation-lock.sqlite')
+    mkdirSync(cachePath, { recursive: true })
+    writeFileSync(gatePath, 'not a sqlite database')
+    const replacement = new DatabaseSync(replacementPath)
+    replacement.close()
+    const replacementIdentity = statSync(replacementPath, { bigint: true })
+    let operationEntered = false
+    cacheLocationTestHooks.afterQuarantineRename = path => {
+      if (basename(path).startsWith('.operation-lock.sqlite.')) {
+        cacheLocationTestHooks.afterQuarantineRename = undefined
+        renameSync(replacementPath, gatePath)
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+          invariant: 'stable-identity',
+        })
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.equal(sameCacheEntryIdentity(replacementIdentity, statSync(gatePath, { bigint: true })), true)
   })
 
   test('carries the locked cache location through add-record hydration', {
@@ -1746,6 +1904,23 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('serves a valid large-summary record through cache preparation and search', () => {
+    const root = createRoot()
+    const summary = `large summary marker ${'x'.repeat(600_000)}`
+    const added = api.addRecord({
+      id: 'large-summary-cache-record',
+      kind: 'context',
+      payload: { summary },
+      root,
+      source: 'agent',
+      subject: 'cache.large-summary',
+    })
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+    assert.equal(api.listRecords({ limit: 1, root })[0]?.id, added.id)
+    assert.equal(api.searchRecords({ limit: 1, query: 'large summary marker', root })[0]?.id, added.id)
+  })
+
   test('accepts request budget boundaries and rejects one unit over before cache I/O', () => {
     const validRoot = createRoot()
     const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
@@ -2209,6 +2384,605 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
   })
 
+  test('recovers not-a-database writer opens across forced and already-held cache preparation', () => {
+    const cases: Array<{
+      name: string
+      run: (root: string) => unknown
+      seed: (root: string) => void
+    }> = [
+      {
+        name: 'public hydrate',
+        run: root => functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }),
+        seed: root => {
+          addCacheRecord(root)
+        },
+      },
+      {
+        name: 'forced gather hydration',
+        run: root =>
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ hydrate: true, root }),
+        seed: root => {
+          addCacheRecord(root)
+        },
+      },
+      {
+        name: 'post-commit add hydration',
+        run: root =>
+          functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+            id: 'recovered-post-commit-hydration',
+            kind: 'context',
+            payload: { summary: 'Recovered post-commit hydration' },
+            root,
+            source: 'agent',
+            subject: 'cache.recovery',
+          }),
+        seed: root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+        },
+      },
+      {
+        name: 'init cache preparation under its held lock',
+        run: root => functionFromApi<(input: Record<string, unknown>) => unknown>('initEncephalon')({ root }),
+        seed: root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('initEncephalon')({ root })
+        },
+      },
+    ]
+
+    for (const { name, run, seed } of cases) {
+      const root = createRoot()
+      seed(root)
+      writeFileSync(cacheDatabasePath(root), 'not a sqlite database')
+      let primaryQuarantines = 0
+      let writerInitialisations = 0
+      cacheLocationTestHooks.beforeQuarantineRename = path => {
+        if (basename(path) === 'brain.sqlite') {
+          primaryQuarantines += 1
+        }
+      }
+      cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+        if (mode === 'writer') {
+          writerInitialisations += 1
+        }
+      }
+
+      const result = run(root) as {
+        hydrated?: { recordsIndexed?: unknown } | null
+        id?: unknown
+        recordsCreated?: unknown[]
+        recordsIndexed?: unknown
+      }
+      if (name === 'public hydrate') {
+        assert.deepEqual(result, { recordsIndexed: 1 }, name)
+      } else if (name === 'forced gather hydration') {
+        assert.deepEqual(result.hydrated, { recordsIndexed: 1 }, name)
+      } else if (name === 'post-commit add hydration') {
+        assert.equal(result.id, 'recovered-post-commit-hydration', name)
+      } else {
+        assert.deepEqual(result.recordsCreated, [], name)
+      }
+      assert.equal(primaryQuarantines, 1, name)
+      assert.equal(writerInitialisations, 1, name)
+      cacheLocationTestHooks.beforeQuarantineRename = undefined
+      cacheReadTestHooks.duringDatabaseInitialisation = undefined
+    }
+  })
+
+  test('quarantines malformed metadata across forced and already-held cache rebuilds', () => {
+    const cases: Array<{
+      name: string
+      run: (root: string) => unknown
+      seed: (root: string) => void
+    }> = [
+      {
+        name: 'public hydrate',
+        run: root => functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }),
+        seed: root => {
+          addCacheRecord(root)
+        },
+      },
+      {
+        name: 'forced gather hydration',
+        run: root =>
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ hydrate: true, root }),
+        seed: root => {
+          addCacheRecord(root)
+        },
+      },
+      {
+        name: 'post-commit add hydration',
+        run: root =>
+          functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+            id: 'metadata-recovered-post-commit',
+            kind: 'context',
+            payload: { summary: 'Recovered malformed metadata' },
+            root,
+            source: 'agent',
+            subject: 'cache.recovery',
+          }),
+        seed: root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+        },
+      },
+      {
+        name: 'init cache preparation under its held lock',
+        run: root => functionFromApi<(input: Record<string, unknown>) => unknown>('initEncephalon')({ root }),
+        seed: root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+        },
+      },
+    ]
+
+    for (const { name, run, seed } of cases) {
+      const root = createRoot()
+      seed(root)
+      mutateCache(root, database => {
+        database.prepare("UPDATE metadata SET value = ? WHERE key = 'artifactPaths'").run('["private-forced",')
+      })
+      let primaryQuarantines = 0
+      let writerInitialisations = 0
+      cacheLocationTestHooks.beforeQuarantineRename = path => {
+        if (basename(path) === 'brain.sqlite') {
+          primaryQuarantines += 1
+        }
+      }
+      cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+        if (mode === 'writer') {
+          writerInitialisations += 1
+        }
+      }
+
+      const result = run(root) as {
+        hydrated?: { recordsIndexed?: unknown } | null
+        id?: unknown
+        recordsCreated?: unknown[]
+        recordsIndexed?: unknown
+      }
+      if (name === 'public hydrate') {
+        assert.deepEqual(result, { recordsIndexed: 1 }, name)
+      } else if (name === 'forced gather hydration') {
+        assert.deepEqual(result.hydrated, { recordsIndexed: 1 }, name)
+      } else if (name === 'post-commit add hydration') {
+        assert.equal(result.id, 'metadata-recovered-post-commit', name)
+      } else {
+        assert.ok(result.recordsCreated !== undefined && result.recordsCreated.length > 0, name)
+      }
+      assert.equal(primaryQuarantines, 1, name)
+      assert.equal(writerInitialisations, 2, name)
+      cacheLocationTestHooks.beforeQuarantineRename = undefined
+      cacheReadTestHooks.duringDatabaseInitialisation = undefined
+    }
+  })
+
+  test('recovers an observed-missing cache without displacing a current successor', () => {
+    const cases = [
+      { expectedHydrated: true, name: 'primary remains absent', successor: false },
+      { expectedHydrated: false, name: 'current successor appears', successor: true },
+    ] as const
+
+    for (const { expectedHydrated, name, successor } of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      const databasePath = cacheDatabasePath(root)
+      const predecessorPath = join(root, 'observed-cache-predecessor.sqlite')
+      const successorPath = join(root, 'observed-cache-successor.sqlite')
+      if (successor) {
+        copyFileSync(databasePath, successorPath)
+      }
+      const successorIdentity = successor ? lstatSync(successorPath, { bigint: true }) : undefined
+      const phases: string[] = []
+      let primaryQuarantines = 0
+      let readerInitialisations = 0
+      let writerInitialisations = 0
+      cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+        phases.push(phase)
+        if (phase === 'prepare-fast-path') {
+          renameSync(databasePath, predecessorPath)
+        }
+        if (phase === 'reader-missing' && successor) {
+          renameSync(successorPath, databasePath)
+        }
+        if (phase === 'reader-missing') {
+          cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+        }
+      }
+      cacheLocationTestHooks.beforeQuarantineRename = path => {
+        if (basename(path) === 'brain.sqlite') {
+          primaryQuarantines += 1
+        }
+      }
+      cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+        if (mode === 'reader') {
+          readerInitialisations += 1
+        } else {
+          writerInitialisations += 1
+        }
+      }
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: expectedHydrated, recordsIndexed: 1 },
+        name,
+      )
+      assert.deepEqual(phases, ['prepare-fast-path', 'reader-missing'], name)
+      assert.equal(primaryQuarantines, 0, name)
+      assert.equal(readerInitialisations, successor ? 1 : 0, name)
+      assert.equal(writerInitialisations, successor ? 0 : 1, name)
+      assert.equal(existsSync(predecessorPath), true, name)
+      if (successorIdentity !== undefined) {
+        const currentIdentity = lstatSync(databasePath, { bigint: true })
+        assert.deepEqual(
+          { dev: currentIdentity.dev, ino: currentIdentity.ino },
+          { dev: successorIdentity.dev, ino: successorIdentity.ino },
+          name,
+        )
+      }
+      cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      cacheLocationTestHooks.beforeQuarantineRename = undefined
+      cacheReadTestHooks.duringDatabaseInitialisation = undefined
+    }
+  })
+
+  test('does not repopulate a successor installed after missing-primary recovery observes absence', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'late-cache-predecessor.sqlite')
+    const successorPath = join(root, 'late-cache-successor.sqlite')
+    copyFileSync(databasePath, successorPath)
+    const successorIdentity = lstatSync(successorPath, { bigint: true })
+    let missingRecoveryObservations = 0
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheReadTestHooks.afterMissingPrimaryRecoveryObservation = () => {
+      missingRecoveryObservations += 1
+      cacheReadTestHooks.afterMissingPrimaryRecoveryObservation = undefined
+      renameSync(successorPath, databasePath)
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+
+    assert.equal(missingRecoveryObservations, 1)
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 0)
+    assert.deepEqual(result, { hydrated: false, recordsIndexed: 1 })
+    assert.equal(existsSync(predecessorPath), true)
+    const currentIdentity = lstatSync(databasePath, { bigint: true })
+    assert.deepEqual(
+      { dev: currentIdentity.dev, ino: currentIdentity.ino },
+      { dev: successorIdentity.dev, ino: successorIdentity.ino },
+    )
+  })
+
+  test('reuses an exclusively claimed primary across repository-change retries', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'retry-cache-predecessor.sqlite')
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (writerInitialisations === 1) {
+          const recordPath = join(root, String(record.path))
+          writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+        }
+      }
+    }
+
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 2)
+    assert.deepEqual(result, { hydrated: true, recordsIndexed: 1 })
+    assert.equal(existsSync(predecessorPath), true)
+  })
+
+  test('preserves a successor swapped between exclusively claimed primary retries', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'swapped-retry-cache-predecessor.sqlite')
+    const claimedPath = join(root, 'swapped-retry-cache-claim.sqlite')
+    const successorPath = join(root, 'swapped-retry-cache-successor.sqlite')
+    const sourceDatabase = new DatabaseSync(databasePath, { readOnly: true })
+    sourceDatabase.prepare('VACUUM INTO ?').run(successorPath)
+    sourceDatabase.close()
+    const successorBytes = readFileSync(successorPath)
+    const successorIdentity = lstatSync(successorPath, { bigint: true })
+    let canonicalValidations = 0
+    let primaryQuarantines = 0
+    let repositoryRetryInjected = false
+    let successorInstalled = false
+    let successorWriterInitialisations = 0
+    let writerOpened = false
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      canonicalValidations += 1
+      if (canonicalValidations === 2) {
+        for (const suffix of ['-wal', '-shm', '-journal']) {
+          const sidecarPath = `${databasePath}${suffix}`
+          if (existsSync(sidecarPath)) {
+            renameSync(sidecarPath, `${claimedPath}${suffix}`)
+          }
+        }
+        renameSync(databasePath, claimedPath)
+        renameSync(successorPath, databasePath)
+        successorInstalled = true
+      }
+    }
+    cacheReadTestHooks.afterManifestRootEnumeration = () => {
+      if (writerOpened && !repositoryRetryInjected) {
+        repositoryRetryInjected = true
+        throw new CanonicalDirectoryChangedError(root)
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        writerOpened = true
+        const currentIdentity = lstatSync(databasePath, { bigint: true })
+        if (
+          successorInstalled &&
+          currentIdentity.dev === successorIdentity.dev &&
+          currentIdentity.ino === successorIdentity.ino
+        ) {
+          successorWriterInitialisations += 1
+        }
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+
+    assert.equal(canonicalValidations, 2)
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(repositoryRetryInjected, true)
+    assert.ok(writerInitialisations >= 1)
+    assert.equal(successorWriterInitialisations, 0)
+    assert.deepEqual(result, { hydrated: false, recordsIndexed: 1 })
+    assert.equal(existsSync(predecessorPath), true)
+    assert.equal(existsSync(claimedPath), true)
+    const currentIdentity = lstatSync(databasePath, { bigint: true })
+    assert.deepEqual(
+      { dev: currentIdentity.dev, ino: currentIdentity.ino },
+      { dev: successorIdentity.dev, ino: successorIdentity.ino },
+    )
+    assert.deepEqual(readFileSync(databasePath), successorBytes)
+  })
+
+  test('owns an exclusively created primary before its first SQLite open', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'exclusive-open-predecessor.sqlite')
+    const claimedPath = join(root, 'exclusive-open-claim.sqlite')
+    const successorPath = join(root, 'exclusive-open-successor.sqlite')
+    const sourceDatabase = new DatabaseSync(databasePath, { readOnly: true })
+    sourceDatabase.prepare('VACUUM INTO ?').run(successorPath)
+    sourceDatabase.close()
+    const successorBytes = readFileSync(successorPath)
+    const successorIdentity = lstatSync(successorPath, { bigint: true })
+    let primaryQuarantines = 0
+    let replacements = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheLocationTestHooks.beforeDatabaseOpen = database => {
+      if (database.name === 'brain.sqlite') {
+        cacheLocationTestHooks.beforeDatabaseOpen = undefined
+        renameSync(databasePath, claimedPath)
+        renameSync(successorPath, databasePath)
+        replacements += 1
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+    assert.equal(replacements, 1)
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 0)
+    assert.equal(existsSync(predecessorPath), true)
+    assert.equal(existsSync(claimedPath), true)
+    const currentIdentity = lstatSync(databasePath, { bigint: true })
+    assert.deepEqual(
+      { dev: currentIdentity.dev, ino: currentIdentity.ino },
+      { dev: successorIdentity.dev, ino: successorIdentity.ino },
+    )
+    assert.deepEqual(readFileSync(databasePath), successorBytes)
+  })
+
+  test('recovers a primary that disappears before its first verified open', () => {
+    const cases = [
+      { expectedHydrated: true, name: 'primary remains absent', successor: false },
+      { expectedHydrated: false, name: 'successor appears after missing observation', successor: true },
+    ] as const
+
+    for (const { expectedHydrated, name, successor } of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      const databasePath = cacheDatabasePath(root)
+      const predecessorPath = join(root, `pre-open-missing-${successor ? 'successor' : 'absent'}.sqlite`)
+      const successorPath = join(root, `pre-open-successor-${successor ? 'ready' : 'unused'}.sqlite`)
+      if (successor) {
+        const sourceDatabase = new DatabaseSync(databasePath, { readOnly: true })
+        sourceDatabase.prepare('VACUUM INTO ?').run(successorPath)
+        sourceDatabase.close()
+      }
+      const successorBytes = successor ? readFileSync(successorPath) : undefined
+      const successorIdentity = successor ? lstatSync(successorPath, { bigint: true }) : undefined
+      let missingObservations = 0
+      let primaryQuarantines = 0
+      let writerInitialisations = 0
+      cacheLocationTestHooks.beforeDatabaseOpen = database => {
+        if (database.name === 'brain.sqlite') {
+          cacheLocationTestHooks.beforeDatabaseOpen = undefined
+          renameSync(databasePath, predecessorPath)
+        }
+      }
+      cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+        if (phase === 'reader-missing') {
+          missingObservations += 1
+          cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+          if (successor) {
+            renameSync(successorPath, databasePath)
+          }
+        }
+      }
+      cacheLocationTestHooks.beforeQuarantineRename = path => {
+        if (basename(path) === 'brain.sqlite') {
+          primaryQuarantines += 1
+        }
+      }
+      cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+        if (mode === 'writer') {
+          writerInitialisations += 1
+        }
+      }
+
+      assert.deepEqual(api.prepare({ root }), { hydrated: expectedHydrated, recordsIndexed: 1 }, name)
+      assert.equal(missingObservations, 1, name)
+      assert.equal(primaryQuarantines, 0, name)
+      assert.equal(writerInitialisations, successor ? 0 : 1, name)
+      assert.equal(existsSync(predecessorPath), true, name)
+      if (successorIdentity !== undefined && successorBytes !== undefined) {
+        const currentIdentity = lstatSync(databasePath, { bigint: true })
+        assert.deepEqual(
+          { dev: currentIdentity.dev, ino: currentIdentity.ino },
+          { dev: successorIdentity.dev, ino: successorIdentity.ino },
+          name,
+        )
+        assert.deepEqual(readFileSync(databasePath), successorBytes, name)
+      }
+      cacheLocationTestHooks.beforeDatabaseOpen = undefined
+      cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      cacheLocationTestHooks.beforeQuarantineRename = undefined
+      cacheReadTestHooks.duringDatabaseInitialisation = undefined
+    }
+  })
+
+  test('recovers primary disappearance after SQLite construction before verified read', {
+    skip: process.platform === 'win32' ? 'Windows cannot rename an open SQLite primary.' : false,
+  }, () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'post-construction-missing-primary.sqlite')
+    let missingObservations = 0
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.afterDatabaseOpen = database => {
+      if (database.name === 'brain.sqlite') {
+        cacheLocationTestHooks.afterDatabaseOpen = undefined
+        renameSync(databasePath, predecessorPath)
+      }
+    }
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'reader-missing') {
+        missingObservations += 1
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
+    assert.equal(missingObservations, 1)
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 1)
+    assert.equal(existsSync(predecessorPath), true)
+  })
+
+  test('prepare returns its completed recovery rebuild without rebuilding changed canonical inputs again', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    writeFileSync(cacheDatabasePath(root), 'not a sqlite database')
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+      cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
+      const recordPath = join(root, String(record.path))
+      writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 1)
+    assert.deepEqual(result, { hydrated: true, recordsIndexed: 1 })
+  })
+
   test('rebuilds a disposable cache with an incompatible table schema', () => {
     const root = createRoot()
     const path = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
@@ -2238,6 +3012,73 @@ describe('SQLite cache and reads', () => {
     const prepare = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
+  })
+
+  test('quarantines one exact cache after a platform-neutral SQLite readonly failure', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (writerInitialisations === 1) {
+          throw Object.assign(new Error('read-only recovery'), { errcode: 264 })
+        }
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }), {
+      recordsIndexed: 1,
+    })
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 2)
+  })
+
+  test('quarantines an exact forced-writer cache after a query-time corrupt failure', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const originalIdentity = lstatSync(databasePath, { bigint: true })
+    let primaryQuarantines = 0
+    let queryFailures = 0
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterIntegrityProbe = observation => {
+      if (observation.name === 'metadata' && queryFailures === 0) {
+        queryFailures += 1
+        throw Object.assign(new Error('database disk image is malformed'), { code: 'SQLITE_CORRUPT' })
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const currentIdentity = lstatSync(path, { bigint: true })
+        assert.deepEqual(
+          { dev: currentIdentity.dev, ino: currentIdentity.ino },
+          { dev: originalIdentity.dev, ino: originalIdentity.ino },
+        )
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+    assert.equal(queryFailures, 1)
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 2)
   })
 
   test('reads a fresh cache without touching the database file', () => {
@@ -2423,6 +3264,254 @@ describe('SQLite cache and reads', () => {
     })
   }
 
+  test('quarantines one exact corrupt cache generation before rebuilding', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    mutateCache(root, database => {
+      database
+        .prepare('UPDATE records SET record_json = CAST(zeroblob(?) AS TEXT) || ? WHERE id = ?')
+        .run(1_052_673, 'private-cache-sentinel', String(record.id))
+    })
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root }),
+      [record],
+    )
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 1)
+  })
+
+  test('bounds failed cache recovery without serving private cache content', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    mutateCache(root, database => {
+      database
+        .prepare('UPDATE records SET record_json = CAST(zeroblob(?) AS TEXT) || ? WHERE id = ?')
+        .run(1_052_673, 'private-cache-sentinel', String(record.id))
+    })
+    let writerAttempts = 0
+    let resultsServed = 0
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerAttempts += 1
+        if (writerAttempts === 1) {
+          throw Object.assign(new Error('Injected recovery writer failure.'), { code: 'EIO' })
+        }
+      }
+    }
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+
+    assert.throws(
+      () => {
+        resultsServed = listRecords({ root }).length
+      },
+      (error: unknown) => {
+        const publicError = error as { cause?: unknown; code?: unknown; details?: unknown; message?: unknown }
+        assert.ok(publicError.code === 'IO_ERROR' || publicError.code === 'INTERNAL_ERROR')
+        assert.doesNotMatch(
+          JSON.stringify({
+            cause: publicError.cause instanceof Error ? publicError.cause.message : publicError.cause,
+            details: publicError.details ?? null,
+            message: publicError.message,
+          }),
+          /private-cache-sentinel/,
+        )
+        return true
+      },
+    )
+    assert.equal(writerAttempts, 1)
+    assert.equal(resultsServed, 0)
+  })
+
+  test('normalises malformed cache JSON throughout a terminal retry cause chain', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    mutateCache(root, database => {
+      database.prepare('UPDATE records SET record_json = ? WHERE id = ?').run('{"first":,}', String(record.id))
+    })
+    const privateSentinel = 'private-ca'
+    let databaseOpensAfterRecoveryStarted = 0
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      cacheLocationTestHooks.beforeDatabaseOpen = () => {
+        databaseOpensAfterRecoveryStarted += 1
+        if (databaseOpensAfterRecoveryStarted === 2) {
+          cacheLocationTestHooks.beforeDatabaseOpen = undefined
+          mutateCache(root, database => {
+            database
+              .prepare('UPDATE records SET record_json = ? WHERE id = ?')
+              .run('private-cache-sentinel', String(record.id))
+          })
+        }
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        assert.doesNotMatch(causeChainText(error), new RegExp(privateSentinel, 'u'))
+        return true
+      },
+    )
+    assert.equal(databaseOpensAfterRecoveryStarted, 2)
+  })
+
+  test('normalises malformed metadata throughout a terminal retry cause chain', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const privateSentinel = 'private-metadata-sentinel'
+    mutateCache(root, database => {
+      database.prepare("UPDATE metadata SET value = ? WHERE key = 'artifactPaths'").run(`["${privateSentinel}",`)
+    })
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
+      mutateCache(root, database => {
+        database.prepare("UPDATE metadata SET value = ? WHERE key = 'artifactPaths'").run(`["${privateSentinel}",`)
+      })
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        assert.doesNotMatch(causeChainText(error), new RegExp(privateSentinel, 'u'))
+        return true
+      },
+    )
+  })
+
+  test('does not quarantine a foreign cache with a valid repository scope', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const foreignRepository = realpathSync.native(createOutsideDirectory())
+    mutateCache(root, database => {
+      database.prepare("UPDATE metadata SET value = ? WHERE key = 'repositoryRealpath'").run(foreignRepository)
+    })
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'CACHE_SCOPE_MISMATCH')
+        return true
+      },
+    )
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 0)
+  })
+
+  test('forced hydration preserves a valid foreign-scope cache exactly', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const foreignRepository = realpathSync.native(createOutsideDirectory())
+    mutateCache(root, database => {
+      database.prepare("UPDATE metadata SET value = ? WHERE key = 'repositoryRealpath'").run(foreignRepository)
+    })
+    const databasePath = cacheDatabasePath(root)
+    const beforeBytes = readFileSync(databasePath)
+    const beforeIdentity = lstatSync(databasePath, { bigint: true })
+    let primaryQuarantines = 0
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.throws(
+      () => api.hydrate({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'CACHE_SCOPE_MISMATCH')
+        return true
+      },
+    )
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(recoveryRebuilds, 0)
+    assert.equal(writerInitialisations, 1)
+    const afterIdentity = lstatSync(databasePath, { bigint: true })
+    assert.deepEqual(
+      { dev: afterIdentity.dev, ino: afterIdentity.ino },
+      { dev: beforeIdentity.dev, ino: beforeIdentity.ino },
+    )
+    assert.deepEqual(readFileSync(databasePath), beforeBytes)
+  })
+
+  test('preserves terminal Encephalon cache errors regardless of recoverable causes', () => {
+    const root = createRoot()
+    api.prepare({ root })
+    mutateCache(root, database => {
+      database.prepare("UPDATE metadata SET value = 'stale' WHERE key = 'manifest'").run()
+    })
+    const location = inspectCacheLocation(root)
+    const cacheDatabase = inspectCacheDatabase(location, 'brain.sqlite')
+    assert.ok(cacheDatabase)
+    const sqliteFailure = Object.assign(new Error('injected schema-like cause'), { code: 'SQLITE_SCHEMA' })
+    const databaseFailure = new CacheDatabaseFailure(sqliteFailure, cacheDatabase, { cause: sqliteFailure })
+    const terminalError = new api.EncephalonError(
+      'REPOSITORY_CHANGED',
+      'Injected terminal cache error.',
+      { invariant: 'terminal-error-priority' },
+      { cause: databaseFailure },
+    )
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (writerInitialisations === 1) {
+          throw terminalError
+        }
+      }
+    }
+
+    assert.throws(
+      () => api.prepare({ root }),
+      (error: unknown) => {
+        assert.equal(error, terminalError)
+        return true
+      },
+    )
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 1)
+  })
+
   test('rebuilds non-text cached record JSON before reading it', () => {
     const root = createRoot()
     const record = addCacheRecord(root)
@@ -2522,6 +3611,487 @@ describe('SQLite cache and reads', () => {
       hydrated: true,
       recordsIndexed: 1,
     })
+  })
+
+  test('bounds schema and metadata before transferring untrusted text', () => {
+    const cases = [
+      {
+        expectedProbe: { name: 'metadata-columns', rows: 2 },
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            CREATE TABLE replacement_metadata(key TEXT, private_metadata_sentinel TEXT);
+            DROP TABLE metadata;
+            ALTER TABLE replacement_metadata RENAME TO metadata;
+          `)
+        },
+        name: 'oversized metadata column name',
+      },
+      {
+        expectedProbe: { name: 'record-search-schema', rows: 1 },
+        mutate: (database: DatabaseSync) => {
+          database.enableDefensive(false)
+          database.exec(`
+            DROP TABLE record_search;
+            CREATE VIRTUAL TABLE record_search USING fts5(
+              ${' '.repeat(4096)}id UNINDEXED,
+              text
+            );
+          `)
+        },
+        name: 'oversized record_search schema SQL',
+      },
+      {
+        expectedProbe: { name: 'metadata', rows: 7 },
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            CREATE TABLE replacement_metadata(key TEXT, value TEXT);
+            INSERT INTO replacement_metadata SELECT key, value FROM metadata;
+            DROP TABLE metadata;
+            ALTER TABLE replacement_metadata RENAME TO metadata;
+            INSERT INTO metadata(key, value) VALUES ('duplicate', 'private-metadata-sentinel');
+          `)
+        },
+        name: 'seventh metadata row',
+      },
+      {
+        expectedProbe: { name: 'metadata', rows: 6 },
+        mutate: (database: DatabaseSync) => {
+          database
+            .prepare("UPDATE metadata SET value = CAST(zeroblob(?) AS TEXT) WHERE key = 'manifest'")
+            .run(1024 * 1024 + 1)
+        },
+        name: 'oversized metadata value containing NUL',
+      },
+    ]
+
+    for (const { expectedProbe, mutate, name } of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, mutate)
+      const observations = observeCacheIntegrity()
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        name,
+      )
+      const probeIndex = observations.findIndex(
+        observation => observation.kind === 'probe' && observation.name === expectedProbe.name,
+      )
+      assert.notEqual(probeIndex, -1, name)
+      assert.deepEqual(observations.at(probeIndex), { kind: 'probe', ...expectedProbe }, name)
+      assert.notDeepEqual(observations.at(probeIndex + 1), { kind: 'text-read', name: expectedProbe.name }, name)
+    }
+  })
+
+  test('bounds cached record validation before transferring untrusted rows', () => {
+    const cases = [
+      {
+        expectedRows: 1001,
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DELETE FROM records;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 1001
+            )
+            INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+            SELECT
+              printf('overflow-%04d', value), 'context', 'cache.overflow', 'test',
+              '2026-08-16T00:00:00.000Z', printf('encephalon/context/overflow-%04d.json', value),
+              1, NULL, '{}'
+            FROM generated;
+          `)
+        },
+        name: '1,001 rows',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.prepare('UPDATE records SET record_json = CAST(zeroblob(?) AS TEXT)').run(1_052_673)
+        },
+        name: 'oversized record JSON containing NUL',
+      },
+      {
+        expectedRows: 13,
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DELETE FROM records;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 13
+            )
+            INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+            SELECT
+              printf('aggregate-%04d', value), 'context', 'cache.aggregate', 'test',
+              '2026-08-16T00:00:00.000Z', printf('encephalon/context/aggregate-%04d.json', value),
+              1, NULL, CAST(zeroblob(1048576) AS TEXT)
+            FROM generated;
+            UPDATE metadata SET value = '13' WHERE key = 'recordsIndexed';
+          `)
+        },
+        name: 'aggregate record JSON above 12 MiB',
+      },
+      {
+        expectedRows: 25,
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            CREATE TEMP TABLE original_record AS SELECT * FROM records;
+            DELETE FROM records;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 25
+            )
+            INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+            SELECT
+              printf('aggregate-text-%04d-', value) || CAST(zeroblob(1048500) AS TEXT),
+              kind, subject, source, created_at, path, active, summary, record_json
+            FROM original_record CROSS JOIN generated;
+            DROP TABLE original_record;
+            UPDATE metadata SET value = '25' WHERE key = 'recordsIndexed';
+          `)
+        },
+        name: 'aggregate denormalised record text above its bound',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.exec('PRAGMA ignore_check_constraints = ON; UPDATE records SET active = 9223372036854775807;')
+        },
+        name: 'hostile 64-bit active integer',
+      },
+    ] as const
+
+    for (const { expectedRows, mutate, name } of cases) {
+      const root = createRoot()
+      const record = addCacheRecord(root)
+      mutateCache(root, mutate)
+      const observations = observeCacheIntegrity()
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        name,
+      )
+      const probeIndex = observations.findIndex(
+        observation =>
+          observation.kind === 'probe' && observation.name === 'records' && observation.rows === expectedRows,
+      )
+      assert.notEqual(probeIndex, -1, name)
+      assert.notDeepEqual(observations.at(probeIndex + 1), { kind: 'text-read', name: 'records' }, name)
+      assert.equal(
+        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root })[0]?.id,
+        record.id,
+        name,
+      )
+    }
+  })
+
+  test('bounds FTS validation before running relationship checks', () => {
+    const cases = [
+      {
+        expectedRows: 1001,
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DELETE FROM record_search;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 1001
+            )
+            INSERT INTO record_search(id, text)
+            SELECT printf('overflow-%04d', value), 'overflow search text'
+            FROM generated;
+          `)
+        },
+        name: '1,001 rows',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.prepare('UPDATE record_search SET text = CAST(zeroblob(?) AS TEXT)').run(2_105_345)
+        },
+        name: 'oversized FTS text containing NUL',
+      },
+      {
+        expectedRows: 24,
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            CREATE TABLE replacement_records AS
+            SELECT id, kind, subject, source, created_at, path, active, summary, record_json
+            FROM records
+            WHERE 0;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 24
+            )
+            INSERT INTO replacement_records
+            SELECT id, kind, subject, source, created_at, path, active, summary, record_json
+            FROM records CROSS JOIN generated;
+            DROP TABLE records;
+            ALTER TABLE replacement_records RENAME TO records;
+            DELETE FROM record_search;
+            WITH RECURSIVE generated(value) AS (
+              SELECT 1
+              UNION ALL
+              SELECT value + 1 FROM generated WHERE value < 24
+            )
+            INSERT INTO record_search(id, text)
+            SELECT 'cache-record', CAST(zeroblob(1048576) AS TEXT)
+            FROM generated;
+            UPDATE metadata SET value = '24' WHERE key = 'recordsIndexed';
+          `)
+        },
+        name: 'aggregate FTS text above its doubled cache-record bound',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.exec('UPDATE record_search SET id = 9223372036854775807;')
+        },
+        name: 'FTS integer ID',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.exec("UPDATE record_search SET id = x'63616368652d7265636f7264';")
+        },
+        name: 'FTS BLOB ID',
+      },
+    ] as const
+
+    for (const { expectedRows, mutate, name } of cases) {
+      const root = createRoot()
+      const record = addCacheRecord(root)
+      mutateCache(root, mutate)
+      const observations = observeCacheIntegrity()
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        name,
+      )
+      const probeIndex = observations.findIndex(
+        observation =>
+          observation.kind === 'probe' && observation.name === 'record-search' && observation.rows === expectedRows,
+      )
+      assert.notEqual(probeIndex, -1, name)
+      assert.notDeepEqual(observations.at(probeIndex + 1), { kind: 'text-read', name: 'record-search' }, name)
+      assert.equal(
+        functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({ root })[0]?.id,
+        record.id,
+        name,
+      )
+    }
+  })
+
+  test('accepts exact cache per-value byte boundaries', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    mutateCache(root, database => {
+      database
+        .prepare(
+          `UPDATE records
+          SET record_json = json_set(
+            record_json,
+            '$.payload.padding',
+            replace(
+              hex(zeroblob(? - length(CAST(json_set(record_json, '$.payload.padding', '') AS BLOB)))),
+              '00',
+              'x'
+            )
+          )`,
+        )
+        .run(1_052_672)
+      database.prepare("UPDATE record_search SET text = replace(hex(zeroblob(?)), '00', 'x')").run(1_052_672)
+      database
+        .prepare("UPDATE metadata SET value = replace(hex(zeroblob(?)), '00', 'x') WHERE key = 'packageVersion'")
+        .run(1_048_576)
+    })
+    const observations = observeCacheIntegrity()
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: false,
+      recordsIndexed: 1,
+    })
+    for (const probe of [
+      { name: 'metadata', rows: 6 },
+      { name: 'records', rows: 1 },
+      { name: 'record-search', rows: 1 },
+    ]) {
+      const probeIndex = observations.findIndex(
+        observation =>
+          observation.kind === 'probe' && observation.name === probe.name && observation.rows === probe.rows,
+      )
+      assert.notEqual(probeIndex, -1, probe.name)
+      assert.deepEqual(observations.at(probeIndex + 1), { kind: 'text-read', name: probe.name }, probe.name)
+    }
+  })
+
+  test('accepts exact aggregate, row-count, and recordsIndexed boundaries', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    mutateCache(root, database => {
+      database.exec(`
+        CREATE TEMP TABLE boundary_record AS SELECT * FROM records;
+        DELETE FROM records;
+        DELETE FROM record_search;
+        WITH RECURSIVE generated(value) AS (
+          SELECT 1
+          UNION ALL
+          SELECT value + 1 FROM generated WHERE value < 1000
+        ), candidates AS (
+          SELECT
+            printf('boundary-%04d', value) AS id,
+            kind,
+            printf('cache.boundary.%04d', value) AS subject,
+            source,
+            created_at,
+            printf('encephalon/context/boundary-%04d.json', value) AS path,
+            active,
+            summary,
+            CASE WHEN value <= 608 THEN 12485 ELSE 12484 END AS target_bytes,
+            json_set(
+              record_json,
+              '$.id', printf('boundary-%04d', value),
+              '$.subject', printf('cache.boundary.%04d', value),
+              '$.path', printf('encephalon/context/boundary-%04d.json', value),
+              '$.payload.padding', ''
+            ) AS base_json
+          FROM boundary_record CROSS JOIN generated
+        )
+        INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+        SELECT
+          id,
+          kind,
+          subject,
+          source,
+          created_at,
+          path,
+          active,
+          summary,
+          json_set(
+            base_json,
+            '$.payload.padding',
+            replace(hex(zeroblob(target_bytes - length(CAST(base_json AS BLOB)))), '00', 'x')
+          )
+        FROM candidates;
+        WITH RECURSIVE generated(value) AS (
+          SELECT 1
+          UNION ALL
+          SELECT value + 1 FROM generated WHERE value < 1000
+        )
+        INSERT INTO record_search(id, text)
+        SELECT printf('boundary-%04d', value), 'boundary search text'
+        FROM generated;
+        UPDATE metadata SET value = '1000' WHERE key = 'recordsIndexed';
+        DROP TABLE boundary_record;
+      `)
+    })
+    const observations = observeCacheIntegrity()
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: false,
+      recordsIndexed: 1000,
+    })
+    for (const probe of [
+      { name: 'metadata', rows: 6 },
+      { name: 'records', rows: 1000 },
+      { name: 'record-search', rows: 1000 },
+    ]) {
+      const probeIndex = observations.findIndex(
+        observation =>
+          observation.kind === 'probe' && observation.name === probe.name && observation.rows === probe.rows,
+      )
+      assert.notEqual(probeIndex, -1, probe.name)
+      assert.deepEqual(observations.at(probeIndex + 1), { kind: 'text-read', name: probe.name }, probe.name)
+    }
+    assert.equal(
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
+        limit: 1,
+        root,
+      }).length,
+      1,
+    )
+  })
+
+  test('pins cache validation and the public read to one verified SQLite snapshot', () => {
+    const root = createRoot()
+    const record = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'snapshot-record',
+      kind: 'context',
+      payload: { generation: 'original' },
+      root,
+      source: 'agent',
+      subject: 'cache.snapshot',
+    })
+    let recordProbes = 0
+    let mutations = 0
+    cacheReadTestHooks.afterIntegrityProbe = observation => {
+      if (observation.name === 'records') {
+        recordProbes += 1
+        if (recordProbes === 2) {
+          mutations += 1
+          const successor = JSON.stringify({ ...record, payload: { generation: 'successor' } })
+          const database = new DatabaseSync(cacheDatabasePath(root))
+          try {
+            database.exec('PRAGMA journal_mode = WAL; BEGIN IMMEDIATE;')
+            database.prepare('UPDATE records SET record_json = ? WHERE id = ?').run(successor, String(record.id))
+            database.exec('COMMIT')
+          } finally {
+            database.close()
+          }
+        }
+      }
+    }
+
+    const [returned] = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
+      root,
+    })
+    const generation = (returned?.payload as { generation?: unknown } | undefined)?.generation
+    assert.equal(mutations, 1)
+    assert.deepEqual({ generation, id: returned?.id }, { generation: 'original', id: record.id })
+  })
+
+  test('requires canonical recordsIndexed metadata', () => {
+    const cases: Array<{
+      expected: { hydrated: boolean; recordsIndexed: number }
+      name: string
+      value: Buffer | string
+    }> = [
+      { expected: { hydrated: false, recordsIndexed: 1 }, name: 'canonical integer', value: '1' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'negative integer', value: '-1' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'fraction', value: '1.5' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'exponent', value: '1e0' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'leading zero', value: '01' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'leading whitespace', value: ' 1' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'trailing whitespace', value: '1 ' },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'SQLite BLOB', value: Buffer.from('1') },
+      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'canonical limit overflow', value: '1001' },
+    ]
+
+    for (const { expected, name, value } of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, database => {
+        database.prepare("UPDATE metadata SET value = ? WHERE key = 'recordsIndexed'").run(value)
+      })
+
+      try {
+        assert.deepEqual(
+          functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+          expected,
+          name,
+        )
+      } catch (error) {
+        assert.equal(String(error).includes(String(value)), false, name)
+        throw error
+      }
+    }
   })
 
   test('rebuilds missing and duplicate FTS rows', () => {
@@ -2631,6 +4201,29 @@ describe('SQLite cache and reads', () => {
       withOperationLock(root, () => 'entered'),
       'entered',
     )
+  })
+
+  test('owns the acquisition marker before opening a malformed operation gate', () => {
+    const root = createRoot()
+    const cachePath = cacheDirectoryPath(root)
+    mkdirSync(cachePath, { recursive: true })
+    writeFileSync(join(cachePath, 'operation-lock.sqlite'), 'not a sqlite database')
+    const events: string[] = []
+    cacheLocationTestHooks.beforeDatabaseOpen = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        events.push('gate-open')
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered', {
+        afterRecoveryCreation: () => {
+          events.push('marker-created')
+        },
+      }),
+      'entered',
+    )
+    assert.deepEqual(events.slice(0, 2), ['marker-created', 'gate-open'])
   })
 
   test('reclaims an abandoned operation gate recovery marker', () => {
@@ -2817,7 +4410,8 @@ describe('SQLite cache and reads', () => {
     const root = createRoot()
     const cachePath = cacheDirectoryPath(root)
     mkdirSync(cachePath, { recursive: true })
-    writeFileSync(join(cachePath, 'operation-lock.sqlite'), 'not a sqlite database')
+    const gate = new DatabaseSync(join(cachePath, 'operation-lock.sqlite'))
+    gate.close()
     let operationEntered = false
     cacheLocationTestHooks.beforeQuarantineRename = path => {
       if (basename(path) === 'operation-lock.recovery') {
@@ -2848,6 +4442,41 @@ describe('SQLite cache and reads', () => {
       }),
       'entered on retry',
     )
+  })
+
+  test('reclaims a marker abandoned during gate acquisition setup', () => {
+    const root = createRoot()
+    const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
+    let operationEntered = false
+    const setupFailure = Object.assign(new Error('recovery setup fault'), { code: 'EIO' })
+
+    assert.throws(
+      () =>
+        withOperationLock(
+          root,
+          () => {
+            operationEntered = true
+          },
+          {
+            afterRecoveryCreation: () => {
+              rmSync(join(recoveryPath, 'owner.json'))
+              throw setupFailure
+            },
+          },
+        ),
+      (error: unknown) => {
+        assert.equal((error as { cause?: unknown }).cause, setupFailure)
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.equal(existsSync(recoveryPath), true)
+    assert.equal(existsSync(join(recoveryPath, 'owner.json')), false)
+    assert.equal(
+      withOperationLock(root, () => 'entered on retry'),
+      'entered on retry',
+    )
+    assert.equal(existsSync(recoveryPath), false)
   })
 
   test('retries a transient recovery-marker sharing violation', () => {
@@ -2893,13 +4522,13 @@ describe('SQLite cache and reads', () => {
       return actual
     }
     const reopened = openVerifiedCacheDatabase({
-      create: true,
       DatabaseConstructor: DatabaseSync,
       location: transient.location,
       name: 'operation-lock.sqlite',
       openOptions: {},
+      primary: { kind: 'create-if-missing' },
     })
-    reopened.close()
+    reopened.database.close()
     transient.owner.close()
     assert.equal(transientMismatches, 1)
 
@@ -2915,11 +4544,11 @@ describe('SQLite cache and reads', () => {
     assert.throws(
       () =>
         openVerifiedCacheDatabase({
-          create: true,
           DatabaseConstructor: DatabaseSync,
           location: persistent.location,
           name: 'operation-lock.sqlite',
           openOptions: {},
+          primary: { kind: 'create-if-missing' },
         }),
       (error: unknown) => {
         assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
@@ -3028,6 +4657,8 @@ describe('SQLite cache and reads', () => {
           )
         } else if (inspections === 2) {
           rmSync(path, { recursive: true })
+        } else if (inspections === 3) {
+          cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
         }
       }
     }
@@ -3389,41 +5020,59 @@ describe('SQLite cache and reads', () => {
     const root = createRoot()
     const cachePath = join(root, 'node_modules', '.cache', 'encephalon')
     const gatePath = join(cachePath, 'operation-lock.sqlite')
-    const releasePath = join(root, 'release-corrupt-gate-contenders')
+    const firstRelease = join(root, 'release-first-corrupt-gate-contender')
+    const secondRelease = join(root, 'release-second-corrupt-gate-contender')
     const activePath = join(root, 'active-corrupt-gate-contender')
     const firstReady = join(root, 'first-corrupt-gate-ready')
     const secondReady = join(root, 'second-corrupt-gate-ready')
+    const markerOwned = join(root, 'corrupt-gate-marker-owned')
+    const markerObserved = join(root, 'corrupt-gate-marker-observed')
     const firstEntered = join(root, 'first-corrupt-gate-entered')
     const secondEntered = join(root, 'second-corrupt-gate-entered')
     mkdirSync(cachePath, { recursive: true })
     writeFileSync(gatePath, 'not a sqlite database')
 
     const fixture = join(import.meta.dirname, 'fixtures', 'contend-for-corrupt-gate.ts')
-    const first = spawn(process.execPath, [fixture, root, firstReady, releasePath, activePath, firstEntered, '300'], {
-      stdio: 'inherit',
-    })
+    const first = spawn(
+      process.execPath,
+      [fixture, root, firstReady, firstRelease, activePath, firstEntered, '300', 'owner', markerOwned, markerObserved],
+      { stdio: 'inherit' },
+    )
     const second = spawn(
       process.execPath,
-      [fixture, root, secondReady, releasePath, activePath, secondEntered, '300'],
+      [
+        fixture,
+        root,
+        secondReady,
+        secondRelease,
+        activePath,
+        secondEntered,
+        '300',
+        'observer',
+        markerOwned,
+        markerObserved,
+      ],
       {
         stdio: 'inherit',
       },
     )
 
-    waitForPath(firstReady, first)
-    waitForPath(secondReady, second)
-    writeFileSync(releasePath, 'release')
+    try {
+      waitForPath(firstReady, first)
+      waitForPath(secondReady, second)
+      writeFileSync(firstRelease, 'release')
+      waitForPath(markerOwned, first)
+      writeFileSync(secondRelease, 'release')
+      waitForPath(markerObserved, second)
 
-    if (first.exitCode === null) {
-      await once(first, 'exit')
+      await Promise.all([waitForChild(first), waitForChild(second)])
+      assert.equal(first.exitCode, 0)
+      assert.equal(second.exitCode, 0)
+      assert.equal(existsSync(firstEntered), true)
+      assert.equal(existsSync(secondEntered), true)
+    } finally {
+      await Promise.all([stopChild(first), stopChild(second)])
     }
-    if (second.exitCode === null) {
-      await once(second, 'exit')
-    }
-    assert.equal(first.exitCode, 0)
-    assert.equal(second.exitCode, 0)
-    assert.equal(existsSync(firstEntered), true)
-    assert.equal(existsSync(secondEntered), true)
   })
 
   test('serialises two contenders that both observed the same stale lock', async () => {

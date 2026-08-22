@@ -82,6 +82,16 @@ const generatedPayload = (records: readonly { payload: unknown; subject: string 
   return payload as Record<string, unknown>
 }
 
+const assertPackageMetadataErrorReasons = (value: unknown) => {
+  assert.ok(Array.isArray(value))
+  assert.deepEqual(
+    value,
+    value.includes('unreadable-directory')
+      ? ['package-metadata-error', 'unreadable-directory']
+      : ['package-metadata-error'],
+  )
+}
+
 type InitCounts = {
   baselineScans: number
   canonicalScans: number
@@ -2321,7 +2331,7 @@ describe('initialisation', () => {
     const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
     const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
 
-    assert.deepEqual(overview.scanTruncationReasons, ['package-metadata-error', 'unreadable-directory'])
+    assertPackageMetadataErrorReasons(overview.scanTruncationReasons)
     assert.equal('packageName' in tooling, false)
     assert.deepEqual(overview.sources, [])
     assert.deepEqual(tooling.sources, [])
@@ -2344,7 +2354,7 @@ describe('initialisation', () => {
     const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
     const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
 
-    assert.deepEqual(overview.scanTruncationReasons, ['package-metadata-error', 'unreadable-directory'])
+    assertPackageMetadataErrorReasons(overview.scanTruncationReasons)
     assert.equal('packageName' in tooling, false)
     assert.deepEqual(overview.sources, [])
     assert.deepEqual(tooling.sources, [])

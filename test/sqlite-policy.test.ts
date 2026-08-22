@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
+import { basename } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { cacheReadTestHooks } from '../src/cache.ts'
 import { cacheLocationTestHooks } from '../src/cache-location.ts'
 import { EncephalonError, wrapIo } from '../src/errors.ts'
-import { prepare } from '../src/index.ts'
+import { listRecords, prepare } from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { classifySQLiteError, type SQLiteErrorCategory } from '../src/sqlite-error.ts'
 import { createTestRepository, removeTestRepository } from './helpers.ts'
@@ -72,6 +73,7 @@ const assertErrorCode = (operation: () => unknown, code: string) => {
 
 afterEach(() => {
   cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+  cacheLocationTestHooks.afterQuarantineRename = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
@@ -118,6 +120,27 @@ describe('SQLite consumer policies', () => {
     }
     assertErrorCode(() => prepare({ root }), 'INTERNAL_ERROR')
     assert.equal(exhaustedSchemaInitialisations, 2)
+  })
+
+  test('cache recovery does not rebuild after a second recoverable validation failure', () => {
+    const root = createRoot()
+    prepare({ root })
+    let readerInitialisations = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'reader') {
+        readerInitialisations += 1
+        if (readerInitialisations <= 2) {
+          throw sqliteError('no such table: metadata', { code: 'ERR_SQLITE_ERROR' })
+        }
+      } else {
+        writerInitialisations += 1
+      }
+    }
+
+    assertErrorCode(() => listRecords({ root }), 'INTERNAL_ERROR')
+    assert.equal(readerInitialisations, 2)
+    assert.equal(writerInitialisations, 1)
   })
 
   test('operation gate handles only contention and disposable corruption categories', () => {
@@ -181,6 +204,54 @@ describe('SQLite consumer policies', () => {
       }
       cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
     }
+  })
+
+  test('confirms a transient corrupt gate result without quarantine', () => {
+    const root = createRoot()
+    let gateInitialisations = 0
+    let gateQuarantines = 0
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = () => {
+      gateInitialisations += 1
+      if (gateInitialisations === 1) {
+        throw corruptRecoveryError
+      }
+    }
+    cacheLocationTestHooks.afterQuarantineRename = path => {
+      if (basename(path).startsWith('.operation-lock.sqlite.')) {
+        gateQuarantines += 1
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
+    assert.equal(gateInitialisations, 2)
+    assert.equal(gateQuarantines, 0)
+  })
+
+  test('quarantines once after two corrupt results from the exact gate', () => {
+    const root = createRoot()
+    let gateInitialisations = 0
+    let gateQuarantines = 0
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = () => {
+      gateInitialisations += 1
+      if (gateInitialisations <= 2) {
+        throw corruptRecoveryError
+      }
+    }
+    cacheLocationTestHooks.afterQuarantineRename = path => {
+      if (basename(path).startsWith('.operation-lock.sqlite.')) {
+        gateQuarantines += 1
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
+    assert.equal(gateInitialisations, 3)
+    assert.equal(gateQuarantines, 1)
   })
 
   test('operation gate reports contention after one corrupt recovery retry', () => {

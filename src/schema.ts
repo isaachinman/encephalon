@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
+import { CANONICAL_BUDGETS } from './canonical-budgets.ts'
 import { ARTIFACTS_DIRECTORY_NAME } from './canonical-layout.ts'
 import { fail, failBudget } from './errors.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import type { AddRecordInput, BrainRecordFile, JsonValue } from './types.ts'
 
-export const MAX_RECORD_BYTES = 1024 * 1024
+export const MAX_RECORD_BYTES = CANONICAL_BUDGETS.recordBytes
 export const MAX_PAYLOAD_DEPTH = 64
 export const MAX_PAYLOAD_NODES = 10_000
 const MAX_SEARCH_TEXT_BYTES = 256 * 1024
