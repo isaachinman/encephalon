@@ -30,7 +30,7 @@
 - [x] Add table-driven RED cases for same-name `metadata` and `records` tables with missing primary keys, changed nullability/types/defaults, and missing or widened `active` checks.
 - [x] Add the six-row duplicate-metadata RED and prove it is rejected before accepted metadata iteration.
 - [x] Replace name-only column validation with bounded `pragma_table_list` and `pragma_table_xinfo` probes plus exact immutable descriptor comparison.
-- [x] Add the bounded records-owned-SQL check for the exact active constraint.
+- [x] Add bounded owned-SQL checks for the exact `metadata` and `records` definitions, including the active constraint and table-level semantics not exposed by the column PRAGMAs.
 - [x] Reject duplicate keys before assigning to the metadata map.
 - [x] Run the focused schema/metadata tests, lint, and all four TypeScript projects.
 
