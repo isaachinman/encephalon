@@ -33,6 +33,7 @@ import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import { MAX_CANONICAL_RECORD_BYTES, type RecordWriteHooks } from '../src/records.ts'
+import { validateAddRecordInput } from '../src/schema.ts'
 import { createOwnedStagingName } from '../src/staging.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
 import {
@@ -1731,13 +1732,79 @@ describe('initialisation', () => {
         subject: 'parallel.history',
       })
     }
+    const [candidate] = scanBaseline(root)
+    assert.ok(candidate)
+    const candidateId = validateAddRecordInput({ ...candidate, root }).id
+    writeRecordFile(root, {
+      createdAt: '2026-01-01T00:00:02.000Z',
+      id: candidateId,
+      kind: 'collision',
+      payload: {},
+      source: 'test',
+      subject: 'baseline.id-collision',
+    })
 
     assert.throws(
       () => api.initEncephalon({ root }),
       (error: unknown) => {
-        const actual = error as { code?: unknown; message?: unknown }
+        const actual = error as {
+          code?: unknown
+          details?: { errors?: unknown }
+          message?: unknown
+        }
         assert.equal(actual.code, 'VALIDATION_FAILED')
         assert.equal(actual.message, 'Canonical records are invalid.')
+        assert.deepEqual(actual.details?.errors, [
+          {
+            code: 'MULTIPLE_ACTIVE_HEADS',
+            message: 'Multiple active records exist for decision/parallel.history.',
+          },
+          {
+            code: 'MULTIPLE_ACTIVE_HEADS',
+            message: 'Multiple active records exist for decision/parallel.history.',
+          },
+        ])
+        return true
+      },
+    )
+  })
+
+  test('preserves canonical-history errors before invalid baseline input', () => {
+    const root = createRoot()
+    const scripts = Object.fromEntries(
+      Array.from({ length: 9000 }, (_, index) => [`script-${String(index).padStart(4, '0')}-${'x'.repeat(64)}`, 'x']),
+    )
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'invalid-baseline-input', packageManager: 'npm@10.0.0', scripts }),
+    )
+    for (const [index, id] of ['invalid-input-history-a', 'invalid-input-history-b'].entries()) {
+      writeRecordFile(root, {
+        createdAt: `2026-01-01T00:00:0${index}.000Z`,
+        id,
+        kind: 'decision',
+        payload: {},
+        source: 'test',
+        subject: 'invalid.input-history',
+      })
+    }
+
+    assert.throws(
+      () => api.initEncephalon({ root }),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: { errors?: unknown }; message?: unknown }
+        assert.equal(actual.code, 'VALIDATION_FAILED')
+        assert.equal(actual.message, 'Canonical records are invalid.')
+        assert.deepEqual(actual.details?.errors, [
+          {
+            code: 'MULTIPLE_ACTIVE_HEADS',
+            message: 'Multiple active records exist for decision/invalid.input-history.',
+          },
+          {
+            code: 'MULTIPLE_ACTIVE_HEADS',
+            message: 'Multiple active records exist for decision/invalid.input-history.',
+          },
+        ])
         return true
       },
     )

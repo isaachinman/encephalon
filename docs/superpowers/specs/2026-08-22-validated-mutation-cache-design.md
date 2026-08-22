@@ -10,7 +10,7 @@ Rebuild disposable cache state from the canonical record snapshot already parsed
 
 ## One final mutation snapshot
 
-`records.ts` separates raw canonical acquisition from strict final validation. The raw planning snapshot retains parsed records, byte accounting, record observations, canonical directory witnesses, and a publication authority, but it is not cacheable. Add and init build their complete candidate records and run one strict validation over that final graph. Validation returns the frozen artifact observations that are currently computed and discarded.
+`records.ts` separates raw canonical acquisition from strict final validation. The raw planning snapshot retains parsed records, byte accounting, record observations, canonical directory witnesses, and a publication-authority factory, but it is not cacheable. The factory prevents a mutable publication authority from being shared as planning state and creates it only after strict candidate validation. Add and init build their complete candidate records and run one strict validation over that final graph. Validation returns the frozen artifact observations that are currently computed and discarded.
 
 The cacheable internal snapshot contains only:
 

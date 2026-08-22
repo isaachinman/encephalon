@@ -76,7 +76,7 @@ git commit -m "[MAR-2565] Prove validated mutation cache reuse"
 
 ```ts
 type RecordPlanningSnapshot = Readonly<{
-  authority: CanonicalPublicationAuthority
+  authority: () => CanonicalPublicationAuthority
   records: readonly BrainRecord[]
   validateFinal: (
     records: readonly BrainRecord[],
