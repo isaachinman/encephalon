@@ -552,6 +552,8 @@ Schema version, not package version, decides cache compatibility. Package versio
 
 Repository identity uses the native realpath, normalised separators, and Windows case folding. If an existing database belongs to another repository identity, return `CACHE_SCOPE_MISMATCH`. Do not silently rebind or rebuild it. This deliberately rejects multiple worktrees that share one physical `node_modules` cache.
 
+Maintained implementations validate the exact owned table, constraint, index, and FTS5 semantics through bounded numeric-first PRAGMA probes and narrowly normalised owned-SQL checks. Existing databases validate before writer PRAGMAs or DDL; only an exclusively created primary receives schema creation. See the maintained contract for the current normative details.
+
 ### 11.2 Database schema
 
 Use a small relational table plus FTS5. The exact SQL may evolve during TDD, but it must provide:
@@ -1438,6 +1440,7 @@ This hardening is deliberately sequenced after 0.1.0 and must not delay the firs
 - [ ] Operation locking covers add, baseline, refresh, prepare, and hydrate.
 - [ ] Live locks are not broken based only on age.
 - [ ] Shared-cache repository identity fails closed.
+- [ ] Incompatible owned table, constraint, index, and FTS5 semantics are quarantined and rebuilt once rather than repaired in place.
 
 ### API and CLI
 

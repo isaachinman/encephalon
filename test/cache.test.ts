@@ -70,6 +70,7 @@ afterEach(() => {
   artifactInspectionTestHooks.open = undefined
   cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
   cacheLocationTestHooks.afterDatabaseOpen = undefined
+  cacheLocationTestHooks.afterPrimaryBootstrapClose = undefined
   cacheLocationTestHooks.afterQuarantineRename = undefined
   cacheLocationTestHooks.beforeDatabaseOpen = undefined
   cacheLocationTestHooks.beforeLocationInspection = undefined
@@ -684,6 +685,40 @@ describe('cache filesystem containment', () => {
       )
       const preserved = statSync(databasePath, { bigint: true })
       assert.equal(sameCacheEntryIdentity(replacement, preserved), true)
+    }
+  })
+
+  test('binds an exclusively created primary before inspecting its pathname', () => {
+    const root = createRoot()
+    const databasePath = cacheDatabasePath(root)
+    const displacedPath = join(root, 'bootstrap-created-primary.sqlite')
+    let replacements = 0
+    cacheLocationTestHooks.afterPrimaryBootstrapClose = path => {
+      if (basename(path) === 'brain.sqlite') {
+        cacheLocationTestHooks.afterPrimaryBootstrapClose = undefined
+        renameSync(path, displacedPath)
+        const successor = new DatabaseSync(path)
+        successor.exec('CREATE TABLE successor_sentinel(value TEXT);')
+        successor.close()
+        replacements += 1
+      }
+    }
+
+    assert.throws(() => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }))
+    assert.equal(replacements, 1)
+    assert.equal(existsSync(displacedPath), true)
+    const successor = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      assert.equal(
+        successor.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'successor_sentinel'").get()?.count,
+        1,
+      )
+      assert.equal(
+        successor.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name = 'metadata'").get()?.count,
+        0,
+      )
+    } finally {
+      successor.close()
     }
   })
 
@@ -1682,6 +1717,20 @@ describe('SQLite cache and reads', () => {
       subject: 'backend.database',
       supersedes: [first.id],
     })
+    const databasePath = cacheDatabasePath(root)
+    const databaseIdentity = lstatSync(databasePath, { bigint: true })
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
 
     const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
     assert.deepEqual(
@@ -1748,11 +1797,20 @@ describe('SQLite cache and reads', () => {
         [second.id, second.id],
       ],
     )
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 0)
     assert.deepEqual(gatherRecords({ hydrate: true, root }), {
       hydrated: { recordsIndexed: 2 },
       records: [],
       searches: [],
     })
+    const identityAfterReads = lstatSync(databasePath, { bigint: true })
+    assert.deepEqual(
+      { dev: identityAfterReads.dev, ino: identityAfterReads.ino },
+      { dev: databaseIdentity.dev, ino: databaseIdentity.ino },
+    )
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 1)
 
     functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
       id: 'without-summary',
@@ -2913,6 +2971,478 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 0 })
   })
 
+  test('rebuilds metadata tables with incompatible semantics', () => {
+    const cases = [
+      { definition: 'key TEXT, value TEXT NOT NULL', name: 'missing primary key' },
+      { definition: 'key TEXT PRIMARY KEY, value TEXT', name: 'nullable value' },
+      { definition: 'key BLOB PRIMARY KEY, value TEXT NOT NULL', name: 'declared key type' },
+      {
+        definition: "key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT 'private-schema-sentinel'",
+        name: 'value default',
+      },
+      {
+        definition: 'key TEXT PRIMARY KEY, value TEXT NOT NULL, diagnostic TEXT GENERATED ALWAYS AS (key) VIRTUAL',
+        name: 'generated column',
+      },
+      {
+        definition: 'key TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (length(value) > 0)',
+        name: 'additional table constraint',
+      },
+      {
+        definition: 'key TEXT PRIMARY KEY, value TEXT NOT NULL',
+        name: 'strict table',
+        tableOptions: 'STRICT',
+      },
+      {
+        definition: 'key TEXT PRIMARY KEY, value TEXT NOT NULL',
+        name: 'without-rowid table',
+        tableOptions: 'WITHOUT ROWID',
+      },
+    ] as const
+
+    for (const fixture of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, database => {
+        database.exec(`
+          CREATE TABLE replacement_metadata(${fixture.definition}) ${'tableOptions' in fixture ? fixture.tableOptions : ''};
+          INSERT INTO replacement_metadata(key, value) SELECT key, value FROM metadata;
+          DROP TABLE metadata;
+          ALTER TABLE replacement_metadata RENAME TO metadata;
+        `)
+      })
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
+    }
+  })
+
+  test('rebuilds same-name records tables with incompatible semantics', () => {
+    const cases = [
+      {
+        name: 'records primary key',
+        recordsDefinition: `
+          id TEXT,
+          kind TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          path TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK (active IN (0, 1)),
+          summary TEXT,
+          record_json TEXT NOT NULL
+        `,
+      },
+      {
+        name: 'records nullability',
+        recordsDefinition: `
+          id TEXT PRIMARY KEY,
+          kind TEXT,
+          subject TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          path TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK (active IN (0, 1)),
+          summary TEXT,
+          record_json TEXT NOT NULL
+        `,
+      },
+      {
+        name: 'records declared type',
+        recordsDefinition: `
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          path TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK (active IN (0, 1)),
+          summary BLOB,
+          record_json TEXT NOT NULL
+        `,
+      },
+      {
+        name: 'records default',
+        recordsDefinition: `
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          path TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK (active IN (0, 1)),
+          summary TEXT DEFAULT 'private-schema-sentinel',
+          record_json TEXT NOT NULL
+        `,
+      },
+      {
+        name: 'records active constraint',
+        recordsDefinition: `
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          source TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          path TEXT NOT NULL,
+          active INTEGER NOT NULL CHECK (active IN (0, 1, 2)),
+          summary TEXT,
+          record_json TEXT NOT NULL
+        `,
+      },
+    ] as const
+
+    for (const fixture of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, database => {
+        database.exec(`
+          CREATE TABLE replacement_records (${fixture.recordsDefinition});
+          INSERT INTO replacement_records
+            SELECT id, kind, subject, source, created_at, path, active, summary, record_json FROM records;
+          DROP TABLE records;
+          ALTER TABLE replacement_records RENAME TO records;
+          CREATE INDEX records_active_order ON records(active, created_at DESC, id DESC);
+          CREATE INDEX records_kind_subject ON records(kind, subject);
+        `)
+      })
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
+    }
+  })
+
+  test('rejects PK-less duplicate metadata before metadata text transfer', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    mutateCache(root, database => {
+      database.exec(`
+        CREATE TABLE replacement_metadata(key TEXT, value TEXT NOT NULL);
+        INSERT INTO replacement_metadata SELECT key, value FROM metadata WHERE key != 'repositoryRealpath';
+        INSERT INTO replacement_metadata SELECT key, value FROM metadata WHERE key = 'manifest';
+        DROP TABLE metadata;
+        ALTER TABLE replacement_metadata RENAME TO metadata;
+      `)
+    })
+    const observations = observeCacheIntegrity()
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 1,
+    })
+    assert.equal(
+      observations.some(observation => observation.kind === 'text-read' && observation.name === 'metadata'),
+      false,
+    )
+  })
+
+  test('rebuilds caches with incompatible required records indexes', () => {
+    const cases = [
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec('DROP INDEX records_active_order;')
+        },
+        name: 'missing active-order index',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_active_order;
+            CREATE INDEX renamed_active_order ON records(active, created_at DESC, id DESC);
+          `)
+        },
+        name: 'renamed active-order index',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_active_order;
+            CREATE INDEX records_active_order ON records(created_at DESC, active, id DESC);
+          `)
+        },
+        name: 'reordered active-order columns',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_active_order;
+            CREATE INDEX records_active_order ON records(active, created_at, id DESC);
+          `)
+        },
+        name: 'changed active-order direction',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_kind_subject;
+            CREATE INDEX records_kind_subject ON records(subject, kind);
+          `)
+        },
+        name: 'reordered kind-subject columns',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_kind_subject;
+            CREATE INDEX records_kind_subject ON records(kind COLLATE NOCASE, subject);
+          `)
+        },
+        name: 'changed kind-subject collation',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec('CREATE INDEX records_extra ON records(source);')
+        },
+        name: 'additional application index',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_active_order;
+            CREATE UNIQUE INDEX records_active_order ON records(active, created_at DESC, id DESC);
+          `)
+        },
+        name: 'unique active-order index',
+      },
+      {
+        mutate: (database: DatabaseSync) => {
+          database.exec(`
+            DROP INDEX records_active_order;
+            CREATE INDEX records_active_order ON records(active, created_at DESC, id DESC) WHERE active = 1;
+          `)
+        },
+        name: 'partial active-order index',
+      },
+    ] as const
+
+    for (const fixture of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, fixture.mutate)
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
+    }
+
+    const validRoot = createRoot()
+    addCacheRecord(validRoot)
+    mutateCache(validRoot, database => {
+      database.exec(`
+        DROP INDEX records_active_order;
+        DROP INDEX records_kind_subject;
+        CREATE INDEX records_kind_subject ON records(kind, subject);
+        CREATE INDEX records_active_order ON records(active, created_at DESC, id DESC);
+      `)
+    })
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root: validRoot }), {
+      hydrated: false,
+      recordsIndexed: 1,
+    })
+  })
+
+  test('rebuilds caches with incompatible FTS5 semantics', () => {
+    const cases = [
+      {
+        definition: 'CREATE TABLE record_search(id TEXT, text TEXT)',
+        name: 'ordinary table',
+      },
+      {
+        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(id, text)',
+        name: 'indexed id',
+      },
+      {
+        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text UNINDEXED)',
+        name: 'unindexed text',
+      },
+      {
+        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(text, id UNINDEXED)',
+        name: 'reversed columns',
+      },
+      {
+        definition: "CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text, tokenize='porter')",
+        name: 'changed tokenizer',
+      },
+    ] as const
+
+    for (const fixture of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, database => {
+        database.enableDefensive(false)
+        database.exec(`
+          CREATE TEMP TABLE saved_search AS SELECT id, text FROM record_search;
+          DROP TABLE record_search;
+          ${fixture.definition};
+          INSERT INTO record_search(id, text) SELECT id, text FROM saved_search;
+        `)
+      })
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
+    }
+
+    const validRoot = createRoot()
+    addCacheRecord(validRoot)
+    mutateCache(validRoot, database => {
+      database.enableDefensive(false)
+      database.exec(`
+        CREATE TEMP TABLE saved_search AS SELECT id, text FROM record_search;
+        DROP TABLE record_search;
+        create virtual table "record_search" using FTS5(
+          "id" unindexed,
+          "text"
+        );
+        INSERT INTO record_search(id, text) SELECT id, text FROM saved_search;
+      `)
+    })
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root: validRoot }), {
+      hydrated: false,
+      recordsIndexed: 1,
+    })
+  })
+
+  test('quarantines an incompatible existing schema instead of repairing it in place', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    mutateCache(root, database => {
+      database.exec('DROP INDEX records_active_order;')
+    })
+    const incompatibleIdentity = lstatSync(databasePath, { bigint: true })
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const current = lstatSync(path, { bigint: true })
+        assert.equal(current.dev, incompatibleIdentity.dev)
+        assert.equal(current.ino, incompatibleIdentity.ino)
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }), {
+      recordsIndexed: 1,
+    })
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 1)
+    const rebuiltIdentity = lstatSync(databasePath, { bigint: true })
+    assert.notEqual(rebuiltIdentity.ino, incompatibleIdentity.ino)
+  })
+
+  test('recovers one exact semantically incompatible cache during a public read', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    mutateCache(root, database => {
+      database.exec(`
+        DROP INDEX records_kind_subject;
+        CREATE INDEX records_kind_subject ON records(subject, kind);
+      `)
+    })
+    const incompatibleIdentity = lstatSync(databasePath, { bigint: true })
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const current = lstatSync(path, { bigint: true })
+        assert.equal(current.dev, incompatibleIdentity.dev)
+        assert.equal(current.ino, incompatibleIdentity.ino)
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const listed = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
+      root,
+    })
+    assert.deepEqual(
+      listed.map(candidate => candidate.id),
+      [record.id],
+    )
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 1)
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: false,
+      recordsIndexed: 1,
+    })
+  })
+
+  test('pins writer schema probes before rebuild metadata and mutation', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    let mutations = 0
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.beforeIntegrityTextRead = name => {
+      if (name === 'metadata-columns' && mutations === 0) {
+        mutations += 1
+        mutateCache(root, database => {
+          database.exec('DROP INDEX records_kind_subject;')
+        })
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }), {
+      recordsIndexed: 1,
+    })
+    assert.equal(mutations, 1)
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 1)
+  })
+
+  test('normalises repeated SQLite schema failures before public wrapping', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const privateSentinel = 'private_schema_parser_sentinel'
+    let schemaFailures = 0
+    cacheReadTestHooks.afterIntegrityProbe = observation => {
+      if (observation.name === 'metadata-columns') {
+        schemaFailures += 1
+        throw Object.assign(new Error(`malformed database schema (${privateSentinel})`), {
+          code: 'SQLITE_CORRUPT',
+        })
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        assert.doesNotMatch(causeChainText(error), new RegExp(privateSentinel, 'u'))
+        return true
+      },
+    )
+    assert.equal(schemaFailures, 2)
+  })
+
   test('rebuilds an empty read-only cache file through writer preparation', {
     skip: process.platform === 'win32' ? 'Windows read-only file replacement semantics differ.' : false,
   }, () => {
@@ -3307,6 +3837,48 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('bounds repeated semantic schema recovery without exposing schema names', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const privateSentinel = 'private_schema_sentinel'
+    const installIncompatibleIndex = () => {
+      mutateCache(root, database => {
+        database.exec(`
+          DROP INDEX records_kind_subject;
+          CREATE INDEX ${privateSentinel} ON records(subject, kind);
+        `)
+      })
+    }
+    installIncompatibleIndex()
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
+      installIncompatibleIndex()
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        assert.doesNotMatch(causeChainText(error), new RegExp(privateSentinel, 'u'))
+        return true
+      },
+    )
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 1)
+  })
+
   test('does not quarantine a foreign cache with a valid repository scope', () => {
     const root = createRoot()
     addCacheRecord(root)
@@ -3558,13 +4130,9 @@ describe('SQLite cache and reads', () => {
       {
         expectedProbe: { name: 'metadata', rows: 7 },
         mutate: (database: DatabaseSync) => {
-          database.exec(`
-            CREATE TABLE replacement_metadata(key TEXT, value TEXT);
-            INSERT INTO replacement_metadata SELECT key, value FROM metadata;
-            DROP TABLE metadata;
-            ALTER TABLE replacement_metadata RENAME TO metadata;
-            INSERT INTO metadata(key, value) VALUES ('duplicate', 'private-metadata-sentinel');
-          `)
+          database
+            .prepare('INSERT INTO metadata(key, value) VALUES (?, ?)')
+            .run('unexpected', 'private-metadata-sentinel')
         },
         name: 'seventh metadata row',
       },
@@ -3735,20 +4303,35 @@ describe('SQLite cache and reads', () => {
         expectedRows: 24,
         mutate: (database: DatabaseSync) => {
           database.exec(`
-            CREATE TABLE replacement_records AS
-            SELECT id, kind, subject, source, created_at, path, active, summary, record_json
-            FROM records
-            WHERE 0;
+            CREATE TABLE replacement_records (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              subject TEXT NOT NULL,
+              source TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              path TEXT NOT NULL,
+              active INTEGER NOT NULL CHECK (active IN (0, 1)),
+              summary TEXT,
+              record_json TEXT NOT NULL
+            );
             WITH RECURSIVE generated(value) AS (
               SELECT 1
               UNION ALL
               SELECT value + 1 FROM generated WHERE value < 24
             )
             INSERT INTO replacement_records
-            SELECT id, kind, subject, source, created_at, path, active, summary, record_json
+            SELECT printf('%s-%02d', id, value), kind, subject, source, created_at,
+              printf('encephalon/context/cache-record-%02d.json', value), active, summary,
+              json_set(
+                record_json,
+                '$.id', printf('%s-%02d', id, value),
+                '$.path', printf('encephalon/context/cache-record-%02d.json', value)
+              )
             FROM records CROSS JOIN generated;
             DROP TABLE records;
             ALTER TABLE replacement_records RENAME TO records;
+            CREATE INDEX records_active_order ON records(active, created_at DESC, id DESC);
+            CREATE INDEX records_kind_subject ON records(kind, subject);
             DELETE FROM record_search;
             WITH RECURSIVE generated(value) AS (
               SELECT 1
@@ -3756,7 +4339,7 @@ describe('SQLite cache and reads', () => {
               SELECT value + 1 FROM generated WHERE value < 24
             )
             INSERT INTO record_search(id, text)
-            SELECT 'cache-record', CAST(zeroblob(1048576) AS TEXT)
+            SELECT printf('cache-record-%02d', value), CAST(zeroblob(1048576) AS TEXT)
             FROM generated;
             UPDATE metadata SET value = '24' WHERE key = 'recordsIndexed';
           `)
@@ -3822,7 +4405,7 @@ describe('SQLite cache and reads', () => {
           )`,
         )
         .run(1_052_672)
-      database.prepare("UPDATE record_search SET text = replace(hex(zeroblob(?)), '00', 'x')").run(1_052_672)
+      database.prepare("UPDATE record_search SET text = replace(hex(zeroblob(?)), '00', 'x')").run(2_105_344)
       database
         .prepare("UPDATE metadata SET value = replace(hex(zeroblob(?)), '00', 'x') WHERE key = 'packageVersion'")
         .run(1_048_576)
@@ -3944,18 +4527,19 @@ describe('SQLite cache and reads', () => {
       source: 'agent',
       subject: 'cache.snapshot',
     })
-    let recordProbes = 0
+    let indexProbes = 0
     let mutations = 0
     cacheReadTestHooks.afterIntegrityProbe = observation => {
-      if (observation.name === 'records') {
-        recordProbes += 1
-        if (recordProbes === 2) {
+      if (observation.name === 'records-indexes') {
+        indexProbes += 1
+        if (indexProbes === 2) {
           mutations += 1
           const successor = JSON.stringify({ ...record, payload: { generation: 'successor' } })
           const database = new DatabaseSync(cacheDatabasePath(root))
           try {
             database.exec('PRAGMA journal_mode = WAL; BEGIN IMMEDIATE;')
             database.prepare('UPDATE records SET record_json = ? WHERE id = ?').run(successor, String(record.id))
+            database.exec('DROP INDEX records_kind_subject;')
             database.exec('COMMIT')
           } finally {
             database.close()
@@ -3970,6 +4554,10 @@ describe('SQLite cache and reads', () => {
     const generation = (returned?.payload as { generation?: unknown } | undefined)?.generation
     assert.equal(mutations, 1)
     assert.deepEqual({ generation, id: returned?.id }, { generation: 'original', id: record.id })
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 1,
+    })
   })
 
   test('requires canonical recordsIndexed metadata', () => {
