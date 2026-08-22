@@ -19,6 +19,7 @@ import {
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
+import { cacheReadTestHooks } from '../src/cache.ts'
 import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
@@ -32,6 +33,7 @@ import {
   planRecordAddition,
   projectedKindDirectoryOverflow,
   publishPlannedRecordOutcome,
+  type RecordReadHooks,
   readRecordSnapshotResolved,
   readValidatedRecordSnapshotResolved,
   recordWriteTestHooks,
@@ -49,6 +51,9 @@ import {
 } from '../test/helpers.ts'
 
 const roots: string[] = []
+const mutationRecordWriteTestHooks = recordWriteTestHooks as typeof recordWriteTestHooks & {
+  readHooks?: RecordReadHooks | undefined
+}
 const renameParentWithOpenChildSkip = canRenameParentWithOpenChild()
   ? false
   : 'The filesystem does not allow replacing a parent while a child descriptor is open.'
@@ -189,14 +194,53 @@ afterEach(() => {
   artifactInspectionTestHooks.fault = undefined
   artifactInspectionTestHooks.open = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
+  cacheReadTestHooks.afterCanonicalValidation = undefined
   recordWriteTestHooks.afterOperationLock = undefined
   recordWriteTestHooks.beforeOperationLock = undefined
   recordWriteTestHooks.fault = undefined
+  mutationRecordWriteTestHooks.readHooks = undefined
   stagingInternals.stagingTestHooks.fsyncDirectory = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
 
 describe('canonical records', () => {
+  test('rebuilds add cache from one validated mutation snapshot', () => {
+    const root = createRoot()
+    const counts = {
+      canonicalScans: 0,
+      diskCacheValidations: 0,
+      graphValidations: 0,
+    }
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        counts.canonicalScans += 1
+      },
+      graphValidation: () => {
+        counts.graphValidations += 1
+      },
+    }
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      counts.diskCacheValidations += 1
+    }
+
+    const added = api.addRecord({
+      id: 'validated-mutation-snapshot',
+      kind: 'decision',
+      payload: { summary: 'Reused validated mutation snapshot' },
+      root,
+      source: 'agent',
+      subject: 'cache.validated-mutation-snapshot',
+    })
+
+    assert.equal(added.id, 'validated-mutation-snapshot')
+    assert.deepEqual(counts, {
+      canonicalScans: 1,
+      diskCacheValidations: 0,
+      graphValidations: 1,
+    })
+    assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+  })
+
   test('orders add and generated baseline timestamps after canonical history', () => {
     const root = createRoot()
     const future = new Date(Date.now() + 86_400_000).toISOString()

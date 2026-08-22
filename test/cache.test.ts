@@ -159,6 +159,23 @@ const cacheDirectoryPath = (root: string) => join(root, 'node_modules', '.cache'
 
 const cacheDatabasePath = (root: string) => join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
 
+const logicalCacheProjection = (root: string) => {
+  const database = new DatabaseSync(cacheDatabasePath(root), { readOnly: true })
+  try {
+    return {
+      metadata: database.prepare('SELECT key, value FROM metadata ORDER BY key').all(),
+      records: database
+        .prepare(
+          'SELECT id, kind, subject, source, created_at, path, active, summary, record_json FROM records ORDER BY id',
+        )
+        .all(),
+      search: database.prepare('SELECT id, text FROM record_search ORDER BY id').all(),
+    }
+  } finally {
+    database.close()
+  }
+}
+
 const databaseOpenCases = [
   {
     databaseName: 'brain.sqlite',
@@ -190,6 +207,86 @@ const addCacheRecord = (root: string) =>
     source: 'agent',
     subject: 'cache.validation',
   })
+
+test('writes validated mutation snapshots equivalently and falls back after identity changes', () => {
+  const cases = [
+    { kind: 'stable', name: 'stable snapshot' },
+    { kind: 'record', name: 'canonical record replacement' },
+    { kind: 'artifact', name: 'artifact replacement' },
+  ] as const
+
+  for (const entry of cases) {
+    const root = createRoot()
+    const seedId = `snapshot-seed-${entry.kind}`
+    const artifact = `_artifacts/decision/${seedId}/evidence.txt`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, 'stable evidence')
+    const seed = api.addRecord({
+      artifacts: [artifact],
+      id: seedId,
+      kind: 'decision',
+      payload: { summary: 'Original snapshot seed' },
+      root,
+      searchText: 'original searchable snapshot seed',
+      source: 'test',
+      subject: `cache.snapshot.${entry.kind}`,
+    })
+    const seedPath = join(root, ...seed.path.split('/'))
+    let diskCacheValidations = 0
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      diskCacheValidations += 1
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'during-hydration') {
+        recordWriteTestHooks.fault = undefined
+        if (entry.kind === 'record') {
+          const displacedPath = `${seedPath}.displaced`
+          renameSync(seedPath, displacedPath)
+          const record = JSON.parse(readFileSync(displacedPath, 'utf8')) as Record<string, unknown>
+          writeFileSync(
+            seedPath,
+            `${JSON.stringify(
+              {
+                ...record,
+                payload: { summary: 'Current replacement snapshot seed' },
+              },
+              null,
+              2,
+            )}\n`,
+          )
+        }
+        if (entry.kind === 'artifact') {
+          renameSync(artifactPath, `${artifactPath}.displaced`)
+          writeFileSync(artifactPath, 'stable evidence')
+        }
+      }
+    }
+
+    api.addRecord({
+      id: `snapshot-addition-${entry.kind}`,
+      kind: 'decision',
+      payload: { summary: 'Validated snapshot addition' },
+      root,
+      searchText: 'new searchable snapshot addition',
+      source: 'test',
+      subject: `cache.snapshot.${entry.kind}`,
+      supersedes: [seedId],
+    })
+
+    assert.equal(diskCacheValidations, entry.kind === 'stable' ? 0 : 1, entry.name)
+    if (entry.kind === 'record') {
+      const shown = api.showRecord({ activeOnly: false, id: seedId, root })
+      assert.ok(shown)
+      assert.equal((shown.payload as { summary?: unknown }).summary, 'Current replacement snapshot seed')
+    }
+    const snapshotProjection = logicalCacheProjection(root)
+    cacheReadTestHooks.afterCanonicalValidation = undefined
+    assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 2 })
+    assert.deepEqual(logicalCacheProjection(root), snapshotProjection, entry.name)
+    assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 2 }, entry.name)
+  }
+})
 
 test('uses verified artifact observations without a detached cache lstat', () => {
   const root = createRoot()
