@@ -21,7 +21,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
+import { DatabaseSync, StatementSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
@@ -41,6 +41,7 @@ import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import { recordWriteTestHooks } from '../src/records.ts'
 import { repositoryTestHooks } from '../src/repository.ts'
+import { responseBudgetTestHooks } from '../src/response-budget.ts'
 import {
   canRenameParentWithOpenChild,
   createTestRepository,
@@ -89,6 +90,7 @@ afterEach(() => {
   cacheReadTestHooks.beforeManifestEntryLstat = undefined
   cacheReadTestHooks.beforeIntegrityTextRead = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
+  responseBudgetTestHooks.afterCharge = undefined
   recordWriteTestHooks.fault = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
   roots.splice(0).forEach(removeTestRepository)
@@ -115,6 +117,33 @@ const assertBudgetError = (operation: () => unknown, expected: { budget: string;
     assert.deepEqual((error as { details?: unknown }).details, expected)
     return true
   })
+}
+
+const expectedResponseBytes = (value: unknown): number => {
+  if (typeof value === 'string') {
+    return Buffer.byteLength(value, 'utf8')
+  }
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') {
+    return 8
+  }
+  if (Array.isArray(value)) {
+    return value.reduce((bytes, item) => bytes + expectedResponseBytes(item), 8)
+  }
+  if (typeof value === 'object') {
+    return Object.entries(value).reduce(
+      (bytes, [key, item]) => bytes + Buffer.byteLength(key, 'utf8') + expectedResponseBytes(item),
+      8,
+    )
+  }
+  throw new Error('Test response fixture must be JSON-compatible.')
+}
+
+const rewriteRecordSummary = (root: string, path: string, summary: string) => {
+  const absolutePath = join(root, ...path.split('/'))
+  const record = JSON.parse(readFileSync(absolutePath, 'utf8')) as Record<string, unknown>
+  const { payload } = record
+  assert.ok(payload !== null && !Array.isArray(payload) && typeof payload === 'object')
+  writeFileSync(absolutePath, `${JSON.stringify({ ...record, payload: { ...payload, summary } }, null, 2)}\n`, 'utf8')
 }
 
 const waitForPath = (path: string, process: ReturnType<typeof spawn>) => {
@@ -2013,7 +2042,7 @@ describe('SQLite cache and reads', () => {
       addRecord({
         id: `large-response-${index}`,
         kind: 'context',
-        payload: { text: 'x'.repeat(900 * 1024) },
+        payload: { text: 'x '.repeat(450 * 1024) },
         root,
         searchText: 'response budget marker',
         source: 'agent',
@@ -2037,7 +2066,7 @@ describe('SQLite cache and reads', () => {
           shows: Array.from({ length: 5 }, () => 'large-response-0'),
         }),
       {
-        budget: 'fullResponseBytes',
+        budget: 'gatherResponseBytes',
         field: 'response',
         maximum: 4 * 1024 * 1024,
       },
@@ -2053,6 +2082,150 @@ describe('SQLite cache and reads', () => {
     const searchCompactRecords =
       functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
     assert.equal(searchCompactRecords({ limit: 5, query: 'response budget marker', root }).length, 5)
+  })
+
+  test('streams compact rows through the exact 4 MiB response boundary', () => {
+    const root = createRoot()
+    const query = 'compactboundary'
+    const initialSummary = `${'é '.repeat(215_999)}é`
+    const records = Array.from({ length: 6 }, (_, index) =>
+      api.addRecord({
+        id: `compact-boundary-${index}`,
+        kind: 'context',
+        payload: { summary: initialSummary },
+        root,
+        source: 'agent',
+        subject: `${query}.${index}`,
+      }),
+    )
+    const initial = api.searchCompactRecords({ limit: records.length, query, root })
+    const remainingBytes = 4 * 1024 * 1024 - expectedResponseBytes(initial)
+    assert.ok(remainingBytes > 0)
+    const adjustedSummary = `${initialSummary}${'x'.repeat(remainingBytes)}`
+    const adjustedRecord = records.at(-1)
+    assert.ok(adjustedRecord !== undefined)
+    rewriteRecordSummary(root, adjustedRecord.path, adjustedSummary)
+
+    const allDescriptor = Object.getOwnPropertyDescriptor(StatementSync.prototype, 'all')
+    assert.ok(allDescriptor !== undefined)
+    Object.defineProperty(StatementSync.prototype, 'all', {
+      ...allDescriptor,
+      value: () => {
+        throw new Error('compact search must stream rows with iterate()')
+      },
+    })
+    try {
+      const exact = api.searchCompactRecords({ limit: records.length, query, root })
+      assert.equal(expectedResponseBytes(exact), 4 * 1024 * 1024)
+
+      rewriteRecordSummary(root, adjustedRecord.path, `${adjustedSummary}x`)
+      assertBudgetError(() => api.searchCompactRecords({ limit: records.length, query, root }), {
+        budget: 'compactResponseBytes',
+        field: 'response',
+        maximum: 4 * 1024 * 1024,
+      })
+    } finally {
+      Object.defineProperty(StatementSync.prototype, 'all', allDescriptor)
+    }
+  })
+
+  test('charges compact response containers in their composing callers', () => {
+    const root = createRoot()
+    const query = 'structural ownership marker'
+    api.addRecord({
+      id: 'structural-ownership',
+      kind: 'context',
+      payload: { summary: 'Structural ownership result' },
+      root,
+      source: 'agent',
+      subject: query,
+    })
+    const events: Array<{ budgetKey: string; value: unknown } | 'prepare'> = []
+    responseBudgetTestHooks.afterCharge = (budgetKey, value) => {
+      events.push({ budgetKey, value })
+    }
+    cacheReadTestHooks.onCompactSearchPrepare = () => {
+      events.push('prepare')
+    }
+
+    api.searchCompactRecords({ query, root })
+    assert.deepEqual(events.slice(0, 2), [{ budgetKey: 'compactResponseBytes', value: [] }, 'prepare'])
+
+    events.length = 0
+    api.gatherRecords({ root, searches: [query] })
+    const gatherCharges = events.filter(event => event !== 'prepare')
+    assert.deepEqual(gatherCharges.at(0), {
+      budgetKey: 'gatherResponseBytes',
+      value: { hydrated: null, records: [], searches: [] },
+    })
+    assert.deepEqual(gatherCharges.at(1), {
+      budgetKey: 'gatherResponseBytes',
+      value: { kind: null, query, results: [] },
+    })
+  })
+
+  test('shares one 4 MiB gather response budget across complete repeated results', () => {
+    const root = createRoot()
+    const query = 'gatherboundary'
+    const initialSummary = `${'é '.repeat(299_999)}é`
+    const repeated = api.addRecord({
+      id: 'gather-boundary-repeated',
+      kind: 'context',
+      payload: { summary: initialSummary },
+      root,
+      source: 'agent',
+      subject: query,
+    })
+    const shown = api.addRecord({
+      id: 'gather-boundary-shown',
+      kind: 'context',
+      payload: { detail: 'full record', summary: `Secondary ${'z'.repeat(200_000)}` },
+      root,
+      source: 'agent',
+      subject: 'gather.boundary.shown',
+    })
+    const gather = (absentId: string) =>
+      api.gatherRecords({
+        hydrate: true,
+        limit: 2,
+        root,
+        searches: [query, query],
+        shows: [repeated.id, repeated.id, shown.id, absentId],
+      })
+    const missingId = 'missing'
+    const initial = gather(missingId)
+    const remainingBytes = 4 * 1024 * 1024 - expectedResponseBytes(initial)
+    assert.ok(remainingBytes > 0)
+    const repeatedOccurrences = 4
+    const summaryBytesToAdd = Math.floor(remainingBytes / repeatedOccurrences)
+    const missingIdBytesToAdd = remainingBytes % repeatedOccurrences
+    rewriteRecordSummary(root, repeated.path, `${initialSummary}${'x'.repeat(summaryBytesToAdd)}`)
+    const exactMissingId = `${missingId}${'x'.repeat(missingIdBytesToAdd)}`
+
+    const exact = gather(exactMissingId)
+    assert.equal(expectedResponseBytes(exact), 4 * 1024 * 1024)
+    assert.deepEqual(exact.hydrated, { recordsIndexed: 2 })
+    assert.deepEqual(
+      exact.records.map(entry => [entry.id, entry.record?.id ?? null]),
+      [
+        [repeated.id, repeated.id],
+        [repeated.id, repeated.id],
+        [shown.id, shown.id],
+        [exactMissingId, null],
+      ],
+    )
+    assert.deepEqual(
+      exact.searches.map(entry => [entry.query, entry.results.map(result => result.id)]),
+      [
+        [query, [repeated.id]],
+        [query, [repeated.id]],
+      ],
+    )
+    assertBudgetError(() => gather(`${exactMissingId}x`), {
+      budget: 'gatherResponseBytes',
+      field: 'response',
+      maximum: 4 * 1024 * 1024,
+    })
   })
 
   test('gather reads every item from one cache snapshot', () => {
@@ -2243,9 +2416,11 @@ describe('SQLite cache and reads', () => {
     let showPrepareCount = 0
     let searchPrepareCount = 0
     let compactSearchSelectedRecordJson = false
+    let showSelectedRecordBytes = false
 
-    cacheReadTestHooks.onShowPrepare = () => {
+    cacheReadTestHooks.onShowPrepare = source => {
       showPrepareCount += 1
+      showSelectedRecordBytes ||= source.includes('record_bytes')
     }
     cacheReadTestHooks.onCompactSearchPrepare = source => {
       searchPrepareCount += 1
@@ -2287,6 +2462,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(showPrepareCount, 1)
     assert.equal(searchPrepareCount, 1)
     assert.equal(compactSearchSelectedRecordJson, false)
+    assert.equal(showSelectedRecordBytes, false)
   })
 
   test('tracks record and referenced-artifact freshness', () => {

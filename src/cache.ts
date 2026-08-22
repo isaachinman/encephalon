@@ -42,6 +42,7 @@ import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { ordinalStringCompare } from './order.ts'
 import { canonicalRecordPath, readRecords, readValidatedRecordSnapshotResolved } from './records.ts'
 import { resolveRepository } from './repository.ts'
+import { createResponseByteBudget, type ResponseByteBudget } from './response-budget.ts'
 import { parseRecordFile, validateArtifactPath } from './schema.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type {
@@ -63,7 +64,6 @@ const MAX_QUERY_BYTES = OPERATION_BUDGETS.queryBytes.maximum
 const MAX_QUERY_TERMS = OPERATION_BUDGETS.queryTerms.maximum
 const MAX_GATHER_SEARCHES = OPERATION_BUDGETS.gatherSearches.maximum
 const MAX_GATHER_SHOWS = OPERATION_BUDGETS.gatherShows.maximum
-const MAX_FULL_RESPONSE_BYTES = OPERATION_BUDGETS.fullResponseBytes.maximum
 const SQLITE_BUSY_TIMEOUT_MILLISECONDS = 1000
 const MAX_CACHE_METADATA_BYTES = 1024 * 1024
 const MAX_CACHE_METADATA_AGGREGATE_BYTES = 6 * MAX_CACHE_METADATA_BYTES
@@ -1884,10 +1884,6 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
 
 const parseRecordRow = (row: RecordRow) => parseCachedRecord(row.record_json)
 
-type FullResponseBudget = {
-  bytes: number
-}
-
 const recordRowBytes = (row: RecordRow) => {
   if (typeof row.record_bytes === 'number' && Number.isFinite(row.record_bytes) && row.record_bytes >= 0) {
     return row.record_bytes
@@ -1898,19 +1894,13 @@ const recordRowBytes = (row: RecordRow) => {
   return 0
 }
 
-const parseRecordRowWithinBudget = (row: RecordRow, budget: FullResponseBudget) => {
-  budget.bytes += recordRowBytes(row)
-  if (budget.bytes > MAX_FULL_RESPONSE_BYTES) {
-    return failBudget(
-      'fullResponseBytes',
-      `full-record responses may contain at most ${MAX_FULL_RESPONSE_BYTES} UTF-8 bytes.`,
-    )
-  }
+const parseRecordRowWithinBudget = (row: RecordRow, budget: ResponseByteBudget) => {
+  budget.chargeBytes(recordRowBytes(row))
   return parseRecordRow(row)
 }
 
 const parseRecordRowsWithinBudget = (rows: Iterable<RecordRow>) => {
-  const budget = { bytes: 0 }
+  const budget = createResponseByteBudget('fullResponseBytes')
   return Array.from(rows, row => parseRecordRowWithinBudget(row, budget))
 }
 
@@ -1947,7 +1937,7 @@ export const showRecord = (input: ShowRecordInput): BrainRecord | null => {
         `SELECT record_json, length(cast(record_json AS BLOB)) AS record_bytes FROM records WHERE id = ?${activeClause}`,
       )
       .get(parsed.id) as RecordRow | undefined
-    return row === undefined ? null : parseRecordRowWithinBudget(row, { bytes: 0 })
+    return row === undefined ? null : parseRecordRowWithinBudget(row, createResponseByteBudget('fullResponseBytes'))
   })
 }
 
@@ -2029,7 +2019,7 @@ const compactRecordFromRow = (row: CompactRow): CompactBrainRecord => ({
   summary: compactSummary(row.summary),
 })
 
-const createCompactSearchReader = (database: DatabaseSync, input: SearchStatementInput) => {
+const createCompactSearchReader = (database: DatabaseSync, input: SearchStatementInput, budget: ResponseByteBudget) => {
   const conditions = [
     'record_search MATCH ?',
     input.includeSuperseded === true ? undefined : 'records.active = 1',
@@ -2059,7 +2049,9 @@ const createCompactSearchReader = (database: DatabaseSync, input: SearchStatemen
     if (match.length === 0) {
       return []
     }
-    const records = (statement.all(match, ...kindParameters, limit) as CompactRow[]).map(compactRecordFromRow)
+    const records = Array.from(statement.iterate(match, ...kindParameters, limit) as Iterable<CompactRow>, row =>
+      budget.charge(compactRecordFromRow(row)),
+    )
     cacheReadTestHooks.afterCompactSearchRead?.(query)
     return records
   }
@@ -2078,19 +2070,22 @@ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRec
   const parsed = parseCompactSearchRecordsInput(input)
   literalMatchQuery(parsed.query)
   compactResultLimit(parsed.limit)
-  return withPreparedDatabase(parsed, database => createCompactSearchReader(database, parsed)(parsed.query))
+  return withPreparedDatabase(parsed, database => {
+    const budget = createResponseByteBudget('compactResponseBytes')
+    budget.charge([])
+    return createCompactSearchReader(database, parsed, budget)(parsed.query)
+  })
 }
 
 const createShowReader = (database: DatabaseSync, includeSuperseded: boolean | undefined) => {
   const activeClause = includeSuperseded === true ? '' : ' AND active = 1'
-  const source = `SELECT record_json, length(cast(record_json AS BLOB)) AS record_bytes FROM records WHERE id = ?${activeClause}`
+  const source = `SELECT record_json FROM records WHERE id = ?${activeClause}`
   cacheReadTestHooks.onShowPrepare?.(source)
   const statement = database.prepare(source)
-  const budget = { bytes: 0 }
   return (id: string) => {
     const row = statement.get(id) as RecordRow | undefined
     cacheReadTestHooks.afterShowRead?.(id)
-    return row === undefined ? null : parseRecordRowWithinBudget(row, budget)
+    return row === undefined ? null : parseRecordRow(row)
   }
 }
 
@@ -2113,16 +2108,18 @@ const readGatherFromDatabase = (
 ): GatherResult => {
   const searches = input.searches ?? []
   const shows = input.shows ?? []
+  const budget = createResponseByteBudget('gatherResponseBytes')
+  budget.charge({ hydrated, records: [], searches: [] })
   const showRecordForId = shows.length === 0 ? () => null : createShowReader(database, input.includeSuperseded)
-  const searchCompactRecordsForQuery = searches.length === 0 ? () => [] : createCompactSearchReader(database, input)
+  const searchCompactRecordsForQuery =
+    searches.length === 0 ? () => [] : createCompactSearchReader(database, input, budget)
   return {
     hydrated,
-    records: shows.map(id => ({ id, record: showRecordForId(id) })),
-    searches: searches.map(query => ({
-      kind: input.kind ?? null,
-      query,
-      results: searchCompactRecordsForQuery(query),
-    })),
+    records: shows.map(id => budget.charge({ id, record: showRecordForId(id) })),
+    searches: searches.map(query => {
+      const envelope = budget.charge({ kind: input.kind ?? null, query, results: [] })
+      return { ...envelope, results: searchCompactRecordsForQuery(query) }
+    }),
   }
 }
 
