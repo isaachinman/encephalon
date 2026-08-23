@@ -49,4 +49,4 @@ The existing gather benchmark becomes duplicate-heavy without changing the repor
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test snapshot is `5421abe15ac21189675e2ad88e944803915f272e`. Documentation does not change the public API, package exports, cache schema, canonical records, or operation budgets.
+The exact implementation and behavioural-test snapshot is `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`. Documentation does not change the public API, package exports, cache schema, canonical records, or operation budgets.
