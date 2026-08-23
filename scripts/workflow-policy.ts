@@ -16,7 +16,7 @@ import { ordinalStringCompare } from '../src/order.ts'
 export type WorkflowPolicyRule =
   | 'credential-environment'
   | 'credential-forwarding'
-  | 'external-action-sha'
+  | 'external-reference-sha'
   | 'local-reference'
   | 'permission'
   | 'source-integrity'
@@ -111,6 +111,14 @@ const sourceIntegrityFinding = {
   location: '$',
   rule: 'source-integrity',
 } as const satisfies WorkflowPolicyFinding
+const workflowPolicyGuidance: Record<WorkflowPolicyRule, string> = {
+  'credential-environment': 'target the exact pullfrog-review environment',
+  'credential-forwarding': 'remove secrets from the external reusable-workflow call',
+  'external-reference-sha': 'pin the external reference to a lowercase 40-character commit SHA',
+  'local-reference': 'use an existing repository-contained target allowed for this local reference',
+  permission: 'use the exact least-authority permission map allowed at this location',
+  'source-integrity': 'restore stable, unambiguous regular workflow and action sources',
+}
 
 const compareFindings = (left: WorkflowPolicyFinding, right: WorkflowPolicyFinding) => {
   let comparison = ordinalStringCompare(left.file, right.file)
@@ -615,19 +623,36 @@ const inspectJobPermissions = (job: ParsedObject, jobName: string, file: string,
   }
 }
 
+const inspectExternalReusableWorkflowPermissions = (
+  job: ParsedObject,
+  jobName: string,
+  file: string,
+  findings: WorkflowPolicyFinding[],
+) => {
+  const exactEmptyPermissions = isPlainObject(job.permissions) && Object.keys(job.permissions).length === 0
+  if (!exactEmptyPermissions) {
+    findings.push({ file, location: `jobs.${jobName}.permissions`, rule: 'permission' })
+  }
+}
+
 const inspectWorkflowJobs = (document: ParsedObject, file: string, findings: WorkflowPolicyFinding[]) => {
   const { jobs } = document
   if (isPlainObject(jobs)) {
     const workflowEnvironmentContainsSecret = containsSecretExpression(document.env)
     for (const [jobName, value] of Object.entries(jobs)) {
       if (isPlainObject(value)) {
-        inspectJobPermissions(value, jobName, file, findings)
         const reusableWorkflowReference = value.uses
         if (typeof reusableWorkflowReference === 'string') {
-          if (!localReference.test(reusableWorkflowReference) && value.secrets !== undefined) {
-            findings.push({ file, location: `jobs.${jobName}.secrets`, rule: 'credential-forwarding' })
+          if (localReference.test(reusableWorkflowReference)) {
+            inspectJobPermissions(value, jobName, file, findings)
+          } else {
+            inspectExternalReusableWorkflowPermissions(value, jobName, file, findings)
+            if (value.secrets !== undefined) {
+              findings.push({ file, location: `jobs.${jobName}.secrets`, rule: 'credential-forwarding' })
+            }
           }
         } else {
+          inspectJobPermissions(value, jobName, file, findings)
           const credentialBearing =
             workflowEnvironmentContainsSecret ||
             containsSecretExpression(value) ||
@@ -707,7 +732,7 @@ export const inspectWorkflowPolicy = (
                 inspectFile(target.path, reference.kind)
               }
             } else if (!fullCommitReference.test(reference.reference)) {
-              findings.push({ file, location: reference.location, rule: 'external-action-sha' })
+              findings.push({ file, location: reference.location, rule: 'external-reference-sha' })
             }
           }
         }
@@ -835,7 +860,9 @@ export const inspectWorkflowPolicy = (
 export const formatWorkflowPolicyFindings = (findings: readonly WorkflowPolicyFinding[]) => {
   let output = ''
   if (findings.length > 0) {
-    output = `${findings.map(finding => `${finding.file}:${finding.location}: ${finding.rule}`).join('\n')}\n`
+    output = `${findings
+      .map(finding => `${finding.file}:${finding.location}: ${finding.rule}: ${workflowPolicyGuidance[finding.rule]}`)
+      .join('\n')}\n`
   }
   return output
 }

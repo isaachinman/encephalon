@@ -196,7 +196,7 @@ jobs:
     {
       file: '.github/actions/nested/action.yaml',
       location: 'runs.steps[0].uses',
-      rule: 'external-action-sha',
+      rule: 'external-reference-sha',
     },
   ])
 })
@@ -241,7 +241,7 @@ jobs:
     {
       file: '.github/workflows/action.yml',
       location: 'runs.steps[0].uses',
-      rule: 'external-action-sha',
+      rule: 'external-reference-sha',
     },
   ])
 })
@@ -459,14 +459,23 @@ jobs:
 })
 
 // Mutation caught: treating a local reusable-workflow caller as a runner would require an unsupported caller environment.
-test('allows local reusable workflows to inherit secrets when the consuming runner is protected', () => {
+test('allows local reusable workflows to map or inherit secrets when every consuming runner is protected', () => {
   const root = createFixture({
     '.github/workflows/called.yml': `name: Called
-on: workflow_call
+on:
+  workflow_call:
+    secrets:
+      REUSABLE_TOKEN:
+        required: true
 permissions:
   contents: read
 jobs:
-  consume:
+  consume-inherited:
+    runs-on: ubuntu-latest
+    environment: pullfrog-review
+    steps:
+      - run: echo "\${{ secrets.REUSABLE_TOKEN }}"
+  consume-named:
     runs-on: ubuntu-latest
     environment: pullfrog-review
     steps:
@@ -477,9 +486,13 @@ on: workflow_dispatch
 permissions:
   contents: read
 jobs:
-  call:
+  inherited:
     uses: ./.github/workflows/called.yml
     secrets: inherit
+  named:
+    uses: ./.github/workflows/called.yml
+    secrets:
+      REUSABLE_TOKEN: \${{ secrets.REUSABLE_TOKEN }}
 `,
   })
 
@@ -529,9 +542,11 @@ permissions:
 jobs:
   inherited:
     uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
+    permissions: {}
     secrets: inherit
   named:
     uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
+    permissions: {}
     secrets:
       token: \${{ secrets.TOKEN }}
 `,
@@ -547,6 +562,77 @@ jobs:
       file: '.github/workflows/external.yml',
       location: 'jobs.named.secrets',
       rule: 'credential-forwarding',
+    },
+  ])
+})
+
+// Mutation caught: reusing runner-job permission defaults would give an external reusable workflow configurable repository authority.
+test('accepts a pinned external reusable workflow only with exact empty job permissions', () => {
+  const root = createFixture({
+    '.github/workflows/external.yml': `name: External
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
+    permissions: {}
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [])
+})
+
+// Mutation caught: accepting omitted or non-empty caller permissions would delegate configurable repository authority externally.
+test('rejects omitted or non-empty permissions on external reusable workflows', () => {
+  const root = createFixture({
+    '.github/workflows/external.yml': `name: External
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  non-empty:
+    uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
+    permissions:
+      contents: read
+  omitted:
+    uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/external.yml',
+      location: 'jobs.non-empty.permissions',
+      rule: 'permission',
+    },
+    {
+      file: '.github/workflows/external.yml',
+      location: 'jobs.omitted.permissions',
+      rule: 'permission',
+    },
+  ])
+})
+
+// Mutation caught: limiting immutable-reference diagnostics to action steps would miss mutable reusable-workflow calls.
+test('rejects an unpinned external reusable workflow under the reference taxonomy', () => {
+  const root = createFixture({
+    '.github/workflows/external.yml': `name: External
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: owner/repository/.github/workflows/called.yml@main
+    permissions: {}
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/external.yml',
+      location: 'jobs.call.uses',
+      rule: 'external-reference-sha',
     },
   ])
 })
@@ -1285,17 +1371,17 @@ jobs:
     {
       file: '.github/workflows/references.yml',
       location: 'jobs.verify.steps[1].uses',
-      rule: 'external-action-sha',
+      rule: 'external-reference-sha',
     },
     {
       file: '.github/workflows/references.yml',
       location: 'jobs.verify.steps[2].uses',
-      rule: 'external-action-sha',
+      rule: 'external-reference-sha',
     },
     {
       file: '.github/workflows/references.yml',
       location: 'jobs.verify.steps[3].uses',
-      rule: 'external-action-sha',
+      rule: 'external-reference-sha',
     },
   ])
 })
@@ -1335,24 +1421,24 @@ jobs:
     {
       file: '.github/workflows/a.yaml',
       location: 'jobs.verify.steps[0].uses',
-      rule: 'external-action-sha',
+      rule: 'external-reference-sha',
     },
     {
       file: '.github/workflows/z.yml',
       location: 'jobs.a.steps[0].uses',
-      rule: 'external-action-sha',
+      rule: 'external-reference-sha',
     },
     {
       file: '.github/workflows/z.yml',
       location: 'jobs.z.steps[0].uses',
-      rule: 'external-action-sha',
+      rule: 'external-reference-sha',
     },
   ])
   assert.equal(
     formatWorkflowPolicyFindings(findings),
-    `.github/workflows/a.yaml:jobs.verify.steps[0].uses: external-action-sha
-.github/workflows/z.yml:jobs.a.steps[0].uses: external-action-sha
-.github/workflows/z.yml:jobs.z.steps[0].uses: external-action-sha
+    `.github/workflows/a.yaml:jobs.verify.steps[0].uses: external-reference-sha: pin the external reference to a lowercase 40-character commit SHA
+.github/workflows/z.yml:jobs.a.steps[0].uses: external-reference-sha: pin the external reference to a lowercase 40-character commit SHA
+.github/workflows/z.yml:jobs.z.steps[0].uses: external-reference-sha: pin the external reference to a lowercase 40-character commit SHA
 `,
   )
 })
@@ -1398,7 +1484,10 @@ jobs:
   const failing = spawnSync(process.execPath, [policyPath], { cwd: failingRoot, encoding: 'utf8' })
   assert.equal(failing.status, 1)
   assert.equal(failing.stdout, '')
-  assert.equal(failing.stderr, '.github/workflows/fail.yml:jobs.verify.steps[0].uses: external-action-sha\n')
+  assert.equal(
+    failing.stderr,
+    '.github/workflows/fail.yml:jobs.verify.steps[0].uses: external-reference-sha: pin the external reference to a lowercase 40-character commit SHA\n',
+  )
 })
 
 // This suite owns the structural workflow security contract; test/package.test.ts independently guards its CI bootstrap.
@@ -1518,12 +1607,4 @@ test('repository workflows obey immutable action and credential boundaries', () 
     ],
     version: 2,
   })
-
-  const packageJson = JSON.parse(readFileSync(join(repositoryRoot, 'package.json'), 'utf8')) as {
-    scripts?: Readonly<Record<string, unknown>>
-  }
-  assert.equal(
-    packageJson.scripts?.['check:workflows'],
-    'bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts',
-  )
 })
