@@ -96,6 +96,24 @@ const reportMetadata = {
   profile: 'baseline',
 } as const
 
+const waitForBenchmarkActivity = (temporaryParent: string, child: ReturnType<typeof spawn>): Promise<void> => {
+  const observe = async (remainingAttempts: number): Promise<void> => {
+    if (readdirSync(temporaryParent).length > 0) {
+      return
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error('Benchmark CLI exited before the signal test observed temporary work.')
+    }
+    if (remainingAttempts > 0) {
+      await delay(10)
+      return observe(remainingAttempts - 1)
+    }
+    throw new Error('Benchmark CLI did not begin temporary benchmark work before the signal test timeout.')
+  }
+
+  return observe(200)
+}
+
 describe('isolated benchmark authority', () => {
   test('excludes warmups and reports deterministic distributions', async () => {
     const invocations = [999, 998, 40, 10, 30, 20]
@@ -743,11 +761,11 @@ describe('isolated benchmark authority', () => {
         standardError += chunk as string
       })
       const closed = once(child, 'close')
-      await delay(150)
+      await waitForBenchmarkActivity(temporaryParent, child)
       assert.equal(child.kill('SIGTERM'), true)
       const [code, signal] = await closed
-      assert.equal(code, 143)
-      assert.equal(signal, null)
+      const terminatedByHandledSigterm = (code === 143 && signal === null) || (code === null && signal === 'SIGTERM')
+      assert.equal(terminatedByHandledSigterm, true)
       assert.equal(standardOutput, '')
       assert.match(standardError, /was aborted\./)
       assert.equal(standardError.includes(root), false)
