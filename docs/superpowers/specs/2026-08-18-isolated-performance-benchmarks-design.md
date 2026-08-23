@@ -29,7 +29,7 @@ The parent uses `child_process.fork` with Node IPC, no shell, an empty `execArgv
 
 Public read operations already perform repository resolution, cache preparation, schema/content integrity validation, freshness validation, and result reading within one call. Measuring a separate `prepare()` and subtracting it would double-run work and would not be additive.
 
-A separate stripped internal `cacheReadInstrumentation` authority owns two read-boundary callbacks. `readFreshCache` invokes them immediately before and after the private result reader, while fault-injection hooks remain test-only. A benchmark child records four nested, non-negative phases:
+A separate stripped internal `cacheReadInstrumentation` authority owns the successful cache-validation boundary plus the two result-read boundaries. The shared prepared-cache resolver invokes them around validation and the private result reader, while fault-injection hooks remain test-only. A benchmark child requires exactly one successful validation for every public read sample and records four nested, non-negative phases:
 
 - `totalMs`: the complete public API call;
 - `preparationIntegrityMs`: call start through the verified/fresh cache boundary;
@@ -67,12 +67,12 @@ A failed check names the corpus size, operation or cache, metric, statistic, act
 - `bun run benchmark` and `bun run benchmark:check` remain the entry points.
 - The synthetic corpus, operation inputs, public result shapes, package exports, runtime dependencies, canonical record format, SQLite schema, and product budgets do not change.
 - Raw child stdout is not a protocol and environment values are not copied into reports.
-- Timing does not assert correctness beyond validating the bounded worker result contract.
+- Timing thresholds do not assert structural correctness; the worker's exact-one validation-boundary check does.
 - External benchmark services, 10,000-record product support, runtime optimisation, and platform-specific memory profilers remain out of scope.
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test snapshot is `eae98315e53ce568c62f6854a8542b285b7f9e4f`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
+The exact MAR-2566 implementation and behavioural-test snapshot is `eae98315e53ce568c62f6854a8542b285b7f9e4f`; MAR-2552 extends its stripped read instrumentation at `9b5821d59999215f975d613edf4a9c252fb6258d`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
 
 ## Acceptance coverage
 

@@ -94,9 +94,13 @@ const measure = (operation: BenchmarkOperation, records: number, root: string): 
   const boundary: { state: ReadBoundaryState } = {
     state: preparationOnly ? 'not-applicable' : 'awaiting-before',
   }
+  let integrityValidations = 0
   let resultReadStart: number | undefined
   let resultReadEnd: number | undefined
   if (!preparationOnly) {
+    cacheReadInstrumentation.afterIntegrityValidation = () => {
+      integrityValidations += 1
+    }
     cacheReadInstrumentation.beforeResultRead = () => {
       if (boundary.state !== 'awaiting-before') {
         throw new Error(`The ${operation} benchmark repeated its read boundary.`)
@@ -118,11 +122,15 @@ const measure = (operation: BenchmarkOperation, records: number, root: string): 
     result = runOperation(operation, records, root)
     end = performance.now()
   } finally {
+    cacheReadInstrumentation.afterIntegrityValidation = undefined
     cacheReadInstrumentation.beforeResultRead = undefined
     cacheReadInstrumentation.afterResultRead = undefined
   }
   if (boundary.state !== 'complete' && boundary.state !== 'not-applicable') {
     throw new Error(`The ${operation} benchmark did not report a complete read boundary.`)
+  }
+  if (!preparationOnly && integrityValidations !== 1) {
+    throw new Error(`The ${operation} benchmark did not validate exactly one cache generation.`)
   }
   assertOperationResult(operation, records, result)
   const endingRss = process.memoryUsage().rss

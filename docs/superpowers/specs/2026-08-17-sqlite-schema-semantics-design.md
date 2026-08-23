@@ -110,7 +110,7 @@ The complete lint, four-project typecheck, full test, benchmark, build, package,
 
 - FTS row-text equality remains MAR-2550.
 - Cached record JSON equality with canonical files remains MAR-2571.
-- Per-operation cache-generation memoisation remains MAR-2552.
+- MAR-2552 now retains one verified read transaction per public operation and binds any post-rebuild read to that exact primary; cross-operation cache-generation memoisation remains out of scope.
 - In-place cache migration, user-configurable cache schemas, attached databases, triggers unrelated to the owned schema, and arbitrary same-user mutation inside SQLite's pathname-only open window remain out of scope.
 
 ## Reviewed implementation provenance

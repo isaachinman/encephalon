@@ -1434,7 +1434,7 @@ This hardening is deliberately sequenced after 0.1.0 and must not delay the firs
 
 - [ ] Cache lives only at `node_modules/.cache/encephalon/brain.sqlite`.
 - [ ] It uses one stable WAL database and transactional full rebuilds.
-- [ ] Every read automatically calls prepare.
+- [ ] Every read performs the preparation state machine once and uses the retained verified transaction for its result.
 - [ ] Record and artifact changes invalidate freshness.
 - [ ] Failed hydration rolls back and does not query stale data.
 - [ ] Operation locking covers add, baseline, refresh, prepare, and hydrate.
