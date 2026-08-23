@@ -77,7 +77,7 @@ type CacheDatabasePrimary =
   | { kind: 'existing' }
 
 type VerifiedCacheDatabaseOptions<Database> = {
-  afterVerifiedOpen?: ((database: Database) => void) | undefined
+  afterVerifiedOpen?: ((database: Database, context: { primaryCreated: boolean }) => void) | undefined
   DatabaseConstructor: CacheDatabaseConstructor<Database>
   location: CacheLocation
   missing?: (() => never) | undefined
@@ -109,9 +109,12 @@ export class CacheDatabaseFailure extends Error {
 
 /** @internal */
 export class CacheDatabaseCreationConflict extends Error {
-  constructor() {
-    super('A cache database primary appeared while exclusive creation was attempted.')
+  readonly relativePath: string
+
+  constructor(relativePath: string) {
+    super('A cache database primary changed while exclusive ownership was required.')
     this.name = 'CacheDatabaseCreationConflict'
+    this.relativePath = relativePath
   }
 }
 
@@ -135,6 +138,7 @@ export const failCacheDatabase = (failure: unknown, database: CacheDatabase): ne
 type CacheLocationTestHooks = {
   afterDatabaseLockInitialisation?: ((database: CacheDatabase) => void) | undefined
   afterDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
+  afterPrimaryBootstrapClose?: ((path: string) => void) | undefined
   afterQuarantineRename?: ((path: string) => void) | undefined
   beforeDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
   beforeLocationInspection?: (() => void) | undefined
@@ -493,14 +497,20 @@ const bootstrapPrimary = (
   const path = resolve(location.directory, name)
   const relativePath = databaseRelativePath(name)
   let created = false
+  let createdIdentity: CacheEntryIdentity | undefined
   try {
     const descriptor = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | NO_FOLLOW, 0o600)
-    closeSync(descriptor)
+    try {
+      createdIdentity = identityFrom(fstatSync(descriptor, { bigint: true }))
+    } finally {
+      closeSync(descriptor)
+    }
+    cacheLocationTestHooks.afterPrimaryBootstrapClose?.(path)
     created = true
   } catch (error) {
     if (existingPath(error) && mode === 'create-exclusive') {
       // biome-ignore lint/style/useErrorCause: this internal control sentinel must not retain a path-bearing EEXIST.
-      throw new CacheDatabaseCreationConflict()
+      throw new CacheDatabaseCreationConflict(relativePath)
     }
     if (!existingPath(error)) {
       throw error
@@ -508,23 +518,33 @@ const bootstrapPrimary = (
   }
   const identity = inspectRegularFile(path, relativePath)
   if (identity === undefined) {
-    return changedLayout(relativePath, created ? 'created-file-present' : 'existing-file-present')
+    if (createdIdentity !== undefined) {
+      throw new CacheDatabaseCreationConflict(relativePath)
+    }
+    return changedLayout(relativePath, 'existing-file-present')
   }
-  return identity
+  if (createdIdentity !== undefined && !sameCacheEntryIdentity(createdIdentity, identity)) {
+    throw new CacheDatabaseCreationConflict(relativePath)
+  }
+  return { identity, primaryCreated: created }
 }
 
 const prepareCacheDatabase = (
   location: CacheLocation,
   name: CacheDatabaseName,
   mode: 'create-exclusive' | 'create-if-missing',
-): CacheDatabase => {
+) => {
   assertCacheLocation(location)
   const sidecars = inspectSidecars(location, name)
   const path = resolve(location.directory, name)
   const existing = mode === 'create-if-missing' ? inspectRegularFile(path, databaseRelativePath(name)) : undefined
-  const identity = existing ?? bootstrapPrimary(location, name, mode)
+  const prepared =
+    existing === undefined ? bootstrapPrimary(location, name, mode) : { identity: existing, primaryCreated: false }
   assertCacheLocation(location)
-  return { ...identity, name, sidecars: { ...sidecars, ...inspectSidecars(location, name) } }
+  return {
+    database: { ...prepared.identity, name, sidecars: { ...sidecars, ...inspectSidecars(location, name) } },
+    primaryCreated: prepared.primaryCreated,
+  }
 }
 
 export const inspectCacheDatabase = (location: CacheLocation, name: CacheDatabaseName): CacheDatabase | undefined => {
@@ -565,7 +585,7 @@ const assertOwnedCacheDatabase = (location: CacheLocation, database: CacheDataba
   assertCacheLocation(location)
   const identity = inspectRegularFile(database.path, databaseRelativePath(database.name))
   if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
-    throw new CacheDatabaseCreationConflict()
+    throw new CacheDatabaseCreationConflict(database.relativePath)
   }
   return { ...database, sidecars: reconcileSidecars(location, database) }
 }
@@ -580,10 +600,11 @@ const closeDatabaseAfterFailure = (database: { close: () => void }) => {
 
 const initialCacheDatabase = <Database>(options: VerifiedCacheDatabaseOptions<Database>) => {
   if (options.primary.kind === 'existing') {
-    return inspectCacheDatabase(options.location, options.name)
+    const database = inspectCacheDatabase(options.location, options.name)
+    return database === undefined ? undefined : { database, primaryCreated: false }
   }
   if (options.primary.kind === 'expected-owned') {
-    return assertOwnedCacheDatabase(options.location, options.primary.database)
+    return { database: assertOwnedCacheDatabase(options.location, options.primary.database), primaryCreated: false }
   }
   return prepareCacheDatabase(options.location, options.name, options.primary.kind)
 }
@@ -598,7 +619,8 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
     }
     return fail('INTERNAL_ERROR', 'The requested Encephalon cache database is missing.')
   }
-  let snapshot = initial
+  let snapshot = initial.database
+  let { primaryCreated } = initial
   const ownedPrimary = options.primary.kind === 'create-exclusive' || options.primary.kind === 'expected-owned'
   const assertPrimary = (database: CacheDatabase) =>
     ownedPrimary
@@ -628,7 +650,9 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
     try {
       cacheLocationTestHooks.afterDatabaseOpen?.(snapshot)
       snapshot = assertPrimary(snapshot)
-      options.afterVerifiedOpen?.(database)
+      const context = { primaryCreated }
+      primaryCreated = false
+      options.afterVerifiedOpen?.(database, context)
       if (options.preserveDatabaseLocksAfterInitialisation) {
         cacheLocationTestHooks.afterDatabaseLockInitialisation?.(snapshot)
       }

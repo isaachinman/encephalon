@@ -17,6 +17,7 @@ All notable changes to Encephalon are documented here.
 - Assigned record creation timestamps under the repository operation lock so new records and generated baseline batches remain strictly ordered after canonical history.
 - Made canonical record staging, publication, instruction-file writes, and post-commit recovery safer across filesystem failures.
 - Made cache hydration and gather reads transactional, snapshot-consistent, and resilient to malformed disposable state.
+- Validated disposable SQLite table, constraint, index, and FTS5 semantics before reads or writer mutation, with exact one-generation recovery for incompatible caches.
 - Made compact search avoid materialising full record JSON and removed persistent-style copying from hot scans.
 - Centralised the package version and separated cache schema compatibility from diagnostic package metadata.
 - Improved validation of record graphs, kind directories, artifact paths, Windows filename portability, and locale-independent ordering.
