@@ -27,7 +27,7 @@ The outer disposable-cache recovery wrapper remains the sole retry owner. One in
 
 The verified database identity is captured around SQLite open. `BEGIN` precedes validation; the public result reader completes before `ROLLBACK`; and final database-path identity checks still decide whether the result is accepted. After a rebuild, both the open and final identity checks require the exact rebuilt primary. Rollback and close retain their established primary-failure precedence.
 
-Literal search expressions remain computed exactly once before repository resolution. Empty full or compact searches and eligible empty-only gathers continue to return without repository or cache access.
+Literal search expressions remain computed exactly once before repository resolution. Empty full or compact searches and eligible empty-only gathers continue to validate repository discovery and root installation, then return without cache inspection or SQLite access.
 
 ## Performance evidence
 

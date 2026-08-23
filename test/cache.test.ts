@@ -2183,6 +2183,7 @@ describe('SQLite cache and reads', () => {
     })
     assert.ok(repositoryInspections > 0)
     assert.equal(cacheInspections, 0)
+    assert.equal(integrityProbes, 0)
   })
 
   test('preserves root-install-required before punctuation-only cache fast paths', () => {
@@ -2209,7 +2210,6 @@ describe('SQLite cache and reads', () => {
     assertRootInstallRequired(() => searchCompactRecords({ query, root }))
     assertRootInstallRequired(() => gatherRecords({ root, searches: [query] }))
     assert.equal(cacheInspections, 0)
-    assert.equal(integrityProbes, 0)
   })
 
   test('serves a valid large-summary record through cache preparation and search', () => {
