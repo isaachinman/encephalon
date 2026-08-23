@@ -59,6 +59,10 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-17-sqlite-schema-semantics-design.md'),
       'utf8',
     )
+    const ftsTextIntegrityDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-17-fts-text-integrity-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -74,7 +78,7 @@ describe('package contract', () => {
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `f539720542a3302dd849002652e958da4a6063bf`\./,
+      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`\./,
     )
     assert.match(
       contract,
@@ -100,6 +104,10 @@ describe('package contract', () => {
     assert.match(
       semanticCacheSchemaDesign,
       /The exact reviewed code and behavioural-test snapshot implementing this design is `f539720542a3302dd849002652e958da4a6063bf`\./,
+    )
+    assert.match(
+      ftsTextIntegrityDesign,
+      /The exact reviewed code and behavioural-test snapshot implementing this design is `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),

@@ -796,36 +796,52 @@ const createCacheSchema = (database: DatabaseSync) => {
   `)
 }
 
-const assertCacheSchemaTransaction = (database: DatabaseSync) => {
+const assertCacheTransaction = (database: DatabaseSync, validate: (opened: DatabaseSync) => void): void => {
   database.exec('BEGIN')
   try {
-    assertCacheSchema(database)
+    validate(database)
     database.exec('ROLLBACK')
   } catch (error) {
     try {
       database.exec('ROLLBACK')
     } catch {
-      // Preserve the original schema validation failure.
+      // Preserve the original cache validation failure.
     }
     throw error
   }
 }
 
+const assertCacheSchemaTransaction = (database: DatabaseSync): void => {
+  assertCacheTransaction(database, assertCacheSchema)
+}
+
 type CacheWriterPrimary =
   | { kind: 'create-exclusive' }
   | { kind: 'create-if-missing' }
+  | { database: CacheDatabase; kind: 'expected-new' }
   | { database: CacheDatabase; kind: 'expected-owned' }
 
-const openWriterDatabase = (location: CacheLocation, primary: CacheWriterPrimary = { kind: 'create-if-missing' }) => {
+const openWriterDatabase = (
+  location: CacheLocation,
+  primary: CacheWriterPrimary,
+  validateExisting: (database: DatabaseSync) => void,
+) => {
   const { DatabaseSync: DatabaseConstructor } = loadSQLite()
   verifySQLiteFeatures(DatabaseConstructor)
-  return openVerifiedCacheDatabase({
+  const verifiedPrimary =
+    primary.kind === 'expected-new' ? { database: primary.database, kind: 'expected-owned' as const } : primary
+  let openedPrimaryCreated = false
+  const opened = openVerifiedCacheDatabase({
     afterVerifiedOpen: (database, { primaryCreated }) => {
+      openedPrimaryCreated = primaryCreated
       if (primaryCreated) {
         database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
         createCacheSchema(database)
+      } else if (primary.kind === 'expected-new') {
+        assertEmptyCacheContentTransaction(database)
+        database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
       } else {
-        assertCacheSchemaTransaction(database)
+        validateExisting(database)
         database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
       }
       assertCacheSchemaTransaction(database)
@@ -835,8 +851,9 @@ const openWriterDatabase = (location: CacheLocation, primary: CacheWriterPrimary
     location,
     name: 'brain.sqlite',
     openOptions: { timeout: SQLITE_BUSY_TIMEOUT_MILLISECONDS },
-    primary,
+    primary: verifiedPrimary,
   })
+  return { ...opened, acceptsEmptyContent: openedPrimaryCreated || primary.kind === 'expected-new' }
 }
 
 const NO_VERIFIED_CACHE_RESULT = Symbol('no-verified-cache-result')
@@ -1305,6 +1322,12 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
       throw new CacheSchemaMismatch('The cache record table does not match its canonical JSON.')
     }
   }
+  const expectedSearchRows = new Map(
+    records.map(({ record }) => [
+      Buffer.from(record.id, 'utf8').toString('hex'),
+      Buffer.from(searchDocumentForRecord(record), 'utf8'),
+    ]),
+  )
   const searchProbe = readIntegrityProbe(
     'record-search',
     database
@@ -1347,32 +1370,58 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
     throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
   }
   cacheReadTestHooks.beforeIntegrityTextRead?.('record-search')
-  const counts = database
-    .prepare(
-      `SELECT
-        (SELECT COUNT(*) FROM records) AS records,
-        (SELECT COUNT(*) FROM record_search) AS searchRows,
-        (SELECT COUNT(DISTINCT id) FROM record_search) AS distinctSearchRows,
-        (SELECT COUNT(*) FROM records LEFT JOIN record_search ON records.id = record_search.id WHERE record_search.id IS NULL) AS missingSearchRows,
-        (SELECT COUNT(*) FROM record_search LEFT JOIN records ON records.id = record_search.id WHERE records.id IS NULL) AS orphanSearchRows
-      `,
-    )
-    .get() as {
-    distinctSearchRows?: unknown
-    missingSearchRows?: unknown
-    orphanSearchRows?: unknown
-    records?: unknown
-    searchRows?: unknown
+  const searchRows = database
+    .prepare('SELECT CAST(id AS BLOB) AS id_bytes, CAST(text AS BLOB) AS text_bytes FROM record_search LIMIT ?')
+    .iterate(maximumRows) as Iterable<{ id_bytes?: unknown; text_bytes?: unknown }>
+  for (const row of searchRows) {
+    if (!(row.id_bytes instanceof Uint8Array && row.text_bytes instanceof Uint8Array)) {
+      throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
+    }
+    const idBytes = Buffer.from(row.id_bytes)
+    const expected = expectedSearchRows.get(idBytes.toString('hex'))
+    if (expected === undefined || !expected.equals(Buffer.from(row.text_bytes))) {
+      throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
+    }
+    expectedSearchRows.delete(idBytes.toString('hex'))
   }
-  if (
-    counts.records !== metadata.recordsIndexed ||
-    counts.searchRows !== metadata.recordsIndexed ||
-    counts.distinctSearchRows !== metadata.recordsIndexed ||
-    counts.missingSearchRows !== 0 ||
-    counts.orphanSearchRows !== 0
-  ) {
+  if (expectedSearchRows.size !== 0) {
     throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
   }
+}
+
+const assertExistingCacheContentConsistent = (root: string, database: DatabaseSync): void => {
+  assertCacheSchema(database)
+  const metadata = readMetadata(database)
+  if (metadata === undefined) {
+    throw new CacheSchemaMismatch('The cache metadata is incomplete.')
+  }
+  assertCacheScope(root, metadata)
+  assertCacheContentConsistent(database, metadata)
+}
+
+const assertEmptyCacheContent = (database: DatabaseSync): void => {
+  assertCacheSchema(database)
+  const rows = database
+    .prepare(
+      `SELECT
+        EXISTS(SELECT 1 FROM metadata LIMIT 1) AS metadata_rows,
+        EXISTS(SELECT 1 FROM records LIMIT 1) AS record_rows,
+        EXISTS(SELECT 1 FROM record_search LIMIT 1) AS search_rows`,
+    )
+    .get() as { metadata_rows?: unknown; record_rows?: unknown; search_rows?: unknown }
+  if (rows.metadata_rows !== 0 || rows.record_rows !== 0 || rows.search_rows !== 0) {
+    throw new CacheSchemaMismatch('The newly created cache is not empty.')
+  }
+}
+
+const assertExistingCacheContentTransaction = (root: string, database: DatabaseSync): void => {
+  assertCacheTransaction(database, opened => {
+    assertExistingCacheContentConsistent(root, opened)
+  })
+}
+
+const assertEmptyCacheContentTransaction = (database: DatabaseSync): void => {
+  assertCacheTransaction(database, assertEmptyCacheContent)
 }
 
 const metadataIsFresh = (
@@ -1491,7 +1540,9 @@ const rebuildCache = (
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
     let opened: ReturnType<typeof openWriterDatabase>
     try {
-      opened = openWriterDatabase(location, nextWriterPrimary)
+      opened = openWriterDatabase(location, nextWriterPrimary, openedDatabase => {
+        assertExistingCacheContentTransaction(root, openedDatabase)
+      })
     } catch (error) {
       if (error instanceof CacheDatabaseCreationConflict && primary.kind === 'create-if-missing') {
         return fail('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
@@ -1501,17 +1552,25 @@ const rebuildCache = (
       }
       throw error
     }
-    const { database, identity } = opened
-    nextWriterPrimary = { database: identity, kind: 'expected-owned' }
+    const { acceptsEmptyContent, database, identity } = opened
+    if (acceptsEmptyContent) {
+      nextWriterPrimary = { database: identity, kind: 'expected-new' }
+    } else if (nextWriterPrimary.kind === 'create-if-missing') {
+      nextWriterPrimary = { kind: 'create-if-missing' }
+    } else {
+      nextWriterPrimary = { database: identity, kind: 'expected-owned' }
+    }
     let rebuildResult: PrepareResult | undefined
     let writerFailure: unknown
     let writerFailed = false
     try {
       database.exec('BEGIN IMMEDIATE')
       try {
-        assertCacheSchema(database)
-        const existingMetadata = readMetadata(database)
-        assertCacheScope(root, existingMetadata)
+        if (acceptsEmptyContent) {
+          assertEmptyCacheContent(database)
+        } else {
+          assertExistingCacheContentConsistent(root, database)
+        }
         database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
         const insertRecord = database.prepare(`
           INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)

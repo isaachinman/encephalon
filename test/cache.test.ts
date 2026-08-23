@@ -2663,7 +2663,7 @@ describe('SQLite cache and reads', () => {
         assert.ok(result.recordsCreated !== undefined && result.recordsCreated.length > 0, name)
       }
       assert.equal(primaryQuarantines, 1, name)
-      assert.equal(writerInitialisations, 2, name)
+      assert.equal(writerInitialisations, 1, name)
       cacheLocationTestHooks.beforeQuarantineRename = undefined
       cacheReadTestHooks.duringDatabaseInitialisation = undefined
     }
@@ -2821,6 +2821,109 @@ describe('SQLite cache and reads', () => {
     assert.equal(writerInitialisations, 2)
     assert.deepEqual(result, { hydrated: true, recordsIndexed: 1 })
     assert.equal(existsSync(predecessorPath), true)
+  })
+
+  test('rejects a non-empty exclusively claimed primary before a repository-change retry', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'non-empty-retry-cache-predecessor.sqlite')
+    let canonicalValidations = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      canonicalValidations += 1
+      if (canonicalValidations === 2) {
+        mutateCache(root, database => {
+          database.prepare("INSERT INTO record_search(id, text) VALUES ('injected-retry-row', 'untrusted')").run()
+        })
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (writerInitialisations === 1) {
+          const recordPath = join(root, String(record.path))
+          writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+        }
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        return true
+      },
+    )
+    assert.equal(writerInitialisations, 1)
+    const preserved = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      assert.equal(
+        preserved.prepare("SELECT COUNT(*) AS count FROM record_search WHERE id = 'injected-retry-row'").get()?.count,
+        1,
+      )
+    } finally {
+      preserved.close()
+    }
+  })
+
+  test('rejects a non-empty exclusively claimed primary after writer initialisation', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'post-initialisation-retry-cache-predecessor.sqlite')
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (writerInitialisations === 1) {
+          const recordPath = join(root, String(record.path))
+          writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+        }
+        if (writerInitialisations === 2) {
+          mutateCache(root, database => {
+            database
+              .prepare("INSERT INTO record_search(id, text) VALUES ('post-initialisation-row', 'untrusted')")
+              .run()
+          })
+        }
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'INTERNAL_ERROR')
+        return true
+      },
+    )
+    assert.equal(writerInitialisations, 2)
+    const preserved = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      assert.equal(
+        preserved.prepare("SELECT COUNT(*) AS count FROM record_search WHERE id = 'post-initialisation-row'").get()
+          ?.count,
+        1,
+      )
+    } finally {
+      preserved.close()
+    }
   })
 
   test('preserves a successor swapped between exclusively claimed primary retries', () => {
@@ -3674,6 +3777,41 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('quarantines an existing metadata-less cache before mutating bounded tables', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    mutateCache(root, database => {
+      database.exec(`
+        DELETE FROM metadata;
+        WITH RECURSIVE generated(value) AS (
+          SELECT 1
+          UNION ALL
+          SELECT value + 1 FROM generated WHERE value < 1001
+        )
+        INSERT INTO record_search(id, text)
+        SELECT printf('metadata-less-%04d', value), 'untrusted search text'
+        FROM generated;
+      `)
+    })
+    const original = lstatSync(databasePath, { bigint: true })
+    let exactQuarantines = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const current = lstatSync(path, { bigint: true })
+        if (current.dev === original.dev && current.ino === original.ino) {
+          exactQuarantines += 1
+        }
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
+      hydrated: true,
+      recordsIndexed: 1,
+    })
+    assert.equal(exactQuarantines, 1)
+  })
+
   test('recovers one exact semantically incompatible cache during a public read', () => {
     const root = createRoot()
     const record = addCacheRecord(root)
@@ -3852,6 +3990,41 @@ describe('SQLite cache and reads', () => {
     assert.equal(queryFailures, 1)
     assert.equal(primaryQuarantines, 1)
     assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 1)
+  })
+
+  test('revalidates exact FTS content after writer initialisation and before rebuild mutation', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const original = lstatSync(databasePath, { bigint: true })
+    let exactQuarantines = 0
+    let mutated = false
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const current = lstatSync(path, { bigint: true })
+        if (current.dev === original.dev && current.ino === original.ino) {
+          exactQuarantines += 1
+        }
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (!mutated) {
+          mutated = true
+          mutateCache(root, database => {
+            database.prepare("UPDATE record_search SET text = 'mutated after writer initialisation'").run()
+          })
+        }
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }), {
+      recordsIndexed: 1,
+    })
+    assert.equal(exactQuarantines, 1)
     assert.equal(writerInitialisations, 2)
   })
 
@@ -4275,7 +4448,7 @@ describe('SQLite cache and reads', () => {
     )
     assert.equal(primaryQuarantines, 0)
     assert.equal(recoveryRebuilds, 0)
-    assert.equal(writerInitialisations, 1)
+    assert.equal(writerInitialisations, 0)
     const afterIdentity = lstatSync(databasePath, { bigint: true })
     assert.deepEqual(
       { dev: afterIdentity.dev, ino: afterIdentity.ino },
@@ -4629,6 +4802,13 @@ describe('SQLite cache and reads', () => {
         name: 'oversized FTS text containing NUL',
       },
       {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.prepare('UPDATE record_search SET id = ?').run('x'.repeat(256))
+        },
+        name: 'oversized textual FTS ID',
+      },
+      {
         expectedRows: 24,
         mutate: (database: DatabaseSync) => {
           database.exec(`
@@ -4716,7 +4896,7 @@ describe('SQLite cache and reads', () => {
     }
   })
 
-  test('accepts exact cache per-value byte boundaries', () => {
+  test('bounds exact cache per-value bytes before semantic FTS recovery', () => {
     const root = createRoot()
     addCacheRecord(root)
     mutateCache(root, database => {
@@ -4742,7 +4922,7 @@ describe('SQLite cache and reads', () => {
     const observations = observeCacheIntegrity()
 
     assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
-      hydrated: false,
+      hydrated: true,
       recordsIndexed: 1,
     })
     for (const probe of [
@@ -4759,7 +4939,7 @@ describe('SQLite cache and reads', () => {
     }
   })
 
-  test('accepts exact aggregate, row-count, and recordsIndexed boundaries', () => {
+  test('bounds exact aggregate, row-count, and recordsIndexed values before semantic recovery', () => {
     const root = createRoot()
     addCacheRecord(root)
     mutateCache(root, database => {
@@ -4822,8 +5002,8 @@ describe('SQLite cache and reads', () => {
     const observations = observeCacheIntegrity()
 
     assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
-      hydrated: false,
-      recordsIndexed: 1000,
+      hydrated: true,
+      recordsIndexed: 1,
     })
     for (const probe of [
       { name: 'metadata', rows: 6 },
@@ -4926,23 +5106,226 @@ describe('SQLite cache and reads', () => {
     }
   })
 
-  test('rebuilds missing and duplicate FTS rows', () => {
-    for (const duplicate of [false, true]) {
+  test('recovers a non-canonical FTS projection during a representative public read', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const original = lstatSync(databasePath, { bigint: true })
+    const expected = Buffer.from(
+      [
+        'context',
+        'cache.validation',
+        'agent',
+        'Cache record',
+        '{"detail":"cache corruption marker","summary":"Cache record"}',
+        'recoverable cache row',
+      ].join('\n'),
+      'utf8',
+    )
+    mutateCache(root, database => {
+      database.prepare("UPDATE record_search SET text = 'x' || substr(text, 2) WHERE id = ?").run(String(record.id))
+    })
+    const observations = observeCacheIntegrity()
+    let exactQuarantines = 0
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const current = lstatSync(path, { bigint: true })
+        if (current.dev === original.dev && current.ino === original.ino) {
+          exactQuarantines += 1
+        }
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const listed = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')({
+      root,
+    })
+    assert.deepEqual(
+      listed.map(item => item.id),
+      [record.id],
+    )
+    const corruptProbe = observations.findIndex(
+      observation => observation.kind === 'probe' && observation.name === 'record-search' && observation.rows === 1,
+    )
+    assert.notEqual(corruptProbe, -1)
+    assert.deepEqual(observations.at(corruptProbe + 1), { kind: 'text-read', name: 'record-search' })
+    assert.equal(exactQuarantines, 1)
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 1)
+    const rebuilt = new DatabaseSync(databasePath, { readOnly: true })
+    try {
+      const row = rebuilt
+        .prepare('SELECT CAST(text AS BLOB) AS bytes FROM record_search WHERE id = ?')
+        .get(String(record.id)) as {
+        bytes?: unknown
+      }
+      assert.equal(row.bytes instanceof Uint8Array, true)
+      assert.deepEqual(Buffer.from(row.bytes as Uint8Array), expected)
+    } finally {
+      rebuilt.close()
+    }
+  })
+
+  test('rejects invalid FTS bytes that decode to the canonical JavaScript string during forced hydrate', () => {
+    const root = createRoot()
+    const id = 'invalid-fts-bytes'
+    functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id,
+      kind: 'context',
+      payload: { marker: '�' },
+      root,
+      source: 'agent',
+      subject: 'cache.invalid-fts-bytes',
+    })
+    const canonical = 'context\ncache.invalid-fts-bytes\nagent\n{"marker":"�"}'
+    const canonicalBytes = Buffer.from(canonical, 'utf8')
+    const replacementBytes = Buffer.from('�', 'utf8')
+    const replacementOffset = canonicalBytes.indexOf(replacementBytes)
+    assert.notEqual(replacementOffset, -1)
+    const invalidBytes = Buffer.concat([
+      canonicalBytes.subarray(0, replacementOffset),
+      Buffer.from([0x80]),
+      canonicalBytes.subarray(replacementOffset + replacementBytes.length),
+    ])
+    mutateCache(root, database => {
+      database.prepare('UPDATE record_search SET text = CAST(? AS TEXT) WHERE id = ?').run(invalidBytes, id)
+      const row = database
+        .prepare('SELECT text, CAST(text AS BLOB) AS bytes FROM record_search WHERE id = ?')
+        .get(id) as { bytes?: unknown; text?: unknown }
+      assert.equal(row.text, canonical)
+      assert.equal(row.bytes instanceof Uint8Array, true)
+      assert.deepEqual(Buffer.from(row.bytes as Uint8Array), invalidBytes)
+      assert.equal(database.prepare('PRAGMA journal_mode = DELETE').get()?.journal_mode, 'delete')
+    })
+    let quarantines = 0
+    let recoveryRebuilds = 0
+    let writerInitialisations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        const predecessor = new DatabaseSync(path, { readOnly: true })
+        try {
+          assert.equal(predecessor.prepare('PRAGMA journal_mode').get()?.journal_mode, 'delete')
+        } finally {
+          predecessor.close()
+        }
+        quarantines += 1
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }), {
+      recordsIndexed: 1,
+    })
+    assert.equal(quarantines, 1)
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 1)
+    const rebuilt = new DatabaseSync(cacheDatabasePath(root), { readOnly: true })
+    try {
+      const row = rebuilt.prepare('SELECT CAST(text AS BLOB) AS bytes FROM record_search WHERE id = ?').get(id) as {
+        bytes?: unknown
+      }
+      assert.equal(row.bytes instanceof Uint8Array, true)
+      assert.deepEqual(Buffer.from(row.bytes as Uint8Array), canonicalBytes)
+    } finally {
+      rebuilt.close()
+    }
+  })
+
+  test('rebuilds missing, duplicate, and orphaned FTS rows', () => {
+    const cases = [
+      {
+        mutate: (database: DatabaseSync, id: string) => {
+          database.prepare('DELETE FROM record_search WHERE id = ?').run(id)
+        },
+        name: 'missing row',
+      },
+      {
+        mutate: (database: DatabaseSync, id: string) => {
+          database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)').run(id, 'duplicate search row')
+        },
+        name: 'duplicate ID',
+      },
+      {
+        mutate: (database: DatabaseSync, id: string) => {
+          database.prepare("UPDATE record_search SET id = 'orphan-search-row' WHERE id = ?").run(id)
+        },
+        name: 'same-count orphan',
+      },
+    ] as const
+
+    for (const fixture of cases) {
       const root = createRoot()
       const record = addCacheRecord(root)
       mutateCache(root, database => {
-        if (duplicate) {
-          database
-            .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
-            .run(String(record.id), 'duplicate search row')
-        } else {
-          database.prepare('DELETE FROM record_search WHERE id = ?').run(String(record.id))
-        }
+        fixture.mutate(database, String(record.id))
       })
-      assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }), {
-        hydrated: true,
-        recordsIndexed: 1,
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 1 },
+        fixture.name,
+      )
+    }
+  })
+
+  test('binds every same-count FTS projection to exactly one cached record ID', () => {
+    const cases = [
+      {
+        mutate: (database: DatabaseSync, first: { id: string; text: string }, second: { id: string; text: string }) => {
+          database.prepare('UPDATE record_search SET text = ? WHERE id = ?').run(second.text, first.id)
+          database.prepare('UPDATE record_search SET text = ? WHERE id = ?').run(first.text, second.id)
+        },
+        name: 'swapped canonical texts',
+      },
+      {
+        mutate: (database: DatabaseSync, first: { id: string; text: string }, second: { id: string; text: string }) => {
+          database.prepare('DELETE FROM record_search WHERE id = ?').run(second.id)
+          database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)').run(first.id, first.text)
+        },
+        name: 'duplicate first ID with second ID missing',
+      },
+    ] as const
+
+    for (const fixture of cases) {
+      const root = createRoot()
+      addCacheRecord(root)
+      functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')({
+        id: 'cache-record-two',
+        kind: 'context',
+        payload: { summary: 'Second cache record' },
+        root,
+        source: 'agent',
+        subject: 'cache.validation.two',
       })
+      mutateCache(root, database => {
+        const rows = database.prepare('SELECT id, text FROM record_search ORDER BY id').all() as Array<{
+          id: string
+          text: string
+        }>
+        assert.equal(rows.length, 2)
+        fixture.mutate(database, rows[0] as { id: string; text: string }, rows[1] as { id: string; text: string })
+      })
+
+      assert.deepEqual(
+        functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        { hydrated: true, recordsIndexed: 2 },
+        fixture.name,
+      )
     }
   })
 
