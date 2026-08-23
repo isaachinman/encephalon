@@ -4331,77 +4331,144 @@ describe('SQLite cache and reads', () => {
     }
   })
 
-  test('does not rebuild twice when canonical state changes before the post-rebuild read', () => {
+  test('validates a forced gather rebuild once before materialising its result', () => {
     const root = createRoot()
     const record = addCacheRecord(root)
-    const databasePath = cacheDatabasePath(root)
-    renameSync(databasePath, join(root, 'missing-read-predecessor.sqlite'))
     let readerInitialisations = 0
     let writerInitialisations = 0
     cacheReadTestHooks.duringDatabaseInitialisation = mode => {
       if (mode === 'reader') {
         readerInitialisations += 1
-        if (readerInitialisations === 1) {
-          const { path, ...recordFile } = record
-          writeFileSync(
-            join(root, String(path)),
-            `${JSON.stringify({ ...recordFile, payload: { summary: 'Changed after rebuild' } }, null, 2)}\n`,
-          )
-        }
       } else {
         writerInitialisations += 1
       }
     }
 
-    assert.throws(
-      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
-      (error: unknown) => {
-        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
-        return true
-      },
-    )
+    const result = functionFromApi<
+      (input: Record<string, unknown>) => {
+        hydrated: { recordsIndexed?: unknown } | null
+        records: Array<{ record: { id?: unknown } | null }>
+        searches: Array<{ results: Array<{ id?: unknown }> }>
+      }
+    >('gatherRecords')({
+      hydrate: true,
+      root,
+      searches: ['recoverable cache row'],
+      shows: [record.id],
+    })
+
+    assert.equal(result.hydrated?.recordsIndexed, 1)
+    assert.equal(result.records[0]?.record?.id, record.id)
+    assert.equal(result.searches[0]?.results[0]?.id, record.id)
     assert.equal(readerInitialisations, 1)
     assert.equal(writerInitialisations, 1)
   })
 
-  test('preserves a stale successor installed after corrupt-cache recovery', () => {
-    const root = createRoot()
-    const record = addCacheRecord(root)
-    const databasePath = cacheDatabasePath(root)
-    const successorSource = join(root, 'post-rebuild-successor.sqlite')
-    const displacedRebuild = join(root, 'post-rebuild-owned.sqlite')
-    copyFileSync(databasePath, successorSource)
-    mutateCache(root, database => {
-      database.prepare("UPDATE record_search SET text = 'corrupt' WHERE id = ?").run(String(record.id))
-    })
-    let recoveryRebuilds = 0
-    let writerInitialisations = 0
-    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
-      recoveryRebuilds += 1
-      const { path, ...recordFile } = record
-      writeFileSync(
-        join(root, String(path)),
-        `${JSON.stringify({ ...recordFile, payload: { summary: 'Changed before successor read' } }, null, 2)}\n`,
-      )
-      renameSync(databasePath, displacedRebuild)
-      copyFileSync(successorSource, databasePath)
-    }
-    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
-      if (mode === 'writer') {
-        writerInitialisations += 1
-      }
-    }
-
-    assert.throws(
-      () => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
-      (error: unknown) => {
-        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
-        return true
+  test('does not rebuild twice when canonical state changes before the post-rebuild read', () => {
+    const cases = [
+      {
+        arrange: (root: string) => {
+          renameSync(cacheDatabasePath(root), join(root, 'missing-read-predecessor.sqlite'))
+        },
+        name: 'automatic list',
+        read: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
       },
-    )
-    assert.equal(recoveryRebuilds, 1)
-    assert.equal(writerInitialisations, 1)
-    assert.deepEqual(readFileSync(databasePath), readFileSync(successorSource))
+      {
+        arrange: (_root: string) => undefined,
+        name: 'forced gather hydration',
+        read: (root: string) =>
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ hydrate: true, root }),
+      },
+    ]
+
+    for (const entry of cases) {
+      const root = createRoot()
+      const record = addCacheRecord(root)
+      entry.arrange(root)
+      let readerInitialisations = 0
+      let writerInitialisations = 0
+      cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+        if (mode === 'reader') {
+          readerInitialisations += 1
+          if (readerInitialisations === 1) {
+            const { path, ...recordFile } = record
+            writeFileSync(
+              join(root, String(path)),
+              `${JSON.stringify({ ...recordFile, payload: { summary: 'Changed after rebuild' } }, null, 2)}\n`,
+            )
+          }
+        } else {
+          writerInitialisations += 1
+        }
+      }
+
+      assert.throws(
+        () => entry.read(root),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED', entry.name)
+          return true
+        },
+      )
+      assert.equal(readerInitialisations, 1, entry.name)
+      assert.equal(writerInitialisations, 1, entry.name)
+      cacheReadTestHooks.duringDatabaseInitialisation = undefined
+    }
+  })
+
+  test('preserves a stale successor installed after corrupt-cache recovery', () => {
+    const cases = [
+      {
+        name: 'automatic list',
+        read: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')({ root }),
+      },
+      {
+        name: 'forced gather hydration',
+        read: (root: string) =>
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ hydrate: true, root }),
+      },
+    ]
+
+    for (const entry of cases) {
+      const root = createRoot()
+      const record = addCacheRecord(root)
+      const databasePath = cacheDatabasePath(root)
+      const successorSource = join(root, 'post-rebuild-successor.sqlite')
+      const displacedRebuild = join(root, 'post-rebuild-owned.sqlite')
+      copyFileSync(databasePath, successorSource)
+      mutateCache(root, database => {
+        database.prepare("UPDATE record_search SET text = 'corrupt' WHERE id = ?").run(String(record.id))
+      })
+      let recoveryRebuilds = 0
+      let writerInitialisations = 0
+      cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+        recoveryRebuilds += 1
+        const { path, ...recordFile } = record
+        writeFileSync(
+          join(root, String(path)),
+          `${JSON.stringify({ ...recordFile, payload: { summary: 'Changed before successor read' } }, null, 2)}\n`,
+        )
+        renameSync(databasePath, displacedRebuild)
+        copyFileSync(successorSource, databasePath)
+      }
+      cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+        if (mode === 'writer') {
+          writerInitialisations += 1
+        }
+      }
+
+      assert.throws(
+        () => entry.read(root),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED', entry.name)
+          return true
+        },
+      )
+      assert.equal(recoveryRebuilds, 1, entry.name)
+      assert.equal(writerInitialisations, 1, entry.name)
+      assert.deepEqual(readFileSync(databasePath), readFileSync(successorSource), entry.name)
+      cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
+      cacheReadTestHooks.duringDatabaseInitialisation = undefined
+    }
   })
 
   test('normalises repeated SQLite schema failures before public wrapping', () => {

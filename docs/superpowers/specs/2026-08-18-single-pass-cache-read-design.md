@@ -41,7 +41,7 @@ The stripped benchmark instrumentation reports a complete validation boundary in
 - A semantic cache corruption produces one exact quarantine, one rebuild, two reader initialisations total, and the canonical result.
 - Canonical mutation before the post-rebuild read reports `REPOSITORY_CHANGED` after exactly one writer initialisation.
 - Replacing a recovered primary with a valid stale successor preserves that successor byte-for-byte and reports `REPOSITORY_CHANGED` after one recovery rebuild.
-- Punctuation-only searches observe no repository, cache-location, or integrity work.
+- Punctuation-only searches retain repository and root-installation validation but observe no cache-location or integrity work.
 - Reintroducing prepare-then-read orchestration makes all three focused single-pass tests fail.
 
 ## Reviewed implementation provenance
