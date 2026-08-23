@@ -18,7 +18,7 @@ Preserve Unicode search terms when Encephalon converts user text into an FTS5 `M
 
 ## Design
 
-One internal, dependency-free literal-query module owns validation, normalization, tokenization, and FTS expression construction.
+One internal search-text module owns shared NFC normalization, query validation, tokenization, and FTS expression construction.
 
 1. Require a string and enforce the existing 1,024-byte budget against the original UTF-8 input. Normalization cannot make an oversized request admissible.
 2. Normalize the accepted input to Unicode NFC.
@@ -38,8 +38,8 @@ The produced query remains input to FTS5's own `unicode61` tokenizer. A quoted t
 - Full search computes the literal expression before opening the prepared cache read.
 - Compact search performs the same pre-I/O validation and passes the computed expression into its prepared statement reader.
 - Gather computes every expression once before repository resolution and passes those expressions into its shared prepared statement reader.
-- Standalone full/compact searches with zero normalized terms return `[]` before repository discovery, cache inspection, or SQLite access.
-- A gather containing only zero-term searches, no shows, and no hydration request returns its empty search envelopes before repository/cache work. Mixed gathers still perform requested shows, hydration, and non-empty searches while skipping `MATCH` execution for each empty query.
+- Standalone full/compact searches with zero normalized terms return `[]` after required repository discovery and root-installation validation but before cache inspection or SQLite access.
+- A gather containing only zero-term searches, no shows, and no hydration request returns its empty search envelopes after required repository/root-installation validation but before cache work. Mixed gathers still perform requested shows, hydration, and non-empty searches while skipping `MATCH` execution for each empty query.
 
 No result shape, response budget, limit, supersession, cache-recovery, or error-code behaviour changes. Existing BM25 ordering, tie-breakers, and snippet construction remain unchanged; newly matched or NFC-normalized Unicode text can necessarily change affected result membership, rank values, and snippet code-point bytes.
 
@@ -54,11 +54,11 @@ No result shape, response budget, limit, supersession, cache-recovery, or error-
 
 - A pure parser table covers accented Latin, Greek, Cyrillic, Arabic, Hebrew, CJK, combining-mark scripts, composed/decomposed input, underscore compatibility, duplicates, operators, wildcards, quotes, punctuation, controls, and empty normalized output.
 - One integration fixture proves Unicode matches through full search, compact search, and gather without changing ASCII ordering or snippets.
-- One public no-I/O test proves punctuation/control-only input returns empty results before repository/cache hooks.
+- One public fast-path test proves punctuation/control-only input retains repository/root-installation validation while returning empty results before cache hooks.
 - One public add, prepare, list, and search regression proves a valid record using NFC's threefold UTF-8 expansion remains readable after cache rebuilding.
 - Packed CLI validation proves a Unicode query reaches the same public search path.
 - Existing exact byte/term budget tests remain the budget authority and are not duplicated.
 
 ## Reviewed implementation provenance
 
-The exact implementation and behavioural-test snapshot is `1274d11a1d0d3102e03a23fb091612f02813def3`. Documentation does not change the public API, package exports, cache schema, canonical record format, or operation budgets.
+The exact implementation and behavioural-test snapshot is `3b468b264e227ec1cd9cdd6913b036368a13c076`. Documentation does not change the public API, package exports, cache schema, canonical record format, or operation budgets.

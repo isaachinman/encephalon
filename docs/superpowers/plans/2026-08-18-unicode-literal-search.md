@@ -6,10 +6,10 @@
 ## Task 1: Characterise literal Unicode terms
 
 - [x] Add a pure parser table for scripts, canonical equivalence, combining marks, underscore compatibility, duplicates, and hostile FTS syntax.
-- [x] Add one public zero-term no-I/O case.
+- [x] Add one public zero-term cache-fast-path case that retains repository/root-installation validation.
 - [x] Run the focused command and record the exact RED.
 
-## Task 2: Implement one literal-query authority
+## Task 2: Implement one search-text authority
 
 - [x] Move literal query validation/construction into one internal module.
 - [x] Preserve original UTF-8 byte and normalized term budgets.
@@ -34,8 +34,8 @@
 
 ## Implementation evidence
 
-- RED: the pure parser command failed because `src/literal-query.ts` did not exist; the focused cache command failed 0/2 because composed Unicode input was discarded and punctuation-only search entered repository resolution.
-- GREEN: the parser passes 2/2, focused Unicode/no-I/O integration passes 2/2, and the affected cache/parser suites pass 156/156.
+- RED: the pure parser command failed because the search-text authority did not exist; the focused cache command failed 0/2 because composed Unicode input was discarded and punctuation-only search entered cache resolution.
+- GREEN: the parser passes 2/2, focused Unicode/cache-fast-path integration passes 2/2, and the affected cache/parser suites pass 156/156.
 - Removing query NFC makes the parser case fail; removing derived-document NFC makes the integration case fail. Restored production passes both.
 - Review remediation reproduced and fixed three independent failures: maximum NFC expansion exceeded the old derived FTS bounds, an exclusively created cache primary disappearing before inspection bypassed the existing creation-conflict retry, and primary disappearance during the SQLite constructor was wrapped before revalidation. All focused regressions and their deliberate mutations pass/fail as expected.
-- Lint, all four TypeScript projects, the full suite (526 pass, 0 fail, 2 established capability skips), both benchmarks, build, packed-package Unicode CLI validation, publish contract, frozen install, declarations, Bun/config, and diff-hygiene gates pass after review remediation at `1274d11a1d0d3102e03a23fb091612f02813def3`.
+- Lint, all four TypeScript projects, the full suite (526 pass, 0 fail, 2 established capability skips), both benchmarks, build, packed-package Unicode CLI validation, publish contract, frozen install, declarations, Bun/config, and diff-hygiene gates pass after review remediation at `3b468b264e227ec1cd9cdd6913b036368a13c076`.

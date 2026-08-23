@@ -76,7 +76,7 @@ npx --no-install encephalon gather \
   --show "<record-id>"
 ```
 
-Every `list`, `show`, `search`, and `gather` call prepares the cache automatically. `prepare` reuses a valid fresh cache and rebuilds after canonical inputs change or a recoverable cache failure; `hydrate` forces a transactional rebuild.
+Every `list` and `show` call, and every `search` or `gather` call that needs records, prepares the cache automatically. A literal search with no extracted terms still validates the repository and root installation but skips cache preparation. `prepare` reuses a valid fresh cache and rebuilds after canonical inputs change or a recoverable cache failure; `hydrate` forces a transactional rebuild.
 
 ```bash
 npx --no-install encephalon list --kind decision
@@ -86,7 +86,7 @@ npx --no-install encephalon validate
 
 Active records are returned by default. Add `--include-superseded` to `list`, `search`, or `gather` when historical records are needed. Missing `show` results are `null`, and empty searches are `[]`.
 
-Search text is literal rather than raw FTS syntax. Encephalon checks the original UTF-8 byte limit, normalizes the query and derived cached search document to NFC, preserves Unicode letter/number terms with attached combining marks, quotes every term, and combines terms with `AND`. Accented Latin, Greek, Cyrillic, Arabic, Hebrew, CJK, and combining-mark scripts therefore remain searchable without exposing FTS operators, wildcards, quotes, punctuation, or controls. Standalone punctuation-only searches, and gather calls containing only such searches with no shows or hydration, return empty results before repository or cache access.
+Search text is literal rather than raw FTS syntax. Encephalon checks the original UTF-8 byte limit, normalizes the query and derived cached search document to NFC, preserves Unicode letter/number terms with attached combining marks, quotes every term, and combines terms with `AND`. Accented Latin, Greek, Cyrillic, Arabic, Hebrew, CJK, and combining-mark scripts therefore remain searchable without exposing FTS operators, wildcards, quotes, punctuation, or controls. Standalone punctuation-only searches, and gather calls containing only such searches with no shows or hydration, return empty results after required repository/root-installation validation and before cache access.
 
 ### Operation budgets
 
