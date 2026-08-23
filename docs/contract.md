@@ -175,7 +175,7 @@ MAR-2565 validated mutation cache construction, deterministic disk fallback, and
 - MAR-2574 cannot satisfy its least-authority acceptance criteria until a reviewed upstream Pullfrog release removes the internal MCP contents-write authority and makes the agent-runtime production dependency closure lock-verifiable, followed by the protected-environment rollout and an approved exact-head dispatch. This contract does not claim acceptance, rollout, or GitHub settings completion.
 - The workflow tooling uses official exact `@types/bun@1.3.1` declarations only as a development dependency. Bun types and `skipLibCheck` are limited to `tsconfig.scripts.json`, the historical handwritten `scripts/bun-runtime.d.ts` declaration is removed, and the Node consumer/runtime remains unchanged with zero published runtime dependencies.
 
-The final repository-controlled implementation and behavioural-test snapshot for this boundary is `31ba01944a1e4afccf867c7f7607859c437f3e0e`. This provenance is additive to the older change provenance below. Documentation after that snapshot records the boundary without changing workflow behaviour.
+The final repository-controlled implementation and behavioural-test snapshot for this boundary is `a242d3f614775d24694ca7122c40efbbc6ec1a1a`. It includes Windows-safe native-path comparison, junction-aware fixtures, and parser trigger-key normalisation. This provenance is additive to the older change provenance below. Documentation after that snapshot records the boundary without changing workflow behaviour.
 
 ## Package and Release Gates
 
