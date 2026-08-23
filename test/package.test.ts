@@ -217,6 +217,7 @@ describe('package contract', () => {
     assert.doesNotMatch(skill, /node \.\/node_modules\/encephalon\/dist\/cli\.mjs/)
   })
 
+  // This bootstrap assertion executes independently so disabling the workflow security suite cannot disable its CI gate.
   test('runs pull-request and current-Node package checks with a trusted release gate', () => {
     const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
     const readme = readFileSync(resolve(root, 'README.md'), 'utf8')

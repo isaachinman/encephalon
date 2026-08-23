@@ -10,6 +10,7 @@ import { formatWorkflowPolicyFindings, inspectWorkflowPolicy } from './workflow-
 const temporaryRoots: string[] = []
 const policyPath = fileURLToPath(new URL('./workflow-policy.ts', import.meta.url))
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url))
+const directorySymlinkType = process.platform === 'win32' ? 'junction' : 'dir'
 
 type PullfrogStep = Record<string, unknown> & {
   env?: unknown
@@ -29,6 +30,7 @@ type PullfrogWorkflow = Record<string, unknown> & {
   name?: unknown
   permissions?: unknown
   'run-name'?: unknown
+  on?: unknown
   true?: unknown
 }
 
@@ -76,11 +78,18 @@ const assertExactPullfrogJob = (job: PullfrogJob) => {
 }
 
 const assertExactPullfrogWorkflow = (workflow: PullfrogWorkflow) => {
-  assert.deepEqual(Object.keys(workflow).toSorted(), ['jobs', 'name', 'permissions', 'run-name', 'true'])
+  const triggerKeys = Object.keys(workflow).filter(key => key === 'on' || key === 'true')
+  assert.equal(triggerKeys.length, 1)
+  assert.deepEqual(
+    Object.keys(workflow)
+      .filter(key => key !== 'on' && key !== 'true')
+      .toSorted(),
+    ['jobs', 'name', 'permissions', 'run-name'],
+  )
   assert.equal(workflow.name, 'Pullfrog')
   assert.equal(workflow['run-name'], `${'$'}{{ inputs.name || github.workflow }}`)
   assert.deepEqual(workflow.permissions, { contents: 'read' })
-  assert.deepEqual(workflow.true, {
+  assert.deepEqual(workflow.on ?? workflow.true, {
     workflow_dispatch: {
       inputs: {
         name: {
@@ -646,6 +655,38 @@ runs:
   ])
 })
 
+// Mutation caught: normalising POSIX backslashes as separators would hide an ancestor symlink behind a slash-shaped path.
+test('rejects a POSIX ancestor symlink whose backslash name resembles a slash path', {
+  skip: process.platform === 'win32' ? 'Windows treats backslashes as path separators.' : false,
+}, () => {
+  const root = createFixture({
+    '.github/actions/slash/path/checked/action.yml': `name: Checked
+runs:
+  using: composite
+  steps: []
+`,
+    '.github/workflows/backslash.yml': `name: Backslash
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/slash\\path/checked
+`,
+  })
+  symlinkSync(join(root, '.github/actions/slash/path'), join(root, '.github/actions/slash\\path'), directorySymlinkType)
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/backslash.yml',
+      location: 'jobs.verify.steps[0].uses',
+      rule: 'local-reference',
+    },
+  ])
+})
+
 // Mutation caught: trusting lexical paths, directory defaults, or raw parsing would accept unsafe targets or crash on malformed YAML.
 test('accepts only unambiguous regular local YAML targets within the native repository path', () => {
   const root = createFixture({
@@ -678,7 +719,7 @@ runs:
 `,
   })
   symlinkSync(join(outside, 'action/action.yml'), join(root, '.github/actions/ambiguous/action.yaml'))
-  symlinkSync(join(outside, 'action'), join(root, '.github/actions/symlinked'))
+  symlinkSync(join(outside, 'action'), join(root, '.github/actions/symlinked'), directorySymlinkType)
 
   assert.deepEqual(inspectWorkflowPolicy(root), [
     {
@@ -728,7 +769,11 @@ jobs: {}
   const symlinkedDirectoryRoot = createFixture({
     '.github/placeholder': 'fixture\n',
   })
-  symlinkSync(join(outside, '.github/workflows'), join(symlinkedDirectoryRoot, '.github/workflows'), 'dir')
+  symlinkSync(
+    join(outside, '.github/workflows'),
+    join(symlinkedDirectoryRoot, '.github/workflows'),
+    directorySymlinkType,
+  )
 
   const candidateRoot = createFixture({
     '.github/workflows/directory.yaml/placeholder': 'fixture\n',
@@ -770,7 +815,7 @@ test('rejects a symlinked GitHub parent even when its workflow child is absent',
   const root = createFixture({
     'README.md': 'fixture\n',
   })
-  symlinkSync(join(outside, '.github'), join(root, '.github'), 'dir')
+  symlinkSync(join(outside, '.github'), join(root, '.github'), directorySymlinkType)
 
   assert.deepEqual(inspectWorkflowPolicy(root), [
     {
@@ -786,7 +831,7 @@ test('rejects dangling symlinks at either workflow discovery directory', () => {
   const danglingGithubRoot = createFixture({
     'README.md': 'fixture\n',
   })
-  symlinkSync(join(danglingGithubRoot, 'missing-github'), join(danglingGithubRoot, '.github'), 'dir')
+  symlinkSync(join(danglingGithubRoot, 'missing-github'), join(danglingGithubRoot, '.github'), directorySymlinkType)
 
   const danglingWorkflowsRoot = createFixture({
     '.github/placeholder': 'fixture\n',
@@ -794,7 +839,7 @@ test('rejects dangling symlinks at either workflow discovery directory', () => {
   symlinkSync(
     join(danglingWorkflowsRoot, '.github/missing-workflows'),
     join(danglingWorkflowsRoot, '.github/workflows'),
-    'dir',
+    directorySymlinkType,
   )
 
   const expectedFinding = [
@@ -946,6 +991,7 @@ jobs:
   assert.equal(failing.stderr, '.github/workflows/fail.yml:jobs.verify.steps[0].uses: external-action-sha\n')
 })
 
+// This suite owns the structural workflow security contract; test/package.test.ts independently guards its CI bootstrap.
 // Mutation caught: mutable actions, hidden local wrappers, unprotected credentials, or write permissions would escape repository policy.
 test('repository workflows obey immutable action and credential boundaries', () => {
   assert.deepEqual(inspectWorkflowPolicy(repositoryRoot), [])
@@ -956,6 +1002,9 @@ test('repository workflows obey immutable action and credential boundaries', () 
   ) as PullfrogWorkflow
   const pullfrogJob = pullfrogWorkflow.jobs.pullfrog
   assertExactPullfrogWorkflow(pullfrogWorkflow)
+  const { true: bunTrigger, ...stablePullfrogWorkflow } = pullfrogWorkflow
+  assertExactPullfrogWorkflow({ ...stablePullfrogWorkflow, on: bunTrigger })
+  assert.throws(() => assertExactPullfrogWorkflow({ ...pullfrogWorkflow, on: pullfrogWorkflow.true }))
 
   // Mutations caught: credentials cannot be inherited from workflow scope and action families cannot hide in sibling jobs.
   assert.throws(() =>

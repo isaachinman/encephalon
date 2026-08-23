@@ -21,6 +21,7 @@ export type WorkflowPolicyFinding = Readonly<{
 
 type ParsedObject = Record<string, unknown>
 
+// Scripts keep local witness/error semantics instead of importing runtime BrainError modules.
 type DirectoryObservation =
   | Readonly<{ kind: 'directory'; stats: BigIntStats }>
   | Readonly<{ kind: 'invalid' }>
@@ -76,7 +77,13 @@ const objectLocation = (location: string, key: string) => {
 
 const relativeFile = (root: string, path: string) => relative(root, path).split(sep).join('/')
 
-const isContainedPath = (root: string, path: string) => path === root || path.startsWith(`${root}${sep}`)
+const comparablePath = (path: string) =>
+  process.platform === 'win32' ? path.replaceAll('\\', '/').toLowerCase() : path
+
+const samePath = (first: string, second: string) => comparablePath(first) === comparablePath(second)
+
+const isContainedPath = (root: string, path: string) =>
+  samePath(root, path) || comparablePath(path).startsWith(`${comparablePath(root)}/`)
 
 const hasErrorCode = (value: unknown, code: string) => {
   let matches = false
@@ -121,13 +128,18 @@ const isRegularNativeFile = (root: string, path: string) => {
   return (
     stats?.isFile() === true &&
     stats.isSymbolicLink() === false &&
-    nativePath === path &&
+    nativePath !== undefined &&
+    samePath(nativePath, path) &&
     isContainedPath(root, nativePath)
   )
 }
 
 const isNativeDirectory = (root: string, path: string, stats: BigIntStats, nativePath: string | undefined) =>
-  stats.isDirectory() && !stats.isSymbolicLink() && nativePath === path && isContainedPath(root, path)
+  stats.isDirectory() &&
+  !stats.isSymbolicLink() &&
+  nativePath !== undefined &&
+  samePath(nativePath, path) &&
+  isContainedPath(root, path)
 
 const observeNativeDirectory = (root: string, path: string): DirectoryObservation => {
   let observation: DirectoryObservation = { kind: 'invalid' }
@@ -165,7 +177,7 @@ const readValidatedNativeFile = (root: string, path: string) => {
     if (
       initialStats.isFile() &&
       !initialStats.isSymbolicLink() &&
-      initialNativePath === path &&
+      samePath(initialNativePath, path) &&
       isContainedPath(root, initialNativePath)
     ) {
       const noFollow = constants.O_NOFOLLOW ?? 0
@@ -179,7 +191,7 @@ const readValidatedNativeFile = (root: string, path: string) => {
         if (
           finalStats.isFile() &&
           !finalStats.isSymbolicLink() &&
-          finalNativePath === path &&
+          samePath(finalNativePath, path) &&
           isContainedPath(root, finalNativePath) &&
           hasStableFileIdentity(beforeReadStats, afterReadStats) &&
           hasStableFileIdentity(afterReadStats, finalStats)
@@ -227,7 +239,8 @@ const resolveLocalTarget = (root: string, reference: string) => {
       const nativeDirectoryIsValid =
         directoryStats?.isDirectory() === true &&
         directoryStats.isSymbolicLink() === false &&
-        nativeDirectory === candidate &&
+        nativeDirectory !== undefined &&
+        samePath(nativeDirectory, candidate) &&
         isContainedPath(root, nativeDirectory)
       if (nativeDirectoryIsValid) {
         const presentActionTargets = ['action.yml', 'action.yaml']
@@ -424,8 +437,9 @@ export const inspectWorkflowPolicy = (root: string): readonly WorkflowPolicyFind
   const parsedPaths = new Set<string>()
 
   const inspectFile = (path: string, rootWorkflow: boolean) => {
-    if (!parsedPaths.has(path)) {
-      parsedPaths.add(path)
+    const parsedPath = comparablePath(path)
+    if (!parsedPaths.has(parsedPath)) {
+      parsedPaths.add(parsedPath)
       const file = relativeFile(nativeRoot, path)
       let document: ParsedObject | undefined
       try {
