@@ -10,6 +10,8 @@ import {
   realpathSync,
 } from 'node:fs'
 import { extname, relative, resolve, sep } from 'node:path'
+import { sameStableEntryMetadata } from '../src/filesystem-entry.ts'
+import { ordinalStringCompare } from '../src/order.ts'
 
 export type WorkflowPolicyRule =
   | 'credential-environment'
@@ -17,6 +19,7 @@ export type WorkflowPolicyRule =
   | 'external-action-sha'
   | 'local-reference'
   | 'permission'
+  | 'source-integrity'
 
 export type WorkflowPolicyFinding = Readonly<{
   file: string
@@ -32,7 +35,62 @@ type ExecutableReference = Readonly<{
   reference: string
 }>
 
-// Scripts keep local witness/error semantics instead of importing runtime BrainError modules.
+type WorkflowPolicyOptions = Readonly<{
+  beforeFinalRevalidation?: () => void
+}>
+
+type FileWitness = Readonly<{
+  metadata: BigIntStats
+  path: string
+}>
+
+type ValidatedNativeFile = Readonly<{
+  contents: string
+  witness: FileWitness
+}>
+
+type SourceFileObservation =
+  | Readonly<{ kind: 'file'; metadata: BigIntStats }>
+  | Readonly<{ kind: 'invalid' }>
+  | Readonly<{ kind: 'missing' }>
+
+type ActionManifestWitness = Readonly<{
+  observation: Exclude<SourceFileObservation, Readonly<{ kind: 'invalid' }>>
+  path: string
+}>
+
+type ActionDirectoryWitness = Readonly<{
+  candidates: readonly ActionManifestWitness[]
+  metadata: BigIntStats
+  path: string
+  target: string
+}>
+
+type LocalTargetResult =
+  | Readonly<{ kind: 'local-reference' }>
+  | Readonly<{ kind: 'resolved'; actionDirectoryWitness?: ActionDirectoryWitness; path: string }>
+  | Readonly<{ kind: 'source-integrity' }>
+
+type WorkflowDiscoveryWitness =
+  | Readonly<{ kind: 'github-missing'; root: FileSystemDirectoryWitness }>
+  | Readonly<{
+      github: FileSystemDirectoryWitness
+      kind: 'workflows-missing'
+      root: FileSystemDirectoryWitness
+    }>
+  | Readonly<{
+      github: FileSystemDirectoryWitness
+      kind: 'workflows-present'
+      root: FileSystemDirectoryWitness
+      workflows: FileSystemDirectoryWitness
+    }>
+
+type FileSystemDirectoryWitness = Readonly<{
+  metadata: BigIntStats
+  path: string
+}>
+
+// Policy keeps local directory-observation/failure semantics instead of importing runtime witness/error modules.
 type DirectoryObservation =
   | Readonly<{ kind: 'directory'; stats: BigIntStats }>
   | Readonly<{ kind: 'invalid' }>
@@ -47,24 +105,20 @@ const expressionClosing = '}}'
 const secretsIdentifier = 'secrets'
 const workflowFilename = /\.ya?ml$/u
 const protectedEnvironment = 'pullfrog-review'
-
-const compareStrings = (left: string, right: string) => {
-  let comparison = 0
-  if (left < right) {
-    comparison = -1
-  } else if (left > right) {
-    comparison = 1
-  }
-  return comparison
-}
+const actionManifestFilenames = ['action.yml', 'action.yaml'] as const
+const sourceIntegrityFinding = {
+  file: '.github/workflows',
+  location: '$',
+  rule: 'source-integrity',
+} as const satisfies WorkflowPolicyFinding
 
 const compareFindings = (left: WorkflowPolicyFinding, right: WorkflowPolicyFinding) => {
-  let comparison = compareStrings(left.file, right.file)
+  let comparison = ordinalStringCompare(left.file, right.file)
   if (comparison === 0) {
-    comparison = compareStrings(left.location, right.location)
+    comparison = ordinalStringCompare(left.location, right.location)
   }
   if (comparison === 0) {
-    comparison = compareStrings(left.rule, right.rule)
+    comparison = ordinalStringCompare(left.rule, right.rule)
   }
   return comparison
 }
@@ -96,25 +150,6 @@ const hasErrorCode = (value: unknown, code: string) => {
   return matches
 }
 
-const readStats = (path: string) => {
-  let stats: BigIntStats | undefined
-  try {
-    stats = lstatSync(path, { bigint: true })
-  } catch {
-    stats = undefined
-  }
-  return stats
-}
-
-const hasStableFileIdentity = (left: BigIntStats, right: BigIntStats) =>
-  left.dev === right.dev &&
-  left.ino === right.ino &&
-  left.size === right.size &&
-  left.mode === right.mode &&
-  left.birthtimeNs === right.birthtimeNs &&
-  left.mtimeNs === right.mtimeNs &&
-  left.ctimeNs === right.ctimeNs
-
 const readRealPath = (path: string) => {
   let nativePath: string | undefined
   try {
@@ -127,17 +162,29 @@ const readRealPath = (path: string) => {
 
 const isSingleLinkRegularFile = (stats: BigIntStats) => stats.isFile() && stats.nlink === 1n
 
-const isRegularNativeFile = (root: string, path: string) => {
-  const stats = readStats(path)
-  const nativePath = readRealPath(path)
-  return (
-    stats !== undefined &&
-    isSingleLinkRegularFile(stats) &&
-    stats.isSymbolicLink() === false &&
-    nativePath !== undefined &&
-    samePath(nativePath, path) &&
-    isContainedPath(root, nativePath)
-  )
+const observeNativeFile = (root: string, path: string): SourceFileObservation => {
+  let observation: SourceFileObservation = { kind: 'invalid' }
+  let metadata: BigIntStats | undefined
+  try {
+    metadata = lstatSync(path, { bigint: true })
+  } catch (error) {
+    if (hasErrorCode(error, 'ENOENT')) {
+      observation = { kind: 'missing' }
+    }
+  }
+  if (metadata !== undefined) {
+    const nativePath = readRealPath(path)
+    if (
+      isSingleLinkRegularFile(metadata) &&
+      !metadata.isSymbolicLink() &&
+      nativePath !== undefined &&
+      samePath(nativePath, path) &&
+      isContainedPath(root, nativePath)
+    ) {
+      observation = { kind: 'file', metadata }
+    }
+  }
+  return observation
 }
 
 const isNativeDirectory = (root: string, path: string, stats: BigIntStats, nativePath: string | undefined) =>
@@ -171,10 +218,10 @@ const observeNativeDirectory = (root: string, path: string): DirectoryObservatio
 }
 
 const isSameDirectoryGeneration = (initial: DirectoryObservation, final: DirectoryObservation) =>
-  initial.kind === 'directory' && final.kind === 'directory' && hasStableFileIdentity(initial.stats, final.stats)
+  initial.kind === 'directory' && final.kind === 'directory' && sameStableEntryMetadata(initial.stats, final.stats)
 
-const readValidatedNativeFile = (root: string, path: string) => {
-  let contents: string | undefined
+const readValidatedNativeFile = (root: string, path: string): ValidatedNativeFile | undefined => {
+  let validatedFile: ValidatedNativeFile | undefined
   let descriptor: number | undefined
   let operationFailed = false
   try {
@@ -189,7 +236,7 @@ const readValidatedNativeFile = (root: string, path: string) => {
       const noFollow = constants.O_NOFOLLOW ?? 0
       descriptor = openSync(path, constants.O_RDONLY | noFollow)
       const beforeReadStats = fstatSync(descriptor, { bigint: true })
-      if (isSingleLinkRegularFile(beforeReadStats) && hasStableFileIdentity(initialStats, beforeReadStats)) {
+      if (isSingleLinkRegularFile(beforeReadStats) && sameStableEntryMetadata(initialStats, beforeReadStats)) {
         const candidateContents = readFileSync(descriptor, 'utf8')
         const afterReadStats = fstatSync(descriptor, { bigint: true })
         const finalStats = lstatSync(path, { bigint: true })
@@ -200,10 +247,13 @@ const readValidatedNativeFile = (root: string, path: string) => {
           !finalStats.isSymbolicLink() &&
           samePath(finalNativePath, path) &&
           isContainedPath(root, finalNativePath) &&
-          hasStableFileIdentity(beforeReadStats, afterReadStats) &&
-          hasStableFileIdentity(afterReadStats, finalStats)
+          sameStableEntryMetadata(beforeReadStats, afterReadStats) &&
+          sameStableEntryMetadata(afterReadStats, finalStats)
         ) {
-          contents = candidateContents
+          validatedFile = {
+            contents: candidateContents,
+            witness: { metadata: finalStats, path },
+          }
         } else {
           operationFailed = true
         }
@@ -226,45 +276,143 @@ const readValidatedNativeFile = (root: string, path: string) => {
     }
   }
   if (operationFailed || closeFailed) {
-    contents = undefined
+    validatedFile = undefined
   }
-  return contents
+  return validatedFile
 }
 
-const resolveLocalTarget = (root: string, reference: string, kind: ExecutableReference['kind']) => {
-  const repositoryRelativeReference = reference.startsWith('$/') ? `./${reference.slice(2)}` : reference
-  const candidate = resolve(root, repositoryRelativeReference)
-  let target: string | undefined
-  if (isContainedPath(root, candidate)) {
-    if (kind === 'workflow' && (extname(candidate) === '.yml' || extname(candidate) === '.yaml')) {
-      if (isRegularNativeFile(root, candidate)) {
-        target = candidate
-      }
-    } else if (kind === 'action') {
-      const directoryStats = readStats(candidate)
-      const nativeDirectory = readRealPath(candidate)
-      const nativeDirectoryIsValid =
-        directoryStats?.isDirectory() === true &&
-        directoryStats.isSymbolicLink() === false &&
-        nativeDirectory !== undefined &&
-        samePath(nativeDirectory, candidate) &&
-        isContainedPath(root, nativeDirectory)
-      if (nativeDirectoryIsValid) {
-        const presentActionTargets = ['action.yml', 'action.yaml']
-          .map(filename => resolve(candidate, filename))
-          .filter(path => readStats(path) !== undefined)
-        const [onlyActionTarget] = presentActionTargets
-        if (
-          presentActionTargets.length === 1 &&
-          onlyActionTarget !== undefined &&
-          isRegularNativeFile(root, onlyActionTarget)
-        ) {
-          target = onlyActionTarget
+const captureActionDirectoryTarget = (root: string, path: string): LocalTargetResult => {
+  const initialDirectory = observeNativeDirectory(root, path)
+  let result: LocalTargetResult = { kind: 'source-integrity' }
+  if (initialDirectory.kind === 'missing') {
+    result = { kind: 'local-reference' }
+  } else if (initialDirectory.kind === 'directory') {
+    const candidates = actionManifestFilenames.map(filename => {
+      const candidatePath = resolve(path, filename)
+      return { observation: observeNativeFile(root, candidatePath), path: candidatePath }
+    })
+    const finalDirectory = observeNativeDirectory(root, path)
+    if (isSameDirectoryGeneration(initialDirectory, finalDirectory)) {
+      const invalidCandidate = candidates.some(candidate => candidate.observation.kind === 'invalid')
+      const presentCandidates = candidates.filter(
+        (
+          candidate,
+        ): candidate is Readonly<{
+          observation: Readonly<{ kind: 'file'; metadata: BigIntStats }>
+          path: string
+        }> => candidate.observation.kind === 'file',
+      )
+      if (invalidCandidate || presentCandidates.length > 1) {
+        result = { kind: 'source-integrity' }
+      } else if (presentCandidates.length === 0) {
+        result = { kind: 'local-reference' }
+      } else {
+        const [presentCandidate] = presentCandidates
+        if (presentCandidate !== undefined && finalDirectory.kind === 'directory') {
+          result = {
+            actionDirectoryWitness: {
+              candidates: candidates as readonly ActionManifestWitness[],
+              metadata: finalDirectory.stats,
+              path,
+              target: presentCandidate.path,
+            },
+            kind: 'resolved',
+            path: presentCandidate.path,
+          }
         }
       }
     }
   }
-  return target
+  return result
+}
+
+const resolveLocalTarget = (root: string, reference: string, kind: ExecutableReference['kind']): LocalTargetResult => {
+  const repositoryRelativeReference = reference.startsWith('$/') ? `./${reference.slice(2)}` : reference
+  const candidate = resolve(root, repositoryRelativeReference)
+  let result: LocalTargetResult = { kind: 'local-reference' }
+  if (isContainedPath(root, candidate)) {
+    if (kind === 'workflow' && (extname(candidate) === '.yml' || extname(candidate) === '.yaml')) {
+      const observation = observeNativeFile(root, candidate)
+      if (observation.kind === 'file') {
+        result = { kind: 'resolved', path: candidate }
+      } else if (observation.kind === 'invalid') {
+        result = { kind: 'source-integrity' }
+      }
+    } else if (kind === 'action') {
+      result = captureActionDirectoryTarget(root, candidate)
+    }
+  }
+  return result
+}
+
+const sameAcceptedFileObservation = (
+  expected: ActionManifestWitness['observation'],
+  current: SourceFileObservation,
+) => {
+  let matches = expected.kind === 'missing' && current.kind === 'missing'
+  if (expected.kind === 'file' && current.kind === 'file') {
+    matches = sameStableEntryMetadata(expected.metadata, current.metadata)
+  }
+  return matches
+}
+
+const sameActionDirectoryWitness = (left: ActionDirectoryWitness, right: ActionDirectoryWitness) =>
+  samePath(left.path, right.path) &&
+  samePath(left.target, right.target) &&
+  sameStableEntryMetadata(left.metadata, right.metadata) &&
+  left.candidates.length === right.candidates.length &&
+  left.candidates.every((candidate, index) => {
+    const otherCandidate = right.candidates[index]
+    return (
+      otherCandidate !== undefined &&
+      samePath(candidate.path, otherCandidate.path) &&
+      sameAcceptedFileObservation(candidate.observation, otherCandidate.observation)
+    )
+  })
+
+const revalidateFileWitness = (root: string, witness: FileWitness) => {
+  const current = observeNativeFile(root, witness.path)
+  return current.kind === 'file' && sameStableEntryMetadata(witness.metadata, current.metadata)
+}
+
+const revalidateActionDirectoryWitness = (root: string, witness: ActionDirectoryWitness) => {
+  const currentDirectory = observeNativeDirectory(root, witness.path)
+  return (
+    currentDirectory.kind === 'directory' &&
+    sameStableEntryMetadata(witness.metadata, currentDirectory.stats) &&
+    witness.candidates.every(candidate => {
+      const current = observeNativeFile(root, candidate.path)
+      return sameAcceptedFileObservation(candidate.observation, current)
+    })
+  )
+}
+
+const directoryWitness = (path: string, observation: DirectoryObservation) => {
+  let witness: FileSystemDirectoryWitness | undefined
+  if (observation.kind === 'directory') {
+    witness = { metadata: observation.stats, path }
+  }
+  return witness
+}
+
+const revalidateDirectoryWitness = (root: string, witness: FileSystemDirectoryWitness) => {
+  const current = observeNativeDirectory(root, witness.path)
+  return current.kind === 'directory' && sameStableEntryMetadata(witness.metadata, current.stats)
+}
+
+const revalidateWorkflowDiscovery = (root: string, witness: WorkflowDiscoveryWitness) => {
+  let accepted = revalidateDirectoryWitness(root, witness.root)
+  if (witness.kind === 'github-missing') {
+    accepted = accepted && observeNativeDirectory(root, resolve(root, '.github')).kind === 'missing'
+  } else {
+    accepted = accepted && revalidateDirectoryWitness(root, witness.github)
+    if (witness.kind === 'workflows-missing') {
+      accepted = accepted && observeNativeDirectory(root, resolve(root, '.github/workflows')).kind === 'missing'
+    } else {
+      accepted = accepted && revalidateDirectoryWitness(root, witness.workflows)
+    }
+  }
+  return accepted
 }
 
 const stepReferences = (value: unknown, location: string): readonly ExecutableReference[] => {
@@ -493,133 +641,195 @@ const inspectWorkflowJobs = (document: ParsedObject, file: string, findings: Wor
   }
 }
 
-export const inspectWorkflowPolicy = (root: string): readonly WorkflowPolicyFinding[] => {
+export const inspectWorkflowPolicy = (
+  root: string,
+  options: WorkflowPolicyOptions = {},
+): readonly WorkflowPolicyFinding[] => {
   const nativeRoot = readRealPath(resolve(root))
+  let policyFindings: readonly WorkflowPolicyFinding[] = [sourceIntegrityFinding]
   if (nativeRoot === undefined) {
-    return [{ file: '.github/workflows', location: '$', rule: 'local-reference' }]
-  }
-  const findings: WorkflowPolicyFinding[] = []
-  const parsedPaths = new Set<string>()
+    policyFindings = [sourceIntegrityFinding]
+  } else {
+    const findings: WorkflowPolicyFinding[] = []
+    const roleVisits = new Set<string>()
+    const fileWitnesses = new Map<string, FileWitness>()
+    const actionDirectoryWitnesses = new Map<string, ActionDirectoryWitness>()
+    let traversalIntegrityAccepted = true
 
-  const inspectFile = (path: string, kind: ExecutableReference['kind']) => {
-    const parsedPath = comparablePath(path)
-    if (!parsedPaths.has(parsedPath)) {
-      parsedPaths.add(parsedPath)
-      const file = relativeFile(nativeRoot, path)
-      let document: ParsedObject | undefined
-      try {
-        const contents = readValidatedNativeFile(nativeRoot, path)
-        const parsed = contents === undefined ? undefined : Bun.YAML.parse(contents)
-        if (isPlainObject(parsed)) {
-          document = parsed
-        }
-      } catch {
-        document = undefined
-      }
-
-      if (document === undefined) {
-        findings.push({ file, location: '$', rule: 'local-reference' })
-      } else {
-        if (kind === 'workflow') {
-          inspectWorkflowPermissions(document, file, findings)
-          inspectWorkflowJobs(document, file, findings)
-        }
-
-        for (const reference of executableReferences(document, kind)) {
-          if (localReference.test(reference.reference)) {
-            const workspaceRelativeAction = reference.kind === 'action' && reference.reference.startsWith('./')
-            const target = workspaceRelativeAction
-              ? undefined
-              : resolveLocalTarget(nativeRoot, reference.reference, reference.kind)
-            if (target === undefined) {
-              findings.push({ file, location: reference.location, rule: 'local-reference' })
-            } else {
-              inspectFile(target, reference.kind)
-            }
-          } else if (!fullCommitReference.test(reference.reference)) {
-            findings.push({ file, location: reference.location, rule: 'external-action-sha' })
-          }
-        }
-      }
-    }
-  }
-
-  const githubDirectory = resolve(nativeRoot, '.github')
-  const workflowsDirectory = resolve(githubDirectory, 'workflows')
-  const initialRoot = observeNativeDirectory(nativeRoot, nativeRoot)
-  const initialGithubDirectory = observeNativeDirectory(nativeRoot, githubDirectory)
-  const generationFindings: WorkflowPolicyFinding[] = []
-  let discoveryAccepted = false
-
-  if (initialRoot.kind === 'directory') {
-    if (initialGithubDirectory.kind === 'missing') {
-      const secondGithubDirectory = observeNativeDirectory(nativeRoot, githubDirectory)
-      const finalRoot = observeNativeDirectory(nativeRoot, nativeRoot)
-      discoveryAccepted = secondGithubDirectory.kind === 'missing' && isSameDirectoryGeneration(initialRoot, finalRoot)
-    } else if (initialGithubDirectory.kind === 'directory') {
-      const initialWorkflowsDirectory = observeNativeDirectory(nativeRoot, workflowsDirectory)
-      if (initialWorkflowsDirectory.kind === 'missing') {
-        const secondWorkflowsDirectory = observeNativeDirectory(nativeRoot, workflowsDirectory)
-        const finalGithubDirectory = observeNativeDirectory(nativeRoot, githubDirectory)
-        discoveryAccepted =
-          secondWorkflowsDirectory.kind === 'missing' &&
-          isSameDirectoryGeneration(initialGithubDirectory, finalGithubDirectory)
-      } else if (initialWorkflowsDirectory.kind === 'directory') {
-        let directory: ReturnType<typeof opendirSync> | undefined
-        let operationFailed = false
-        const generationFindingStart = findings.length
+    const inspectFile = (path: string, kind: ExecutableReference['kind']) => {
+      const visitKey = `${kind}\0${comparablePath(path)}`
+      if (!roleVisits.has(visitKey)) {
+        roleVisits.add(visitKey)
+        const file = relativeFile(nativeRoot, path)
+        let document: ParsedObject | undefined
+        let validatedFile: ValidatedNativeFile | undefined
         try {
-          directory = opendirSync(workflowsDirectory)
-          const workflowPaths: string[] = []
-          let entry = directory.readSync()
-          while (entry !== null) {
-            if (workflowFilename.test(entry.name)) {
-              workflowPaths.push(resolve(workflowsDirectory, entry.name))
-            }
-            entry = directory.readSync()
-          }
-          workflowPaths.sort(compareStrings)
-          for (const path of workflowPaths) {
-            inspectFile(path, 'workflow')
-          }
-
-          const finalWorkflowsDirectory = observeNativeDirectory(nativeRoot, workflowsDirectory)
-          const finalGithubDirectory = observeNativeDirectory(nativeRoot, githubDirectory)
-          if (
-            isSameDirectoryGeneration(initialWorkflowsDirectory, finalWorkflowsDirectory) &&
-            isSameDirectoryGeneration(initialGithubDirectory, finalGithubDirectory)
-          ) {
-            discoveryAccepted = true
-          } else {
-            operationFailed = true
+          validatedFile = readValidatedNativeFile(nativeRoot, path)
+          const parsed = validatedFile === undefined ? undefined : Bun.YAML.parse(validatedFile.contents)
+          if (isPlainObject(parsed)) {
+            document = parsed
           }
         } catch {
-          operationFailed = true
+          document = undefined
         }
-        generationFindings.push(...findings.splice(generationFindingStart))
 
-        let closeFailed = false
-        if (directory !== undefined) {
-          try {
-            directory.closeSync()
-          } catch {
-            closeFailed = true
-          }
+        if (validatedFile !== undefined) {
+          fileWitnesses.set(visitKey, validatedFile.witness)
         }
-        if (operationFailed || closeFailed) {
-          discoveryAccepted = false
+        if (document === undefined) {
+          findings.push({ file, location: '$', rule: 'source-integrity' })
+        } else {
+          if (kind === 'workflow') {
+            inspectWorkflowPermissions(document, file, findings)
+            inspectWorkflowJobs(document, file, findings)
+          }
+
+          for (const reference of executableReferences(document, kind)) {
+            if (localReference.test(reference.reference)) {
+              const workspaceRelativeAction = reference.kind === 'action' && reference.reference.startsWith('./')
+              const target = workspaceRelativeAction
+                ? ({ kind: 'local-reference' } as const)
+                : resolveLocalTarget(nativeRoot, reference.reference, reference.kind)
+              if (target.kind === 'local-reference') {
+                findings.push({ file, location: reference.location, rule: 'local-reference' })
+              } else if (target.kind === 'source-integrity') {
+                findings.push({ file, location: reference.location, rule: 'source-integrity' })
+              } else {
+                if (target.actionDirectoryWitness !== undefined) {
+                  const directoryKey = comparablePath(target.actionDirectoryWitness.path)
+                  const existingWitness = actionDirectoryWitnesses.get(directoryKey)
+                  if (existingWitness === undefined) {
+                    actionDirectoryWitnesses.set(directoryKey, target.actionDirectoryWitness)
+                  } else if (!sameActionDirectoryWitness(existingWitness, target.actionDirectoryWitness)) {
+                    traversalIntegrityAccepted = false
+                  }
+                }
+                inspectFile(target.path, reference.kind)
+              }
+            } else if (!fullCommitReference.test(reference.reference)) {
+              findings.push({ file, location: reference.location, rule: 'external-action-sha' })
+            }
+          }
         }
       }
     }
-  }
 
-  if (discoveryAccepted) {
-    findings.push(...generationFindings)
-  } else {
-    findings.push({ file: '.github/workflows', location: '$', rule: 'local-reference' })
-  }
+    const githubDirectory = resolve(nativeRoot, '.github')
+    const workflowsDirectory = resolve(githubDirectory, 'workflows')
+    const initialRoot = observeNativeDirectory(nativeRoot, nativeRoot)
+    const initialGithubDirectory = observeNativeDirectory(nativeRoot, githubDirectory)
+    let discoveryWitness: WorkflowDiscoveryWitness | undefined
 
-  return findings.sort(compareFindings)
+    if (initialRoot.kind === 'directory') {
+      if (initialGithubDirectory.kind === 'missing') {
+        const secondGithubDirectory = observeNativeDirectory(nativeRoot, githubDirectory)
+        const finalRoot = observeNativeDirectory(nativeRoot, nativeRoot)
+        const rootWitness = directoryWitness(nativeRoot, finalRoot)
+        if (
+          secondGithubDirectory.kind === 'missing' &&
+          isSameDirectoryGeneration(initialRoot, finalRoot) &&
+          rootWitness !== undefined
+        ) {
+          discoveryWitness = { kind: 'github-missing', root: rootWitness }
+        }
+      } else if (initialGithubDirectory.kind === 'directory') {
+        const initialWorkflowsDirectory = observeNativeDirectory(nativeRoot, workflowsDirectory)
+        if (initialWorkflowsDirectory.kind === 'missing') {
+          const secondWorkflowsDirectory = observeNativeDirectory(nativeRoot, workflowsDirectory)
+          const finalGithubDirectory = observeNativeDirectory(nativeRoot, githubDirectory)
+          const finalRoot = observeNativeDirectory(nativeRoot, nativeRoot)
+          const rootWitness = directoryWitness(nativeRoot, finalRoot)
+          const githubWitness = directoryWitness(githubDirectory, finalGithubDirectory)
+          if (
+            secondWorkflowsDirectory.kind === 'missing' &&
+            isSameDirectoryGeneration(initialRoot, finalRoot) &&
+            isSameDirectoryGeneration(initialGithubDirectory, finalGithubDirectory) &&
+            rootWitness !== undefined &&
+            githubWitness !== undefined
+          ) {
+            discoveryWitness = { github: githubWitness, kind: 'workflows-missing', root: rootWitness }
+          }
+        } else if (initialWorkflowsDirectory.kind === 'directory') {
+          let directory: ReturnType<typeof opendirSync> | undefined
+          let operationFailed = false
+          let candidateWitness: WorkflowDiscoveryWitness | undefined
+          try {
+            directory = opendirSync(workflowsDirectory)
+            const workflowPaths: string[] = []
+            let entry = directory.readSync()
+            while (entry !== null) {
+              if (workflowFilename.test(entry.name)) {
+                workflowPaths.push(resolve(workflowsDirectory, entry.name))
+              }
+              entry = directory.readSync()
+            }
+            workflowPaths.sort(ordinalStringCompare)
+            for (const path of workflowPaths) {
+              inspectFile(path, 'workflow')
+            }
+
+            const finalWorkflowsDirectory = observeNativeDirectory(nativeRoot, workflowsDirectory)
+            const finalGithubDirectory = observeNativeDirectory(nativeRoot, githubDirectory)
+            const finalRoot = observeNativeDirectory(nativeRoot, nativeRoot)
+            const rootWitness = directoryWitness(nativeRoot, finalRoot)
+            const githubWitness = directoryWitness(githubDirectory, finalGithubDirectory)
+            const workflowsWitness = directoryWitness(workflowsDirectory, finalWorkflowsDirectory)
+            if (
+              isSameDirectoryGeneration(initialRoot, finalRoot) &&
+              isSameDirectoryGeneration(initialWorkflowsDirectory, finalWorkflowsDirectory) &&
+              isSameDirectoryGeneration(initialGithubDirectory, finalGithubDirectory) &&
+              rootWitness !== undefined &&
+              githubWitness !== undefined &&
+              workflowsWitness !== undefined
+            ) {
+              candidateWitness = {
+                github: githubWitness,
+                kind: 'workflows-present',
+                root: rootWitness,
+                workflows: workflowsWitness,
+              }
+            } else {
+              operationFailed = true
+            }
+          } catch {
+            operationFailed = true
+          }
+
+          let closeFailed = false
+          if (directory !== undefined) {
+            try {
+              directory.closeSync()
+            } catch {
+              closeFailed = true
+            }
+          }
+          if (!(operationFailed || closeFailed)) {
+            discoveryWitness = candidateWitness
+          }
+        }
+      }
+    }
+
+    let finalIntegrityAccepted = discoveryWitness !== undefined && traversalIntegrityAccepted
+    if (finalIntegrityAccepted && discoveryWitness !== undefined) {
+      try {
+        options.beforeFinalRevalidation?.()
+        finalIntegrityAccepted =
+          revalidateWorkflowDiscovery(nativeRoot, discoveryWitness) &&
+          Array.from(fileWitnesses.values()).every(witness => revalidateFileWitness(nativeRoot, witness)) &&
+          Array.from(actionDirectoryWitnesses.values()).every(witness =>
+            revalidateActionDirectoryWitness(nativeRoot, witness),
+          )
+      } catch {
+        finalIntegrityAccepted = false
+      }
+    }
+
+    if (finalIntegrityAccepted) {
+      policyFindings = findings.sort(compareFindings)
+    }
+  }
+  return policyFindings
 }
 
 export const formatWorkflowPolicyFindings = (findings: readonly WorkflowPolicyFinding[]) => {

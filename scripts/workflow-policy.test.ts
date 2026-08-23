@@ -144,13 +144,13 @@ test('treats only an absent workflow directory as an empty workflow set', () => 
     {
       file: '.github/workflows',
       location: '$',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
   ])
 })
 
 // Mutation caught: leaving root realpath errors unguarded would expose filesystem exceptions instead of policy diagnostics.
-test('reports an invalid missing repository root as a local-reference finding', () => {
+test('reports an invalid missing repository root as a source-integrity finding', () => {
   const root = createFixture({
     'README.md': 'fixture\n',
   })
@@ -159,7 +159,7 @@ test('reports an invalid missing repository root as a local-reference finding', 
     {
       file: '.github/workflows',
       location: '$',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
   ])
 })
@@ -197,6 +197,140 @@ jobs:
       file: '.github/actions/nested/action.yaml',
       location: 'runs.steps[0].uses',
       rule: 'external-action-sha',
+    },
+  ])
+})
+
+// Mutation caught: keying recursive visits by path alone would skip either the workflow jobs or composite-action steps of one dual-role source.
+test('inspects one source independently as a reusable workflow and composite action', () => {
+  const root = createFixture({
+    '.github/workflows/action.yml': `name: Dual role
+on: workflow_call
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ secrets.TOKEN }}"
+runs:
+  using: composite
+  steps:
+    - uses: owner/action@v1
+`,
+    '.github/workflows/entry.yml': `name: Entry
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: ./.github/workflows/action.yml
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/workflows
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/action.yml',
+      location: 'jobs.inspect.environment',
+      rule: 'credential-environment',
+    },
+    {
+      file: '.github/workflows/action.yml',
+      location: 'runs.steps[0].uses',
+      rule: 'external-action-sha',
+    },
+  ])
+})
+
+// Mutation caught: accepting parsed findings without final file revalidation would return a decision from replaced workflow bytes.
+test('rejects a workflow replaced after traversal and discards provisional findings', () => {
+  const root = createFixture({
+    '.github/workflows/mutable.yml': `name: Mutable
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/action@v1
+`,
+  })
+  let finalRevalidationCalls = 0
+
+  const findings = inspectWorkflowPolicy(root, {
+    beforeFinalRevalidation: () => {
+      finalRevalidationCalls += 1
+      writeFileSync(
+        join(root, '.github/workflows/mutable.yml'),
+        `name: Replacement
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+        'utf8',
+      )
+    },
+  })
+
+  assert.equal(finalRevalidationCalls, 1)
+  assert.deepEqual(findings, [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: retaining only the selected action manifest would accept a second candidate added after target resolution.
+test('rejects action-manifest ambiguity introduced after target selection', () => {
+  const root = createFixture({
+    '.github/actions/mutable/action.yml': `name: Mutable
+runs:
+  using: composite
+  steps:
+    - uses: owner/action@v1
+`,
+    '.github/workflows/action.yml': `name: Action caller
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/mutable
+`,
+  })
+  let finalRevalidationCalls = 0
+
+  const findings = inspectWorkflowPolicy(root, {
+    beforeFinalRevalidation: () => {
+      finalRevalidationCalls += 1
+      writeFileSync(
+        join(root, '.github/actions/mutable/action.yaml'),
+        `name: Late manifest
+runs:
+  using: composite
+  steps: []
+`,
+        'utf8',
+      )
+    },
+  })
+
+  assert.equal(finalRevalidationCalls, 1)
+  assert.deepEqual(findings, [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
     },
   ])
 })
@@ -888,7 +1022,7 @@ jobs:
     {
       file: '.github/workflows/backslash.yml',
       location: 'jobs.verify.steps[0].uses',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
   ])
 })
@@ -958,22 +1092,22 @@ runs:
     {
       file: '.github/actions/invalid/action.yml',
       location: '$',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
     {
       file: '.github/workflows/invalid.yaml',
       location: '$',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
     {
       file: '.github/workflows/local-files.yml',
       location: 'jobs.verify.steps[0].uses',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
     {
       file: '.github/workflows/local-files.yml',
       location: 'jobs.verify.steps[1].uses',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
     {
       file: '.github/workflows/local-files.yml',
@@ -1017,12 +1151,12 @@ jobs: {}
     {
       file: '.github/workflows/entry.yml',
       location: 'jobs.verify.steps[0].uses',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
     {
       file: '.github/workflows/linked.yml',
       location: '$',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
   ])
 })
@@ -1066,19 +1200,19 @@ jobs: {}
     {
       file: '.github/workflows',
       location: '$',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
   ])
   assert.deepEqual(inspectWorkflowPolicy(candidateRoot), [
     {
       file: '.github/workflows/directory.yaml',
       location: '$',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
     {
       file: '.github/workflows/linked.yml',
       location: '$',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
   ])
 })
@@ -1097,7 +1231,7 @@ test('rejects a symlinked GitHub parent even when its workflow child is absent',
     {
       file: '.github/workflows',
       location: '$',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
   ])
 })
@@ -1122,7 +1256,7 @@ test('rejects dangling symlinks at either workflow discovery directory', () => {
     {
       file: '.github/workflows',
       location: '$',
-      rule: 'local-reference',
+      rule: 'source-integrity',
     },
   ]
   assert.deepEqual(inspectWorkflowPolicy(danglingGithubRoot), expectedFinding)
