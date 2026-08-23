@@ -59,4 +59,4 @@ Pagination, silent truncation, query/result-count budgets, CLI transport newline
 
 ## Reviewed implementation provenance
 
-The exact reviewed code and behavioural-test snapshot implementing this design is `1252562c636ec663b2ed7e8b29ea3e1a7774c492`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.
+The exact reviewed code and behavioural-test snapshot implementing this design is `b43daf795de35d34602d1018ad509f68e494fe3d`. Documentation changes do not alter the runtime API, package exports, cache schema, or generated declarations.
