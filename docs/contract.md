@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-23 for code and behavioural-test snapshot `6c54f0032be3fcf8932a8e1ba80b8e2bc6d5354a`.
+Last reviewed: 2026-08-23 for code and behavioural-test snapshot `f22fafeec2346d1ced699433711dd51985a2f9e8`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -175,7 +175,7 @@ MAR-2565 validated mutation cache construction, deterministic disk fallback, and
 - MAR-2574 cannot satisfy its least-authority acceptance criteria until a reviewed upstream Pullfrog release removes the internal MCP contents-write authority and makes the agent-runtime production dependency closure lock-verifiable, followed by the protected-environment rollout and an approved exact-head dispatch. This contract does not claim acceptance, rollout, or GitHub settings completion.
 - The workflow tooling uses official exact `@types/bun@1.3.1` declarations only as a development dependency. Bun types and `skipLibCheck` are limited to `tsconfig.scripts.json`, the historical handwritten `scripts/bun-runtime.d.ts` declaration is removed, and the Node consumer/runtime remains unchanged with zero published runtime dependencies.
 
-The final repository-controlled implementation and behavioural-test snapshot for this boundary is `6c54f0032be3fcf8932a8e1ba80b8e2bc6d5354a`. It retains Windows-safe native-path comparison, junction-aware fixtures, and parser trigger-key normalisation, and additionally normalises an invalid repository root into a policy finding, enforces the protected-environment boundary for jobs inheriting top-level OIDC permission, binds the reviewed adjacent version comments to the exact checked-in workflow pins in behavioural coverage, and exercises Windows case and separator equivalence without weakening stricter POSIX semantics. This provenance is additive to the older change provenance below. Documentation after that snapshot records the boundary without changing workflow behaviour.
+The final repository-controlled implementation and behavioural-test snapshot for this boundary is `f22fafeec2346d1ced699433711dd51985a2f9e8`. It retains Windows-safe native-path comparison, junction-aware fixtures, parser trigger-key normalisation, invalid-root diagnostics, inherited OIDC environment enforcement, and exact pin/comment binding coverage. It also rejects multiply linked workflow inputs before and throughout descriptor-bound reads, treats POSIX-only fixtures portably, and accepts both documented `$/` self-repository references and the established `./` form without weakening external-action SHA enforcement. This provenance is additive to the older change provenance below. Documentation after that snapshot records the boundary without changing workflow behaviour.
 
 ## Package and Release Gates
 
