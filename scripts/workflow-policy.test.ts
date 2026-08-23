@@ -273,8 +273,8 @@ jobs:
   assert.deepEqual(inspectWorkflowPolicy(root), [])
 })
 
-// Mutation caught: removing credential detection would allow dot, bracket, inherited, or OIDC credentials without the protected environment.
-test('requires the exact protected environment for every credential-bearing job shape', () => {
+// Mutation caught: removing runner credential detection would allow dotted, bracket, or OIDC credentials without the protected environment.
+test('requires the exact protected environment for direct runner credentials', () => {
   const root = createFixture({
     '.github/workflows/credentials.yml': `name: Credentials
 on: workflow_dispatch
@@ -290,11 +290,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "\${{ secrets.TOKEN }}"
-  inherited:
-    runs-on: ubuntu-latest
-    secrets: inherit
-    steps:
-      - run: echo inherited
   oidc:
     runs-on: ubuntu-latest
     permissions:
@@ -318,11 +313,6 @@ jobs:
     },
     {
       file: '.github/workflows/credentials.yml',
-      location: 'jobs.inherited.environment',
-      rule: 'credential-environment',
-    },
-    {
-      file: '.github/workflows/credentials.yml',
       location: 'jobs.oidc.environment',
       rule: 'credential-environment',
     },
@@ -330,6 +320,99 @@ jobs:
       file: '.github/workflows/credentials.yml',
       location: 'jobs.oidc.permissions.id-token',
       rule: 'permission',
+    },
+  ])
+})
+
+// Mutation caught: treating a local reusable-workflow caller as a runner would require an unsupported caller environment.
+test('allows local reusable workflows to inherit secrets when the consuming runner is protected', () => {
+  const root = createFixture({
+    '.github/workflows/called.yml': `name: Called
+on: workflow_call
+permissions:
+  contents: read
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    environment: pullfrog-review
+    steps:
+      - run: echo "\${{ secrets.REUSABLE_TOKEN }}"
+`,
+    '.github/workflows/caller.yml': `name: Caller
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: ./.github/workflows/called.yml
+    secrets: inherit
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [])
+})
+
+// Mutation caught: trusting a local caller's protected boundary would let its called credential-consuming runner omit the environment.
+test('reports an unprotected local reusable-workflow runner in the called file', () => {
+  const root = createFixture({
+    '.github/workflows/called.yml': `name: Called
+on: workflow_call
+permissions:
+  contents: read
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ secrets.REUSABLE_TOKEN }}"
+`,
+    '.github/workflows/caller.yml': `name: Caller
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: $/.github/workflows/called.yml
+    secrets: inherit
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/called.yml',
+      location: 'jobs.consume.environment',
+      rule: 'credential-environment',
+    },
+  ])
+})
+
+// Mutation caught: allowing a pinned external reusable workflow to receive caller credentials would escape recursive local policy inspection.
+test('rejects named and inherited secrets forwarded to external reusable workflows', () => {
+  const root = createFixture({
+    '.github/workflows/external.yml': `name: External
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  inherited:
+    uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
+    secrets: inherit
+  named:
+    uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
+    secrets:
+      token: \${{ secrets.TOKEN }}
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/external.yml',
+      location: 'jobs.inherited.secrets',
+      rule: 'credential-forwarding',
+    },
+    {
+      file: '.github/workflows/external.yml',
+      location: 'jobs.named.secrets',
+      rule: 'credential-forwarding',
     },
   ])
 })
@@ -488,9 +571,15 @@ jobs:
   ])
 })
 
-// Mutation caught: omitting workflow-level env inheritance would let every job consume a shared secret without the protected environment.
-test('requires the exact protected environment for workflow-level secret inheritance', () => {
+// Mutation caught: applying workflow-level env to callers would require an unsupported environment even though workflow env is not forwarded.
+test('requires the exact protected environment only for runners inheriting workflow-level secret env', () => {
   const root = createFixture({
+    '.github/workflows/called.yml': `name: Called
+on: workflow_call
+permissions:
+  contents: read
+jobs: {}
+`,
     '.github/workflows/workflow-environment.yml': `name: Workflow environment
 on: workflow_dispatch
 permissions:
@@ -498,6 +587,9 @@ permissions:
 env:
   TOKEN: \${{ secrets.TOKEN }}
 jobs:
+  call:
+    uses: ./.github/workflows/called.yml
+    secrets: inherit
   missing:
     runs-on: ubuntu-latest
     steps:

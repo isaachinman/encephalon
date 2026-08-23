@@ -11,7 +11,12 @@ import {
 } from 'node:fs'
 import { extname, relative, resolve, sep } from 'node:path'
 
-export type WorkflowPolicyRule = 'credential-environment' | 'external-action-sha' | 'local-reference' | 'permission'
+export type WorkflowPolicyRule =
+  | 'credential-environment'
+  | 'credential-forwarding'
+  | 'external-action-sha'
+  | 'local-reference'
+  | 'permission'
 
 export type WorkflowPolicyFinding = Readonly<{
   file: string
@@ -469,13 +474,19 @@ const inspectWorkflowJobs = (document: ParsedObject, file: string, findings: Wor
     for (const [jobName, value] of Object.entries(jobs)) {
       if (isPlainObject(value)) {
         inspectJobPermissions(value, jobName, file, findings)
-        const credentialBearing =
-          workflowEnvironmentContainsSecret ||
-          containsSecretExpression(value) ||
-          value.secrets === 'inherit' ||
-          effectiveIdTokenIsWrite(document.permissions, value.permissions)
-        if (credentialBearing && !hasProtectedEnvironment(value.environment)) {
-          findings.push({ file, location: `jobs.${jobName}.environment`, rule: 'credential-environment' })
+        const reusableWorkflowReference = value.uses
+        if (typeof reusableWorkflowReference === 'string') {
+          if (!localReference.test(reusableWorkflowReference) && value.secrets !== undefined) {
+            findings.push({ file, location: `jobs.${jobName}.secrets`, rule: 'credential-forwarding' })
+          }
+        } else {
+          const credentialBearing =
+            workflowEnvironmentContainsSecret ||
+            containsSecretExpression(value) ||
+            effectiveIdTokenIsWrite(document.permissions, value.permissions)
+          if (credentialBearing && !hasProtectedEnvironment(value.environment)) {
+            findings.push({ file, location: `jobs.${jobName}.environment`, rule: 'credential-environment' })
+          }
         }
       }
     }
