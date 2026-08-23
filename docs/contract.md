@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-23 for code and behavioural-test snapshot `ee1e197e53e31f637c807e2621b69b247ae3d855`.
+Last reviewed: 2026-08-23 for code and behavioural-test snapshot `1274d11a1d0d3102e03a23fb091612f02813def3`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -165,7 +165,7 @@ When an implementation change intentionally alters this contract:
 
 - MAR-2554 bounded full, compact, and gather read responses: `b43daf795de35d34602d1018ad509f68e494fe3d`.
 - MAR-2550 exact cached FTS row-text projection validation, bounded pre-mutation writer validation, and recovery: `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`.
-- MAR-2559 Unicode-preserving literal FTS query construction, derived search-document NFC normalization and bounded expansion recovery: `ee1e197e53e31f637c807e2621b69b247ae3d855`.
+- MAR-2559 Unicode-preserving literal FTS query construction, derived search-document NFC normalization and bounded expansion recovery: `1274d11a1d0d3102e03a23fb091612f02813def3`.
 - MAR-2553 semantic SQLite schema validation and exact incompatible-generation recovery: `f539720542a3302dd849002652e958da4a6063bf`.
 - MAR-2549 bounded disposable cache validation and exact-generation recovery: `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`.
 - MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2874874096bb7d327e084d7e17d5243564244c43`.
