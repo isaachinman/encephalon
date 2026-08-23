@@ -32,6 +32,18 @@ type PullfrogWorkflow = Record<string, unknown> & {
   true?: unknown
 }
 
+type WorkflowStep = Readonly<{
+  uses?: unknown
+  with?: Readonly<Record<string, unknown>>
+}>
+
+type CiWorkflow = Readonly<{
+  jobs: Readonly<{
+    release: Readonly<{ steps: readonly WorkflowStep[] }>
+    verify: Readonly<{ steps: readonly WorkflowStep[] }>
+  }>
+}>
+
 const assertExactPullfrogJob = (job: PullfrogJob) => {
   assert.deepEqual(Object.keys(job).toSorted(), ['environment', 'permissions', 'runs-on', 'steps'])
   assert.equal(job['runs-on'], 'ubuntu-latest')
@@ -105,14 +117,18 @@ afterEach(() => {
 
 // Mutation caught: swallowing every discovery failure, or rejecting absence, would make missing and invalid workflow paths equivalent.
 test('treats only an absent workflow directory as an empty workflow set', () => {
-  const absentRoot = createFixture({
+  const absentGithubRoot = createFixture({
     'README.md': 'No workflows\n',
+  })
+  const absentWorkflowsRoot = createFixture({
+    '.github/placeholder': 'No workflows\n',
   })
   const root = createFixture({
     '.github/workflows': 'not a directory\n',
   })
 
-  assert.deepEqual(inspectWorkflowPolicy(absentRoot), [])
+  assert.deepEqual(inspectWorkflowPolicy(absentGithubRoot), [])
+  assert.deepEqual(inspectWorkflowPolicy(absentWorkflowsRoot), [])
   assert.deepEqual(inspectWorkflowPolicy(root), [
     {
       file: '.github/workflows',
@@ -283,6 +299,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "\${{ SeCrEtS.TOKEN }}"
+  member:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ outputs.secrets }}"
+  function-member:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ fromJSON(needs.prepare.outputs.payload).secrets }}"
+  spaced-member:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ outputs . SeCrEtS }}"
   second-expression:
     runs-on: ubuntu-latest
     steps:
@@ -333,6 +361,30 @@ jobs:
     {
       file: '.github/workflows/nested-secrets.yml',
       location: 'jobs.serialized.environment',
+      rule: 'credential-environment',
+    },
+  ])
+})
+
+// Mutation caught: excluding reusable workflow roots from discovery would miss their own unprotected secret expressions.
+test('independently inspects credential environments in local reusable workflows', () => {
+  const root = createFixture({
+    '.github/workflows/reusable.yml': `name: Reusable
+on: workflow_call
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ secrets.REUSABLE_TOKEN }}"
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/reusable.yml',
+      location: 'jobs.inspect.environment',
       rule: 'credential-environment',
     },
   ])
@@ -406,6 +458,51 @@ jobs:
     steps:
       - run: echo extra
 `,
+    '.github/workflows/job-shapes.yml': `name: Job shapes
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  inherited:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inherited
+  exact:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - run: echo exact
+  empty:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo empty
+  read-all:
+    runs-on: ubuntu-latest
+    permissions: read-all
+    steps:
+      - run: echo broad
+  write-all:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - run: echo broad
+  extra-read:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - run: echo extra
+  extra-write:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - run: echo extra
+`,
     '.github/workflows/missing.yml': `name: Missing
 on: workflow_dispatch
 jobs:
@@ -440,6 +537,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      issues: read
     steps:
       - run: echo allowed
 `,
@@ -462,6 +560,36 @@ jobs:
       rule: 'permission',
     },
     {
+      file: '.github/workflows/job-shapes.yml',
+      location: 'jobs.empty.permissions',
+      rule: 'permission',
+    },
+    {
+      file: '.github/workflows/job-shapes.yml',
+      location: 'jobs.extra-read.permissions.issues',
+      rule: 'permission',
+    },
+    {
+      file: '.github/workflows/job-shapes.yml',
+      location: 'jobs.extra-write.permissions.checks',
+      rule: 'permission',
+    },
+    {
+      file: '.github/workflows/job-shapes.yml',
+      location: 'jobs.read-all.permissions',
+      rule: 'permission',
+    },
+    {
+      file: '.github/workflows/job-shapes.yml',
+      location: 'jobs.write-all.environment',
+      rule: 'credential-environment',
+    },
+    {
+      file: '.github/workflows/job-shapes.yml',
+      location: 'jobs.write-all.permissions',
+      rule: 'permission',
+    },
+    {
       file: '.github/workflows/missing.yml',
       location: 'permissions',
       rule: 'permission',
@@ -469,6 +597,11 @@ jobs:
     {
       file: '.github/workflows/oidc.yml',
       location: 'jobs.verify.permissions.id-token',
+      rule: 'permission',
+    },
+    {
+      file: '.github/workflows/pullfrog.yml',
+      location: 'jobs.pullfrog.permissions.issues',
       rule: 'permission',
     },
   ])
@@ -574,6 +707,105 @@ runs:
       rule: 'local-reference',
     },
   ])
+})
+
+// Mutation caught: trusting Dirent types or the workflow directory path would hide symlinked and non-regular root candidates.
+test('rejects a symlinked workflow directory and every non-regular YAML candidate', () => {
+  const outside = createFixture({
+    '.github/workflows/outside.yml': `name: Outside
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+    'linked.yml': `name: Linked
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+  })
+  const symlinkedDirectoryRoot = createFixture({
+    '.github/placeholder': 'fixture\n',
+  })
+  symlinkSync(join(outside, '.github/workflows'), join(symlinkedDirectoryRoot, '.github/workflows'), 'dir')
+
+  const candidateRoot = createFixture({
+    '.github/workflows/directory.yaml/placeholder': 'fixture\n',
+    '.github/workflows/valid.yml': `name: Valid
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+  })
+  symlinkSync(join(outside, 'linked.yml'), join(candidateRoot, '.github/workflows/linked.yml'))
+
+  assert.deepEqual(inspectWorkflowPolicy(symlinkedDirectoryRoot), [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'local-reference',
+    },
+  ])
+  assert.deepEqual(inspectWorkflowPolicy(candidateRoot), [
+    {
+      file: '.github/workflows/directory.yaml',
+      location: '$',
+      rule: 'local-reference',
+    },
+    {
+      file: '.github/workflows/linked.yml',
+      location: '$',
+      rule: 'local-reference',
+    },
+  ])
+})
+
+// Mutation caught: treating child ENOENT as sufficient would accept a missing workflow directory through a non-native parent.
+test('rejects a symlinked GitHub parent even when its workflow child is absent', () => {
+  const outside = createFixture({
+    '.github/placeholder': 'outside\n',
+  })
+  const root = createFixture({
+    'README.md': 'fixture\n',
+  })
+  symlinkSync(join(outside, '.github'), join(root, '.github'), 'dir')
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'local-reference',
+    },
+  ])
+})
+
+// Mutation caught: treating realpath ENOENT as path absence would accept a persistent dangling symlink.
+test('rejects dangling symlinks at either workflow discovery directory', () => {
+  const danglingGithubRoot = createFixture({
+    'README.md': 'fixture\n',
+  })
+  symlinkSync(join(danglingGithubRoot, 'missing-github'), join(danglingGithubRoot, '.github'), 'dir')
+
+  const danglingWorkflowsRoot = createFixture({
+    '.github/placeholder': 'fixture\n',
+  })
+  symlinkSync(
+    join(danglingWorkflowsRoot, '.github/missing-workflows'),
+    join(danglingWorkflowsRoot, '.github/workflows'),
+    'dir',
+  )
+
+  const expectedFinding = [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'local-reference',
+    },
+  ]
+  assert.deepEqual(inspectWorkflowPolicy(danglingGithubRoot), expectedFinding)
+  assert.deepEqual(inspectWorkflowPolicy(danglingWorkflowsRoot), expectedFinding)
 })
 
 // Mutation caught: weakening external-reference validation would accept Docker, short, uppercase, or owner-less action references.
@@ -763,15 +995,52 @@ test('repository workflows obey immutable action and credential boundaries', () 
     }),
   )
 
-  const ciWorkflow = Bun.YAML.parse(readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8')) as {
-    jobs: Record<string, { steps?: Array<{ uses?: string; with?: Record<string, unknown> }> }>
-  }
+  const ciWorkflow = Bun.YAML.parse(
+    readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8'),
+  ) as CiWorkflow
+  assert.deepEqual(
+    ciWorkflow.jobs.verify.steps.filter(step => step.uses !== undefined).map(step => step.uses),
+    [
+      'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6',
+    ],
+  )
+  assert.deepEqual(
+    ciWorkflow.jobs.release.steps.filter(step => step.uses !== undefined).map(step => step.uses),
+    [
+      'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
+      'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6',
+      'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+    ],
+  )
   const ciCheckoutSteps = Object.values(ciWorkflow.jobs).flatMap(job =>
-    (job.steps ?? []).filter(step => step.uses?.startsWith('actions/checkout@')),
+    job.steps.filter(step => typeof step.uses === 'string' && step.uses.startsWith('actions/checkout@')),
   )
   assert.equal(ciCheckoutSteps.length, 2)
   assert.equal(
     ciCheckoutSteps.every(step => step.with?.['persist-credentials'] === false),
     true,
+  )
+
+  const dependabotConfiguration = Bun.YAML.parse(readFileSync(join(repositoryRoot, '.github/dependabot.yml'), 'utf8'))
+  assert.deepEqual(dependabotConfiguration, {
+    updates: [
+      {
+        directory: '/',
+        'package-ecosystem': 'github-actions',
+        schedule: { interval: 'weekly' },
+      },
+    ],
+    version: 2,
+  })
+
+  const packageJson = JSON.parse(readFileSync(join(repositoryRoot, 'package.json'), 'utf8')) as {
+    scripts?: Readonly<Record<string, unknown>>
+  }
+  assert.equal(
+    packageJson.scripts?.['check:workflows'],
+    'bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts',
   )
 })
