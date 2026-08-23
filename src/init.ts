@@ -1,6 +1,12 @@
 import { parseInitInput } from './api-input.ts'
 import { canonicalPayload, scanBaseline } from './baseline.ts'
-import { hydrateResolvedRepository, prepareResolvedRepository } from './cache.ts'
+import {
+  hydrateResolvedMutationSnapshot,
+  hydrateResolvedRepository,
+  prepareResolvedMutationSnapshot,
+  prepareResolvedRepository,
+  type ValidatedMutationCacheSnapshot,
+} from './cache.ts'
 import { assertCacheLocation } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { applyInstructionChangesOutcome, planInstructionChanges } from './instructions.ts'
@@ -8,13 +14,13 @@ import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import {
   assertCanonicalLayoutAdditions,
-  assertRecordGraph,
+  MAX_CANONICAL_RECORD_BYTES,
   nextRecordCreatedAt,
   planRecordAddition,
   publishPlannedRecordOutcome,
   type RecordReadHooks,
   type RecordWriteHooks,
-  readRecordSnapshotResolved,
+  readRecordPlanningSnapshotResolved,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import { createRecordFile, validateAddRecordInput } from './schema.ts'
@@ -123,12 +129,12 @@ const wrapInitError = (error: unknown): EncephalonError => {
   }
 }
 
-const activeRecords = (records: BrainRecord[]) => {
+const activeRecords = (records: readonly BrainRecord[]) => {
   const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
   return records.filter(record => !superseded.has(record.id))
 }
 
-const baselineActions = (records: BrainRecord[], baseline: AddRecordInput[], refresh: boolean) =>
+const baselineActions = (records: readonly BrainRecord[], baseline: AddRecordInput[], refresh: boolean) =>
   baseline.reduce<{
     additions: AddRecordInput[]
     conflicts: InitEncephalonResult['skippedConflicts']
@@ -217,36 +223,50 @@ const initResolved = (
       hooks.baselineScan?.()
       const baseline = scanBaseline(root)
       const refresh = input.refreshBaseline === true
-      const recordSnapshot = readRecordSnapshotResolved(
-        root,
-        hooks,
-        refresh
-          ? baseline.map(candidate => ({
-              kind: candidate.kind,
-              source: 'encephalon:init',
-              subject: candidate.subject,
-            }))
-          : undefined,
-        location,
-      )
-      const { records } = recordSnapshot
+      const allowedGeneratedHeads = refresh
+        ? baseline.map(candidate => ({
+            kind: candidate.kind,
+            source: 'encephalon:init',
+            subject: candidate.subject,
+          }))
+        : undefined
+      const planning = readRecordPlanningSnapshotResolved(root, hooks, location)
+      const { records } = planning
       assertCacheLocation(location)
-      const actions = baselineActions(records, baseline, refresh)
-      const validatedAdditions = actions.additions.map(addition => validateAddRecordInput({ ...addition, root }))
+      const { actions, validatedAdditions } = (() => {
+        try {
+          const plannedActions = baselineActions(records, baseline, refresh)
+          return {
+            actions: plannedActions,
+            validatedAdditions: plannedActions.additions.map(addition => validateAddRecordInput({ ...addition, root })),
+          }
+        } catch (error) {
+          planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
+          throw error
+        }
+      })()
       let recordsCreated: BrainRecord[] = []
+      let cacheSnapshot: ValidatedMutationCacheSnapshot | undefined
       if (validatedAdditions.length > 0) {
         const validationPlans = validatedAdditions.map(addition =>
           planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
         )
-        assertRecordGraph(
-          root,
-          [...records, ...validationPlans.map(plan => plan.record)],
-          'The generated baseline would make canonical records invalid.',
-          hooks,
-        )
+        const artifacts = (() => {
+          try {
+            return planning.validateFinal(
+              [...records, ...validationPlans.map(plan => plan.record)],
+              'The generated baseline would make canonical records invalid.',
+            )
+          } catch (error) {
+            if (error instanceof EncephalonError && error.code === 'VALIDATION_FAILED') {
+              planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
+            }
+            throw error
+          }
+        })()
         const { plans } = validatedAdditions.reduce<{
-          cursor: BrainRecord[]
-          plans: ReturnType<typeof planRecordAddition>[]
+          cursor: readonly BrainRecord[]
+          plans: readonly ReturnType<typeof planRecordAddition>[]
         }>(
           (result, addition) => {
             const plan = planRecordAddition(root, createRecordFile(addition, nextRecordCreatedAt(result.cursor)))
@@ -256,7 +276,7 @@ const initResolved = (
         )
         const authority = assertCanonicalLayoutAdditions(
           plans.map(plan => plan.record.kind),
-          recordSnapshot.authority,
+          planning.authority(),
         )
         const recordWriteOptions = {
           authority,
@@ -272,13 +292,46 @@ const initResolved = (
             throw publication.committedError
           }
         }
+        const mutationBytes =
+          planning.bytes + plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted), 0)
+        if (mutationBytes <= MAX_CANONICAL_RECORD_BYTES) {
+          cacheSnapshot = Object.freeze({
+            artifacts,
+            assertCurrent: authority.assertCurrent,
+            records: Object.freeze([...records, ...recordsCreated]),
+            repositoryRealpath: location.repository,
+          })
+        }
+      } else {
+        const artifacts = planning.validateFinal(
+          records,
+          'Canonical records are invalid.',
+          planning.bytes,
+          allowedGeneratedHeads,
+        )
+        const authority = planning.authority()
+        if (!refresh) {
+          cacheSnapshot = Object.freeze({
+            artifacts,
+            assertCurrent: authority.assertCurrent,
+            records: Object.freeze([...records]),
+            repositoryRealpath: location.repository,
+          })
+        }
       }
       progress.phase = 'cachePreparation'
       progress.cacheState = 'disposable'
-      const cacheResult =
-        validatedAdditions.length > 0
-          ? hydrateResolvedRepository(root, 'held', location)
-          : prepareResolvedRepository(root, 'held', location)
+      const cacheResult = (() => {
+        if (validatedAdditions.length > 0) {
+          return cacheSnapshot === undefined
+            ? hydrateResolvedRepository(root, 'held', location)
+            : hydrateResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
+        }
+        if (cacheSnapshot !== undefined) {
+          return prepareResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
+        }
+        return prepareResolvedRepository(root, 'held', location)
+      })()
       progress.cacheState = 'prepared'
       hooks.hydration?.(cacheResult)
       progress.phase = 'instructionApplication'

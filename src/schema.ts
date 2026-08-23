@@ -454,6 +454,20 @@ export const validateAddRecordInput = (input: AddRecordInput): ValidatedAddRecor
   return validated
 }
 
+/** @internal */
+export const projectParsedRecordFile = (record: BrainRecordFile): BrainRecordFile => ({
+  createdAt: record.createdAt,
+  id: record.id,
+  kind: record.kind,
+  payload: record.payload,
+  source: record.source,
+  subject: record.subject,
+  ...(record.artifacts === undefined ? {} : { artifacts: record.artifacts }),
+  ...(record.confidence === undefined ? {} : { confidence: record.confidence }),
+  ...(record.searchText === undefined ? {} : { searchText: record.searchText }),
+  ...(record.supersedes === undefined ? {} : { supersedes: record.supersedes }),
+})
+
 export const parseRecordFile = (value: unknown): BrainRecordFile => {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return fail('INVALID_ARGUMENT', 'Record JSON must contain an object.')
@@ -494,7 +508,7 @@ export const parseRecordFile = (value: unknown): BrainRecordFile => {
   if (object.supersedes !== undefined) {
     record.supersedes = validateSupersedes(object.supersedes)
   }
-  return record
+  return projectParsedRecordFile(record)
 }
 
 export const formatRecordFile = (record: BrainRecordFile) => {

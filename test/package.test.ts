@@ -87,6 +87,10 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-gather-deduplication-design.md'),
       'utf8',
     )
+    const validatedMutationCacheDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-22-validated-mutation-cache-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -112,7 +116,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`\./,
+      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `30104a049f72ba2e87f51af95d5da11b55045cc3`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
@@ -128,12 +132,21 @@ describe('package contract', () => {
       /The exact implementation and behavioural-test snapshot is `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`\./,
     )
     assert.match(
+      validatedMutationCacheDesign,
+      /The exact implementation and behavioural-test snapshot is `30104a049f72ba2e87f51af95d5da11b55045cc3`\./,
+    )
+    assert.match(
       contract,
       /MAR-2560 snapshot-local exact-key gather deduplication: `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`\./,
+    )
+    assert.match(
+      contract,
+      /MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `30104a049f72ba2e87f51af95d5da11b55045cc3`\./,
     )
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /implementing the MAR-2566 benchmark guarantees above/)
     assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `de66f6ab7e10696fc878e380dd5417d194d60fe8`\./)
+    assert.match(performance, /## Validated mutation snapshot comparison/)
     assert.match(performance, /Correctness tests enforce deterministic output and bounded work counts/)
     assert.match(
       contract,

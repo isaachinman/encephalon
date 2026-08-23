@@ -36,6 +36,7 @@ import {
   revalidateCanonicalDirectory,
 } from './canonical-layout.ts'
 import { EncephalonError, fail, failBudget, failWithCause, wrapIo } from './errors.ts'
+import { sameStableEntryMetadata } from './filesystem-entry.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import { withOperationLock } from './lock.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
@@ -43,7 +44,7 @@ import { ordinalStringCompare } from './order.ts'
 import { canonicalRecordPath, readRecords, readValidatedRecordSnapshotResolved } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import { createResponseByteBudget, type ResponseByteBudget } from './response-budget.ts'
-import { parseRecordFile, validateArtifactPath } from './schema.ts'
+import { parseRecordFile, projectParsedRecordFile, validateArtifactPath } from './schema.ts'
 import { literalMatchQuery, MAX_NFC_UTF8_EXPANSION_FACTOR, normalizeSearchText } from './search-text.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type {
@@ -1472,6 +1473,11 @@ const searchDocumentForRecord = (record: BrainRecord) =>
       .join('\n'),
   )
 
+const projectedCacheRecord = (record: BrainRecord): BrainRecord => ({
+  ...projectParsedRecordFile(record),
+  path: record.path,
+})
+
 const writeMetadata = (database: DatabaseSync, metadata: Metadata) => {
   const statement = database.prepare('INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)')
   const values = {
@@ -1490,6 +1496,187 @@ const writeMetadata = (database: DatabaseSync, metadata: Metadata) => {
 type CompletedCacheRebuild = {
   database: CacheDatabase
   result: PrepareResult
+}
+
+/** @internal */
+export type ValidatedMutationCacheSnapshot = Readonly<{
+  artifacts: readonly ArtifactObservation[]
+  assertCurrent: () => void
+  records: readonly BrainRecord[]
+  repositoryRealpath: string
+}>
+
+type CacheWriteSnapshot = Readonly<{
+  artifacts: readonly ArtifactObservation[]
+  assertCurrent?: (() => void) | undefined
+  manifest: string
+  records: readonly BrainRecord[]
+  repositoryRealpath: string
+}>
+
+type CacheSnapshotWrite =
+  | { kind: 'committed'; rebuild: CompletedCacheRebuild }
+  | { kind: 'repository-changed'; retryPrimary: CacheWriterPrimary }
+
+class MutationCacheSnapshotChanged extends Error {}
+
+const mutationSnapshotChanged = (): never => {
+  throw new MutationCacheSnapshotChanged()
+}
+
+const assertMutationSnapshotCurrent = (
+  root: string,
+  location: CacheLocation,
+  snapshot: ValidatedMutationCacheSnapshot,
+) => {
+  if (location.repository !== snapshot.repositoryRealpath) {
+    return mutationSnapshotChanged()
+  }
+  try {
+    snapshot.assertCurrent()
+    const results = inspectArtifactFiles(
+      resolve(root, 'encephalon'),
+      snapshot.artifacts.map(artifact => artifact.path),
+    )
+    const current = results.flatMap(result => (result.kind === 'stable' ? [result.observation] : []))
+    const sameArtifacts =
+      current.length === snapshot.artifacts.length &&
+      snapshot.artifacts.every(
+        (artifact, index) =>
+          artifact.path === current[index]?.path &&
+          current[index] !== undefined &&
+          sameStableEntryMetadata(artifact.metadata, current[index].metadata),
+      )
+    if (!sameArtifacts) {
+      return mutationSnapshotChanged()
+    }
+    snapshot.assertCurrent()
+  } catch (error) {
+    if (
+      error instanceof MutationCacheSnapshotChanged ||
+      error instanceof ArtifactChangedError ||
+      (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED')
+    ) {
+      return mutationSnapshotChanged()
+    }
+    throw error
+  }
+}
+
+const writeCacheSnapshot = (
+  root: string,
+  location: CacheLocation,
+  primary: CacheWriterPrimary,
+  snapshot: CacheWriteSnapshot,
+): CacheSnapshotWrite => {
+  const artifactPaths = snapshot.artifacts.map(artifact => artifact.path)
+  const superseded = new Set(snapshot.records.flatMap(record => record.supersedes ?? []))
+  const opened = openWriterDatabase(location, primary, openedDatabase => {
+    assertExistingCacheContentTransaction(root, openedDatabase)
+  })
+  const { acceptsEmptyContent, database, identity } = opened
+  const retryPrimary: CacheWriterPrimary = (() => {
+    if (acceptsEmptyContent) {
+      return { database: identity, kind: 'expected-new' }
+    }
+    if (primary.kind === 'create-if-missing') {
+      return { kind: 'create-if-missing' }
+    }
+    return { database: identity, kind: 'expected-owned' }
+  })()
+  let rebuildResult: PrepareResult | undefined
+  let repositoryChanged = false
+  let writerFailure: unknown
+  let writerFailed = false
+  try {
+    database.exec('BEGIN IMMEDIATE')
+    try {
+      if (acceptsEmptyContent) {
+        assertEmptyCacheContent(database)
+      } else {
+        assertExistingCacheContentConsistent(root, database)
+      }
+      snapshot.assertCurrent?.()
+      database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
+      const insertRecord = database.prepare(`
+        INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      const insertSearch = database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
+      for (const record of snapshot.records) {
+        const projected = projectedCacheRecord(record)
+        insertRecord.run(
+          projected.id,
+          projected.kind,
+          projected.subject,
+          projected.source,
+          projected.createdAt,
+          projected.path,
+          superseded.has(projected.id) ? 0 : 1,
+          summaryForRecord(projected),
+          JSON.stringify(projected),
+        )
+        insertSearch.run(projected.id, searchDocumentForRecord(projected))
+      }
+      writeMetadata(database, {
+        artifactPaths,
+        manifest: snapshot.manifest,
+        packageVersion: PACKAGE_VERSION,
+        recordsIndexed: snapshot.records.length,
+        repositoryRealpath: snapshot.repositoryRealpath,
+        schemaVersion: SCHEMA_VERSION,
+      })
+      const manifestAfter = boundedRepositoryManifest(root, artifactPaths)
+      snapshot.assertCurrent?.()
+      if (manifestAfter.kind === 'stable' && manifestAfter.value === snapshot.manifest) {
+        database.exec('COMMIT')
+        rebuildResult = { hydrated: true, recordsIndexed: snapshot.records.length }
+      } else {
+        repositoryChanged = true
+        database.exec('ROLLBACK')
+      }
+    } catch (error) {
+      try {
+        database.exec('ROLLBACK')
+      } catch (rollbackError) {
+        if (error instanceof MutationCacheSnapshotChanged) {
+          throw rollbackError
+        }
+        // The original transaction failure is more useful than a secondary rollback failure.
+      }
+      throw error
+    }
+  } catch (error) {
+    writerFailure = error
+    writerFailed = true
+  }
+  try {
+    database.close()
+  } catch (error) {
+    if (!writerFailed || writerFailure instanceof MutationCacheSnapshotChanged) {
+      writerFailure = error
+      writerFailed = true
+    }
+  }
+  if (writerFailed) {
+    if (writerFailure instanceof MutationCacheSnapshotChanged) {
+      return { kind: 'repository-changed', retryPrimary }
+    }
+    if (writerFailure instanceof EncephalonError || writerFailure instanceof CacheDatabaseFailure) {
+      throw writerFailure
+    }
+    if (isRecoverableCacheFailure(writerFailure)) {
+      return failCacheDatabase(writerFailure, identity)
+    }
+    throw writerFailure
+  }
+  if (rebuildResult !== undefined) {
+    return { kind: 'committed', rebuild: { database: identity, result: rebuildResult } }
+  }
+  if (repositoryChanged) {
+    return { kind: 'repository-changed', retryPrimary }
+  }
+  return fail('INTERNAL_ERROR', 'The Encephalon cache writer ended unexpectedly.')
 }
 
 const rebuildCache = (
@@ -1539,7 +1726,6 @@ const rebuildCache = (
       throw error
     }
     cacheReadTestHooks.afterCanonicalValidation?.()
-    const artifactPaths = artifacts.map(artifact => artifact.path)
     const manifestBefore = boundedRepositoryManifestFromObservations(root, artifacts)
     const recordsAfterValidation = boundedRepositoryManifest(root, [])
     if (
@@ -1553,13 +1739,70 @@ const rebuildCache = (
       }
       continue
     }
-    const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-    let opened: ReturnType<typeof openWriterDatabase>
+    const written = (() => {
+      try {
+        return writeCacheSnapshot(root, location, nextWriterPrimary, {
+          artifacts,
+          manifest: manifestBefore.value,
+          records,
+          repositoryRealpath: location.repository,
+        })
+      } catch (error) {
+        if (error instanceof CacheDatabaseCreationConflict && primary.kind === 'create-if-missing') {
+          return fail('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
+            entry: error.relativePath,
+            invariant: 'stable-identity',
+          })
+        }
+        throw error
+      }
+    })()
+    if (written.kind === 'committed') {
+      return written.rebuild
+    }
+    repositoryChangeObserved = true
+    nextWriterPrimary = written.retryPrimary
+    if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {
+      return fail('REPOSITORY_CHANGED', 'The repository changed repeatedly while rebuilding the Encephalon cache.')
+    }
+  }
+  return fail('INTERNAL_ERROR', 'The Encephalon cache rebuild ended unexpectedly.')
+}
+
+type CacheRebuilder = (root: string, location: CacheLocation, primary?: CacheWriterPrimary) => CompletedCacheRebuild
+
+const mutationCacheRebuilder = (snapshot: ValidatedMutationCacheSnapshot): CacheRebuilder => {
+  let discarded = false
+  return (root, location, primary = { kind: 'create-if-missing' }) => {
+    if (discarded) {
+      return rebuildCache(root, location, primary)
+    }
     try {
-      opened = openWriterDatabase(location, nextWriterPrimary, openedDatabase => {
-        assertExistingCacheContentTransaction(root, openedDatabase)
+      assertMutationSnapshotCurrent(root, location, snapshot)
+      const manifest = boundedRepositoryManifestFromObservations(root, snapshot.artifacts)
+      if (manifest.kind !== 'stable') {
+        return mutationSnapshotChanged()
+      }
+      assertMutationSnapshotCurrent(root, location, snapshot)
+      const written = writeCacheSnapshot(root, location, primary, {
+        artifacts: snapshot.artifacts,
+        assertCurrent: () => {
+          assertMutationSnapshotCurrent(root, location, snapshot)
+        },
+        manifest: manifest.value,
+        records: snapshot.records,
+        repositoryRealpath: snapshot.repositoryRealpath,
       })
+      if (written.kind === 'committed') {
+        return written.rebuild
+      }
+      discarded = true
+      return rebuildCache(root, location, written.retryPrimary)
     } catch (error) {
+      if (error instanceof MutationCacheSnapshotChanged) {
+        discarded = true
+        return rebuildCache(root, location, primary)
+      }
       if (error instanceof CacheDatabaseCreationConflict && primary.kind === 'create-if-missing') {
         return fail('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
           entry: error.relativePath,
@@ -1568,98 +1811,7 @@ const rebuildCache = (
       }
       throw error
     }
-    const { acceptsEmptyContent, database, identity } = opened
-    if (acceptsEmptyContent) {
-      nextWriterPrimary = { database: identity, kind: 'expected-new' }
-    } else if (nextWriterPrimary.kind === 'create-if-missing') {
-      nextWriterPrimary = { kind: 'create-if-missing' }
-    } else {
-      nextWriterPrimary = { database: identity, kind: 'expected-owned' }
-    }
-    let rebuildResult: PrepareResult | undefined
-    let writerFailure: unknown
-    let writerFailed = false
-    try {
-      database.exec('BEGIN IMMEDIATE')
-      try {
-        if (acceptsEmptyContent) {
-          assertEmptyCacheContent(database)
-        } else {
-          assertExistingCacheContentConsistent(root, database)
-        }
-        database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
-        const insertRecord = database.prepare(`
-          INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `)
-        const insertSearch = database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
-        for (const record of records) {
-          insertRecord.run(
-            record.id,
-            record.kind,
-            record.subject,
-            record.source,
-            record.createdAt,
-            record.path,
-            superseded.has(record.id) ? 0 : 1,
-            summaryForRecord(record),
-            JSON.stringify(record),
-          )
-          insertSearch.run(record.id, searchDocumentForRecord(record))
-        }
-        writeMetadata(database, {
-          artifactPaths,
-          manifest: manifestBefore.value,
-          packageVersion: PACKAGE_VERSION,
-          recordsIndexed: records.length,
-          repositoryRealpath: realpathSync.native(root),
-          schemaVersion: SCHEMA_VERSION,
-        })
-        const manifestAfter = boundedRepositoryManifest(root, artifactPaths)
-        if (manifestAfter.kind === 'stable' && manifestAfter.value === manifestBefore.value) {
-          database.exec('COMMIT')
-          rebuildResult = { hydrated: true, recordsIndexed: records.length }
-        } else {
-          repositoryChangeObserved = true
-          database.exec('ROLLBACK')
-        }
-      } catch (error) {
-        try {
-          database.exec('ROLLBACK')
-        } catch {
-          // The original transaction failure is more useful than a secondary rollback failure.
-        }
-        throw error
-      }
-    } catch (error) {
-      writerFailure = error
-      writerFailed = true
-    }
-    try {
-      database.close()
-    } catch (error) {
-      if (!writerFailed) {
-        writerFailure = error
-        writerFailed = true
-      }
-    }
-    if (writerFailed) {
-      if (writerFailure instanceof EncephalonError || writerFailure instanceof CacheDatabaseFailure) {
-        throw writerFailure
-      }
-      if (isRecoverableCacheFailure(writerFailure)) {
-        return failCacheDatabase(writerFailure, identity)
-      }
-      throw writerFailure
-    }
-    if (rebuildResult !== undefined) {
-      return { database: identity, result: rebuildResult }
-    }
-    if (attempt === MAX_REPOSITORY_CHANGE_RETRIES - 1) {
-      return fail('REPOSITORY_CHANGED', 'The repository changed repeatedly while rebuilding the Encephalon cache.')
-    }
   }
-  return fail('INTERNAL_ERROR', 'The Encephalon cache rebuild ended unexpectedly.')
 }
 
 const withCacheOperationLock = <Result>(
@@ -1708,6 +1860,7 @@ type DisposableCacheRecoveryOptions<Result> = {
   completion: DisposableCacheRecoveryCompletion<Result>
   lockMode: CacheRecoveryLockMode
   readState?: CacheReadRecoveryState | undefined
+  rebuilder?: CacheRebuilder | undefined
 }
 
 const completedRecoveryRebuild = (rebuild: CompletedCacheRebuild): DisposableCacheRecovery => {
@@ -1719,16 +1872,17 @@ const recoverDisposableCacheUnderLock = (
   root: string,
   location: CacheLocation,
   failure: unknown,
+  rebuilder: CacheRebuilder,
 ): DisposableCacheRecovery => {
   if (failure instanceof CacheDatabaseFailure) {
     quarantineCacheDatabase(location, failure.database)
-    return completedRecoveryRebuild(rebuildCache(root, location))
+    return completedRecoveryRebuild(rebuilder(root, location))
   }
   if (failure instanceof CacheDatabaseObservedMissing) {
     if (inspectCacheDatabase(location, 'brain.sqlite') === undefined) {
       cacheReadTestHooks.afterMissingPrimaryRecoveryObservation?.()
       try {
-        return completedRecoveryRebuild(rebuildCache(root, location, { kind: 'create-exclusive' }))
+        return completedRecoveryRebuild(rebuilder(root, location, { kind: 'create-exclusive' }))
       } catch (error) {
         if (error instanceof CacheDatabaseCreationConflict) {
           return { kind: 'retry' }
@@ -1746,11 +1900,14 @@ const recoverDisposableCacheOnce = (
   location: CacheLocation,
   failure: unknown,
   lockMode: CacheRecoveryLockMode,
+  rebuilder: CacheRebuilder,
 ): DisposableCacheRecovery => {
   if (isRecoverableCacheFailure(failure)) {
     return lockMode === 'acquire'
-      ? withCacheOperationLock(root, location, captured => recoverDisposableCacheUnderLock(root, captured, failure))
-      : recoverDisposableCacheUnderLock(root, location, failure)
+      ? withCacheOperationLock(root, location, captured =>
+          recoverDisposableCacheUnderLock(root, captured, failure, rebuilder),
+        )
+      : recoverDisposableCacheUnderLock(root, location, failure, rebuilder)
   }
   throw failure
 }
@@ -1768,7 +1925,13 @@ const runWithDisposableCacheRecovery = <Result>(
       if (options.readState?.rebuiltDatabase !== undefined) {
         throw failure
       }
-      const recovery = recoverDisposableCacheOnce(root, location, failure, options.lockMode)
+      const recovery = recoverDisposableCacheOnce(
+        root,
+        location,
+        failure,
+        options.lockMode,
+        options.rebuilder ?? rebuildCache,
+      )
       if (recovery.kind === 'rebuilt' && options.readState !== undefined) {
         options.readState.rebuiltDatabase = recovery.rebuild.database
       }
@@ -1856,18 +2019,21 @@ function resolvePreparedCacheWithoutCorruptionRecovery(
   location: CacheLocation,
   completion: { kind: 'prepare' },
   lockMode?: CacheRecoveryLockMode,
+  rebuilder?: CacheRebuilder,
 ): PrepareResult
 function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
   root: string,
   location: CacheLocation,
   completion: { kind: 'read'; read: (database: DatabaseSync) => Result; state: CacheReadRecoveryState },
   lockMode?: CacheRecoveryLockMode,
+  rebuilder?: CacheRebuilder,
 ): Result
 function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
   root: string,
   location: CacheLocation,
   completion: CachePreparationCompletion<Result>,
   lockMode: CacheRecoveryLockMode = 'acquire',
+  rebuilder: CacheRebuilder = rebuildCache,
 ): PrepareResult | Result {
   if (completion.kind === 'read' && completion.state.rebuiltDatabase !== undefined) {
     return requireFreshCacheResult(root, location, completion, completion.state.rebuiltDatabase)
@@ -1879,7 +2045,7 @@ function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
     return operation(location)
   }
   const completeRebuild = (captured: CacheLocation) => {
-    const rebuild = rebuildCache(root, captured)
+    const rebuild = rebuilder(root, captured)
     if (completion.kind === 'read') {
       completion.state.rebuiltDatabase = rebuild.database
       return requireFreshCacheResult(root, captured, completion, rebuild.database)
@@ -1917,17 +2083,21 @@ const prepareResolvedWithoutCorruptionRecovery = (
   root: string,
   location: CacheLocation,
   lockMode: CacheRecoveryLockMode = 'acquire',
-): PrepareResult => resolvePreparedCacheWithoutCorruptionRecovery(root, location, { kind: 'prepare' }, lockMode)
+  rebuilder: CacheRebuilder = rebuildCache,
+): PrepareResult =>
+  resolvePreparedCacheWithoutCorruptionRecovery(root, location, { kind: 'prepare' }, lockMode, rebuilder)
 
 const prepareResolved = (
   root: string,
   lockMode: CacheRecoveryLockMode = 'acquire',
   capturedLocation: CacheLocation = inspectCacheLocation(root),
+  rebuilder: CacheRebuilder = rebuildCache,
 ): PrepareResult => {
-  const operation = () => prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lockMode)
+  const operation = () => prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lockMode, rebuilder)
   return runWithDisposableCacheRecovery(root, capturedLocation, operation, {
     completion: { complete: rebuild => rebuild.result, kind: 'complete-from-rebuild' },
     lockMode,
+    rebuilder,
   })
 }
 
@@ -1937,19 +2107,43 @@ export const prepareResolvedRepository = (
   location?: CacheLocation,
 ): PrepareResult => prepareResolved(root, lockMode, location)
 
+/** @internal */
+export const prepareResolvedMutationSnapshot = (
+  root: string,
+  snapshot: ValidatedMutationCacheSnapshot,
+  lockMode: CacheRecoveryLockMode = 'acquire',
+  location?: CacheLocation,
+): PrepareResult => prepareResolved(root, lockMode, location, mutationCacheRebuilder(snapshot))
+
+const hydrateResolvedWithRebuilder = (
+  root: string,
+  lockMode: CacheRecoveryLockMode,
+  location: CacheLocation | undefined,
+  rebuilder: CacheRebuilder,
+): PrepareResult => {
+  const captured = location ?? inspectCacheLocation(root)
+  const hydrateUnderLock = (heldLocation: CacheLocation) =>
+    runWithDisposableCacheRecovery(root, heldLocation, () => rebuilder(root, heldLocation).result, {
+      completion: { complete: rebuild => rebuild.result, kind: 'complete-from-rebuild' },
+      lockMode: 'held',
+      rebuilder,
+    })
+  return lockMode === 'acquire' ? withCacheOperationLock(root, captured, hydrateUnderLock) : hydrateUnderLock(captured)
+}
+
 export const hydrateResolvedRepository = (
   root: string,
   lockMode: CacheRecoveryLockMode = 'acquire',
   location?: CacheLocation,
-): PrepareResult => {
-  const captured = location ?? inspectCacheLocation(root)
-  const hydrateUnderLock = (heldLocation: CacheLocation) =>
-    runWithDisposableCacheRecovery(root, heldLocation, () => rebuildCache(root, heldLocation).result, {
-      completion: { complete: rebuild => rebuild.result, kind: 'complete-from-rebuild' },
-      lockMode: 'held',
-    })
-  return lockMode === 'acquire' ? withCacheOperationLock(root, captured, hydrateUnderLock) : hydrateUnderLock(captured)
-}
+): PrepareResult => hydrateResolvedWithRebuilder(root, lockMode, location, rebuildCache)
+
+/** @internal */
+export const hydrateResolvedMutationSnapshot = (
+  root: string,
+  snapshot: ValidatedMutationCacheSnapshot,
+  lockMode: CacheRecoveryLockMode = 'acquire',
+  location?: CacheLocation,
+): PrepareResult => hydrateResolvedWithRebuilder(root, lockMode, location, mutationCacheRebuilder(snapshot))
 
 export const prepare = (input: RootInput = {}): PrepareResult => {
   const root = resolveRepository(parseRootInput(input, 'prepare'))
