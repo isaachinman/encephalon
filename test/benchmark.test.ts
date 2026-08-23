@@ -31,7 +31,7 @@ import {
   summarizeDistribution,
 } from '../scripts/benchmark-model.ts'
 import { runBenchmarkWorker } from '../scripts/benchmark-process.ts'
-import { gatherBenchmarkInput } from '../scripts/benchmark-workload.ts'
+import { gatherBenchmarkInput, shownIdForBenchmarkCase } from '../scripts/benchmark-workload.ts'
 import { hydrate, prepare } from '../src/index.ts'
 import { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
 import { createTestRepository, removeTestRepository } from './helpers.ts'
@@ -147,6 +147,11 @@ describe('isolated benchmark authority', () => {
         ['benchmark-missing', OPERATION_BUDGETS.gatherShows.maximum / 2],
       ]),
     )
+  })
+
+  test('targets the last active chain record in populated benchmark workloads', () => {
+    assert.equal(shownIdForBenchmarkCase(100), 'chain-00009')
+    assert.deepEqual(gatherBenchmarkInput(100).shows.slice(0, 2), ['chain-00009', 'benchmark-missing'])
   })
 
   test('excludes warmups and reports deterministic distributions', async () => {
