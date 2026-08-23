@@ -31,7 +31,7 @@ describe('package contract', () => {
       .join('\n')
     assert.doesNotMatch(
       declarations,
-      /BaselineWork|RecordWork|onEntry|onWork|scanBaselineWithHooks|validateRecordsResolved/,
+      /BaselineWork|RecordWork|WorkObserver|onEntry|onWork|scanBaselineWithHooks|validateRecordsResolved/,
     )
   })
 
@@ -106,6 +106,7 @@ describe('package contract', () => {
       /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `eae98315e53ce568c62f6854a8542b285b7f9e4f`\./,
     )
     assert.match(contract, /## Performance Evidence/)
+    assert.match(contract, /implementing the MAR-2566 benchmark guarantees above/)
     assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `7304c07b0fd1554470a25307ff028c03b3653274`\./)
     assert.match(performance, /Correctness tests enforce deterministic output and bounded work counts/)
     assert.match(

@@ -142,7 +142,7 @@ This document is the concise contract maintainers should update when public beha
 - Zero-record stale preparation is unavailable and represented as `null`. Stale samples use a valid different-length canonical record variant so rapid runs cannot mistake unchanged timestamp/size metadata for a changed corpus.
 - Report output is written at mode `0600` inside a private `0700` staging directory beside the destination. The retained descriptor, rather than the replaceable destination pathname, applies an existing regular report's permission mode or the normal process-umask mode for a new report before close and atomic rename. Rename is the publication commit; later best-effort removal of the now-empty private staging directory cannot turn a successful publication into a reported failure. On platforms that deliver handled `SIGINT` and `SIGTERM`, signals cancel the active child, await closure, clean temporary repositories, and return a non-zero status without publishing a report. Windows force-terminates Node children for `SIGTERM`, so that CLI signal-cleanup guarantee does not apply there; platform-neutral `AbortController` cancellation cleanup remains covered everywhere.
 
-The exact code and behavioural-test snapshot implementing these guarantees is `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
+The exact code and behavioural-test snapshot implementing the MAR-2566 benchmark guarantees above is `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 
 MAR-2568 behavioural hot-scan work bounds: `7304c07b0fd1554470a25307ff028c03b3653274`.
 

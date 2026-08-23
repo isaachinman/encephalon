@@ -49,11 +49,53 @@ const writeRecord = (
 }
 
 describe('hot scan performance regressions', () => {
-  test('leaves unobserved baseline results free of instrumentation wrappers', () => {
+  test('leaves returned baseline results free of instrumentation wrappers', () => {
     const root = createRoot()
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'sample-project' }))
 
     assert.doesNotThrow(() => structuredClone(scanBaseline(root)))
+    assert.doesNotThrow(() =>
+      structuredClone(
+        scanBaselineWithHooks(root, {
+          onWork: () => undefined,
+        }),
+      ),
+    )
+  })
+
+  test('propagates internal work observer failures unchanged', () => {
+    const baselineRoot = createRoot()
+    writeFileSync(join(baselineRoot, 'package.json'), JSON.stringify({ name: 'sample-project' }))
+    const baselineFailure = new Error('baseline observer failed')
+
+    assert.throws(
+      () =>
+        scanBaselineWithHooks(baselineRoot, {
+          onWork: () => {
+            throw baselineFailure
+          },
+        }),
+      error => error === baselineFailure,
+    )
+
+    const recordsRoot = createRoot()
+    writeRecord(recordsRoot, {
+      createdAt: '2026-08-08T00:00:00.000Z',
+      id: 'observed-record',
+    })
+    const recordFailure = new Error('record observer failed')
+
+    assert.throws(
+      () =>
+        validateRecordsResolved(recordsRoot, {
+          hooks: {
+            onWork: () => {
+              throw recordFailure
+            },
+          },
+        }),
+      error => error === recordFailure,
+    )
   })
 
   test('bounds validation work while preserving dense-history issue order', () => {
