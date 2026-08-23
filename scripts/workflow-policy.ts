@@ -122,11 +122,14 @@ const readRealPath = (path: string) => {
   return nativePath
 }
 
+const isSingleLinkRegularFile = (stats: BigIntStats) => stats.isFile() && stats.nlink === 1n
+
 const isRegularNativeFile = (root: string, path: string) => {
   const stats = readStats(path)
   const nativePath = readRealPath(path)
   return (
-    stats?.isFile() === true &&
+    stats !== undefined &&
+    isSingleLinkRegularFile(stats) &&
     stats.isSymbolicLink() === false &&
     nativePath !== undefined &&
     samePath(nativePath, path) &&
@@ -175,7 +178,7 @@ const readValidatedNativeFile = (root: string, path: string) => {
     const initialStats = lstatSync(path, { bigint: true })
     const initialNativePath = realpathSync.native(path)
     if (
-      initialStats.isFile() &&
+      isSingleLinkRegularFile(initialStats) &&
       !initialStats.isSymbolicLink() &&
       samePath(initialNativePath, path) &&
       isContainedPath(root, initialNativePath)
@@ -183,13 +186,14 @@ const readValidatedNativeFile = (root: string, path: string) => {
       const noFollow = constants.O_NOFOLLOW ?? 0
       descriptor = openSync(path, constants.O_RDONLY | noFollow)
       const beforeReadStats = fstatSync(descriptor, { bigint: true })
-      if (beforeReadStats.isFile() && hasStableFileIdentity(initialStats, beforeReadStats)) {
+      if (isSingleLinkRegularFile(beforeReadStats) && hasStableFileIdentity(initialStats, beforeReadStats)) {
         const candidateContents = readFileSync(descriptor, 'utf8')
         const afterReadStats = fstatSync(descriptor, { bigint: true })
         const finalStats = lstatSync(path, { bigint: true })
         const finalNativePath = realpathSync.native(path)
         if (
-          finalStats.isFile() &&
+          isSingleLinkRegularFile(afterReadStats) &&
+          isSingleLinkRegularFile(finalStats) &&
           !finalStats.isSymbolicLink() &&
           samePath(finalNativePath, path) &&
           isContainedPath(root, finalNativePath) &&

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
@@ -12,6 +12,7 @@ const policyPath = fileURLToPath(new URL('./workflow-policy.ts', import.meta.url
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url))
 const directorySymlinkType = process.platform === 'win32' ? 'junction' : 'dir'
 const windowsOnlyTest = process.platform === 'win32' ? test : test.skip
+const posixOnlyTest = process.platform === 'win32' ? test.skip : test
 
 type PullfrogStep = Record<string, unknown> & {
   env?: unknown
@@ -693,9 +694,7 @@ runs:
 })
 
 // Mutation caught: normalising POSIX backslashes as separators would hide an ancestor symlink behind a slash-shaped path.
-test('rejects a POSIX ancestor symlink whose backslash name resembles a slash path', {
-  skip: process.platform === 'win32' ? 'Windows treats backslashes as path separators.' : false,
-}, () => {
+posixOnlyTest('rejects a POSIX ancestor symlink whose backslash name resembles a slash path', () => {
   const root = createFixture({
     '.github/actions/slash/path/checked/action.yml': `name: Checked
 runs:
@@ -809,6 +808,50 @@ runs:
     {
       file: '.github/workflows/local-files.yml',
       location: 'jobs.verify.steps[2].uses',
+      rule: 'local-reference',
+    },
+  ])
+})
+
+test('rejects multiply linked workflow and local-action files', () => {
+  const root = createFixture({
+    '.github/actions/linked/placeholder': 'fixture\n',
+    '.github/workflows/entry.yml': `name: Entry
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/linked
+`,
+  })
+  const outside = createFixture({
+    'action.yml': `name: Linked action
+runs:
+  using: composite
+  steps: []
+`,
+    'workflow.yml': `name: Linked workflow
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+  })
+  linkSync(join(outside, 'action.yml'), join(root, '.github/actions/linked/action.yml'))
+  linkSync(join(outside, 'workflow.yml'), join(root, '.github/workflows/linked.yml'))
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/entry.yml',
+      location: 'jobs.verify.steps[0].uses',
+      rule: 'local-reference',
+    },
+    {
+      file: '.github/workflows/linked.yml',
+      location: '$',
       rule: 'local-reference',
     },
   ])
