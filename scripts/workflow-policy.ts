@@ -13,7 +13,11 @@ type ParsedObject = Record<string, unknown>
 
 const fullCommitReference = /^[^\s@/]+\/[^\s@/]+(?:\/[^\s@/]+)*@[0-9a-f]{40}$/u
 const localReference = /^\.\//u
-const secretExpression = /\$\{\{\s*secrets\s*(?:\.|\[)/u
+const identifierStart = /[A-Za-z_]/u
+const identifierCharacter = /[A-Za-z0-9_-]/u
+const expressionOpening = '${{'
+const expressionClosing = '}}'
+const secretsIdentifier = 'secrets'
 const workflowFilename = /\.ya?ml$/u
 const protectedEnvironment = 'pullfrog-review'
 
@@ -141,10 +145,63 @@ const hasProtectedEnvironment = (value: unknown) => {
   return protected_
 }
 
+const isIdentifierCharacter = (character: string | undefined) =>
+  character !== undefined && identifierCharacter.test(character)
+
+const isIdentifierStart = (character: string | undefined) => character !== undefined && identifierStart.test(character)
+
+const stringContainsSecretExpression = (value: string) => {
+  let containsSecret = false
+  let expressionStart = value.indexOf(expressionOpening)
+  while (!containsSecret && expressionStart >= 0) {
+    let position = expressionStart + expressionOpening.length
+    let inSingleQuotedLiteral = false
+    let expressionClosed = false
+    let expressionContainsSecret = false
+    while (!expressionClosed && position < value.length) {
+      const character = value[position]
+      const nextCharacter = value[position + 1]
+      if (inSingleQuotedLiteral) {
+        if (character === "'" && nextCharacter === "'") {
+          position += 2
+        } else {
+          if (character === "'") {
+            inSingleQuotedLiteral = false
+          }
+          position += 1
+        }
+      } else if (character === "'") {
+        inSingleQuotedLiteral = true
+        position += 1
+      } else if (character === '}' && nextCharacter === '}') {
+        expressionClosed = true
+        position += expressionClosing.length
+      } else if (isIdentifierStart(character)) {
+        let identifierEnd = position + 1
+        while (isIdentifierCharacter(value[identifierEnd])) {
+          identifierEnd += 1
+        }
+        if (value.slice(position, identifierEnd).toLowerCase() === secretsIdentifier) {
+          expressionContainsSecret = true
+        }
+        position = identifierEnd
+      } else {
+        position += 1
+      }
+    }
+    if (expressionClosed && expressionContainsSecret) {
+      containsSecret = true
+    } else {
+      expressionStart = value.indexOf(expressionOpening, position)
+    }
+  }
+  return containsSecret
+}
+
 const containsSecretExpression = (value: unknown): boolean => {
   let containsSecret = false
   if (typeof value === 'string') {
-    containsSecret = secretExpression.test(value)
+    containsSecret = stringContainsSecretExpression(value)
   } else if (Array.isArray(value)) {
     containsSecret = value.some(item => containsSecretExpression(item))
   } else if (isPlainObject(value)) {

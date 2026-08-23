@@ -225,6 +225,7 @@ describe('package contract', () => {
       scripts?: Record<string, unknown>
     }
     const publishScript = String(packageJson.scripts?.['check:publish'])
+    const workflowCheckScript = String(packageJson.scripts?.['check:workflows'])
     const eventsStart = workflow.indexOf('\non:\n') + 1
     const permissionsStart = workflow.indexOf('\npermissions:\n', eventsStart)
     const jobsStart = workflow.indexOf('\njobs:\n')
@@ -294,15 +295,19 @@ jobs:
     )
     assert.match(verificationRunner, /^ {4}runs-on: \$\{\{ matrix\.os \}\}\n$/)
     assert.doesNotMatch(verificationJob, /^ {4}(?:if|continue-on-error):/m)
-    assert.match(verificationSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
     assert.match(
       verificationSteps,
-      /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}/,
+      /uses: actions\/checkout@[0-9a-f]{40} # v\d+\.\d+\.\d+\n\s+with:\n\s+persist-credentials: false/,
+    )
+    assert.match(
+      verificationSteps,
+      /uses: actions\/setup-node@[0-9a-f]{40} # v\d+\.\d+\.\d+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}/,
     )
     assert.deepEqual(
       [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
       [
         'bun install --frozen-lockfile',
+        'bun run check:workflows',
         'bun run typecheck',
         'bun run test',
         'bun run lint',
@@ -311,7 +316,7 @@ jobs:
         'bun run check:package',
       ],
     )
-    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
+    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 8)
     assert.doesNotMatch(verificationSteps, /^\s{8}(?:if|continue-on-error):/m)
 
     assert.equal(
@@ -324,13 +329,19 @@ jobs:
     runs-on: ubuntu-latest
 `,
     )
-    assert.match(releaseSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
-    assert.match(releaseSteps, /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0/)
+    assert.match(
+      releaseSteps,
+      /uses: actions\/checkout@[0-9a-f]{40} # v\d+\.\d+\.\d+\n\s+with:\n\s+persist-credentials: false/,
+    )
+    assert.match(
+      releaseSteps,
+      /uses: actions\/setup-node@[0-9a-f]{40} # v\d+\.\d+\.\d+\n\s+with:\n\s+node-version: 24\.15\.0/,
+    )
     assert.deepEqual(
       [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
-      ['bun install --frozen-lockfile', 'bun run build', 'bun run check:package'],
+      ['bun install --frozen-lockfile', 'bun run check:workflows', 'bun run build', 'bun run check:package'],
     )
-    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 5)
+    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 6)
     assert.doesNotMatch(releaseSteps, /^\s{8}(?:if|continue-on-error):/m)
     assert.match(
       releaseJob,
@@ -365,6 +376,7 @@ jobs:
     assert.match(readme, /four verification lanes/)
     assert.match(readme, /trusted pushes to `main`/)
     assert.match(readme, /release-equivalent package gate/)
+    assert.equal(workflowCheckScript, 'bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts')
     assert.equal(publishScript, 'bun run scripts/check-publish.ts')
     assert.equal(publishCheck.includes("'--dry-run'"), true)
     assert.equal(publishCheck.includes("'--ignore-scripts'"), true)

@@ -54,6 +54,7 @@
     "build": "bun run scripts/build.ts",
     "check:package": "bun run scripts/check-package.ts",
     "check:publish": "bun run scripts/check-publish.ts",
+    "check:workflows": "bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts",
     "lint": "ultracite check",
     "prepack": "bun run build && bun run check:package",
     "test": "bun run build && node --test test/*.test.ts",

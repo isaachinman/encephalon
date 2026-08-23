@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
@@ -9,6 +9,82 @@ import { formatWorkflowPolicyFindings, inspectWorkflowPolicy } from './workflow-
 
 const temporaryRoots: string[] = []
 const policyPath = fileURLToPath(new URL('./workflow-policy.ts', import.meta.url))
+const repositoryRoot = fileURLToPath(new URL('..', import.meta.url))
+
+type PullfrogStep = Record<string, unknown> & {
+  env?: unknown
+  name?: unknown
+  uses?: unknown
+  with?: unknown
+}
+
+type PullfrogJob = Record<string, unknown> & {
+  environment?: unknown
+  permissions?: unknown
+  steps: PullfrogStep[]
+}
+
+type PullfrogWorkflow = Record<string, unknown> & {
+  jobs: Record<string, PullfrogJob> & { pullfrog: PullfrogJob }
+  name?: unknown
+  permissions?: unknown
+  'run-name'?: unknown
+  true?: unknown
+}
+
+const assertExactPullfrogJob = (job: PullfrogJob) => {
+  assert.deepEqual(Object.keys(job).toSorted(), ['environment', 'permissions', 'runs-on', 'steps'])
+  assert.equal(job['runs-on'], 'ubuntu-latest')
+  assert.equal(job.environment, 'pullfrog-review')
+  assert.deepEqual(job.permissions, {
+    contents: 'read',
+    'id-token': 'write',
+  })
+  assert.equal(job.steps.length, 2)
+
+  const [checkoutStep, pullfrogStep] = job.steps
+  assert.deepEqual(Object.keys(checkoutStep ?? {}).toSorted(), ['name', 'uses', 'with'])
+  assert.equal(checkoutStep?.name, 'Checkout code')
+  assert.equal(checkoutStep?.uses, 'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803')
+  assert.deepEqual(checkoutStep?.with, {
+    'fetch-depth': 1,
+    'persist-credentials': false,
+  })
+
+  assert.deepEqual(Object.keys(pullfrogStep ?? {}).toSorted(), ['env', 'name', 'uses', 'with'])
+  assert.equal(pullfrogStep?.name, 'Run agent')
+  assert.equal(pullfrogStep?.uses, 'pullfrog/pullfrog@c4d0ca6f15d12382ddd20d2010bc596b405f42f0')
+  assert.deepEqual(pullfrogStep?.with, {
+    prompt: `${'$'}{{ inputs.prompt }}`,
+    push: 'disabled',
+  })
+  assert.deepEqual(pullfrogStep?.env, {
+    PULLFROG_FORCE_LOCAL_CLI: '1',
+  })
+}
+
+const assertExactPullfrogWorkflow = (workflow: PullfrogWorkflow) => {
+  assert.deepEqual(Object.keys(workflow).toSorted(), ['jobs', 'name', 'permissions', 'run-name', 'true'])
+  assert.equal(workflow.name, 'Pullfrog')
+  assert.equal(workflow['run-name'], `${'$'}{{ inputs.name || github.workflow }}`)
+  assert.deepEqual(workflow.permissions, { contents: 'read' })
+  assert.deepEqual(workflow.true, {
+    workflow_dispatch: {
+      inputs: {
+        name: {
+          description: 'Run name',
+          type: 'string',
+        },
+        prompt: {
+          description: 'Agent prompt',
+          type: 'string',
+        },
+      },
+    },
+  })
+  assert.deepEqual(Object.keys(workflow.jobs), ['pullfrog'])
+  assertExactPullfrogJob(workflow.jobs.pullfrog)
+}
 
 const createFixture = (files: Readonly<Record<string, string>>) => {
   const root = mkdtempSync(join(tmpdir(), 'encephalon-workflow-policy-test-'))
@@ -182,6 +258,81 @@ jobs:
     {
       file: '.github/workflows/spaced-secrets.yml',
       location: 'jobs.dot.environment',
+      rule: 'credential-environment',
+    },
+  ])
+})
+
+// Mutation caught: requiring secrets at the expression start would miss nested context use, while scanning outside expression bounds would flag plain text.
+test('detects the secrets context anywhere inside a GitHub expression', () => {
+  const root = createFixture({
+    '.github/workflows/nested-secrets.yml': `name: Nested secrets
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  formatted:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ format('{{value {0}}}', secrets.TOKEN) }}"
+  serialized:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ toJSON(secrets) }}"
+  mixed-case:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ SeCrEtS.TOKEN }}"
+  second-expression:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ github.ref }} then \${{ secrets.SECOND }}"
+  quoted:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ 'secrets' }}"
+  quoted-format:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ format('don''t expose secrets {0}', github.ref) }}"
+  outside:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ github.ref }} secrets.TOKEN"
+  hyphenated:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ outputs.non-secrets }} \${{ outputs.secrets-token }}"
+  prefixed:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ outputs.mysecrets }}"
+  suffixed:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "\${{ outputs.secretsValue }}"
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/nested-secrets.yml',
+      location: 'jobs.formatted.environment',
+      rule: 'credential-environment',
+    },
+    {
+      file: '.github/workflows/nested-secrets.yml',
+      location: 'jobs.mixed-case.environment',
+      rule: 'credential-environment',
+    },
+    {
+      file: '.github/workflows/nested-secrets.yml',
+      location: 'jobs.second-expression.environment',
+      rule: 'credential-environment',
+    },
+    {
+      file: '.github/workflows/nested-secrets.yml',
+      location: 'jobs.serialized.environment',
       rule: 'credential-environment',
     },
   ])
@@ -561,4 +712,66 @@ jobs:
   assert.equal(failing.status, 1)
   assert.equal(failing.stdout, '')
   assert.equal(failing.stderr, '.github/workflows/fail.yml:jobs.verify.steps[0].uses: external-action-sha\n')
+})
+
+// Mutation caught: mutable actions, hidden local wrappers, unprotected credentials, or write permissions would escape repository policy.
+test('repository workflows obey immutable action and credential boundaries', () => {
+  assert.deepEqual(inspectWorkflowPolicy(repositoryRoot), [])
+
+  // Mutation caught: removing push: disabled would restore Pullfrog's write-capable Git token and push tools.
+  const pullfrogWorkflow = Bun.YAML.parse(
+    readFileSync(join(repositoryRoot, '.github/workflows/pullfrog.yml'), 'utf8'),
+  ) as PullfrogWorkflow
+  const pullfrogJob = pullfrogWorkflow.jobs.pullfrog
+  assertExactPullfrogWorkflow(pullfrogWorkflow)
+
+  // Mutations caught: credentials cannot be inherited from workflow scope and action families cannot hide in sibling jobs.
+  assert.throws(() =>
+    assertExactPullfrogWorkflow({
+      ...pullfrogWorkflow,
+      env: { PROVIDER_API_KEY: 'provider-secret-mapping' },
+    }),
+  )
+  assert.throws(() =>
+    assertExactPullfrogWorkflow({
+      ...pullfrogWorkflow,
+      jobs: {
+        ...pullfrogWorkflow.jobs,
+        'pullfrog-shadow': pullfrogJob,
+      },
+    }),
+  )
+
+  // Mutations caught: provider mappings cannot move to job scope or hide in an additional step.
+  assert.throws(() =>
+    assertExactPullfrogJob({
+      ...pullfrogJob,
+      env: { PROVIDER_API_KEY: 'provider-secret-mapping' },
+    }),
+  )
+  assert.throws(() =>
+    assertExactPullfrogJob({
+      ...pullfrogJob,
+      steps: [
+        ...pullfrogJob.steps,
+        {
+          env: { PROVIDER_API_KEY: 'provider-secret-mapping' },
+          name: 'Map provider credential',
+          run: 'echo mapped',
+        },
+      ],
+    }),
+  )
+
+  const ciWorkflow = Bun.YAML.parse(readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8')) as {
+    jobs: Record<string, { steps?: Array<{ uses?: string; with?: Record<string, unknown> }> }>
+  }
+  const ciCheckoutSteps = Object.values(ciWorkflow.jobs).flatMap(job =>
+    (job.steps ?? []).filter(step => step.uses?.startsWith('actions/checkout@')),
+  )
+  assert.equal(ciCheckoutSteps.length, 2)
+  assert.equal(
+    ciCheckoutSteps.every(step => step.with?.['persist-credentials'] === false),
+    true,
+  )
 })
