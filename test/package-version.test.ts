@@ -15,4 +15,10 @@ test('rejects generated package-version source that is not an exact match', () =
     () => assertPackageVersionSource('0.2.0', renderPackageVersionSource('0.2.1')),
     new Error('Generated runtime package version is stale. Run `bun run build` and commit src/generated/version.ts.'),
   )
+  const misleadingStaleSource = '// Expected PACKAGE_VERSION = "0.2.0"\nexport const PACKAGE_VERSION = "0.2.1"\n'
+  assert.equal(misleadingStaleSource.includes('PACKAGE_VERSION = "0.2.0"'), true)
+  assert.throws(
+    () => assertPackageVersionSource('0.2.0', misleadingStaleSource),
+    new Error('Generated runtime package version is stale. Run `bun run build` and commit src/generated/version.ts.'),
+  )
 })

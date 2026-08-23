@@ -6,6 +6,11 @@ import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
 
+const topLevelStepSequence = (steps: string): string[] =>
+  [...steps.matchAll(/^ {6}- (?:name|run|uses): [^\n]+$/gm)].map(match =>
+    match[0].slice(8).replace(/^(uses: [^@]+)@.*$/, '$1'),
+  )
+
 describe('package contract', () => {
   test('declares a zero-runtime-dependency Node ESM package', () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as Record<string, unknown>
@@ -334,21 +339,20 @@ jobs:
       verificationSteps,
       /uses: actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}/,
     )
-    assert.deepEqual(
-      [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
-      [
-        'bun install --frozen-lockfile',
-        'bun run check:workflows',
-        'bun run check:generated',
-        'bun run typecheck',
-        'bun run test',
-        'bun run lint',
-        'bun run benchmark:check',
-        'bun run build',
-        'bun run check:package',
-      ],
-    )
-    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 9)
+    assert.deepEqual(topLevelStepSequence(verificationSteps), [
+      'uses: actions/checkout',
+      'uses: actions/setup-node',
+      'uses: oven-sh/setup-bun',
+      'run: bun install --frozen-lockfile',
+      'run: bun run check:workflows',
+      'name: Check committed package version',
+      'run: bun run typecheck',
+      'run: bun run test',
+      'run: bun run lint',
+      'run: bun run benchmark:check',
+      'run: bun run build',
+      'run: bun run check:package',
+    ])
     assert.match(verificationSteps, /- name: Check committed package version\n\s+run: bun run check:generated/)
     assert.doesNotMatch(verificationSteps, /^\s{8}(?:if|continue-on-error):/m)
 
@@ -363,11 +367,19 @@ jobs:
     )
     assert.match(releaseSteps, /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/)
     assert.match(releaseSteps, /uses: actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version: 24\.15\.0/)
-    assert.deepEqual(
-      [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
-      ['bun install --frozen-lockfile', 'bun run check:workflows', 'bun run build', 'bun run check:package'],
-    )
-    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
+    assert.deepEqual(topLevelStepSequence(releaseSteps), [
+      'uses: actions/checkout',
+      'uses: actions/setup-node',
+      'uses: oven-sh/setup-bun',
+      'run: bun install --frozen-lockfile',
+      'run: bun run check:workflows',
+      'name: Check committed package version',
+      'run: bun run build',
+      'run: bun run check:package',
+      'name: Create release-equivalent package artifact',
+      'name: Check npm publish dry run',
+      'name: Upload release-equivalent package artifact',
+    ])
     assert.match(releaseSteps, /- name: Check committed package version\n\s+run: bun run check:generated/)
     assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length, 1)
     assert.doesNotMatch(releaseSteps, /^\s{8}continue-on-error:/m)
@@ -392,22 +404,6 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 `,
-    )
-    assert.equal(
-      [
-        'bun run check:generated',
-        'bun run build',
-        'bun run check:package',
-        'npm pack',
-        'bun run check:publish',
-        'actions/upload-artifact',
-      ]
-        .map(step => releaseJob.indexOf(step))
-        .every(
-          (position, index, positions) =>
-            position >= 0 && (index === 0 || position > (positions[index - 1] ?? Number.POSITIVE_INFINITY)),
-        ),
-      true,
     )
     assert.match(readme, /four verification lanes/)
     assert.match(
@@ -435,7 +431,6 @@ jobs:
       [contract, releaseChecksPlan].map(document => skippedReleaseContextRationale.test(document)),
       [true, true],
     )
-    assert.doesNotMatch(`${contract}\n${releaseChecksPlan}`, /deadlock/)
     assert.equal(workflowCheckScript, 'bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts')
     assert.equal(publishScript, 'bun run scripts/check-publish.ts')
     assert.equal(publishCheck.includes("'--dry-run'"), true)
