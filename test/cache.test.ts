@@ -4802,6 +4802,13 @@ describe('SQLite cache and reads', () => {
         name: 'oversized FTS text containing NUL',
       },
       {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.prepare('UPDATE record_search SET id = ?').run('x'.repeat(256))
+        },
+        name: 'oversized textual FTS ID',
+      },
+      {
         expectedRows: 24,
         mutate: (database: DatabaseSync) => {
           database.exec(`
