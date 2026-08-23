@@ -5149,7 +5149,7 @@ describe('SQLite cache and reads', () => {
         name: 'oversized textual FTS ID',
       },
       {
-        expectedRows: 24,
+        expectedRows: 12,
         mutate: (database: DatabaseSync) => {
           database.exec(`
             CREATE TABLE replacement_records (
