@@ -1739,12 +1739,24 @@ const rebuildCache = (
       }
       continue
     }
-    const written = writeCacheSnapshot(root, location, nextWriterPrimary, {
-      artifacts,
-      manifest: manifestBefore.value,
-      records,
-      repositoryRealpath: location.repository,
-    })
+    const written = (() => {
+      try {
+        return writeCacheSnapshot(root, location, nextWriterPrimary, {
+          artifacts,
+          manifest: manifestBefore.value,
+          records,
+          repositoryRealpath: location.repository,
+        })
+      } catch (error) {
+        if (error instanceof CacheDatabaseCreationConflict && primary.kind === 'create-if-missing') {
+          return fail('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
+            entry: error.relativePath,
+            invariant: 'stable-identity',
+          })
+        }
+        throw error
+      }
+    })()
     if (written.kind === 'committed') {
       return written.rebuild
     }
@@ -1790,6 +1802,12 @@ const mutationCacheRebuilder = (snapshot: ValidatedMutationCacheSnapshot): Cache
       if (error instanceof MutationCacheSnapshotChanged) {
         discarded = true
         return rebuildCache(root, location, primary)
+      }
+      if (error instanceof CacheDatabaseCreationConflict && primary.kind === 'create-if-missing') {
+        return fail('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
+          entry: error.relativePath,
+          invariant: 'stable-identity',
+        })
       }
       throw error
     }
