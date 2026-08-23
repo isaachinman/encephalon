@@ -10,6 +10,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -648,10 +649,18 @@ describe('isolated benchmark authority', () => {
     const temporaryParent = mkdtempSync(join(tmpdir(), 'encephalon-benchmark-restore-test-'))
     const root = createTestRepository()
     const template = join(temporaryParent, 'template')
+    const wrongPackage = join(temporaryParent, 'wrong-package')
     try {
       mkdirSync(join(root, 'encephalon'))
       hydrate({ root })
       cpSync(root, template, { recursive: true, verbatimSymlinks: true })
+      mkdirSync(wrongPackage)
+      rmSync(join(template, 'node_modules', 'encephalon'), { force: true, recursive: true })
+      symlinkSync(
+        wrongPackage,
+        join(template, 'node_modules', 'encephalon'),
+        process.platform === 'win32' ? 'junction' : 'dir',
+      )
 
       restoreBenchmarkSample(template, root, 'unchangedPrepare')
 

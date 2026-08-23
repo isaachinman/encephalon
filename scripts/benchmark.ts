@@ -73,6 +73,9 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const defaultWorkerPath = join(packageRoot, 'scripts', 'benchmark-worker.ts')
 const deterministicStart = Date.UTC(2026, 0, 1)
 
+const createPackageLink = (root: string): void =>
+  symlinkSync(packageRoot, join(root, 'node_modules', 'encephalon'), process.platform === 'win32' ? 'junction' : 'dir')
+
 const help = `Usage: node scripts/benchmark.ts [options]
 
 Options:
@@ -135,11 +138,7 @@ const createRepository = (
     afterAllocation?.('repository')
     mkdirSync(join(root, '.git'))
     mkdirSync(join(root, 'node_modules'))
-    symlinkSync(
-      packageRoot,
-      join(root, 'node_modules', 'encephalon'),
-      process.platform === 'win32' ? 'junction' : 'dir',
-    )
+    createPackageLink(root)
     return root
   } catch (error) {
     return completeBenchmarkCleanup<string>({ error, kind: 'failure' }, [root], removeRoot)
@@ -165,6 +164,8 @@ const snapshotRepository = (
 const restoreRepository = (template: string, root: string): void => {
   rmSync(root, { force: true, recursive: true })
   cpSync(template, root, { recursive: true, verbatimSymlinks: true })
+  rmSync(join(root, 'node_modules', 'encephalon'), { force: true, recursive: true })
+  createPackageLink(root)
 }
 
 export const restoreBenchmarkSample = (template: string, root: string, operation: BenchmarkOperation): void => {
