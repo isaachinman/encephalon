@@ -36,11 +36,18 @@ describe('bounded canonical directory collection', () => {
   test('reads no more than limit plus one and hides order and names on overflow', () => {
     const first = readerFor([{ name: 'z' }, { name: 'secret-excess' }, { name: 'a' }, { name: 'unread' }])
     const second = readerFor([{ name: 'a' }, { name: 'z' }, { name: 'different-excess' }, { name: 'unread' }])
+    let observedEntries = 0
 
-    assert.deepEqual(collectBoundedDirectoryEntries('ignored', 2, first.open), { entries: [], overflow: true })
+    assert.deepEqual(
+      collectBoundedDirectoryEntries('ignored', 2, first.open, () => {
+        observedEntries += 1
+      }),
+      { entries: [], overflow: true },
+    )
     assert.deepEqual(collectBoundedDirectoryEntries('ignored', 2, second.open), { entries: [], overflow: true })
     assert.deepEqual(first.state(), { closed: 1, entriesRead: 3 })
     assert.deepEqual(second.state(), { closed: 1, entriesRead: 3 })
+    assert.equal(observedEntries, 3)
   })
 
   test('does not inspect entry names after detecting overflow', () => {

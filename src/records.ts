@@ -69,6 +69,7 @@ import type {
   ValidateResult,
   ValidationIssue,
 } from './types.ts'
+import { observedArray, observedSet, observeWork, reportWork, rethrowWorkObserverError } from './work-observer.ts'
 
 type RecordScan = {
   records: BrainRecord[]
@@ -156,6 +157,21 @@ export const recordWriteTestHooks: AddRecordTestHooks = {}
 
 type RecordReadFault = 'after-record-fstat' | 'after-record-lstat' | 'after-record-open'
 
+type RecordWork =
+  | 'active-group-read'
+  | 'active-group-write'
+  | 'active-issue-read'
+  | 'active-issue-write'
+  | 'allowed-group-write'
+  | 'allowed-id-write'
+  | 'canonical-entry'
+  | 'cycle-edge'
+  | 'duplicate-issue-read'
+  | 'duplicate-issue-write'
+  | 'duplicate-record'
+  | 'edge-validation'
+  | 'superseded-edge'
+
 /** @internal */
 export type RecordReadHooks = {
   afterBrainRootEnumeration?: (() => void) | undefined
@@ -164,6 +180,7 @@ export type RecordReadHooks = {
   beforeFinalWitnessValidation?: (() => void) | undefined
   fault?: (point: RecordReadFault, path: string) => void
   graphValidation?: () => void
+  onWork?: ((operation: RecordWork) => void) | undefined
 }
 
 type AddRecordOptions = {
@@ -182,6 +199,15 @@ type PlannedRecord = {
 
 type ValidateRecordsOptions = {
   hooks?: RecordReadHooks
+}
+
+const preserveWorkObserverFailure = <Result>(operation: () => Result) => {
+  try {
+    return operation()
+  } catch (error) {
+    rethrowWorkObserverError(error)
+    throw error
+  }
 }
 
 type AllowedMultiHead = {
@@ -561,6 +587,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
 
     const kindDirectoryNames = new Map<string, string>()
     const scanned: RecordScan = { bytes: 0, errors: [], observations: [], records: [] }
+    const onWork = options.hooks?.onWork
     let recordBytes = 0
     let stopScanning = false
     const addScanError = (validationIssue: ValidationIssue) => {
@@ -623,6 +650,9 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
           for (const recordEntry of recordEntries.entries) {
             if (stopScanning) {
               break
+            }
+            if (onWork !== undefined) {
+              reportWork(onWork, 'canonical-entry')
             }
             const recordPath = join(kindPath, recordEntry.name)
             const relativePath = posixRelative(root, recordPath)
@@ -733,11 +763,18 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
   return { bytes: 0, errors: [], layout: { kinds: new Map(), root: null }, observations: [], records: [] }
 }
 
-const duplicateAndCaseIssues = (records: BrainRecord[]) => {
+const duplicateAndCaseIssues = (records: BrainRecord[], hooks: RecordReadHooks) => {
   const ids = new Map<string, BrainRecord>()
   const paths = new Map<string, BrainRecord>()
-  const errors: ValidationIssue[] = []
+  const { onWork } = hooks
+  const errors = observedArray<ValidationIssue>(
+    observeWork(hooks.onWork, 'duplicate-issue-read'),
+    observeWork(hooks.onWork, 'duplicate-issue-write'),
+  )
   for (const record of records) {
+    if (onWork !== undefined) {
+      reportWork(onWork, 'duplicate-record')
+    }
     const idCollision = ids.get(record.id)
     const pathCollision = paths.get(record.path.normalize('NFC').toLowerCase())
     ids.set(record.id, record)
@@ -754,8 +791,9 @@ const duplicateAndCaseIssues = (records: BrainRecord[]) => {
   return errors
 }
 
-const supersessionIssues = (records: BrainRecord[]) => {
+const supersessionIssues = (records: BrainRecord[], hooks: RecordReadHooks) => {
   const byId = new Map(records.map(record => [record.id, record]))
+  const { onWork } = hooks
   const edgeCount = records.reduce((count, record) => count + (record.supersedes?.length ?? 0), 0)
   if (edgeCount > MAX_SUPERSESSION_EDGES) {
     return [
@@ -768,6 +806,9 @@ const supersessionIssues = (records: BrainRecord[]) => {
   const edgeIssues: ValidationIssue[] = []
   for (const record of records) {
     for (const targetId of record.supersedes ?? []) {
+      if (onWork !== undefined) {
+        reportWork(onWork, 'edge-validation')
+      }
       const target = byId.get(targetId)
       if (target === undefined) {
         edgeIssues.push(
@@ -806,6 +847,9 @@ const supersessionIssues = (records: BrainRecord[]) => {
         } else {
           const targetId = targets[frame.index] ?? ''
           frame.index += 1
+          if (onWork !== undefined) {
+            reportWork(onWork, 'cycle-edge')
+          }
           const target = byId.get(targetId)
           if (target !== undefined) {
             const targetState = state.get(target.id)
@@ -831,6 +875,9 @@ const supersessionIssues = (records: BrainRecord[]) => {
   const superseded = new Set<string>()
   for (const record of records) {
     for (const targetId of record.supersedes ?? []) {
+      if (onWork !== undefined) {
+        reportWork(onWork, 'superseded-edge')
+      }
       superseded.add(targetId)
     }
   }
@@ -840,13 +887,21 @@ const supersessionIssues = (records: BrainRecord[]) => {
       const key = `${record.kind}\0${record.subject}`
       const group = activeGroups.get(key)
       if (group === undefined) {
-        activeGroups.set(key, [record])
+        const firstGroup = observedArray<BrainRecord>(
+          observeWork(hooks.onWork, 'active-group-read'),
+          observeWork(hooks.onWork, 'active-group-write'),
+        )
+        firstGroup.push(record)
+        activeGroups.set(key, firstGroup)
       } else {
         group.push(record)
       }
     }
   }
-  const activeIssues: ValidationIssue[] = []
+  const activeIssues = observedArray<ValidationIssue>(
+    observeWork(hooks.onWork, 'active-issue-read'),
+    observeWork(hooks.onWork, 'active-issue-write'),
+  )
   for (const group of activeGroups.values()) {
     if (group.length > 1) {
       for (const record of group) {
@@ -975,8 +1030,8 @@ const validateScannedSnapshot = (root: string, scan: RecordScan, hooks: RecordRe
   const collectedErrors = [
     ...scan.errors,
     ...corpusBudgetIssues(scan),
-    ...duplicateAndCaseIssues(scan.records),
-    ...supersessionIssues(scan.records),
+    ...duplicateAndCaseIssues(scan.records, hooks),
+    ...supersessionIssues(scan.records, hooks),
     ...artifactValidation.errors,
   ]
   const { errors, truncated } = truncateValidationIssues(collectedErrors)
@@ -994,7 +1049,7 @@ const validateScannedSnapshot = (root: string, scan: RecordScan, hooks: RecordRe
 const validateScanned = (root: string, scan: RecordScan, hooks: RecordReadHooks = {}): ValidateResult =>
   validateScannedSnapshot(root, scan, hooks).result
 
-const allowedMultiHeadRecordIds = (records: BrainRecord[], allowed: AllowedMultiHead[]) => {
+const allowedMultiHeadRecordIds = (records: BrainRecord[], allowed: AllowedMultiHead[], hooks: RecordReadHooks) => {
   const allowedKeys = new Set(allowed.map(candidate => `${candidate.kind} ${candidate.subject} ${candidate.source}`))
   const superseded = new Set<string>()
   for (const record of records) {
@@ -1008,13 +1063,15 @@ const allowedMultiHeadRecordIds = (records: BrainRecord[], allowed: AllowedMulti
       const key = `${record.kind} ${record.subject}`
       const group = activeGroups.get(key)
       if (group === undefined) {
-        activeGroups.set(key, [record])
+        const firstGroup = observedArray<BrainRecord>(undefined, observeWork(hooks.onWork, 'allowed-group-write'))
+        firstGroup.push(record)
+        activeGroups.set(key, firstGroup)
       } else {
         group.push(record)
       }
     }
   }
-  const ids = new Set<string>()
+  const ids = observedSet<string>(observeWork(hooks.onWork, 'allowed-id-write'))
   for (const group of activeGroups.values()) {
     const [first] = group
     if (
@@ -1033,8 +1090,9 @@ const allowedMultiHeadRecordIds = (records: BrainRecord[], allowed: AllowedMulti
 /** @internal */
 export const validateRecordsResolved = (root: string, options: ValidateRecordsOptions = {}): ValidateResult => {
   try {
-    return validateScanned(root, scanCanonicalRecords(root, options))
+    return validateScanned(root, scanCanonicalRecords(root, options), options.hooks)
   } catch (error) {
+    rethrowWorkObserverError(error)
     if (error instanceof EncephalonError) {
       throw error
     }
@@ -1047,7 +1105,7 @@ export const validateRecords = (input: RootInput = {}): ValidateResult => {
   return validateRecordsResolved(root)
 }
 
-const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
+const readRecordScanResolvedUnchecked = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
   hooks.canonicalScan?.()
   const scan = scanCanonicalRecords(root, { hooks })
   const validation = validateScannedSnapshot(root, scan, hooks)
@@ -1063,7 +1121,7 @@ const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allow
       })),
     })
   }
-  const allowedIds = allowedMultiHeadRecordIds(scan.records, allowed)
+  const allowedIds = allowedMultiHeadRecordIds(scan.records, allowed, hooks)
   const blockingErrors = result.errors.filter(
     error =>
       !(error.code === 'MULTIPLE_ACTIVE_HEADS' && error.recordId !== undefined && allowedIds.has(error.recordId)),
@@ -1078,6 +1136,9 @@ const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allow
     })),
   })
 }
+
+const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
+  preserveWorkObserverFailure(() => readRecordScanResolvedUnchecked(root, hooks, allowed))
 
 const canonicalPublicationAuthority = (
   root: string,
@@ -1333,15 +1394,17 @@ export const assertRecordGraph = (
   hooks: RecordReadHooks = {},
   bytes?: number,
 ) => {
-  const result = validateScanned(
-    root,
-    {
-      bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
-      errors: [],
-      observations: [],
-      records,
-    },
-    hooks,
+  const result = preserveWorkObserverFailure(() =>
+    validateScanned(
+      root,
+      {
+        bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
+        errors: [],
+        observations: [],
+        records,
+      },
+      hooks,
+    ),
   )
   if (result.valid) {
     return

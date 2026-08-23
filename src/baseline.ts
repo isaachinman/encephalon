@@ -15,6 +15,7 @@ import {
 import { ordinalStringCompare } from './order.ts'
 import type { AddRecordInput, JsonValue } from './types.ts'
 import { decodeVerifiedUtf8, readVerifiedRegularFile } from './verified-file.ts'
+import { observedArray, observedMap, observeWork, rethrowWorkObserverError } from './work-observer.ts'
 
 const MAX_SCANNED_FILES = 100_000
 const MAX_SCANNED_DIRECTORIES = 10_000
@@ -154,6 +155,13 @@ type PackageManagerEvidence =
       status: 'unknown'
     }
 
+type BaselineWork =
+  | 'language-count-write'
+  | 'language-entry'
+  | 'top-level-entry'
+  | 'top-level-fact-write'
+  | 'workflow-entry'
+
 type BaselineScanHooks = {
   afterBaselineSources?: (() => void) | undefined
   afterLanguageDirectoryCapture?: ((path: string) => void) | undefined
@@ -167,6 +175,7 @@ type BaselineScanHooks = {
   maximumScannedDirectories?: number | undefined
   maximumScannedFiles?: number | undefined
   onLanguageDirectoryScheduled?: (() => void) | undefined
+  onWork?: ((operation: BaselineWork) => void) | undefined
 }
 
 type BaselineReason =
@@ -349,7 +358,12 @@ const readBoundedDirectoryEntries = (
   if (parent !== undefined) {
     revalidateCanonicalDirectory(parent)
   }
-  const snapshot = captureCanonicalDirectory(directory, MAX_LANGUAGE_DIRECTORY_ENTRIES)
+  const snapshot = captureCanonicalDirectory(
+    directory,
+    MAX_LANGUAGE_DIRECTORY_ENTRIES,
+    undefined,
+    observeWork(hooks.onWork, 'language-entry'),
+  )
   hooks.afterLanguageDirectoryCapture?.(directory)
   if (parent !== undefined) {
     revalidateCanonicalDirectory(parent)
@@ -371,7 +385,7 @@ const readBoundedDirectoryEntries = (
 const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
   const state: ScanState = {
     filesSeen: 0,
-    languageCounts: new Map(),
+    languageCounts: observedMap(observeWork(hooks.onWork, 'language-count-write')),
     truncationReasons: new Set(),
   }
   const maximumDirectories = hooks.maximumScannedDirectories ?? MAX_SCANNED_DIRECTORIES
@@ -413,7 +427,8 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
           }
         }
       }
-    } catch {
+    } catch (error) {
+      rethrowWorkObserverError(error)
       state.truncationReasons.add('unreadable-directory')
     }
   }
@@ -446,7 +461,12 @@ const workflowFiles = (root: string, hooks: BaselineScanHooks, expectedGithub: b
       if (workflowsWitness === undefined) {
         revalidateDirectoryWitness(githubWitness)
       } else {
-        const collected = collectBoundedDirectoryEntries(workflowsWitness.canonicalPath, MAX_WORKFLOW_ENTRIES)
+        const collected = collectBoundedDirectoryEntries(
+          workflowsWitness.canonicalPath,
+          MAX_WORKFLOW_ENTRIES,
+          undefined,
+          observeWork(hooks.onWork, 'workflow-entry'),
+        )
         hooks.afterWorkflowEnumeration?.()
         revalidateDirectoryWitness(workflowsWitness)
         revalidateDirectoryWitness(githubWitness)
@@ -465,15 +485,16 @@ const workflowFiles = (root: string, hooks: BaselineScanHooks, expectedGithub: b
         }
       }
     }
-  } catch {
+  } catch (error) {
+    rethrowWorkObserverError(error)
     result = { reasons: ['workflow-enumeration-error'], value: [] }
   }
   return result
 }
 
-const emptyTopLevelFacts = () => ({
-  directories: [] as string[],
-  recognisedFiles: [] as string[],
+const emptyTopLevelFacts = (hooks?: BaselineScanHooks) => ({
+  directories: observedArray<string>(undefined, observeWork(hooks?.onWork, 'top-level-fact-write')),
+  recognisedFiles: observedArray<string>(undefined, observeWork(hooks?.onWork, 'top-level-fact-write')),
 })
 
 const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
@@ -482,7 +503,12 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
     value: emptyTopLevelFacts(),
   }
   try {
-    const snapshot = captureCanonicalDirectory(root, MAX_TOP_LEVEL_ENTRIES)
+    const snapshot = captureCanonicalDirectory(
+      root,
+      MAX_TOP_LEVEL_ENTRIES,
+      undefined,
+      observeWork(hooks.onWork, 'top-level-entry'),
+    )
     if (snapshot.overflow) {
       result = { reasons: ['top-level-entry-limit'], value: emptyTopLevelFacts() }
     } else {
@@ -495,12 +521,13 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
             candidate.recognisedFiles.push(entry.name)
           }
           return candidate
-        }, emptyTopLevelFacts())
+        }, emptyTopLevelFacts(hooks))
       hooks.beforeTopLevelRevalidation?.()
       revalidateCanonicalDirectory(snapshot)
       result = { reasons: [], value: facts }
     }
-  } catch {
+  } catch (error) {
+    rethrowWorkObserverError(error)
     result = { reasons: ['unreadable-directory'], value: emptyTopLevelFacts() }
   }
   return result
@@ -636,13 +663,13 @@ export const scanBaselineWithHooks = (root: string, hooks: BaselineScanHooks): A
       kind: 'context',
       payload: {
         languageCounts: languages,
-        recognisedTopLevelFiles: layout.recognisedFiles,
+        recognisedTopLevelFiles: [...layout.recognisedFiles],
         scannedRegularFiles: scan.filesSeen,
         scanTruncated: truncationReasons.size > 0,
         scanTruncationReasons: [...truncationReasons].sort(ordinalStringCompare),
         sources: safeSources,
         summary: 'Derived repository overview captured during Encephalon initialisation.',
-        topLevelDirectories: layout.directories,
+        topLevelDirectories: [...layout.directories],
       },
       source: 'encephalon:init',
       subject: 'encephalon:init/repository-overview',
@@ -654,7 +681,7 @@ export const scanBaselineWithHooks = (root: string, hooks: BaselineScanHooks): A
         ...(packageFacts.name === undefined ? {} : { packageName: packageFacts.name }),
         ...(packageManager === undefined ? {} : { packageManager }),
         packageManagerEvidence: packageEvidence,
-        recognisedFiles: layout.recognisedFiles,
+        recognisedFiles: [...layout.recognisedFiles],
         sources: layoutSources,
         workspaceConfigured: packageFacts.workspacePatterns.length > 0,
         workspacePatterns: packageFacts.workspacePatterns,

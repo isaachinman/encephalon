@@ -26,6 +26,13 @@ describe('package contract', () => {
 
   test('has a side-effect-free TypeScript API entrypoint', () => {
     assert.equal(existsSync(resolve(root, 'src/index.ts')), true)
+    const declarations = ['index.d.ts', 'baseline.d.ts', 'canonical-layout.d.ts', 'records.d.ts']
+      .map(file => readFileSync(resolve(root, 'dist', file), 'utf8'))
+      .join('\n')
+    assert.doesNotMatch(
+      declarations,
+      /BaselineWork|RecordWork|WorkObserver|onEntry|onWork|scanBaselineWithHooks|validateRecordsResolved/,
+    )
   })
 
   test('keeps generated runtime version metadata in sync with the manifest', () => {
@@ -47,6 +54,7 @@ describe('package contract', () => {
   test('marks the old implementation plan historical and maintains a concise contract', () => {
     const implementationPlan = readFileSync(resolve(root, 'docs', 'implementation-plan.md'), 'utf8')
     const contract = readFileSync(resolve(root, 'docs', 'contract.md'), 'utf8')
+    const performance = readFileSync(resolve(root, 'docs', 'performance.md'), 'utf8')
     const operationBudgetsDesign = readFileSync(
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-13-operation-budgets-design.md'),
       'utf8',
@@ -98,6 +106,9 @@ describe('package contract', () => {
       /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `eae98315e53ce568c62f6854a8542b285b7f9e4f`\./,
     )
     assert.match(contract, /## Performance Evidence/)
+    assert.match(contract, /implementing the MAR-2566 benchmark guarantees above/)
+    assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `de66f6ab7e10696fc878e380dd5417d194d60fe8`\./)
+    assert.match(performance, /Correctness tests enforce deterministic output and bounded work counts/)
     assert.match(
       contract,
       /MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `eae98315e53ce568c62f6854a8542b285b7f9e4f`\./,
