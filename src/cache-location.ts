@@ -645,6 +645,7 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
     try {
       database = new options.DatabaseConstructor(snapshot.path, options.openOptions)
     } catch (error) {
+      snapshot = assertPrimary(snapshot)
       return failCacheDatabase(error, snapshot)
     }
     try {

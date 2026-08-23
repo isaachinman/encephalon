@@ -524,6 +524,39 @@ describe('cache filesystem containment', () => {
     assert.equal(closeAttempts, 1)
   })
 
+  test('reclassifies primary disappearance during database construction', () => {
+    const root = createRoot()
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const location = inspectCacheLocation(root)
+    const databasePath = cacheDatabasePath(root)
+    const displacedPath = join(root, 'constructor-disappeared-primary.sqlite')
+    const missingFailure = new Error('verified primary disappeared during construction')
+    class DisappearingDatabase {
+      constructor(path: string) {
+        renameSync(path, displacedPath)
+        throw new Error('database constructor could not open the missing primary')
+      }
+
+      close() {}
+    }
+
+    assert.throws(
+      () =>
+        openVerifiedCacheDatabase({
+          DatabaseConstructor: DisappearingDatabase,
+          location,
+          missing: () => {
+            throw missingFailure
+          },
+          name: 'brain.sqlite',
+          primary: { kind: 'existing' },
+        }),
+      error => error === missingFailure,
+    )
+    assert.equal(existsSync(displacedPath), true)
+    assert.equal(existsSync(databasePath), false)
+  })
+
   test('rejects cache ancestor redirects without changing the redirect target', () => {
     const cases = [
       {
@@ -2048,6 +2081,131 @@ describe('SQLite cache and reads', () => {
     )
   })
 
+  test('preserves Unicode literal terms across full, compact, and gathered search', () => {
+    const root = createRoot()
+    const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
+    const record = addRecord({
+      id: 'unicode-search',
+      kind: 'context',
+      payload: { summary: 'Unicode search marker' },
+      root,
+      searchText: 'Cafe\u0301 Ελληνικά Русский مرحبا שלום 中文 किताब 한글'.normalize('NFD'),
+      source: 'agent',
+      subject: 'search.unicode',
+    })
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    const searchCompactRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+
+    assert.deepEqual(
+      ['Café', 'Cafe\u0301'].map(query => searchRecords({ query, root }).map(result => result.id)),
+      [[record.id], [record.id]],
+    )
+    assert.deepEqual(
+      searchCompactRecords({ query: 'Ελληνικά', root }).map(result => result.id),
+      [record.id],
+    )
+    const gathered = gatherRecords({
+      root,
+      searches: ['Ελληνικά', 'Русский', '* ()', 'مرحبا', 'שלום', '中文', 'किताब', '한글'],
+    }) as {
+      searches: Array<{ results: Array<{ id: string }> }>
+    }
+    assert.deepEqual(
+      gathered.searches.map(search => search.results.map(result => result.id)),
+      [[record.id], [record.id], [], [record.id], [record.id], [record.id], [record.id], [record.id]],
+    )
+  })
+
+  test('accepts worst-case NFC expansion in valid derived search documents', () => {
+    const root = createRoot()
+    const expandingSummary = '\u{1D160}'.repeat(90_000)
+    const added = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')({
+      id: 'unicode-expansion',
+      kind: 'context',
+      payload: { summary: expandingSummary },
+      root,
+      searchText: 'normalization expansion marker',
+      source: 'agent',
+      subject: 'search.unicode-expansion',
+    })
+    const prepare = functionFromApi<(input: Record<string, unknown>) => { recordsIndexed: number }>('prepare')
+    const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+
+    assert.equal(prepare({ root }).recordsIndexed, 1)
+    assert.deepEqual(
+      listRecords({ root }).map(record => record.id),
+      [added.id],
+    )
+    assert.deepEqual(
+      searchRecords({ query: 'normalization expansion marker', root }).map(record => record.id),
+      [added.id],
+    )
+  })
+
+  test('validates the repository but skips the cache for punctuation-only searches', () => {
+    const root = createRoot()
+    const query = '\u0301 _ __ * " - + ^ : () {} []\u0000'
+    let cacheInspections = 0
+    let repositoryInspections = 0
+    cacheLocationTestHooks.beforeLocationInspection = () => {
+      cacheInspections += 1
+      throw new Error('cache inspection must not run for an empty literal query')
+    }
+    repositoryTestHooks.afterGitMarkerDecision = () => {
+      repositoryInspections += 1
+    }
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    const searchCompactRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+
+    assert.deepEqual(searchRecords({ query, root }), [])
+    assert.ok(repositoryInspections > 0)
+    repositoryInspections = 0
+    assert.deepEqual(searchCompactRecords({ query, root }), [])
+    assert.ok(repositoryInspections > 0)
+    repositoryInspections = 0
+    assert.deepEqual(gatherRecords({ root, searches: [query] }), {
+      hydrated: null,
+      records: [],
+      searches: [{ kind: null, query, results: [] }],
+    })
+    assert.ok(repositoryInspections > 0)
+    assert.equal(cacheInspections, 0)
+  })
+
+  test('preserves root-install-required before punctuation-only cache fast paths', () => {
+    const root = createRoot()
+    const query = '* ()'
+    let cacheInspections = 0
+    rmSync(join(root, 'node_modules', 'encephalon'), { recursive: true })
+    cacheLocationTestHooks.beforeLocationInspection = () => {
+      cacheInspections += 1
+      throw new Error('cache inspection must not run before root-installation rejection')
+    }
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    const searchCompactRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+    const assertRootInstallRequired = (read: () => unknown) =>
+      assert.throws(read, (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'ROOT_INSTALL_REQUIRED')
+        return true
+      })
+
+    assertRootInstallRequired(() => searchRecords({ query, root }))
+    assertRootInstallRequired(() => searchCompactRecords({ query, root }))
+    assertRootInstallRequired(() => gatherRecords({ root, searches: [query] }))
+    assert.equal(cacheInspections, 0)
+  })
+
   test('serves a valid large-summary record through cache preparation and search', () => {
     const root = createRoot()
     const summary = `large summary marker ${'x'.repeat(600_000)}`
@@ -2997,6 +3155,41 @@ describe('SQLite cache and reads', () => {
     assert.equal(writerInitialisations, 2)
     assert.deepEqual(result, { hydrated: true, recordsIndexed: 1 })
     assert.equal(existsSync(predecessorPath), true)
+  })
+
+  test('retries an exclusively created primary that disappears before inspection', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    const databasePath = cacheDatabasePath(root)
+    const predecessorPath = join(root, 'missing-bootstrap-predecessor.sqlite')
+    const disappearedClaimPath = join(root, 'missing-bootstrap-claim.sqlite')
+    let disappearedClaims = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterPrimaryDatabaseObservation = phase => {
+      if (phase === 'prepare-fast-path') {
+        renameSync(databasePath, predecessorPath)
+      }
+      if (phase === 'reader-missing') {
+        cacheReadTestHooks.afterPrimaryDatabaseObservation = undefined
+      }
+    }
+    cacheLocationTestHooks.afterPrimaryBootstrapClose = path => {
+      if (basename(path) === 'brain.sqlite' && disappearedClaims === 0) {
+        renameSync(path, disappearedClaimPath)
+        disappearedClaims += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
+    assert.equal(disappearedClaims, 1)
+    assert.equal(writerInitialisations, 1)
+    assert.equal(existsSync(predecessorPath), true)
+    assert.equal(existsSync(disappearedClaimPath), true)
   })
 
   test('rejects a non-empty exclusively claimed primary before a repository-change retry', () => {
@@ -4973,7 +5166,7 @@ describe('SQLite cache and reads', () => {
       {
         expectedRows: 1,
         mutate: (database: DatabaseSync) => {
-          database.prepare('UPDATE record_search SET text = CAST(zeroblob(?) AS TEXT)').run(2_105_345)
+          database.prepare('UPDATE record_search SET text = CAST(zeroblob(?) AS TEXT)').run(6_316_033)
         },
         name: 'oversized FTS text containing NUL',
       },
@@ -4985,7 +5178,7 @@ describe('SQLite cache and reads', () => {
         name: 'oversized textual FTS ID',
       },
       {
-        expectedRows: 24,
+        expectedRows: 12,
         mutate: (database: DatabaseSync) => {
           database.exec(`
             CREATE TABLE replacement_records (
@@ -5002,7 +5195,7 @@ describe('SQLite cache and reads', () => {
             WITH RECURSIVE generated(value) AS (
               SELECT 1
               UNION ALL
-              SELECT value + 1 FROM generated WHERE value < 24
+              SELECT value + 1 FROM generated WHERE value < 12
             )
             INSERT INTO replacement_records
             SELECT printf('%s-%02d', id, value), kind, subject, source, created_at,
@@ -5021,15 +5214,15 @@ describe('SQLite cache and reads', () => {
             WITH RECURSIVE generated(value) AS (
               SELECT 1
               UNION ALL
-              SELECT value + 1 FROM generated WHERE value < 24
+              SELECT value + 1 FROM generated WHERE value < 12
             )
             INSERT INTO record_search(id, text)
-            SELECT printf('cache-record-%02d', value), CAST(zeroblob(1048576) AS TEXT)
+            SELECT printf('cache-record-%02d', value), CAST(zeroblob(6242305) AS TEXT)
             FROM generated;
-            UPDATE metadata SET value = '24' WHERE key = 'recordsIndexed';
+            UPDATE metadata SET value = '12' WHERE key = 'recordsIndexed';
           `)
         },
-        name: 'aggregate FTS text above its doubled cache-record bound',
+        name: 'aggregate FTS text above its normalized projection bound',
       },
       {
         expectedRows: 1,
@@ -5090,7 +5283,7 @@ describe('SQLite cache and reads', () => {
           )`,
         )
         .run(1_052_672)
-      database.prepare("UPDATE record_search SET text = replace(hex(zeroblob(?)), '00', 'x')").run(2_105_344)
+      database.prepare("UPDATE record_search SET text = replace(hex(zeroblob(?)), '00', 'x')").run(6_316_032)
       database
         .prepare("UPDATE metadata SET value = replace(hex(zeroblob(?)), '00', 'x') WHERE key = 'packageVersion'")
         .run(1_048_576)

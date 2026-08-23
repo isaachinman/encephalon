@@ -67,12 +67,17 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-17-response-byte-budgets-design.md'),
       'utf8',
     )
+    const unicodeLiteralSearchDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-unicode-literal-search-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
     assert.doesNotMatch(implementationPlan, /createdAt is assigned only after the repository operation lock is held/)
     assert.match(contract, /## Public API and CLI/)
     assert.match(contract, /## Operation Budgets/)
+    assert.match(contract, /## Unicode Literal Search/)
     assert.match(contract, /## Canonical Storage/)
     assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
@@ -90,7 +95,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `b43daf795de35d34602d1018ad509f68e494fe3d`\./,
+      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `aa1a2596f4ca5be42b8896beedc802040eb57161`\./,
     )
     assert.match(
       contract,
@@ -124,6 +129,10 @@ describe('package contract', () => {
     assert.match(
       responseByteBudgetsDesign,
       /The exact reviewed code and behavioural-test snapshot implementing this design is `b43daf795de35d34602d1018ad509f68e494fe3d`\./,
+    )
+    assert.match(
+      unicodeLiteralSearchDesign,
+      /The exact implementation and behavioural-test snapshot is `aa1a2596f4ca5be42b8896beedc802040eb57161`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),

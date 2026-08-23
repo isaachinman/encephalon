@@ -44,6 +44,7 @@ import { canonicalRecordPath, readRecords, readValidatedRecordSnapshotResolved }
 import { resolveRepository } from './repository.ts'
 import { createResponseByteBudget, type ResponseByteBudget } from './response-budget.ts'
 import { parseRecordFile, validateArtifactPath } from './schema.ts'
+import { literalMatchQuery, MAX_NFC_UTF8_EXPANSION_FACTOR, normalizeSearchText } from './search-text.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type {
   BrainRecord,
@@ -60,8 +61,6 @@ import type {
 
 const SCHEMA_VERSION = '1'
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
-const MAX_QUERY_BYTES = OPERATION_BUDGETS.queryBytes.maximum
-const MAX_QUERY_TERMS = OPERATION_BUDGETS.queryTerms.maximum
 const MAX_GATHER_SEARCHES = OPERATION_BUDGETS.gatherSearches.maximum
 const MAX_GATHER_SHOWS = OPERATION_BUDGETS.gatherShows.maximum
 const SQLITE_BUSY_TIMEOUT_MILLISECONDS = 1000
@@ -73,8 +72,11 @@ const MAX_CACHE_RECORD_BYTES = CANONICAL_BUDGETS.recordBytes + MAX_CACHE_RECORD_
 const MAX_CACHE_RECORD_JSON_BYTES =
   CANONICAL_BUDGETS.recordJsonBytes + CANONICAL_BUDGETS.records * MAX_CACHE_RECORD_OVERHEAD_BYTES
 const MAX_CACHE_RECORD_TEXT_BYTES = MAX_CACHE_RECORD_JSON_BYTES * 2
-const MAX_CACHE_SEARCH_DOCUMENT_BYTES = MAX_CACHE_RECORD_BYTES * 2
-const MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES = MAX_CACHE_RECORD_JSON_BYTES * 2
+const MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR = 2
+const MAX_CACHE_SEARCH_DOCUMENT_BYTES =
+  MAX_CACHE_RECORD_BYTES * MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR * MAX_NFC_UTF8_EXPANSION_FACTOR
+const MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES =
+  MAX_CACHE_RECORD_JSON_BYTES * MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR * MAX_NFC_UTF8_EXPANSION_FACTOR
 const MAX_CACHE_FTS_ID_BYTES = CANONICAL_BUDGETS.records * 255
 const METADATA_KEYS = [
   'artifactPaths',
@@ -1444,16 +1446,18 @@ const metadataIsFresh = (
 }
 
 const searchDocumentForRecord = (record: BrainRecord) =>
-  [
-    record.kind,
-    record.subject,
-    record.source,
-    summaryForRecord(record),
-    JSON.stringify(record.payload),
-    record.searchText ?? '',
-  ]
-    .filter((value): value is string => typeof value === 'string' && value.length > 0)
-    .join('\n')
+  normalizeSearchText(
+    [
+      record.kind,
+      record.subject,
+      record.source,
+      summaryForRecord(record),
+      JSON.stringify(record.payload),
+      record.searchText ?? '',
+    ]
+      .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      .join('\n'),
+  )
 
 const writeMetadata = (database: DatabaseSync, metadata: Metadata) => {
   const statement = database.prepare('INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)')
@@ -1952,22 +1956,6 @@ export const showRecord = (input: ShowRecordInput): BrainRecord | null => {
   })
 }
 
-const literalMatchQuery = (query: unknown) => {
-  if (typeof query !== 'string') {
-    return fail('INVALID_ARGUMENT', 'query must be a string.', {
-      field: 'query',
-    })
-  }
-  if (byteLength(query) > MAX_QUERY_BYTES) {
-    return failBudget('queryBytes', `query must contain at most ${MAX_QUERY_BYTES} UTF-8 bytes.`)
-  }
-  const terms = query.split(/[^A-Za-z0-9_]+/u).filter(term => term.length > 0)
-  if (terms.length > MAX_QUERY_TERMS) {
-    return failBudget('queryTerms', `query may contain at most ${MAX_QUERY_TERMS} literal terms.`)
-  }
-  return terms.map(term => `"${term.replaceAll('"', '""')}"`).join(' AND ')
-}
-
 const searchRows = (database: DatabaseSync, input: SearchRecordsInput, match: string, limit: number) => {
   if (match.length === 0) {
     return []
@@ -2055,8 +2043,7 @@ const createCompactSearchReader = (database: DatabaseSync, input: SearchStatemen
   `
   cacheReadTestHooks.onCompactSearchPrepare?.(source)
   const statement = database.prepare(source)
-  return (query: string) => {
-    const match = literalMatchQuery(query)
+  return (query: string, match: string) => {
     if (match.length === 0) {
       return []
     }
@@ -2072,20 +2059,28 @@ export const searchRecords = (input: SearchRecordsInput): BrainRecord[] => {
   const parsed = parseFullSearchRecordsInput(input)
   const match = literalMatchQuery(parsed.query)
   const limit = fullResultLimit(parsed.limit)
-  return withPreparedDatabase(parsed, database =>
-    parseRecordRowsWithinBudget(searchRows(database, parsed, match, limit)),
-  )
+  if (match.length > 0) {
+    return withPreparedDatabase(parsed, database =>
+      parseRecordRowsWithinBudget(searchRows(database, parsed, match, limit)),
+    )
+  }
+  resolveRepository(parsed)
+  return []
 }
 
 export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRecord[] => {
   const parsed = parseCompactSearchRecordsInput(input)
-  literalMatchQuery(parsed.query)
+  const match = literalMatchQuery(parsed.query)
   compactResultLimit(parsed.limit)
-  return withPreparedDatabase(parsed, database => {
-    const budget = createResponseByteBudget('compactResponseBytes')
-    budget.charge([])
-    return createCompactSearchReader(database, parsed, budget)(parsed.query)
-  })
+  if (match.length > 0) {
+    return withPreparedDatabase(parsed, database => {
+      const budget = createResponseByteBudget('compactResponseBytes')
+      budget.charge([])
+      return createCompactSearchReader(database, parsed, budget)(parsed.query, match)
+    })
+  }
+  resolveRepository(parsed)
+  return []
 }
 
 const createShowReader = (database: DatabaseSync, includeSuperseded: boolean | undefined) => {
@@ -2100,7 +2095,9 @@ const createShowReader = (database: DatabaseSync, includeSuperseded: boolean | u
   }
 }
 
-const assertGatherBudgets = (input: GatherInput) => {
+type LiteralSearch = Readonly<{ match: string; query: string }>
+
+const assertGatherBudgets = (input: GatherInput): LiteralSearch[] => {
   const searches = input.searches ?? []
   const shows = input.shows ?? []
   if (searches.length > MAX_GATHER_SEARCHES) {
@@ -2109,15 +2106,15 @@ const assertGatherBudgets = (input: GatherInput) => {
   if (shows.length > MAX_GATHER_SHOWS) {
     return failBudget('gatherShows', `gather may contain at most ${MAX_GATHER_SHOWS} shows.`)
   }
-  searches.forEach(literalMatchQuery)
+  return searches.map(query => ({ match: literalMatchQuery(query), query }))
 }
 
 const readGatherFromDatabase = (
   database: DatabaseSync,
   input: GatherInput,
   hydrated: HydrateResult | null,
+  searches: readonly LiteralSearch[],
 ): GatherResult => {
-  const searches = input.searches ?? []
   const shows = input.shows ?? []
   const budget = createResponseByteBudget('gatherResponseBytes')
   budget.charge({ hydrated, records: [], searches: [] })
@@ -2127,24 +2124,31 @@ const readGatherFromDatabase = (
   return {
     hydrated,
     records: shows.map(id => budget.charge({ id, record: showRecordForId(id) })),
-    searches: searches.map(query => {
-      const envelope = budget.charge({ kind: input.kind ?? null, query, results: [] })
-      return { ...envelope, results: searchCompactRecordsForQuery(query) }
+    searches: searches.map(search => {
+      const envelope = budget.charge({ kind: input.kind ?? null, query: search.query, results: [] })
+      return { ...envelope, results: searchCompactRecordsForQuery(search.query, search.match) }
     }),
   }
 }
 
-export const gatherRecords = (input: GatherInput): GatherResult => {
-  const parsed = parseGatherInput(input)
-  assertGatherBudgets(parsed)
-  compactResultLimit(parsed.limit)
-  const root = resolveRepository(parsed)
+const emptyGatherResult = (input: GatherInput, searches: readonly LiteralSearch[]): GatherResult => {
+  const budget = createResponseByteBudget('gatherResponseBytes')
+  budget.charge({ hydrated: null, records: [], searches: [] })
+  return {
+    hydrated: null,
+    records: [],
+    searches: searches.map(search => budget.charge({ kind: input.kind ?? null, query: search.query, results: [] })),
+  }
+}
+
+const gatherRecordsFromDatabase = (input: GatherInput, searches: readonly LiteralSearch[]) => {
+  const root = resolveRepository(input)
   try {
     const location = inspectCacheLocation(root)
-    if (parsed.hydrate === true) {
+    if (input.hydrate === true) {
       const readAfterHydration = (heldLocation: CacheLocation, hydration: PrepareResult) =>
         readFreshCache(root, heldLocation, database =>
-          readGatherFromDatabase(database, parsed, { recordsIndexed: hydration.recordsIndexed }),
+          readGatherFromDatabase(database, input, { recordsIndexed: hydration.recordsIndexed }, searches),
         )
       return withCacheOperationLock(root, location, heldLocation =>
         runWithDisposableCacheRecovery(
@@ -2166,7 +2170,7 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
       location,
       () => {
         prepareResolvedWithoutCorruptionRecovery(root, location)
-        return readFreshCache(root, location, database => readGatherFromDatabase(database, parsed, null))
+        return readFreshCache(root, location, database => readGatherFromDatabase(database, input, null, searches))
       },
       { completion: { kind: 'retry-operation' }, lockMode: 'acquire' },
     )
@@ -2176,4 +2180,20 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
     }
     return wrapIo('Unable to gather Encephalon records.', error)
   }
+}
+
+export const gatherRecords = (input: GatherInput): GatherResult => {
+  const parsed = parseGatherInput(input)
+  const searches = assertGatherBudgets(parsed)
+  compactResultLimit(parsed.limit)
+  const requiresDatabase =
+    searches.length === 0 ||
+    parsed.hydrate === true ||
+    (Array.isArray(parsed.shows) && parsed.shows.length > 0) ||
+    searches.some(search => search.match.length > 0)
+  if (requiresDatabase) {
+    return gatherRecordsFromDatabase(parsed, searches)
+  }
+  resolveRepository(parsed)
+  return emptyGatherResult(parsed, searches)
 }
