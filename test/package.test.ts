@@ -142,7 +142,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `f22fafeec2346d1ced699433711dd51985a2f9e8`\./,
+      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `a8367f56ccab83755ef27e7636de2efc94f70538`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
