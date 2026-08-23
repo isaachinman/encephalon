@@ -2180,6 +2180,32 @@ describe('SQLite cache and reads', () => {
     assert.equal(cacheInspections, 0)
   })
 
+  test('preserves root-install-required before punctuation-only cache fast paths', () => {
+    const root = createRoot()
+    const query = '* ()'
+    let cacheInspections = 0
+    rmSync(join(root, 'node_modules', 'encephalon'), { recursive: true })
+    cacheLocationTestHooks.beforeLocationInspection = () => {
+      cacheInspections += 1
+      throw new Error('cache inspection must not run before root-installation rejection')
+    }
+    const searchRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
+    const searchCompactRecords =
+      functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
+    const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+    const assertRootInstallRequired = (read: () => unknown) =>
+      assert.throws(read, (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'ROOT_INSTALL_REQUIRED')
+        return true
+      })
+
+    assertRootInstallRequired(() => searchRecords({ query, root }))
+    assertRootInstallRequired(() => searchCompactRecords({ query, root }))
+    assertRootInstallRequired(() => gatherRecords({ root, searches: [query] }))
+    assert.equal(cacheInspections, 0)
+  })
+
   test('serves a valid large-summary record through cache preparation and search', () => {
     const root = createRoot()
     const summary = `large summary marker ${'x'.repeat(600_000)}`
