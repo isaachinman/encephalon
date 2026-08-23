@@ -201,6 +201,15 @@ type ValidateRecordsOptions = {
   hooks?: RecordReadHooks
 }
 
+const preserveWorkObserverFailure = <Result>(operation: () => Result) => {
+  try {
+    return operation()
+  } catch (error) {
+    rethrowWorkObserverError(error)
+    throw error
+  }
+}
+
 type AllowedMultiHead = {
   kind: string
   source: string
@@ -1096,7 +1105,7 @@ export const validateRecords = (input: RootInput = {}): ValidateResult => {
   return validateRecordsResolved(root)
 }
 
-const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
+const readRecordScanResolvedUnchecked = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
   hooks.canonicalScan?.()
   const scan = scanCanonicalRecords(root, { hooks })
   const validation = validateScannedSnapshot(root, scan, hooks)
@@ -1127,6 +1136,9 @@ const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allow
     })),
   })
 }
+
+const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
+  preserveWorkObserverFailure(() => readRecordScanResolvedUnchecked(root, hooks, allowed))
 
 const canonicalPublicationAuthority = (
   root: string,
@@ -1382,15 +1394,17 @@ export const assertRecordGraph = (
   hooks: RecordReadHooks = {},
   bytes?: number,
 ) => {
-  const result = validateScanned(
-    root,
-    {
-      bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
-      errors: [],
-      observations: [],
-      records,
-    },
-    hooks,
+  const result = preserveWorkObserverFailure(() =>
+    validateScanned(
+      root,
+      {
+        bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
+        errors: [],
+        observations: [],
+        records,
+      },
+      hooks,
+    ),
   )
   if (result.valid) {
     return

@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
-import { readRecordsResolved, validateRecordsResolved } from '../src/records.ts'
+import { assertRecordGraph, readRecordsResolved, validateRecordsResolved } from '../src/records.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -92,6 +92,26 @@ describe('hot scan performance regressions', () => {
             onWork: () => {
               throw recordFailure
             },
+          },
+        }),
+      error => error === recordFailure,
+    )
+    assert.throws(
+      () =>
+        readRecordsResolved(recordsRoot, {
+          onWork: () => {
+            throw recordFailure
+          },
+        }),
+      error => error === recordFailure,
+    )
+
+    const records = readRecordsResolved(recordsRoot)
+    assert.throws(
+      () =>
+        assertRecordGraph(recordsRoot, records, 'Observed records are invalid.', {
+          onWork: () => {
+            throw recordFailure
           },
         }),
       error => error === recordFailure,
