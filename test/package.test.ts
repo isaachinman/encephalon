@@ -74,7 +74,7 @@ describe('package contract', () => {
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /Last reviewed: 2026-08-17 for code and behavioural-test snapshot `f539720542a3302dd849002652e958da4a6063bf`\./,
+      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `f539720542a3302dd849002652e958da4a6063bf`\./,
     )
     assert.match(
       contract,
