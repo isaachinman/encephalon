@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import {
+  appendFileSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
@@ -16,6 +17,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
+  type DescriptorIoObservation,
   formatWorkflowPolicyFindings,
   inspectWorkflowPolicy,
   isContainedComparablePath,
@@ -221,8 +223,8 @@ jobs: {}
   ])
 })
 
-// Mutation caught: an unbounded descriptor read or missing aggregate ledger would accept one byte beyond either source limit.
-test('accepts exact source-byte limits and rejects one over', () => {
+// Mutation caught: an unbounded descriptor read would accept one byte beyond the per-source limit.
+test('accepts the exact per-source byte limit and rejects one over', () => {
   const source = `name: Bounded
 on: workflow_dispatch
 permissions:
@@ -242,13 +244,146 @@ jobs: {}
       rule: 'source-integrity',
     },
   ])
-  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumAggregateSourceBytes: sourceBytes } }), [])
-  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumAggregateSourceBytes: sourceBytes - 1 } }), [
-    {
-      file: '.github/workflows',
-      location: '$',
-      rule: 'source-integrity',
+})
+
+// Mutation caught: allocating or requesting a sentinel byte would cross the supplied descriptor allowance on growth.
+test('keeps allocation, read requests, and transferred bytes within the exact source allowance', () => {
+  const source = `name: Growing
+permissions:
+  contents: read
+jobs: {}
+`
+  const sourceBytes = Buffer.byteLength(source)
+  const root = createFixture({ 'source.yml': source })
+  const nativeRoot = realpathSync.native(root)
+  const sourcePath = join(nativeRoot, 'source.yml')
+  const observations: DescriptorIoObservation[] = []
+  let grew = false
+
+  const validated = readValidatedNativeFile(nativeRoot, sourcePath, {
+    maximumBytes: sourceBytes,
+    onDescriptorIo: observation => {
+      observations.push(observation)
+      if (observation.kind === 'read' && !grew) {
+        grew = true
+        appendFileSync(sourcePath, 'x')
+      }
     },
+  })
+
+  assert.equal(grew, true)
+  assert.deepEqual(validated, { kind: 'invalid' })
+  assert.deepEqual(observations, [
+    { allocatedBytes: sourceBytes, kind: 'allocation' },
+    { bytesRead: sourceBytes, kind: 'read', requestedBytes: sourceBytes },
+  ])
+})
+
+// Mutation caught: applying the aggregate limit after reading would transfer the second source's overflowing byte.
+test('accepts an exact multi-source aggregate and does not read a source one byte over', () => {
+  const firstSource = `name: First
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`
+  const secondSource = `name: Second
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`
+  const firstBytes = Buffer.byteLength(firstSource)
+  const secondBytes = Buffer.byteLength(secondSource)
+  const aggregateBytes = firstBytes + secondBytes
+  const root = createFixture({
+    '.github/workflows/a.yml': firstSource,
+    '.github/workflows/b.yml': secondSource,
+  })
+  const nativeRoot = realpathSync.native(root)
+  const firstPath = join(nativeRoot, '.github/workflows/a.yml')
+  const secondPath = join(nativeRoot, '.github/workflows/b.yml')
+  const exactObservations: Readonly<{ observation: DescriptorIoObservation; path: string }>[] = []
+
+  assert.deepEqual(
+    inspectWorkflowPolicy(root, {
+      limits: { maximumAggregateSourceBytes: aggregateBytes },
+      onSourceDescriptorIo: (path, observation) => {
+        exactObservations.push({ observation, path })
+      },
+    }),
+    [],
+  )
+  assert.deepEqual(exactObservations, [
+    { observation: { allocatedBytes: firstBytes, kind: 'allocation' }, path: firstPath },
+    { observation: { bytesRead: firstBytes, kind: 'read', requestedBytes: firstBytes }, path: firstPath },
+    { observation: { allocatedBytes: secondBytes, kind: 'allocation' }, path: secondPath },
+    { observation: { bytesRead: secondBytes, kind: 'read', requestedBytes: secondBytes }, path: secondPath },
+  ])
+
+  const overflowObservations: Readonly<{ observation: DescriptorIoObservation; path: string }>[] = []
+  assert.deepEqual(
+    inspectWorkflowPolicy(root, {
+      limits: { maximumAggregateSourceBytes: aggregateBytes - 1 },
+      onSourceDescriptorIo: (path, observation) => {
+        overflowObservations.push({ observation, path })
+      },
+    }),
+    [
+      {
+        file: '.github/workflows',
+        location: '$',
+        rule: 'source-integrity',
+      },
+    ],
+  )
+  assert.deepEqual(overflowObservations, [
+    { observation: { allocatedBytes: firstBytes, kind: 'allocation' }, path: firstPath },
+    { observation: { bytesRead: firstBytes, kind: 'read', requestedBytes: firstBytes }, path: firstPath },
+  ])
+})
+
+// Mutation caught: treating zero remaining bytes as automatic overflow would reject an empty reachable source globally.
+test('accepts an empty source when the preceding workflow exactly consumes the aggregate allowance', () => {
+  const workflow = `name: Exact aggregate
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/empty
+`
+  const workflowBytes = Buffer.byteLength(workflow)
+  const root = createFixture({
+    '.github/actions/empty/action.yml': '',
+    '.github/workflows/exact.yml': workflow,
+  })
+  const nativeRoot = realpathSync.native(root)
+  const workflowPath = join(nativeRoot, '.github/workflows/exact.yml')
+  const emptyActionPath = join(nativeRoot, '.github/actions/empty/action.yml')
+  const observations: Readonly<{ observation: DescriptorIoObservation; path: string }>[] = []
+
+  assert.deepEqual(
+    inspectWorkflowPolicy(root, {
+      limits: { maximumAggregateSourceBytes: workflowBytes },
+      onSourceDescriptorIo: (path, observation) => {
+        observations.push({ observation, path })
+      },
+    }),
+    [
+      {
+        file: '.github/actions/empty/action.yml',
+        location: '$',
+        rule: 'source-integrity',
+      },
+    ],
+  )
+  assert.deepEqual(observations, [
+    { observation: { allocatedBytes: workflowBytes, kind: 'allocation' }, path: workflowPath },
+    { observation: { bytesRead: workflowBytes, kind: 'read', requestedBytes: workflowBytes }, path: workflowPath },
+    { observation: { allocatedBytes: 0, kind: 'allocation' }, path: emptyActionPath },
   ])
 })
 

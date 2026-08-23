@@ -49,18 +49,25 @@ type WorkflowPolicyLimits = Readonly<{
   maximumWorkflowDirectoryEntries: number
 }>
 
+/** @internal */
+export type DescriptorIoObservation =
+  | Readonly<{ allocatedBytes: number; kind: 'allocation' }>
+  | Readonly<{ bytesRead: number; kind: 'read'; requestedBytes: number }>
+
 type WorkflowPolicyOptions = Readonly<{
   afterActionCandidateRevalidation?: (path: string, index: number) => void
   afterFinalDirectoryRealpath?: (path: string) => void
   afterFinalFileRealpath?: (path: string) => void
   beforeFinalRevalidation?: () => void
   limits?: Partial<WorkflowPolicyLimits>
+  onSourceDescriptorIo?: (path: string, observation: DescriptorIoObservation) => void
   onSourceVisit?: (phase: 'enter' | 'exit', path: string, kind: ExecutableReference['kind']) => void
 }>
 
 type ValidatedNativeFileOptions = Readonly<{
   afterFinalRealpath?: (path: string) => void
   maximumBytes?: number
+  onDescriptorIo?: (observation: DescriptorIoObservation) => void
 }>
 
 type FileWitness = Readonly<{
@@ -298,21 +305,28 @@ const observeNativeDirectory = (
 const isSameDirectoryGeneration = (initial: DirectoryObservation, final: DirectoryObservation) =>
   initial.kind === 'directory' && final.kind === 'directory' && sameStableEntryMetadata(initial.stats, final.stats)
 
-const readBoundedDescriptor = (descriptor: number, maximumBytes: number) => {
-  const bytes = Buffer.alloc(maximumBytes + 1)
+const readBoundedDescriptor = (
+  descriptor: number,
+  sourceBytes: number,
+  onDescriptorIo?: (observation: DescriptorIoObservation) => void,
+) => {
+  onDescriptorIo?.({ allocatedBytes: sourceBytes, kind: 'allocation' })
+  const bytes = Buffer.alloc(sourceBytes)
   let bytesRead = 0
-  let complete = false
-  while (!complete && bytesRead <= maximumBytes) {
-    const count = readSync(descriptor, bytes, bytesRead, bytes.length - bytesRead, null)
+  let complete = true
+  while (complete && bytesRead < sourceBytes) {
+    const requestedBytes = sourceBytes - bytesRead
+    const count = readSync(descriptor, bytes, bytesRead, requestedBytes, null)
+    onDescriptorIo?.({ bytesRead: count, kind: 'read', requestedBytes })
     if (count === 0) {
-      complete = true
+      complete = false
     } else {
       bytesRead += count
     }
   }
   let contents: Readonly<{ bytes: number; value: string }> | undefined
-  if (complete && bytesRead <= maximumBytes) {
-    contents = { bytes: bytesRead, value: bytes.subarray(0, bytesRead).toString('utf8') }
+  if (complete) {
+    contents = { bytes: bytesRead, value: bytes.toString('utf8') }
   }
   return contents
 }
@@ -342,9 +356,13 @@ export const readValidatedNativeFile = (
       const beforeReadStats = fstatSync(descriptor, { bigint: true })
       if (isSingleLinkRegularFile(beforeReadStats) && sameStableEntryMetadata(initialStats, beforeReadStats)) {
         if (beforeReadStats.size <= BigInt(maximumBytes)) {
-          const candidateContents = readBoundedDescriptor(descriptor, maximumBytes)
+          const candidateContents = readBoundedDescriptor(
+            descriptor,
+            Number(beforeReadStats.size),
+            options.onDescriptorIo,
+          )
           if (candidateContents === undefined) {
-            sourceLimitExceeded = true
+            operationFailed = true
           } else {
             const afterReadStats = fstatSync(descriptor, { bigint: true })
             const beforeFinalRealpathStats = lstatSync(path, { bigint: true })
@@ -884,8 +902,13 @@ export const inspectWorkflowPolicy = (
       const file = relativeFile(nativeRoot, source.path)
       let document: ParsedObject | undefined
       let validatedFile: ValidatedNativeFile | undefined
+      const remainingAggregateSourceBytes = Math.max(0, limits.maximumAggregateSourceBytes - aggregateSourceBytes)
+      const sourceAllowance = Math.max(0, Math.min(limits.maximumSourceBytes, remainingAggregateSourceBytes))
       const readResult = readValidatedNativeFile(nativeRoot, source.path, {
-        maximumBytes: limits.maximumSourceBytes,
+        maximumBytes: sourceAllowance,
+        onDescriptorIo: observation => {
+          options.onSourceDescriptorIo?.(source.path, observation)
+        },
       })
       if (readResult.kind === 'source-limit') {
         traversalIntegrityAccepted = false
