@@ -118,16 +118,18 @@ Document all three 4 MiB budgets, the logical accounting formula, lazy compact i
 
 Run lint, all TypeScript projects, the full suite, baseline and CI-budget benchmarks, build, package, publish-contract, and frozen install. Audit declarations, Bun/package/config diffs, `git diff --check`, branch/base/upstream, and tracked status.
 
-Evidence: package contract 7/7; lint checked 105 files; all four TypeScript projects passed; the full suite passed 506/508 with two established filesystem-capability skips; both benchmark profiles, build, package, publish-contract, and frozen install passed. Public declarations and package/config files remained unchanged, both base-range diff checks were clean, and the tracked Task 3 scope contained only the six documented files.
+Evidence after rebasing onto current `main`: package contract 7/7; lint checked 106 files; all four TypeScript projects passed; the full suite passed 519/521 with two established filesystem-capability skips on both Node 24.15.0 and current Node; baseline and CI-budget benchmarks, build, package, publish-contract, and frozen install passed. Public declarations and package/config files remained unchanged, the base-range diff was clean, and repository validation passed for all 38 records.
 
 - [x] **Step 5: Commit documentation**
 
 Commit the maintained documentation and provenance with `[MAR-2554] Document bounded read responses`.
 
-- [ ] **Step 6: Review the branch against its base**
+- [x] **Step 6: Review the branch against its base**
 
 Provide one shared evidence packet to the six required parallel reviewers: security, correctness, race/data consistency, tests, maintainability, and UX/API. Fix every concrete high- or medium-confidence issue with focused RED/GREEN evidence, rerun proportionate gates, and repeat review at most three broad waves.
 
+Evidence: all six final reviewers returned `SHIP` with no findings against current `main`. Two initial reports were withdrawn after checking the recursive show accounting and the actual branch diff; neither required a production change.
+
 - [ ] **Step 7: Publish without merging**
 
-Push explicitly to `origin mar-2554-api-bound-compact-search-and-gather-response-bytes:mar-2554-api-bound-compact-search-and-gather-response-bytes`, open the ticket PR against the reviewed MAR-2550 stack branch, request the bot review, and leave the PR unmerged until every remaining ticket PR is complete and reviewed.
+Push explicitly to `origin mar-2554-api-bound-compact-search-and-gather-response-bytes:mar-2554-api-bound-compact-search-and-gather-response-bytes`, refresh the existing ticket PR against `main`, request the bot review, and merge only after the branch and resulting `main` CI are green in the ordered queue.
