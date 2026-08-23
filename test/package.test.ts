@@ -107,7 +107,7 @@ describe('package contract', () => {
     )
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /implementing the MAR-2566 benchmark guarantees above/)
-    assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `d775559bad4189621f07d837c14082009fbe380c`\./)
+    assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `de66f6ab7e10696fc878e380dd5417d194d60fe8`\./)
     assert.match(performance, /Correctness tests enforce deterministic output and bounded work counts/)
     assert.match(
       contract,

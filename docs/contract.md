@@ -144,7 +144,7 @@ This document is the concise contract maintainers should update when public beha
 
 The exact code and behavioural-test snapshot implementing the MAR-2566 benchmark guarantees above is `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 
-MAR-2568 behavioural hot-scan work bounds: `d775559bad4189621f07d837c14082009fbe380c`.
+MAR-2568 behavioural hot-scan work bounds: `de66f6ab7e10696fc878e380dd5417d194d60fe8`.
 
 ## Package and Release Gates
 
