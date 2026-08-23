@@ -52,6 +52,7 @@
     "benchmark": "node scripts/benchmark.ts",
     "benchmark:check": "node scripts/benchmark.ts --profile ci --budget docs/performance-budgets.json",
     "build": "bun run scripts/build.ts",
+    "check:generated": "bun run scripts/check-generated-version.ts",
     "check:package": "bun run scripts/check-package.ts",
     "check:publish": "bun run scripts/check-publish.ts",
     "check:workflows": "bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts",
