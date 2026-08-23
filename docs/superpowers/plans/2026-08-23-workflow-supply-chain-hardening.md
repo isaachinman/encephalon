@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make every Encephalon `uses` target identify reviewed immutable action code, remove provider-secret fan-out, and put Pullfrog's required hosted-OIDC authority behind an explicit environment boundary while proving or recording any authority that v0.1.60 cannot narrow from repository configuration.
+**Goal:** Make every Encephalon external executable reference identify reviewed immutable action code, remove provider-secret fan-out, and put Pullfrog's required hosted-OIDC authority behind an explicit environment boundary while proving or recording any authority that v0.1.60 cannot narrow from repository configuration.
 
-**Architecture:** A dependency-free structural policy parses workflow and local action YAML with `Bun.YAML`, follows repository-contained local references cycle-safely, and returns deterministic rule findings. The existing CI and Pullfrog workflows then use exact reviewed SHAs, minimal YAML permissions, no provider-secret fan-out, a protected Pullfrog environment, disabled credential persistence/push, and the SHA-pinned local Pullfrog core path; Dependabot proposes reviewed SHA updates without merging them automatically. Upstream authority that cannot be narrowed in v0.1.60 remains an explicit acceptance blocker rather than being hidden by workflow prose.
+**Architecture:** A dependency-free structural policy parses workflow and local action YAML with `Bun.YAML`, follows repository-contained local references cycle-safely, and returns deterministic rule findings. Owner/repository references use exact reviewed commit SHAs, while executable Docker action references use exact SHA-256 image digests. The existing CI and Pullfrog workflows then use minimal YAML permissions, no provider-secret fan-out, a protected Pullfrog environment, disabled credential persistence/push, and the SHA-pinned local Pullfrog core path; Dependabot proposes reviewed SHA updates without merging them automatically. Upstream authority that cannot be narrowed in v0.1.60 remains an explicit acceptance blocker rather than being hidden by workflow prose.
 
 **Tech Stack:** TypeScript 7, Bun 1.3.1 YAML parser and test runner, GitHub Actions YAML, Dependabot.
 
@@ -15,13 +15,13 @@
 - Preserve all documented valid public inputs, public TypeScript signatures, synchronous behaviour, result shapes, ordering, CLI framing, existing subsystem error codes, canonical data, and repository formats.
 - Add no runtime dependency. Use exact `@types/bun@1.3.1` only as a development dependency for the scripts TypeScript project; remove the historical handwritten Bun runtime declarations.
 - The workflow policy must parse YAML structurally; source regexes are not an acceptable substitute.
-- External `uses` references must have an owner/repository[/path] shape and end in one lowercase 40-character commit SHA; a trailing comment records the human-readable release.
+- External owner/repository[/path] references must end in one lowercase 40-character commit SHA; a trailing comment records the human-readable release. Executable `docker://` action references must end in `@sha256:` plus 64 lowercase hex characters, including reachable local Docker actions' `runs.image`. Repository-local `Dockerfile` and `./Dockerfile` images remain accepted, but their `FROM` chains are outside policy proof.
 - Repository-local reusable workflows and composite actions must be resolved through `lstat` and native real paths beneath the repository root, reject symlinks/non-regular/ambiguous targets, and be scanned recursively with cycle detection.
 - Source visits use a deterministic iterative queue keyed by comparable path and workflow/action role. Each file or directory observation is bound across `lstat`/native-realpath/final-`lstat`; action-manifest observations are bracketed by matching initial and final directory generations. Final acceptance revalidates repository/workflow discovery, every successfully read file witness, and every resolved action directory's exact `action.yml`/`action.yaml` candidate set; any late instability discards provisional findings and returns one deterministic `source-integrity` finding without retrying traversal.
 - Bound repository-controlled input to 256 raw workflow-directory entries, 256 KiB per source through a bounded descriptor read, 4 MiB aggregate source bytes, 512 unique source-path/role visits, and 16,384 parsed secret-tree nodes. A secret-tree cycle or any exceeded bound discards provisional findings and fails closed to the single global `source-integrity` finding.
 - Credential-bearing runner jobs include workflow- or job-level secret-context expressions across dotted, bracket, and whitespace forms, or effective `id-token: write`; each requires the exact `pullfrog-review` environment. Workflow-level env applies only to runner jobs because it is not propagated to called workflows.
 - Repository-local reusable-workflow callers may forward named secrets or use `secrets: inherit` because the called workflow is recursively inspected and its credential-consuming runner jobs independently require `pullfrog-review`. External reusable workflows remain subject to immutable pinning, require exact `jobs.<id>.permissions: {}`, and may not receive forwarded secrets. Empty permissions leave no configurable repository permission scopes without asserting that no token object exists; named or inherited `secrets` is rejected at the caller under `credential-forwarding`.
-- Every workflow must declare exactly the top-level permission map `{ contents: read }`; job permissions remain read-only except for the single protected Pullfrog OIDC exception.
+- Every workflow must explicitly declare exact `{}` or `{ contents: read }`. Ordinary runner and repository-local caller jobs may omit permissions to inherit or use either map; exact `{}` overrides inherited authority but does not bypass credential-environment policy. External reusable callers still require explicit exact `{}`. The protected Pullfrog job alone may additionally use exact `{ contents: read, id-token: write }`. This lower-authority acceptance broadening is monotonic: write/additional scopes and top-level omission remain rejected.
 - Only `.github/workflows/pullfrog.yml` job `pullfrog`, attached to `pullfrog-review`, may request `id-token: write`; repository permissions otherwise remain read-only.
 - Pullfrog uses hosted OIDC. Remove provider-secret mappings, retain only its narrowly scoped OIDC permission, set `push: disabled`, force the pinned local CLI path, and preserve manual inputs and run naming.
 - Do not claim complete Pullfrog execution immutability: v0.1.60 installs exact-version agent runtimes whose production dependency resolution is outside the action lock.
@@ -51,6 +51,7 @@
 export type WorkflowPolicyRule =
   | 'credential-environment'
   | 'credential-forwarding'
+  | 'external-image-digest'
   | 'external-reference-sha'
   | 'local-reference'
   | 'permission'
@@ -78,10 +79,11 @@ Create temporary fixture repositories and test the real parser and traversal. Be
 2. Keying recursive visits by path without the workflow/action role would skip independently relevant `jobs` or `runs.steps` in one dual-role source.
 3. Removing runner credential detection would allow `${{ secrets.TOKEN }}` or effective `id-token: write` without an environment; treating reusable callers as runners would demand an unsupported caller environment.
 4. Allowing external reusable-workflow callers to forward named or inherited secrets would move credentials outside the recursively inspected repository boundary.
-5. Broadening permissions would allow `contents: write` or OIDC outside the protected Pullfrog job, or give an external reusable-workflow call configurable repository permission scopes.
-6. Removing containment or cycle handling would allow `./../outside/action` or a self-referencing local action to escape or loop.
-7. Omitting final source and action-directory candidate revalidation would accept a replaced parsed workflow or a late second action manifest.
-8. Removing deterministic sorting would make diagnostics depend on directory or object insertion order.
+5. Treating Docker actions as repository references would reject immutable image digests, while omitting local `runs.image` inspection would hide mutable container tags.
+6. Broadening permissions would allow `contents: write` or OIDC outside the protected Pullfrog job, or give an external reusable-workflow call configurable repository permission scopes; rejecting exact `{}` would unnecessarily exclude lower authority.
+7. Removing containment or cycle handling would allow `./../outside/action` or a self-referencing local action to escape or loop.
+8. Omitting final source and action-directory candidate revalidation would accept a replaced parsed workflow or a late second action manifest.
+9. Removing deterministic sorting would make diagnostics depend on directory or object insertion order.
 
 Use hand-written YAML fixtures. Assert literal findings rather than computing expected values with the production formatter. A valid fixture must include a pinned external reference such as:
 
@@ -122,6 +124,7 @@ Implement a pure traversal with these rules:
 
 ```ts
 const fullCommitReference = /^[^\s@]+@[0-9a-f]{40}$/u
+const fullDockerImageDigest = /^docker:\/\/[^@\s]+@sha256:[0-9a-f]{64}$/u
 const localReference = /^\.\//u
 ```
 
@@ -131,14 +134,15 @@ const localReference = /^\.\//u
 - Resolve local references against the repository root, reject any resolved path outside it, and load only `.yml`, `.yaml`, `action.yml`, or `action.yaml` targets. Treat ambiguous or unsafe action manifests as `source-integrity`, while absent local targets remain `local-reference`.
 - Bind file and directory observations across `lstat`/native-realpath/final-`lstat`. Read at most 256 KiB per source through a bounded descriptor and 4 MiB in aggregate. Retain each successful validated file read's final stable metadata/path witness and each unique resolved action directory's stable generation plus exact `action.yml`/`action.yaml` observations bracketed by matching initial and final directory generations. At one optional-hooked final boundary, revalidate discovery and every retained witness; discard provisional findings and return one deterministic `source-integrity` finding on any mismatch without retrying or traversing again.
 - Inspect at most 256 raw workflow-directory entries and 16,384 parsed secret-tree nodes. Reject secret-tree cycles. Any exceeded bound discards provisional findings and returns the same single global `source-integrity` finding.
-- Scan every string-valued `uses` field. Local references recurse; all other action/reusable-workflow references require the full commit pattern.
+- Scan every executable string-valued `uses` field. Local references recurse. Owner/repository action and reusable-workflow references require the full commit pattern. Action-kind `docker://` references require the full Docker digest pattern; a job-level reusable-workflow reference that begins `docker://` remains invalid under `external-reference-sha`.
+- For every reachable local action with `runs.using: docker`, inspect a string `runs.image` beginning `docker://` at location `runs.image` under `external-image-digest`. Preserve repository-local `Dockerfile` and `./Dockerfile` forms without claiming that their `FROM` chains are inspected or proven.
 - Distinguish reusable-workflow caller jobs whose `uses` value is a string from runner jobs. Treat a runner as credential-bearing when workflow-level `env` or its own subtree contains a secret-context expression with optional expression/accessor whitespace and dotted or bracket access, or when effective job permissions contain `id-token: write`.
 - Require the exact string environment `pullfrog-review` or an object whose exact non-empty `name` is `pullfrog-review` for every credential-bearing runner. Do not apply caller workflow env to reusable-workflow caller jobs because GitHub does not propagate it to the called workflow.
 - Allow repository-local `$/` and `./` reusable-workflow callers to forward named secrets or use `secrets: inherit`; recursive inspection enforces the environment on actual credential-consuming runners in the called workflow. Require exact `jobs.<id>.permissions: {}` on an external reusable-workflow caller, reject any caller `secrets` property at `jobs.<id>.secrets` under `credential-forwarding`, and preserve external pinning checks under `external-reference-sha`.
-- Require the top-level permission map to be exactly `{ contents: read }`. Require job permissions to remain read-only and reject every other `write` permission except `id-token: write` for `.github/workflows/pullfrog.yml`, job `pullfrog`, environment `pullfrog-review`.
+- Require an explicit top-level permission map of exact `{}` or `{ contents: read }`. Ordinary runners and repository-local callers may omit permissions to inherit or use either exact map; exact `{}` overrides inherited OIDC but does not bypass protected-environment enforcement for secret-bearing runners. Reject every other `write` or additional permission except exact `{ contents: read, id-token: write }` for `.github/workflows/pullfrog.yml`, job `pullfrog`, environment `pullfrog-review`. External reusable callers remain restricted to explicit exact `{}`.
 - Sort findings by `file`, `location`, then `rule` with ordinal string ordering.
 - Keep CLI execution behind `if (import.meta.main)` so tests import without exiting.
-- Keep the formatted `file:location: rule` prefix and append guidance from an exhaustive `Record<WorkflowPolicyRule, string>`: exact protected environment, removal of external secret forwarding, immutable external pin, allowed contained local target, exact least-authority permissions, or stable unambiguous sources, respectively.
+- Keep the formatted `file:location: rule` prefix. Append exhaustive static guidance for protected environments, external secret forwarding, Docker image digests, repository pins, contained local targets, and stable sources. Use a file/location-aware permission helper that names literal workflow maps, ordinary job inheritance/maps, the ambiguous external-caller root requirement, and the exact Pullfrog OIDC map.
 
 Avoid early negative returns, mutation outside contained traversal state, and `.then()`/`.catch()` control flow.
 
@@ -311,13 +315,14 @@ Before committing, rerun `bun run test`, `bun run typecheck`, and `bun run lint`
 
 - [x] **Step 1: Update maintained documentation**
 
-In `README.md`, add `bun run check:workflows` to Development and explain that CI/Pullfrog action references are immutable, workflow policy follows local wrappers, and Pullfrog uses a branch-restricted protected environment with hosted OIDC rather than repository provider secrets. Document that `push: disabled` prevents git pushes and that the local CLI switch prevents the mutable Pullfrog-core bootstrap.
+In `README.md`, add `bun run check:workflows` to Development and explain that owner/repository references use immutable commit SHAs, executable Docker actions use immutable image digests, workflow policy follows local wrappers and Docker `runs.image`, and repository-local Dockerfile `FROM` chains remain outside proof. Document the explicit lower-authority permission maps, branch-restricted protected environment with hosted OIDC rather than repository provider secrets, `push: disabled`, and the local CLI switch that prevents the mutable Pullfrog-core bootstrap.
 
 In `docs/contract.md`, add a `## Workflow Trust Boundary` section specifying:
 
-- exact-SHA external actions with reviewed version comments;
+- exact-SHA owner/repository actions and exact-digest Docker actions with reviewed version comments where applicable;
 - recursive structural validation of local reusable workflows/composite actions;
-- read-only repository permissions;
+- the local Dockerfile `FROM`-chain boundary;
+- explicit empty/read-only workflow permissions and ordinary job inheritance/empty/read-only compatibility;
 - the sole `pullfrog-review` OIDC exception;
 - exact environment branch policies for `main` and the ticket branch currently being reviewed;
 - no provider-secret fan-out;

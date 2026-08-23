@@ -929,6 +929,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo "\${{ secrets.TOKEN }}"
+  empty:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo "\${{ secrets.TOKEN }}"
   oidc:
     runs-on: ubuntu-latest
     permissions:
@@ -948,6 +953,11 @@ jobs:
     {
       file: '.github/workflows/credentials.yml',
       location: 'jobs.dot.environment',
+      rule: 'credential-environment',
+    },
+    {
+      file: '.github/workflows/credentials.yml',
+      location: 'jobs.empty.environment',
       rule: 'credential-environment',
     },
     {
@@ -993,9 +1003,12 @@ permissions:
 jobs:
   inherited:
     uses: ./.github/workflows/called.yml
+    permissions: {}
     secrets: inherit
   named:
     uses: ./.github/workflows/called.yml
+    permissions:
+      contents: read
     secrets:
       REUSABLE_TOKEN: \${{ secrets.REUSABLE_TOKEN }}
 `,
@@ -1024,6 +1037,7 @@ permissions:
 jobs:
   call:
     uses: $/.github/workflows/called.yml
+    permissions: {}
     secrets: inherit
 `,
   })
@@ -1347,8 +1361,8 @@ jobs:
   ])
 })
 
-// Mutation caught: broadening permissions would allow missing scope, contents writes, extra read scopes, or OIDC outside Pullfrog.
-test('enforces exact workflow read scope and the narrow Pullfrog OIDC exception', () => {
+// Mutation caught: accepting lower authority must not admit omission, writes, extra scopes, or OIDC outside Pullfrog.
+test('accepts explicit least-authority permission maps and retains the narrow Pullfrog OIDC exception', () => {
   const root = createFixture({
     '.github/workflows/contents-write.yml': `name: Contents write
 on: workflow_dispatch
@@ -1361,6 +1375,15 @@ jobs:
       contents: write
     steps:
       - run: echo unsafe
+`,
+    '.github/workflows/empty-top.yml': `name: Empty top-level permissions
+on: workflow_dispatch
+permissions: {}
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo empty
 `,
     '.github/workflows/extra-read.yml': `name: Extra read
 on: workflow_dispatch
@@ -1466,6 +1489,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo inherited
+  overridden:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo no oidc
 `,
   })
 
@@ -1483,11 +1511,6 @@ jobs:
     {
       file: '.github/workflows/extra-read.yml',
       location: 'permissions',
-      rule: 'permission',
-    },
-    {
-      file: '.github/workflows/job-shapes.yml',
-      location: 'jobs.empty.permissions',
       rule: 'permission',
     },
     {
@@ -1854,19 +1877,27 @@ test('rejects dangling symlinks at either workflow discovery directory', () => {
   assert.deepEqual(inspectWorkflowPolicy(danglingWorkflowsRoot), expectedFinding)
 })
 
-// Mutation caught: weakening external-reference validation would accept Docker, short, uppercase, or owner-less action references.
-test('accepts only owner and repository references pinned to a lowercase full commit', () => {
+// Mutation caught: treating Docker actions as repository references would reject immutable images or misclassify mutable ones.
+test('accepts immutable repository and Docker action references under their exact pin rules', () => {
   const root = createFixture({
     '.github/workflows/references.yml': `name: References
 on: workflow_dispatch
 permissions:
   contents: read
 jobs:
+  call:
+    uses: docker://alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    permissions: {}
   verify:
     runs-on: ubuntu-latest
     steps:
       - uses: owner/repository/path@0123456789abcdef0123456789abcdef01234567
-      - uses: docker://alpine@0123456789abcdef0123456789abcdef01234567
+      - uses: docker://alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      - uses: docker://registry.example.com:5000/team/image:v1@sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+      - uses: docker://alpine:3.20
+      - uses: docker://alpine@sha256:01234567
+      - uses: docker://alpine@sha256:0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+      - uses: docker://alpine@sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
       - uses: action@0123456789abcdef0123456789abcdef01234567
       - uses: owner/action@0123456789ABCDEF0123456789ABCDEF01234567
 `,
@@ -1875,18 +1906,87 @@ jobs:
   assert.deepEqual(inspectWorkflowPolicy(root), [
     {
       file: '.github/workflows/references.yml',
-      location: 'jobs.verify.steps[1].uses',
-      rule: 'external-reference-sha',
-    },
-    {
-      file: '.github/workflows/references.yml',
-      location: 'jobs.verify.steps[2].uses',
+      location: 'jobs.call.uses',
       rule: 'external-reference-sha',
     },
     {
       file: '.github/workflows/references.yml',
       location: 'jobs.verify.steps[3].uses',
+      rule: 'external-image-digest',
+    },
+    {
+      file: '.github/workflows/references.yml',
+      location: 'jobs.verify.steps[4].uses',
+      rule: 'external-image-digest',
+    },
+    {
+      file: '.github/workflows/references.yml',
+      location: 'jobs.verify.steps[5].uses',
+      rule: 'external-image-digest',
+    },
+    {
+      file: '.github/workflows/references.yml',
+      location: 'jobs.verify.steps[6].uses',
+      rule: 'external-image-digest',
+    },
+    {
+      file: '.github/workflows/references.yml',
+      location: 'jobs.verify.steps[7].uses',
       rule: 'external-reference-sha',
+    },
+    {
+      file: '.github/workflows/references.yml',
+      location: 'jobs.verify.steps[8].uses',
+      rule: 'external-reference-sha',
+    },
+  ])
+})
+
+// Mutation caught: scanning only workflow steps would let a reachable local Docker action hide a mutable base image.
+test('inspects reachable local Docker images while accepting repository Dockerfiles', () => {
+  const root = createFixture({
+    '.github/actions/dockerfile-relative/action.yml': `name: Relative Dockerfile
+runs:
+  using: docker
+  image: ./Dockerfile
+`,
+    '.github/actions/dockerfile-relative/Dockerfile': 'FROM scratch\n',
+    '.github/actions/dockerfile/action.yml': `name: Dockerfile
+runs:
+  using: docker
+  image: Dockerfile
+`,
+    '.github/actions/dockerfile/Dockerfile': 'FROM scratch\n',
+    '.github/actions/mutable/action.yml': `name: Mutable image
+runs:
+  using: docker
+  image: docker://alpine:3.20
+`,
+    '.github/actions/pinned/action.yml': `name: Pinned image
+runs:
+  using: docker
+  image: docker://registry.example.com:5000/team/image:v1@sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+`,
+    '.github/workflows/docker.yml': `name: Docker actions
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/pinned
+      - uses: $/.github/actions/mutable
+      - uses: $/.github/actions/dockerfile
+      - uses: $/.github/actions/dockerfile-relative
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/actions/mutable/action.yml',
+      location: 'runs.image',
+      rule: 'external-image-digest',
     },
   ])
 })
@@ -1944,6 +2044,37 @@ jobs:
     `.github/workflows/a.yaml:jobs.verify.steps[0].uses: external-reference-sha: pin the external reference to a lowercase 40-character commit SHA
 .github/workflows/z.yml:jobs.a.steps[0].uses: external-reference-sha: pin the external reference to a lowercase 40-character commit SHA
 .github/workflows/z.yml:jobs.z.steps[0].uses: external-reference-sha: pin the external reference to a lowercase 40-character commit SHA
+`,
+  )
+})
+
+// Mutation caught: a context-free permission suffix would not tell maintainers which literal maps each location accepts.
+test('formats permission remediation for workflow, job, ambiguous caller, and Pullfrog locations', () => {
+  assert.equal(
+    formatWorkflowPolicyFindings([
+      { file: '.github/workflows/root.yml', location: 'permissions', rule: 'permission' },
+      {
+        file: '.github/workflows/runner.yml',
+        location: 'jobs.verify.permissions.contents',
+        rule: 'permission',
+      },
+      { file: '.github/workflows/caller.yml', location: 'jobs.call.permissions', rule: 'permission' },
+      {
+        file: '.github/workflows/pullfrog.yml',
+        location: 'jobs.pullfrog.permissions.issues',
+        rule: 'permission',
+      },
+      {
+        file: '.github/actions/docker/action.yml',
+        location: 'runs.image',
+        rule: 'external-image-digest',
+      },
+    ]),
+    `.github/workflows/root.yml:permissions: permission: set permissions to literal {} or { contents: read }
+.github/workflows/runner.yml:jobs.verify.permissions.contents: permission: omit permissions to inherit, or set literal {} or { contents: read }
+.github/workflows/caller.yml:jobs.call.permissions: permission: external reusable-workflow callers require literal {}; runners and local callers may omit permissions to inherit or set literal {} or { contents: read }
+.github/workflows/pullfrog.yml:jobs.pullfrog.permissions.issues: permission: omit permissions to inherit, or set literal {}, { contents: read }, or { contents: read, id-token: write }
+.github/actions/docker/action.yml:runs.image: external-image-digest: pin the external Docker image to a lowercase 64-character SHA-256 digest
 `,
   )
 })

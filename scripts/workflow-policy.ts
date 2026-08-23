@@ -16,6 +16,7 @@ import { ordinalStringCompare } from '../src/order.ts'
 export type WorkflowPolicyRule =
   | 'credential-environment'
   | 'credential-forwarding'
+  | 'external-image-digest'
   | 'external-reference-sha'
   | 'local-reference'
   | 'permission'
@@ -134,6 +135,7 @@ type DirectoryObservation =
   | Readonly<{ kind: 'missing' }>
 
 const fullCommitReference = /^[^\s@/]+\/[^\s@/]+(?:\/[^\s@/]+)*@[0-9a-f]{40}$/u
+const fullDockerImageDigest = /^docker:\/\/[^@\s]+@sha256:[0-9a-f]{64}$/u
 const localReference = /^(?:\.|\$)\//u
 const identifierStart = /[A-Za-z_]/u
 const identifierCharacter = /[A-Za-z0-9_-]/u
@@ -156,13 +158,40 @@ const sourceIntegrityFinding = {
   location: '$',
   rule: 'source-integrity',
 } as const satisfies WorkflowPolicyFinding
-const workflowPolicyGuidance: Record<WorkflowPolicyRule, string> = {
+const workflowPolicyGuidance: Record<Exclude<WorkflowPolicyRule, 'permission'>, string> = {
   'credential-environment': 'target the exact pullfrog-review environment',
   'credential-forwarding': 'remove secrets from the external reusable-workflow call',
+  'external-image-digest': 'pin the external Docker image to a lowercase 64-character SHA-256 digest',
   'external-reference-sha': 'pin the external reference to a lowercase 40-character commit SHA',
   'local-reference': 'use an existing repository-contained target allowed for this local reference',
-  permission: 'use the exact least-authority permission map allowed at this location',
   'source-integrity': 'restore stable, unambiguous regular workflow and action sources',
+}
+
+const permissionGuidance = (finding: WorkflowPolicyFinding) => {
+  let guidance = 'omit permissions to inherit, or set literal {} or { contents: read }'
+  if (finding.location === 'permissions' || finding.location.startsWith('permissions.')) {
+    guidance = 'set permissions to literal {} or { contents: read }'
+  } else if (
+    finding.file === '.github/workflows/pullfrog.yml' &&
+    (finding.location === 'jobs.pullfrog.permissions' || finding.location.startsWith('jobs.pullfrog.permissions.'))
+  ) {
+    guidance =
+      'omit permissions to inherit, or set literal {}, { contents: read }, or { contents: read, id-token: write }'
+  } else if (/^jobs\.[^.]+\.permissions$/u.test(finding.location)) {
+    guidance =
+      'external reusable-workflow callers require literal {}; runners and local callers may omit permissions to inherit or set literal {} or { contents: read }'
+  }
+  return guidance
+}
+
+const workflowPolicyFindingGuidance = (finding: WorkflowPolicyFinding) => {
+  let guidance: string
+  if (finding.rule === 'permission') {
+    guidance = permissionGuidance(finding)
+  } else {
+    guidance = workflowPolicyGuidance[finding.rule]
+  }
+  return guidance
 }
 
 const compareFindings = (left: WorkflowPolicyFinding, right: WorkflowPolicyFinding) => {
@@ -617,7 +646,12 @@ const executableReferences = (
       return jobReferences
     })
   } else if (kind === 'action' && isPlainObject(document.runs)) {
-    references = stepReferences(document.runs.steps, 'runs.steps')
+    const dockerImage = document.runs.image
+    const dockerImageReference =
+      document.runs.using === 'docker' && typeof dockerImage === 'string' && dockerImage.startsWith('docker://')
+        ? [{ kind: 'action' as const, location: 'runs.image', reference: dockerImage }]
+        : []
+    references = [...dockerImageReference, ...stepReferences(document.runs.steps, 'runs.steps')]
   }
   return references
 }
@@ -750,9 +784,10 @@ const effectiveIdTokenIsWrite = (workflowPermissions: unknown, jobPermissions: u
 
 const inspectWorkflowPermissions = (document: ParsedObject, file: string, findings: WorkflowPolicyFinding[]) => {
   const { permissions } = document
+  const exactEmptyScope = isPlainObject(permissions) && Object.keys(permissions).length === 0
   const exactReadScope =
     isPlainObject(permissions) && Object.keys(permissions).length === 1 && permissions.contents === 'read'
-  if (!exactReadScope) {
+  if (!(exactEmptyScope || exactReadScope)) {
     if (isPlainObject(permissions)) {
       let reportedSpecificPermission = false
       if (permissions.contents !== 'read') {
@@ -780,6 +815,7 @@ const inspectJobPermissions = (job: ParsedObject, jobName: string, file: string,
     const permissionLocation = `jobs.${jobName}.permissions`
     if (isPlainObject(permissions)) {
       const permissionNames = Object.keys(permissions)
+      const exactEmptyScope = permissionNames.length === 0
       const exactReadScope = permissionNames.length === 1 && permissions.contents === 'read'
       const allowsPullfrogOidc =
         file === '.github/workflows/pullfrog.yml' && jobName === 'pullfrog' && hasProtectedEnvironment(job.environment)
@@ -788,19 +824,15 @@ const inspectJobPermissions = (job: ParsedObject, jobName: string, file: string,
         permissionNames.length === 2 &&
         permissions.contents === 'read' &&
         permissions['id-token'] === 'write'
-      if (!(exactReadScope || exactPullfrogOidcScope)) {
-        if (permissionNames.length === 0) {
-          findings.push({ file, location: permissionLocation, rule: 'permission' })
-        } else {
-          if (permissions.contents !== 'read') {
-            findings.push({ file, location: `${permissionLocation}.contents`, rule: 'permission' })
-          }
-          for (const permission of permissionNames) {
-            const isAllowedOidcPermission =
-              allowsPullfrogOidc && permission === 'id-token' && permissions[permission] === 'write'
-            if (permission !== 'contents' && !isAllowedOidcPermission) {
-              findings.push({ file, location: `${permissionLocation}.${permission}`, rule: 'permission' })
-            }
+      if (!(exactEmptyScope || exactReadScope || exactPullfrogOidcScope)) {
+        if (permissions.contents !== 'read') {
+          findings.push({ file, location: `${permissionLocation}.contents`, rule: 'permission' })
+        }
+        for (const permission of permissionNames) {
+          const isAllowedOidcPermission =
+            allowsPullfrogOidc && permission === 'id-token' && permissions[permission] === 'write'
+          if (permission !== 'contents' && !isAllowedOidcPermission) {
+            findings.push({ file, location: `${permissionLocation}.${permission}`, rule: 'permission' })
           }
         }
       }
@@ -968,6 +1000,10 @@ export const inspectWorkflowPolicy = (
                       scheduleFile(target.path, reference.kind)
                     }
                   }
+                } else if (reference.kind === 'action' && reference.reference.startsWith('docker://')) {
+                  if (!fullDockerImageDigest.test(reference.reference)) {
+                    findings.push({ file, location: reference.location, rule: 'external-image-digest' })
+                  }
                 } else if (!fullCommitReference.test(reference.reference)) {
                   findings.push({ file, location: reference.location, rule: 'external-reference-sha' })
                 }
@@ -1126,7 +1162,7 @@ export const formatWorkflowPolicyFindings = (findings: readonly WorkflowPolicyFi
   let output = ''
   if (findings.length > 0) {
     output = `${findings
-      .map(finding => `${finding.file}:${finding.location}: ${finding.rule}: ${workflowPolicyGuidance[finding.rule]}`)
+      .map(finding => `${finding.file}:${finding.location}: ${finding.rule}: ${workflowPolicyFindingGuidance(finding)}`)
       .join('\n')}\n`
   }
   return output
