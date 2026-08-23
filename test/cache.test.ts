@@ -2147,8 +2147,8 @@ describe('SQLite cache and reads', () => {
     )
   })
 
-  test('returns punctuation-only searches before repository and cache inspection', () => {
-    const root = join(tmpdir(), 'encephalon-search-must-not-resolve')
+  test('validates the repository but skips the cache for punctuation-only searches', () => {
+    const root = createRoot()
     const query = '\u0301 _ __ * " - + ^ : () {} []\u0000'
     let cacheInspections = 0
     let repositoryInspections = 0
@@ -2158,7 +2158,6 @@ describe('SQLite cache and reads', () => {
     }
     repositoryTestHooks.afterGitMarkerDecision = () => {
       repositoryInspections += 1
-      throw new Error('repository inspection must not run for an empty literal query')
     }
     const searchRecords =
       functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchRecords')
@@ -2167,13 +2166,17 @@ describe('SQLite cache and reads', () => {
     const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
 
     assert.deepEqual(searchRecords({ query, root }), [])
+    assert.ok(repositoryInspections > 0)
+    repositoryInspections = 0
     assert.deepEqual(searchCompactRecords({ query, root }), [])
+    assert.ok(repositoryInspections > 0)
+    repositoryInspections = 0
     assert.deepEqual(gatherRecords({ root, searches: [query] }), {
       hydrated: null,
       records: [],
       searches: [{ kind: null, query, results: [] }],
     })
-    assert.equal(repositoryInspections, 0)
+    assert.ok(repositoryInspections > 0)
     assert.equal(cacheInspections, 0)
   })
 

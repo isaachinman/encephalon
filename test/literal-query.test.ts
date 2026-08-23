@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import { EncephalonError } from '../src/errors.ts'
-import { literalMatchQuery } from '../src/literal-query.ts'
+import { literalMatchQuery } from '../src/search-text.ts'
 
 describe('literal Unicode queries', () => {
   test('normalises and quotes Unicode terms without exposing FTS syntax', () => {

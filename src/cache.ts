@@ -37,7 +37,6 @@ import {
 } from './canonical-layout.ts'
 import { EncephalonError, fail, failBudget, failWithCause, wrapIo } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
-import { literalMatchQuery, MAX_NFC_UTF8_EXPANSION_FACTOR, normalizeSearchText } from './literal-query.ts'
 import { withOperationLock } from './lock.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { ordinalStringCompare } from './order.ts'
@@ -45,6 +44,7 @@ import { canonicalRecordPath, readRecords, readValidatedRecordSnapshotResolved }
 import { resolveRepository } from './repository.ts'
 import { createResponseByteBudget, type ResponseByteBudget } from './response-budget.ts'
 import { parseRecordFile, validateArtifactPath } from './schema.ts'
+import { literalMatchQuery, MAX_NFC_UTF8_EXPANSION_FACTOR, normalizeSearchText } from './search-text.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type {
   BrainRecord,
@@ -2064,6 +2064,7 @@ export const searchRecords = (input: SearchRecordsInput): BrainRecord[] => {
       parseRecordRowsWithinBudget(searchRows(database, parsed, match, limit)),
     )
   }
+  resolveRepository(parsed)
   return []
 }
 
@@ -2078,6 +2079,7 @@ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRec
       return createCompactSearchReader(database, parsed, budget)(parsed.query, match)
     })
   }
+  resolveRepository(parsed)
   return []
 }
 
@@ -2192,5 +2194,6 @@ export const gatherRecords = (input: GatherInput): GatherResult => {
   if (requiresDatabase) {
     return gatherRecordsFromDatabase(parsed, searches)
   }
+  resolveRepository(parsed)
   return emptyGatherResult(parsed, searches)
 }
