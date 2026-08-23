@@ -6,7 +6,7 @@ import {
   lstatSync,
   opendirSync,
   openSync,
-  readFileSync,
+  readSync,
   realpathSync,
 } from 'node:fs'
 import { extname, relative, resolve, sep } from 'node:path'
@@ -35,8 +35,32 @@ type ExecutableReference = Readonly<{
   reference: string
 }>
 
+type ExecutableSource = Readonly<{
+  kind: ExecutableReference['kind']
+  path: string
+  visitKey: string
+}>
+
+type WorkflowPolicyLimits = Readonly<{
+  maximumAggregateSourceBytes: number
+  maximumSecretTreeNodes: number
+  maximumSourceBytes: number
+  maximumSourceVisits: number
+  maximumWorkflowDirectoryEntries: number
+}>
+
 type WorkflowPolicyOptions = Readonly<{
+  afterActionCandidateRevalidation?: (path: string, index: number) => void
+  afterFinalDirectoryRealpath?: (path: string) => void
+  afterFinalFileRealpath?: (path: string) => void
   beforeFinalRevalidation?: () => void
+  limits?: Partial<WorkflowPolicyLimits>
+  onSourceVisit?: (phase: 'enter' | 'exit', path: string, kind: ExecutableReference['kind']) => void
+}>
+
+type ValidatedNativeFileOptions = Readonly<{
+  afterFinalRealpath?: (path: string) => void
+  maximumBytes?: number
 }>
 
 type FileWitness = Readonly<{
@@ -45,9 +69,15 @@ type FileWitness = Readonly<{
 }>
 
 type ValidatedNativeFile = Readonly<{
+  bytes: number
   contents: string
   witness: FileWitness
 }>
+
+type ValidatedNativeFileResult =
+  | Readonly<{ file: ValidatedNativeFile; kind: 'file' }>
+  | Readonly<{ kind: 'invalid' }>
+  | Readonly<{ kind: 'source-limit' }>
 
 type SourceFileObservation =
   | Readonly<{ kind: 'file'; metadata: BigIntStats }>
@@ -106,6 +136,14 @@ const secretsIdentifier = 'secrets'
 const workflowFilename = /\.ya?ml$/u
 const protectedEnvironment = 'pullfrog-review'
 const actionManifestFilenames = ['action.yml', 'action.yaml'] as const
+// Current checked-in policy sources are two workflows totalling 3,720 bytes; these limits leave broad local-wrapper headroom.
+const workflowPolicyLimits: WorkflowPolicyLimits = {
+  maximumAggregateSourceBytes: 4 * 1024 * 1024,
+  maximumSecretTreeNodes: 16_384,
+  maximumSourceBytes: 256 * 1024,
+  maximumSourceVisits: 512,
+  maximumWorkflowDirectoryEntries: 256,
+}
 const sourceIntegrityFinding = {
   file: '.github/workflows',
   location: '$',
@@ -147,8 +185,14 @@ const comparablePath = (path: string) =>
 
 const samePath = (first: string, second: string) => comparablePath(first) === comparablePath(second)
 
+/** @internal */
+export const isContainedComparablePath = (root: string, path: string) => {
+  const descendantPrefix = root.endsWith('/') ? root : `${root}/`
+  return root === path || path.startsWith(descendantPrefix)
+}
+
 const isContainedPath = (root: string, path: string) =>
-  samePath(root, path) || comparablePath(path).startsWith(`${comparablePath(root)}/`)
+  isContainedComparablePath(comparablePath(root), comparablePath(path))
 
 const hasErrorCode = (value: unknown, code: string) => {
   let matches = false
@@ -170,26 +214,42 @@ const readRealPath = (path: string) => {
 
 const isSingleLinkRegularFile = (stats: BigIntStats) => stats.isFile() && stats.nlink === 1n
 
-const observeNativeFile = (root: string, path: string): SourceFileObservation => {
+const observeNativeFile = (
+  root: string,
+  path: string,
+  afterRealpath?: (path: string) => void,
+): SourceFileObservation => {
   let observation: SourceFileObservation = { kind: 'invalid' }
-  let metadata: BigIntStats | undefined
+  let initialMetadata: BigIntStats | undefined
   try {
-    metadata = lstatSync(path, { bigint: true })
+    initialMetadata = lstatSync(path, { bigint: true })
   } catch (error) {
     if (hasErrorCode(error, 'ENOENT')) {
       observation = { kind: 'missing' }
     }
   }
-  if (metadata !== undefined) {
+  if (initialMetadata !== undefined) {
     const nativePath = readRealPath(path)
-    if (
-      isSingleLinkRegularFile(metadata) &&
-      !metadata.isSymbolicLink() &&
-      nativePath !== undefined &&
-      samePath(nativePath, path) &&
-      isContainedPath(root, nativePath)
-    ) {
-      observation = { kind: 'file', metadata }
+    if (nativePath !== undefined) {
+      afterRealpath?.(path)
+      let finalMetadata: BigIntStats | undefined
+      try {
+        finalMetadata = lstatSync(path, { bigint: true })
+      } catch {
+        finalMetadata = undefined
+      }
+      if (
+        finalMetadata !== undefined &&
+        isSingleLinkRegularFile(initialMetadata) &&
+        !initialMetadata.isSymbolicLink() &&
+        isSingleLinkRegularFile(finalMetadata) &&
+        !finalMetadata.isSymbolicLink() &&
+        sameStableEntryMetadata(initialMetadata, finalMetadata) &&
+        samePath(nativePath, path) &&
+        isContainedPath(root, nativePath)
+      ) {
+        observation = { kind: 'file', metadata: finalMetadata }
+      }
     }
   }
   return observation
@@ -202,21 +262,31 @@ const isNativeDirectory = (root: string, path: string, stats: BigIntStats, nativ
   samePath(nativePath, path) &&
   isContainedPath(root, path)
 
-const observeNativeDirectory = (root: string, path: string): DirectoryObservation => {
+const observeNativeDirectory = (
+  root: string,
+  path: string,
+  afterRealpath?: (path: string) => void,
+): DirectoryObservation => {
   let observation: DirectoryObservation = { kind: 'invalid' }
-  let stats: BigIntStats | undefined
+  let initialStats: BigIntStats | undefined
   try {
-    stats = lstatSync(path, { bigint: true })
+    initialStats = lstatSync(path, { bigint: true })
   } catch (error) {
     if (hasErrorCode(error, 'ENOENT')) {
       observation = { kind: 'missing' }
     }
   }
-  if (stats !== undefined) {
+  if (initialStats !== undefined) {
     try {
       const nativePath = realpathSync.native(path)
-      if (isNativeDirectory(root, path, stats, nativePath)) {
-        observation = { kind: 'directory', stats }
+      afterRealpath?.(path)
+      const finalStats = lstatSync(path, { bigint: true })
+      if (
+        isNativeDirectory(root, path, initialStats, nativePath) &&
+        isNativeDirectory(root, path, finalStats, nativePath) &&
+        sameStableEntryMetadata(initialStats, finalStats)
+      ) {
+        observation = { kind: 'directory', stats: finalStats }
       }
     } catch {
       observation = { kind: 'invalid' }
@@ -228,10 +298,36 @@ const observeNativeDirectory = (root: string, path: string): DirectoryObservatio
 const isSameDirectoryGeneration = (initial: DirectoryObservation, final: DirectoryObservation) =>
   initial.kind === 'directory' && final.kind === 'directory' && sameStableEntryMetadata(initial.stats, final.stats)
 
-const readValidatedNativeFile = (root: string, path: string): ValidatedNativeFile | undefined => {
+const readBoundedDescriptor = (descriptor: number, maximumBytes: number) => {
+  const bytes = Buffer.alloc(maximumBytes + 1)
+  let bytesRead = 0
+  let complete = false
+  while (!complete && bytesRead <= maximumBytes) {
+    const count = readSync(descriptor, bytes, bytesRead, bytes.length - bytesRead, null)
+    if (count === 0) {
+      complete = true
+    } else {
+      bytesRead += count
+    }
+  }
+  let contents: Readonly<{ bytes: number; value: string }> | undefined
+  if (complete && bytesRead <= maximumBytes) {
+    contents = { bytes: bytesRead, value: bytes.subarray(0, bytesRead).toString('utf8') }
+  }
+  return contents
+}
+
+/** @internal */
+export const readValidatedNativeFile = (
+  root: string,
+  path: string,
+  options: ValidatedNativeFileOptions = {},
+): ValidatedNativeFileResult => {
+  const maximumBytes = options.maximumBytes ?? workflowPolicyLimits.maximumSourceBytes
   let validatedFile: ValidatedNativeFile | undefined
   let descriptor: number | undefined
   let operationFailed = false
+  let sourceLimitExceeded = false
   try {
     const initialStats = lstatSync(path, { bigint: true })
     const initialNativePath = realpathSync.native(path)
@@ -245,25 +341,38 @@ const readValidatedNativeFile = (root: string, path: string): ValidatedNativeFil
       descriptor = openSync(path, constants.O_RDONLY | noFollow)
       const beforeReadStats = fstatSync(descriptor, { bigint: true })
       if (isSingleLinkRegularFile(beforeReadStats) && sameStableEntryMetadata(initialStats, beforeReadStats)) {
-        const candidateContents = readFileSync(descriptor, 'utf8')
-        const afterReadStats = fstatSync(descriptor, { bigint: true })
-        const finalStats = lstatSync(path, { bigint: true })
-        const finalNativePath = realpathSync.native(path)
-        if (
-          isSingleLinkRegularFile(afterReadStats) &&
-          isSingleLinkRegularFile(finalStats) &&
-          !finalStats.isSymbolicLink() &&
-          samePath(finalNativePath, path) &&
-          isContainedPath(root, finalNativePath) &&
-          sameStableEntryMetadata(beforeReadStats, afterReadStats) &&
-          sameStableEntryMetadata(afterReadStats, finalStats)
-        ) {
-          validatedFile = {
-            contents: candidateContents,
-            witness: { metadata: finalStats, path },
+        if (beforeReadStats.size <= BigInt(maximumBytes)) {
+          const candidateContents = readBoundedDescriptor(descriptor, maximumBytes)
+          if (candidateContents === undefined) {
+            sourceLimitExceeded = true
+          } else {
+            const afterReadStats = fstatSync(descriptor, { bigint: true })
+            const beforeFinalRealpathStats = lstatSync(path, { bigint: true })
+            const finalNativePath = realpathSync.native(path)
+            options.afterFinalRealpath?.(path)
+            const finalStats = lstatSync(path, { bigint: true })
+            if (
+              isSingleLinkRegularFile(afterReadStats) &&
+              isSingleLinkRegularFile(beforeFinalRealpathStats) &&
+              isSingleLinkRegularFile(finalStats) &&
+              !finalStats.isSymbolicLink() &&
+              samePath(finalNativePath, path) &&
+              isContainedPath(root, finalNativePath) &&
+              sameStableEntryMetadata(beforeReadStats, afterReadStats) &&
+              sameStableEntryMetadata(afterReadStats, beforeFinalRealpathStats) &&
+              sameStableEntryMetadata(beforeFinalRealpathStats, finalStats)
+            ) {
+              validatedFile = {
+                bytes: candidateContents.bytes,
+                contents: candidateContents.value,
+                witness: { metadata: finalStats, path },
+              }
+            } else {
+              operationFailed = true
+            }
           }
         } else {
-          operationFailed = true
+          sourceLimitExceeded = true
         }
       } else {
         operationFailed = true
@@ -283,10 +392,15 @@ const readValidatedNativeFile = (root: string, path: string): ValidatedNativeFil
       closeFailed = true
     }
   }
-  if (operationFailed || closeFailed) {
-    validatedFile = undefined
+  let result: ValidatedNativeFileResult = { kind: 'invalid' }
+  if (!(operationFailed || closeFailed)) {
+    if (sourceLimitExceeded) {
+      result = { kind: 'source-limit' }
+    } else if (validatedFile !== undefined) {
+      result = { file: validatedFile, kind: 'file' }
+    }
   }
-  return validatedFile
+  return result
 }
 
 const captureActionDirectoryTarget = (root: string, path: string): LocalTargetResult => {
@@ -378,20 +492,29 @@ const sameActionDirectoryWitness = (left: ActionDirectoryWitness, right: ActionD
     )
   })
 
-const revalidateFileWitness = (root: string, witness: FileWitness) => {
-  const current = observeNativeFile(root, witness.path)
+const revalidateFileWitness = (root: string, witness: FileWitness, afterRealpath?: (path: string) => void) => {
+  const current = observeNativeFile(root, witness.path, afterRealpath)
   return current.kind === 'file' && sameStableEntryMetadata(witness.metadata, current.metadata)
 }
 
-const revalidateActionDirectoryWitness = (root: string, witness: ActionDirectoryWitness) => {
-  const currentDirectory = observeNativeDirectory(root, witness.path)
+const revalidateActionDirectoryWitness = (
+  root: string,
+  witness: ActionDirectoryWitness,
+  options: WorkflowPolicyOptions,
+) => {
+  const initialDirectory = observeNativeDirectory(root, witness.path, options.afterFinalDirectoryRealpath)
+  const candidatesMatch = witness.candidates.every((candidate, index) => {
+    const current = observeNativeFile(root, candidate.path, options.afterFinalFileRealpath)
+    options.afterActionCandidateRevalidation?.(witness.path, index)
+    return sameAcceptedFileObservation(candidate.observation, current)
+  })
+  const finalDirectory = observeNativeDirectory(root, witness.path, options.afterFinalDirectoryRealpath)
   return (
-    currentDirectory.kind === 'directory' &&
-    sameStableEntryMetadata(witness.metadata, currentDirectory.stats) &&
-    witness.candidates.every(candidate => {
-      const current = observeNativeFile(root, candidate.path)
-      return sameAcceptedFileObservation(candidate.observation, current)
-    })
+    candidatesMatch &&
+    initialDirectory.kind === 'directory' &&
+    finalDirectory.kind === 'directory' &&
+    sameStableEntryMetadata(witness.metadata, initialDirectory.stats) &&
+    sameStableEntryMetadata(initialDirectory.stats, finalDirectory.stats)
   )
 }
 
@@ -403,21 +526,30 @@ const directoryWitness = (path: string, observation: DirectoryObservation) => {
   return witness
 }
 
-const revalidateDirectoryWitness = (root: string, witness: FileSystemDirectoryWitness) => {
-  const current = observeNativeDirectory(root, witness.path)
+const revalidateDirectoryWitness = (
+  root: string,
+  witness: FileSystemDirectoryWitness,
+  afterRealpath?: (path: string) => void,
+) => {
+  const current = observeNativeDirectory(root, witness.path, afterRealpath)
   return current.kind === 'directory' && sameStableEntryMetadata(witness.metadata, current.stats)
 }
 
-const revalidateWorkflowDiscovery = (root: string, witness: WorkflowDiscoveryWitness) => {
-  let accepted = revalidateDirectoryWitness(root, witness.root)
+const revalidateWorkflowDiscovery = (
+  root: string,
+  witness: WorkflowDiscoveryWitness,
+  afterRealpath?: (path: string) => void,
+) => {
+  let accepted = revalidateDirectoryWitness(root, witness.root, afterRealpath)
   if (witness.kind === 'github-missing') {
-    accepted = accepted && observeNativeDirectory(root, resolve(root, '.github')).kind === 'missing'
+    accepted = accepted && observeNativeDirectory(root, resolve(root, '.github'), afterRealpath).kind === 'missing'
   } else {
-    accepted = accepted && revalidateDirectoryWitness(root, witness.github)
+    accepted = accepted && revalidateDirectoryWitness(root, witness.github, afterRealpath)
     if (witness.kind === 'workflows-missing') {
-      accepted = accepted && observeNativeDirectory(root, resolve(root, '.github/workflows')).kind === 'missing'
+      accepted =
+        accepted && observeNativeDirectory(root, resolve(root, '.github/workflows'), afterRealpath).kind === 'missing'
     } else {
-      accepted = accepted && revalidateDirectoryWitness(root, witness.workflows)
+      accepted = accepted && revalidateDirectoryWitness(root, witness.workflows, afterRealpath)
     }
   }
   return accepted
@@ -538,16 +670,53 @@ const stringContainsSecretExpression = (value: string) => {
   return containsSecret
 }
 
-const containsSecretExpression = (value: unknown): boolean => {
+type SecretTreeBudget = {
+  maximum: number
+  nodes: number
+}
+
+type SecretTreeFrame = Readonly<{ kind: 'enter'; value: unknown }> | Readonly<{ kind: 'exit'; value: object }>
+
+const containsSecretExpression = (value: unknown, budget: SecretTreeBudget) => {
+  const active = new WeakSet<object>()
+  const visited = new WeakSet<object>()
+  const stack: SecretTreeFrame[] = [{ kind: 'enter', value }]
+  let pendingNodes = 1
+  let accepted = true
   let containsSecret = false
-  if (typeof value === 'string') {
-    containsSecret = stringContainsSecretExpression(value)
-  } else if (Array.isArray(value)) {
-    containsSecret = value.some(item => containsSecretExpression(item))
-  } else if (isPlainObject(value)) {
-    containsSecret = Object.values(value).some(item => containsSecretExpression(item))
+  while (accepted && stack.length > 0) {
+    const frame = stack.pop()
+    if (frame?.kind === 'exit') {
+      active.delete(frame.value)
+    } else if (frame?.kind === 'enter') {
+      pendingNodes -= 1
+      budget.nodes += 1
+      if (budget.nodes > budget.maximum) {
+        accepted = false
+      } else if (typeof frame.value === 'string') {
+        containsSecret = stringContainsSecretExpression(frame.value) || containsSecret
+      } else if (Array.isArray(frame.value) || isPlainObject(frame.value)) {
+        const object = frame.value
+        if (active.has(object)) {
+          accepted = false
+        } else if (!visited.has(object)) {
+          visited.add(object)
+          active.add(object)
+          stack.push({ kind: 'exit', value: object })
+          const children = Array.isArray(object) ? object : Object.values(object)
+          if (children.length > budget.maximum - budget.nodes - pendingNodes) {
+            accepted = false
+          } else {
+            pendingNodes += children.length
+            for (let index = children.length - 1; index >= 0; index -= 1) {
+              stack.push({ kind: 'enter', value: children[index] })
+            }
+          }
+        }
+      }
+    }
   }
-  return containsSecret
+  return { accepted, containsSecret }
 }
 
 const effectiveIdTokenIsWrite = (workflowPermissions: unknown, jobPermissions: unknown) => {
@@ -635,12 +804,23 @@ const inspectExternalReusableWorkflowPermissions = (
   }
 }
 
-const inspectWorkflowJobs = (document: ParsedObject, file: string, findings: WorkflowPolicyFinding[]) => {
+const inspectWorkflowJobs = (
+  document: ParsedObject,
+  file: string,
+  findings: WorkflowPolicyFinding[],
+  secretTreeBudget: SecretTreeBudget,
+) => {
   const { jobs } = document
-  if (isPlainObject(jobs)) {
-    const workflowEnvironmentContainsSecret = containsSecretExpression(document.env)
+  let accepted = true
+  let workflowEnvironmentContainsSecret = false
+  if (document.env !== undefined) {
+    const { accepted: environmentAccepted, containsSecret } = containsSecretExpression(document.env, secretTreeBudget)
+    accepted = environmentAccepted
+    workflowEnvironmentContainsSecret = containsSecret
+  }
+  if (accepted && isPlainObject(jobs)) {
     for (const [jobName, value] of Object.entries(jobs)) {
-      if (isPlainObject(value)) {
+      if (accepted && isPlainObject(value)) {
         const reusableWorkflowReference = value.uses
         if (typeof reusableWorkflowReference === 'string') {
           if (localReference.test(reusableWorkflowReference)) {
@@ -653,23 +833,27 @@ const inspectWorkflowJobs = (document: ParsedObject, file: string, findings: Wor
           }
         } else {
           inspectJobPermissions(value, jobName, file, findings)
+          const { accepted: jobAccepted, containsSecret } = containsSecretExpression(value, secretTreeBudget)
+          accepted = jobAccepted
           const credentialBearing =
             workflowEnvironmentContainsSecret ||
-            containsSecretExpression(value) ||
+            containsSecret ||
             effectiveIdTokenIsWrite(document.permissions, value.permissions)
-          if (credentialBearing && !hasProtectedEnvironment(value.environment)) {
+          if (accepted && credentialBearing && !hasProtectedEnvironment(value.environment)) {
             findings.push({ file, location: `jobs.${jobName}.environment`, rule: 'credential-environment' })
           }
         }
       }
     }
   }
+  return accepted
 }
 
 export const inspectWorkflowPolicy = (
   root: string,
   options: WorkflowPolicyOptions = {},
 ): readonly WorkflowPolicyFinding[] => {
+  const limits = { ...workflowPolicyLimits, ...options.limits }
   const nativeRoot = readRealPath(resolve(root))
   let policyFindings: readonly WorkflowPolicyFinding[] = [sourceIntegrityFinding]
   if (nativeRoot === undefined) {
@@ -679,60 +863,92 @@ export const inspectWorkflowPolicy = (
     const roleVisits = new Set<string>()
     const fileWitnesses = new Map<string, FileWitness>()
     const actionDirectoryWitnesses = new Map<string, ActionDirectoryWitness>()
+    const sourceQueue: ExecutableSource[] = []
+    const secretTreeBudget: SecretTreeBudget = { maximum: limits.maximumSecretTreeNodes, nodes: 0 }
+    let aggregateSourceBytes = 0
     let traversalIntegrityAccepted = true
 
-    const inspectFile = (path: string, kind: ExecutableReference['kind']) => {
+    const scheduleFile = (path: string, kind: ExecutableReference['kind']) => {
       const visitKey = `${kind}\0${comparablePath(path)}`
       if (!roleVisits.has(visitKey)) {
-        roleVisits.add(visitKey)
-        const file = relativeFile(nativeRoot, path)
-        let document: ParsedObject | undefined
-        let validatedFile: ValidatedNativeFile | undefined
+        if (roleVisits.size < limits.maximumSourceVisits) {
+          roleVisits.add(visitKey)
+          sourceQueue.push({ kind, path, visitKey })
+        } else {
+          traversalIntegrityAccepted = false
+        }
+      }
+    }
+
+    const inspectFile = (source: ExecutableSource) => {
+      const file = relativeFile(nativeRoot, source.path)
+      let document: ParsedObject | undefined
+      let validatedFile: ValidatedNativeFile | undefined
+      const readResult = readValidatedNativeFile(nativeRoot, source.path, {
+        maximumBytes: limits.maximumSourceBytes,
+      })
+      if (readResult.kind === 'source-limit') {
+        traversalIntegrityAccepted = false
+      } else if (readResult.kind === 'file') {
+        aggregateSourceBytes += readResult.file.bytes
+        if (aggregateSourceBytes <= limits.maximumAggregateSourceBytes) {
+          validatedFile = readResult.file
+          fileWitnesses.set(source.visitKey, validatedFile.witness)
+        } else {
+          traversalIntegrityAccepted = false
+        }
+      }
+
+      if (traversalIntegrityAccepted && validatedFile !== undefined) {
         try {
-          validatedFile = readValidatedNativeFile(nativeRoot, path)
-          const parsed = validatedFile === undefined ? undefined : Bun.YAML.parse(validatedFile.contents)
+          const parsed = Bun.YAML.parse(validatedFile.contents)
           if (isPlainObject(parsed)) {
             document = parsed
           }
         } catch {
           document = undefined
         }
+      }
 
-        if (validatedFile !== undefined) {
-          fileWitnesses.set(visitKey, validatedFile.witness)
-        }
+      if (traversalIntegrityAccepted) {
         if (document === undefined) {
           findings.push({ file, location: '$', rule: 'source-integrity' })
         } else {
-          if (kind === 'workflow') {
+          if (source.kind === 'workflow') {
             inspectWorkflowPermissions(document, file, findings)
-            inspectWorkflowJobs(document, file, findings)
+            traversalIntegrityAccepted = inspectWorkflowJobs(document, file, findings, secretTreeBudget)
           }
 
-          for (const reference of executableReferences(document, kind)) {
-            if (localReference.test(reference.reference)) {
-              const workspaceRelativeAction = reference.kind === 'action' && reference.reference.startsWith('./')
-              const target = workspaceRelativeAction
-                ? ({ kind: 'local-reference' } as const)
-                : resolveLocalTarget(nativeRoot, reference.reference, reference.kind)
-              if (target.kind === 'local-reference') {
-                findings.push({ file, location: reference.location, rule: 'local-reference' })
-              } else if (target.kind === 'source-integrity') {
-                findings.push({ file, location: reference.location, rule: 'source-integrity' })
-              } else {
-                if (target.actionDirectoryWitness !== undefined) {
-                  const directoryKey = comparablePath(target.actionDirectoryWitness.path)
-                  const existingWitness = actionDirectoryWitnesses.get(directoryKey)
-                  if (existingWitness === undefined) {
-                    actionDirectoryWitnesses.set(directoryKey, target.actionDirectoryWitness)
-                  } else if (!sameActionDirectoryWitness(existingWitness, target.actionDirectoryWitness)) {
-                    traversalIntegrityAccepted = false
+          if (traversalIntegrityAccepted) {
+            for (const reference of executableReferences(document, source.kind)) {
+              if (traversalIntegrityAccepted) {
+                if (localReference.test(reference.reference)) {
+                  const workspaceRelativeAction = reference.kind === 'action' && reference.reference.startsWith('./')
+                  const target = workspaceRelativeAction
+                    ? ({ kind: 'local-reference' } as const)
+                    : resolveLocalTarget(nativeRoot, reference.reference, reference.kind)
+                  if (target.kind === 'local-reference') {
+                    findings.push({ file, location: reference.location, rule: 'local-reference' })
+                  } else if (target.kind === 'source-integrity') {
+                    findings.push({ file, location: reference.location, rule: 'source-integrity' })
+                  } else {
+                    if (target.actionDirectoryWitness !== undefined) {
+                      const directoryKey = comparablePath(target.actionDirectoryWitness.path)
+                      const existingWitness = actionDirectoryWitnesses.get(directoryKey)
+                      if (existingWitness === undefined) {
+                        actionDirectoryWitnesses.set(directoryKey, target.actionDirectoryWitness)
+                      } else if (!sameActionDirectoryWitness(existingWitness, target.actionDirectoryWitness)) {
+                        traversalIntegrityAccepted = false
+                      }
+                    }
+                    if (traversalIntegrityAccepted) {
+                      scheduleFile(target.path, reference.kind)
+                    }
                   }
+                } else if (!fullCommitReference.test(reference.reference)) {
+                  findings.push({ file, location: reference.location, rule: 'external-reference-sha' })
                 }
-                inspectFile(target.path, reference.kind)
               }
-            } else if (!fullCommitReference.test(reference.reference)) {
-              findings.push({ file, location: reference.location, rule: 'external-reference-sha' })
             }
           }
         }
@@ -781,16 +997,40 @@ export const inspectWorkflowPolicy = (
           try {
             directory = opendirSync(workflowsDirectory)
             const workflowPaths: string[] = []
+            let workflowDirectoryEntries = 0
             let entry = directory.readSync()
-            while (entry !== null) {
-              if (workflowFilename.test(entry.name)) {
-                workflowPaths.push(resolve(workflowsDirectory, entry.name))
+            while (entry !== null && !operationFailed) {
+              workflowDirectoryEntries += 1
+              if (workflowDirectoryEntries <= limits.maximumWorkflowDirectoryEntries) {
+                if (workflowFilename.test(entry.name)) {
+                  workflowPaths.push(resolve(workflowsDirectory, entry.name))
+                }
+                entry = directory.readSync()
+              } else {
+                operationFailed = true
               }
-              entry = directory.readSync()
             }
-            workflowPaths.sort(ordinalStringCompare)
-            for (const path of workflowPaths) {
-              inspectFile(path, 'workflow')
+
+            if (!operationFailed) {
+              workflowPaths.sort(ordinalStringCompare)
+              for (const path of workflowPaths) {
+                if (traversalIntegrityAccepted) {
+                  scheduleFile(path, 'workflow')
+                }
+              }
+              let sourceIndex = 0
+              while (traversalIntegrityAccepted && sourceIndex < sourceQueue.length) {
+                const source = sourceQueue[sourceIndex]
+                sourceIndex += 1
+                if (source !== undefined) {
+                  options.onSourceVisit?.('enter', source.path, source.kind)
+                  try {
+                    inspectFile(source)
+                  } finally {
+                    options.onSourceVisit?.('exit', source.path, source.kind)
+                  }
+                }
+              }
             }
 
             const finalWorkflowsDirectory = observeNativeDirectory(nativeRoot, workflowsDirectory)
@@ -840,10 +1080,12 @@ export const inspectWorkflowPolicy = (
       try {
         options.beforeFinalRevalidation?.()
         finalIntegrityAccepted =
-          revalidateWorkflowDiscovery(nativeRoot, discoveryWitness) &&
-          Array.from(fileWitnesses.values()).every(witness => revalidateFileWitness(nativeRoot, witness)) &&
+          revalidateWorkflowDiscovery(nativeRoot, discoveryWitness, options.afterFinalDirectoryRealpath) &&
+          Array.from(fileWitnesses.values()).every(witness =>
+            revalidateFileWitness(nativeRoot, witness, options.afterFinalFileRealpath),
+          ) &&
           Array.from(actionDirectoryWitnesses.values()).every(witness =>
-            revalidateActionDirectoryWitness(nativeRoot, witness),
+            revalidateActionDirectoryWitness(nativeRoot, witness, options),
           )
       } catch {
         finalIntegrityAccepted = false

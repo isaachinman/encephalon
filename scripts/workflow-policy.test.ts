@@ -1,11 +1,26 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { formatWorkflowPolicyFindings, inspectWorkflowPolicy } from './workflow-policy.ts'
+import {
+  formatWorkflowPolicyFindings,
+  inspectWorkflowPolicy,
+  isContainedComparablePath,
+  readValidatedNativeFile,
+} from './workflow-policy.ts'
 
 const temporaryRoots: string[] = []
 const policyPath = fileURLToPath(new URL('./workflow-policy.ts', import.meta.url))
@@ -126,6 +141,20 @@ afterEach(() => {
   }
 })
 
+// Mutation caught: always appending a slash to the comparable root rejects children of POSIX, drive, and UNC roots.
+test('contains comparable root children without accepting sibling prefixes', () => {
+  assert.equal(isContainedComparablePath('/', '/repository/workflow.yml'), true)
+  assert.equal(isContainedComparablePath('c:/', 'c:/repository/workflow.yml'), true)
+  assert.equal(isContainedComparablePath('//server/share/', '//server/share/repository/workflow.yml'), true)
+  assert.equal(isContainedComparablePath('/repository', '/repository'), true)
+  assert.equal(isContainedComparablePath('/repository', '/repository-sibling/workflow.yml'), false)
+  assert.equal(isContainedComparablePath('c:/repository', 'c:/repository-sibling/workflow.yml'), false)
+  assert.equal(
+    isContainedComparablePath('//server/share/repository', '//server/share/repository-sibling/workflow.yml'),
+    false,
+  )
+})
+
 // Mutation caught: swallowing every discovery failure, or rejecting absence, would make missing and invalid workflow paths equivalent.
 test('treats only an absent workflow directory as an empty workflow set', () => {
   const absentGithubRoot = createFixture({
@@ -156,6 +185,126 @@ test('reports an invalid missing repository root as a source-integrity finding',
   })
 
   assert.deepEqual(inspectWorkflowPolicy(join(root, 'missing-root')), [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: filtering before counting would let arbitrary raw workflow-directory entries evade the source bound.
+test('accepts the exact raw workflow-entry limit and rejects one over', () => {
+  const root = createFixture({
+    '.github/workflows/a.txt': 'data\n',
+    '.github/workflows/b.txt': 'data\n',
+    '.github/workflows/valid.yml': `name: Valid
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+  })
+
+  assert.deepEqual(
+    inspectWorkflowPolicy(root, {
+      limits: { maximumWorkflowDirectoryEntries: 3 },
+    }),
+    [],
+  )
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumWorkflowDirectoryEntries: 2 } }), [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: an unbounded descriptor read or missing aggregate ledger would accept one byte beyond either source limit.
+test('accepts exact source-byte limits and rejects one over', () => {
+  const source = `name: Bounded
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`
+  const sourceBytes = Buffer.byteLength(source)
+  const root = createFixture({
+    '.github/workflows/bounded.yml': source,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSourceBytes: sourceBytes } }), [])
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSourceBytes: sourceBytes - 1 } }), [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumAggregateSourceBytes: sourceBytes } }), [])
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumAggregateSourceBytes: sourceBytes - 1 } }), [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: reserving visits after traversal would retain a provisional pin finding when unique source work overflows.
+test('accepts the exact unique role-visit limit and discards provisional findings on overflow', () => {
+  const root = createFixture({
+    '.github/actions/checked/action.yml': `name: Checked
+runs:
+  using: composite
+  steps: []
+`,
+    '.github/workflows/entry.yml': `name: Entry
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/action@v1
+      - uses: $/.github/actions/checked
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSourceVisits: 2 } }), [
+    {
+      file: '.github/workflows/entry.yml',
+      location: 'jobs.verify.steps[0].uses',
+      rule: 'external-reference-sha',
+    },
+  ])
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSourceVisits: 1 } }), [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: recursive, unmetered secret detection would accept a parsed job whose tree exceeds the work budget.
+test('accepts the exact secret-tree work limit and rejects one over', () => {
+  const root = createFixture({
+    '.github/workflows/tree.yml': `name: Tree
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps: []
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSecretTreeNodes: 3 } }), [])
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSecretTreeNodes: 2 } }), [
     {
       file: '.github/workflows',
       location: '$',
@@ -199,6 +348,72 @@ jobs:
       rule: 'external-reference-sha',
     },
   ])
+})
+
+// Mutation caught: recursive source calls exhaust the JavaScript stack before a long bounded unique chain is inspected.
+test('iteratively inspects a long unique local-action chain', () => {
+  const chainLength = 5000
+  let activeVisits = 0
+  let maximumActiveVisits = 0
+  let sourceVisits = 0
+  const actionFiles = Object.fromEntries(
+    Array.from({ length: chainLength }, (_, index) => {
+      const name = `chain-${String(index).padStart(4, '0')}`
+      const nextReference =
+        index + 1 < chainLength ? `$/.github/actions/chain-${String(index + 1).padStart(4, '0')}` : 'owner/action@v1'
+      return [
+        `.github/actions/${name}/action.yml`,
+        `name: ${name}
+runs:
+  using: composite
+  steps:
+    - uses: ${nextReference}
+`,
+      ]
+    }),
+  )
+  const root = createFixture({
+    ...actionFiles,
+    '.github/workflows/entry.yml': `name: Entry
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/chain-0000
+`,
+  })
+
+  assert.deepEqual(
+    inspectWorkflowPolicy(root, {
+      limits: {
+        maximumAggregateSourceBytes: 8 * 1024 * 1024,
+        maximumSourceBytes: 1024,
+        maximumSourceVisits: chainLength + 1,
+      },
+      onSourceVisit: phase => {
+        if (phase === 'enter') {
+          activeVisits += 1
+          sourceVisits += 1
+          maximumActiveVisits = Math.max(maximumActiveVisits, activeVisits)
+        } else {
+          activeVisits -= 1
+        }
+      },
+    }),
+    [
+      {
+        file: '.github/actions/chain-4999/action.yml',
+        location: 'runs.steps[0].uses',
+        rule: 'external-reference-sha',
+      },
+    ],
+  )
+  assert.equal(sourceVisits, chainLength + 1)
+  assert.equal(maximumActiveVisits, 1)
+  assert.equal(activeVisits, 0)
 })
 
 // Mutation caught: keying recursive visits by path alone would skip either the workflow jobs or composite-action steps of one dual-role source.
@@ -288,6 +503,118 @@ jobs: {}
   ])
 })
 
+// Mutation caught: trusting metadata captured before final realpath would accept a file replacement at the witness boundary.
+test('rejects a workflow replaced after realpath during final file revalidation', () => {
+  const root = createFixture({
+    '.github/workflows/mutable.yml': `name: Mutable
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/action@v1
+`,
+  })
+  const workflowPath = join(realpathSync.native(root), '.github/workflows/mutable.yml')
+  let replacementCalls = 0
+
+  const findings = inspectWorkflowPolicy(root, {
+    afterFinalFileRealpath: path => {
+      if (path === workflowPath && replacementCalls === 0) {
+        replacementCalls += 1
+        renameSync(path, `${path}.original`)
+        writeFileSync(
+          path,
+          `name: Replacement
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+          'utf8',
+        )
+      }
+    },
+  })
+
+  assert.equal(replacementCalls, 1)
+  assert.deepEqual(findings, [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: recording the lstat taken before final realpath would let the read primitive return a mixed witness.
+test('rejects a source replaced between its final realpath and closing lstat', () => {
+  const root = createFixture({
+    'source.yml': `name: Original
+permissions:
+  contents: read
+jobs: {}
+`,
+  })
+  const nativeRoot = realpathSync.native(root)
+  const sourcePath = join(nativeRoot, 'source.yml')
+  let replacementCalls = 0
+
+  const validated = readValidatedNativeFile(nativeRoot, sourcePath, {
+    afterFinalRealpath: path => {
+      replacementCalls += 1
+      renameSync(path, `${path}.original`)
+      writeFileSync(
+        path,
+        `name: Replacement
+permissions:
+  contents: read
+jobs: {}
+`,
+        'utf8',
+      )
+    },
+  })
+
+  assert.equal(replacementCalls, 1)
+  assert.deepEqual(validated, { kind: 'invalid' })
+})
+
+// Mutation caught: trusting directory metadata captured before final realpath would accept a replaced workflow generation.
+test('rejects a workflow directory replaced after realpath during final discovery revalidation', () => {
+  const root = createFixture({
+    '.github/workflows/stable.yml': `name: Stable
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+  })
+  const workflowsPath = join(realpathSync.native(root), '.github/workflows')
+  let replacementCalls = 0
+
+  const findings = inspectWorkflowPolicy(root, {
+    afterFinalDirectoryRealpath: path => {
+      if (path === workflowsPath && replacementCalls === 0) {
+        replacementCalls += 1
+        renameSync(path, `${path}-original`)
+        mkdirSync(path)
+      }
+    },
+  })
+
+  assert.equal(replacementCalls, 1)
+  assert.deepEqual(findings, [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
 // Mutation caught: retaining only the selected action manifest would accept a second candidate added after target resolution.
 test('rejects action-manifest ambiguity introduced after target selection', () => {
   const root = createFixture({
@@ -326,6 +653,49 @@ runs:
   })
 
   assert.equal(finalRevalidationCalls, 1)
+  assert.deepEqual(findings, [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: observing only the opening action-directory generation would accept a replacement between candidates.
+test('rejects an action directory replaced after its first candidate revalidation', () => {
+  const root = createFixture({
+    '.github/actions/mutable/action.yml': `name: Mutable
+runs:
+  using: composite
+  steps:
+    - uses: owner/action@v1
+`,
+    '.github/workflows/action.yml': `name: Action caller
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/mutable
+`,
+  })
+  const actionPath = join(realpathSync.native(root), '.github/actions/mutable')
+  let replacementCalls = 0
+
+  const findings = inspectWorkflowPolicy(root, {
+    afterActionCandidateRevalidation: (path, index) => {
+      if (path === actionPath && index === 0 && replacementCalls === 0) {
+        replacementCalls += 1
+        renameSync(path, `${path}-original`)
+        mkdirSync(path)
+      }
+    },
+  })
+
+  assert.equal(replacementCalls, 1)
   assert.deepEqual(findings, [
     {
       file: '.github/workflows',
