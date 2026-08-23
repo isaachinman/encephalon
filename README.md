@@ -247,6 +247,8 @@ The full profile runs every operation in fresh child processes with two discarde
 
 `bun run check:generated` checks the committed source without modifying it and rejects stale package-version metadata before a build can repair it. Both workflow jobs run this non-mutating check before any build. `check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything. CI runs four verification lanes: Node 24.15.0 on Ubuntu, macOS, and Windows, plus Node 26 on Ubuntu. The release-equivalent package gate runs without secrets on pull requests and trusted pushes to `main`, and validates the publish dry run in both cases. Only trusted pushes to `main` upload its bounded `npm pack` tarball for inspection.
 
+After rollout, branch protection must require exactly `verify (ubuntu-latest)`, `verify (macos-latest)`, `verify (windows-latest)`, `verify (ubuntu-current)`, and `Release-equivalent package gate`.
+
 ## Licence
 
 MIT

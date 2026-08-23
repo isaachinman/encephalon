@@ -195,11 +195,11 @@ The exact reviewed repository-controlled code and behavioural-test snapshot for 
 - `bun run check:publish` is a dry-run release gate only. Publishing is manual maintainer work and must not be performed by agents.
 - The release-equivalent package gate runs without secrets on pull requests and trusted pushes to `main`. Only trusted pushes to `main` upload the bounded tarball; pull requests build and inspect runner-local artifacts only.
 
-After the guarded rollout, strict branch protection must require exactly `verify (ubuntu-latest)`, `verify (macos-latest)`, `verify (windows-latest)`, `verify (ubuntu-current)`, and `Release-equivalent package gate`. Required checks govern ordinary merges; they do not remove the existing administrator bypass or direct force-push capability.
+After the guarded rollout, branch protection must require exactly `verify (ubuntu-latest)`, `verify (macos-latest)`, `verify (windows-latest)`, `verify (ubuntu-current)`, and `Release-equivalent package gate`. Required checks govern ordinary merges; they do not remove the existing administrator bypass or direct force-push capability.
 
 The rollout order is mandatory:
 
-1. Keep MAR-2640 stacked on MAR-2574. Do not mutate `main` protection while PR #66 can emit only a skipped release context: requiring that context now would deadlock the predecessor that must merge first.
+1. Keep MAR-2640 stacked on MAR-2574. Do not mutate `main` protection while PR #66 can emit only a skipped release context. A job skipped by a job-level `if` reports success and does not block a required check, but that skipped result does not prove the release-equivalent contract and requiring it would give false assurance.
 2. After MAR-2574 merges, rebase MAR-2640 onto current `origin/main`, retarget its pull request to `main`, and wait for all five required contexts to succeed at the exact retargeted head.
 3. Inspect the complete current settings with the read-only command `gh api repos/isaachinman/encephalon/branches/main/protection`. Only after step 2, update the `required_status_checks` subresource to strict mode with the five exact GitHub Actions contexts above; do not replace the complete protection resource.
 4. Run `gh api repos/isaachinman/encephalon/branches/main/protection` again and verify the exact required-context set. The narrow mutation must preserve `enforce_admins: false`, `allow_force_pushes: true`, and every unrelated field, including deletion, signature, linear-history, and conversation-resolution settings.

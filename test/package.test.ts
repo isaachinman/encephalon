@@ -250,6 +250,10 @@ describe('package contract', () => {
     const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
     const readme = readFileSync(resolve(root, 'README.md'), 'utf8')
     const contract = readFileSync(resolve(root, 'docs', 'contract.md'), 'utf8')
+    const releaseChecksPlan = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'plans', '2026-08-23-required-release-checks.md'),
+      'utf8',
+    )
     const publishCheck = readFileSync(resolve(root, 'scripts', 'check-publish.ts'), 'utf8')
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       scripts?: Record<string, unknown>
@@ -419,10 +423,19 @@ jobs:
     )
     assert.match(contract, /Only trusted pushes to `main` upload the bounded tarball/)
     assert.match(contract, /stale generated source non-mutatively before any build/)
-    assert.match(
-      contract,
-      /`verify \(ubuntu-latest\)`, `verify \(macos-latest\)`, `verify \(windows-latest\)`, `verify \(ubuntu-current\)`, and `Release-equivalent package gate`/,
+    const requiredBranchProtection =
+      /After (?:the guarded )?rollout, branch protection must require exactly `verify \(ubuntu-latest\)`, `verify \(macos-latest\)`, `verify \(windows-latest\)`, `verify \(ubuntu-current\)`, and `Release-equivalent package gate`/
+    assert.deepEqual(
+      [readme, contract].map(document => requiredBranchProtection.test(document)),
+      [true, true],
     )
+    const skippedReleaseContextRationale =
+      /A job skipped by a job-level `if` reports success and does not block a required check, but that skipped result does not prove the release-equivalent contract and requiring it would give false assurance\./
+    assert.deepEqual(
+      [contract, releaseChecksPlan].map(document => skippedReleaseContextRationale.test(document)),
+      [true, true],
+    )
+    assert.doesNotMatch(`${contract}\n${releaseChecksPlan}`, /deadlock/)
     assert.equal(workflowCheckScript, 'bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts')
     assert.equal(publishScript, 'bun run scripts/check-publish.ts')
     assert.equal(publishCheck.includes("'--dry-run'"), true)

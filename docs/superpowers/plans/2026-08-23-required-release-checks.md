@@ -254,7 +254,7 @@ Add `bun run check:generated` before build commands in the README development se
 
 In `docs/contract.md`, specify the exact five contexts and the safe rollout order:
 
-1. keep MAR-2640 stacked on MAR-2574 and do not mutate main protection while PR #66 can emit only a skipped release context;
+1. keep MAR-2640 stacked on MAR-2574 and defer the protection mutation while PR #66 can emit only a skipped release context, because that skipped success does not prove the release-equivalent contract;
 2. after MAR-2574 merges, rebase MAR-2640 onto current `origin/main`, retarget it to `main`, and wait for all five successful contexts at the exact head;
 3. query `gh api repos/isaachinman/encephalon/branches/main/protection` and update only `required_status_checks` to strict mode with the five exact GitHub Actions contexts;
 4. query protection again and verify the exact set while preserving administrator-bypass, force-push, deletion, signature, history, and conversation-resolution settings;
@@ -295,7 +295,7 @@ git commit -m "[MAR-2640] Document required release checks"
 
 ## External Rollout Gate
 
-Do not update main branch protection from the stacked draft state. PR #66 currently emits `Release-equivalent package gate` as skipped, so requiring it now would deadlock the predecessor that must merge first. The settings mutation becomes safe only after MAR-2574 merges and the rebased/retargeted MAR-2640 pull request emits all five successful contexts. At that point, update only `required_status_checks`, preserve all unrelated protection fields, re-query the API, and use temporary non-main pull-request commits to prove that a current-Node-only failure and a release-equivalent-only failure each block ordinary merge. Revert those temporary commits on the ticket branch, rerun the exact-head matrix, and never merge the deliberately failing revisions.
+Do not update main branch protection from the stacked draft state. PR #66 currently emits `Release-equivalent package gate` as skipped. A job skipped by a job-level `if` reports success and does not block a required check, but that skipped result does not prove the release-equivalent contract and requiring it would give false assurance. The settings mutation becomes safe only after MAR-2574 merges and the rebased/retargeted MAR-2640 pull request emits all five genuinely executed successful contexts. At that point, update only `required_status_checks`, preserve all unrelated protection fields, re-query the API, and use temporary non-main pull-request commits to prove that a current-Node-only failure and a release-equivalent-only failure each block ordinary merge. Revert those temporary commits on the ticket branch, rerun the exact-head matrix, and never merge the deliberately failing revisions.
 
 ## Implementation Evidence
 
