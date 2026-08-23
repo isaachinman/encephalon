@@ -3250,6 +3250,50 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('accepts semantically equivalent legacy table definitions without rebuilding', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    let primaryQuarantines = 0
+    let writerInitialisations = 0
+    mutateCache(root, database => {
+      database.enableDefensive(false)
+      database.exec('PRAGMA writable_schema = ON;')
+      database
+        .prepare("UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'metadata'")
+        .run('CREATE TABLE IF NOT EXISTS "metadata" ("key" text PRIMARY KEY, "value" text NOT NULL)')
+      database
+        .prepare("UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'records'")
+        .run(`CREATE TABLE IF NOT EXISTS "records" (
+            "id" text PRIMARY KEY,
+            "kind" text NOT NULL,
+            "subject" text NOT NULL,
+            "source" text NOT NULL,
+            "created_at" text NOT NULL,
+            "path" text NOT NULL,
+            "active" integer NOT NULL CHECK ("active" IN (0, 1)),
+            "summary" text,
+            "record_json" text NOT NULL
+          )
+        `)
+      database.exec('PRAGMA writable_schema = OFF;')
+    })
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    assert.equal(primaryQuarantines, 0)
+    assert.equal(writerInitialisations, 0)
+    assert.deepEqual(result, { hydrated: false, recordsIndexed: 1 })
+  })
+
   test('rebuilds same-name records tables with incompatible semantics', () => {
     const cases = [
       {

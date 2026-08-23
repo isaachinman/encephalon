@@ -108,13 +108,13 @@ export class CacheDatabaseFailure extends Error {
 }
 
 /** @internal */
-export class CacheDatabaseCreationConflict extends EncephalonError {
+export class CacheDatabaseCreationConflict extends Error {
+  readonly relativePath: string
+
   constructor(relativePath: string) {
-    super('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
-      entry: relativePath,
-      invariant: 'stable-identity',
-    })
+    super('A cache database primary changed while exclusive ownership was required.')
     this.name = 'CacheDatabaseCreationConflict'
+    this.relativePath = relativePath
   }
 }
 

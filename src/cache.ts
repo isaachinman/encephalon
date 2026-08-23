@@ -1489,7 +1489,18 @@ const rebuildCache = (
       continue
     }
     const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-    const opened = openWriterDatabase(location, nextWriterPrimary)
+    let opened: ReturnType<typeof openWriterDatabase>
+    try {
+      opened = openWriterDatabase(location, nextWriterPrimary)
+    } catch (error) {
+      if (error instanceof CacheDatabaseCreationConflict && primary.kind === 'create-if-missing') {
+        return fail('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
+          entry: error.relativePath,
+          invariant: 'stable-identity',
+        })
+      }
+      throw error
+    }
     const { database, identity } = opened
     nextWriterPrimary = { database: identity, kind: 'expected-owned' }
     let rebuildResult: PrepareResult | undefined
