@@ -162,6 +162,21 @@ MAR-2560 snapshot-local exact-key gather deduplication: `36091c7e886b67b5c5bc355
 
 MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `30104a049f72ba2e87f51af95d5da11b55045cc3`.
 
+## Workflow Trust Boundary
+
+- Every external `uses` reference in checked-in workflows and reachable local actions identifies a reviewed lowercase 40-character commit SHA. An adjacent comment records the reviewed upstream release; package assertions and normal dependency review maintain comments because YAML parsing discards them.
+- `bun run check:workflows` parses YAML structurally, starts from every checked-in workflow, and recursively follows repository-local reusable workflows and composite actions with cycle detection and repository-containment checks. Local wrappers therefore do not bypass immutable external references or credential policy.
+- Every workflow explicitly grants only top-level `contents: read`. Job permissions remain read-only except that `.github/workflows/pullfrog.yml` job `pullfrog` may request `id-token: write` only while targeting the exact `pullfrog-review` environment for hosted OIDC. No provider secrets are mapped, and every checkout disables credential persistence.
+- The checked-in environment target is repository configuration, not proof that the GitHub environment exists. The live `pullfrog-review` environment is currently absent. Creating and protecting it, requiring approval, and allowing only exact `main` plus the exact ticket branch currently under review are planned external rollout steps. Repository `sha_pinning_required` also remains false until the pinned workflow reaches `main`; neither setting has been applied or verified by the local implementation.
+- Pullfrog sets `push: disabled`, so the action may not push repository content or workflows. This does not remove v0.1.60's separately minted internal MCP installation token, which still carries `contents: write` authority for temporary incremental-review refs. That upstream token is an unresolved MAR-2574 acceptance blocker even though the YAML job token remains read-only.
+- Pullfrog sets `PULLFROG_FORCE_LOCAL_CLI: '1'`, preventing the pinned action from bootstrapping the mutable `pullfrog@^0.1.60` core range. The pinned source and its initial frozen, script-disabled install remain bound to the action lock, but later exact-version agent-runtime production dependencies resolve outside that lock. This residual upstream supply-chain surface is the second unresolved MAR-2574 acceptance blocker.
+- GitHub Actions Dependabot checks for updates weekly. Each update remains a normal reviewed change to the immutable SHA and adjacent version comment; no update is merged automatically.
+- Rotate the hosted route by revoking its OIDC trust and approving only the replacement exact repository, workflow, environment, branch/ref, and audience constraints. Emergency disablement disables the Pullfrog workflow before any new approval. These are maintainer-operated external controls rather than repository-side secret rotation.
+- MAR-2574 cannot satisfy its least-authority acceptance criteria until a reviewed upstream Pullfrog release removes the internal MCP contents-write authority and makes the agent-runtime production dependency closure lock-verifiable, followed by the protected-environment rollout and an approved exact-head dispatch. This contract does not claim acceptance, rollout, or GitHub settings completion.
+- The workflow tooling uses official exact `@types/bun@1.3.1` declarations only as a development dependency. Bun types and `skipLibCheck` are limited to `tsconfig.scripts.json`, the historical handwritten `scripts/bun-runtime.d.ts` declaration is removed, and the Node consumer/runtime remains unchanged with zero published runtime dependencies.
+
+The exact repository-controlled implementation and behavioural-test snapshot for this boundary is `a2bb85a7b28aefedbcb13b4c61d16bbce3f76c57`. This provenance is additive to the older change provenance below. Documentation after that snapshot records the boundary without changing workflow behaviour. No push, pull request, workflow dispatch, Linear mutation, or GitHub settings rollout is part of this local snapshot.
+
 ## Package and Release Gates
 
 - Runtime consumers require Node.js 24.15.0 or newer and do not require Bun.

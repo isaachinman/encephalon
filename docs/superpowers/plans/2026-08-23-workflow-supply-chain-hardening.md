@@ -65,7 +65,7 @@ export const formatWorkflowPolicyFindings = (findings: readonly WorkflowPolicyFi
 - Returned `file` values are slash-separated repository-relative paths. `location` values use deterministic object/array paths such as `jobs.verify.steps[0].uses`.
 - The CLI path prints the formatted findings to stderr and exits non-zero when findings exist; it prints nothing and exits zero when the repository passes.
 
-- [ ] **Step 1: Write failing behavioural tests**
+- [x] **Step 1: Write failing behavioural tests**
 
 Create temporary fixture repositories and test the real parser and traversal. Before writing each body, name the production mutation it catches:
 
@@ -98,7 +98,7 @@ runs:
     - uses: owner/action@0123456789abcdef0123456789abcdef01234567
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -108,7 +108,7 @@ bun test scripts/workflow-policy.test.ts
 
 Expected: FAIL because `scripts/workflow-policy.ts` does not exist. Confirm the failure is the missing policy module, not malformed fixture YAML.
 
-- [ ] **Step 3: Implement the minimum structural inspector**
+- [x] **Step 3: Implement the minimum structural inspector**
 
 Implement a pure traversal with these rules:
 
@@ -130,7 +130,7 @@ const localReference = /^\.\//u
 
 Avoid early negative returns, mutation outside contained traversal state, and `.then()`/`.catch()` control flow.
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run:
 
@@ -142,7 +142,7 @@ bun run lint
 
 Expected: all fixture tests pass, all four TypeScript projects pass, and lint reports no fixes.
 
-- [ ] **Step 5: Commit the policy and its tests**
+- [x] **Step 5: Commit the policy and its tests**
 
 Run:
 
@@ -171,7 +171,7 @@ Before committing, rerun `bun run test`, `bun run typecheck`, and `bun run lint`
 - Produces: package script `check:workflows` with command `bun run scripts/workflow-policy.ts`.
 - Produces: a repository integration test that requires `inspectWorkflowPolicy(root)` to return `[]` for the checked-in workflows.
 
-- [ ] **Step 1: Add the checked-in repository RED**
+- [x] **Step 1: Add the checked-in repository RED**
 
 Add one integration test and exact checked-in workflow-shape assertions:
 
@@ -185,7 +185,7 @@ The production mutation it catches is any checked-in mutable action, hidden loca
 
 Parse the checked-in workflows with `Bun.YAML.parse`. Require exactly one Pullfrog action step and one Pullfrog checkout; require exact read-only/OIDC job permissions, exact protected environment, exact action-step environment, and literal `push: disabled`. Require every checkout in both workflows to set `persist-credentials: false`. These assertions catch duplicate unsafe steps and provider-secret reintroduction that the general permission policy cannot observe.
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -195,7 +195,7 @@ bun test --test-name-pattern='repository workflows' scripts/workflow-policy.test
 
 Expected: FAIL with findings for the mutable CI/Pullfrog tags, Pullfrog's unprotected credential mappings, and Pullfrog OIDC without an environment.
 
-- [ ] **Step 3: Pin every current external action**
+- [x] **Step 3: Pin every current external action**
 
 Replace tags with these reviewed immutable references and retain the version in comments:
 
@@ -215,7 +215,7 @@ pullfrog/pullfrog@c4d0ca6f15d12382ddd20d2010bc596b405f42f0 # v0.1.60
 
 Do not upgrade action majors or change CI triggers, runners, Node versions, Bun version, step ordering, job names, package artefact layout, or retention.
 
-- [ ] **Step 4: Minimise Pullfrog authority**
+- [x] **Step 4: Minimise Pullfrog authority**
 
 Keep workflow-level `contents: read`. Keep job-level `contents: read` and the documented hosted-router requirement `id-token: write`. Add:
 
@@ -242,7 +242,7 @@ push: disabled
 
 The review job must not push repository content or workflows. Record that v0.1.60 nevertheless mints a separate internal MCP token with contents-write authority; no workflow-only configuration can remove it without breaking the read-only acceptance criteria or Pullfrog review identity.
 
-- [ ] **Step 5: Add reviewed action updates and the CI gate**
+- [x] **Step 5: Add reviewed action updates and the CI gate**
 
 Create `.github/dependabot.yml`:
 
@@ -257,7 +257,7 @@ updates:
 
 Add `"check:workflows": "bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts"` to `package.json`. In each CI job, run `bun run check:workflows` immediately after frozen installation and before TypeScript/build work. Do not add a new job or status-check name.
 
-- [ ] **Step 6: Run focused tests and policy GREEN**
+- [x] **Step 6: Run focused tests and policy GREEN**
 
 Run:
 
@@ -270,7 +270,7 @@ bun run lint
 
 Expected: fixture and checked-in workflow tests pass, the policy CLI exits zero with no output, all TypeScript projects pass, and lint reports no fixes.
 
-- [ ] **Step 7: Commit the workflow changes**
+- [x] **Step 7: Commit the workflow changes**
 
 Run:
 
@@ -297,7 +297,7 @@ Before committing, rerun `bun run test`, `bun run typecheck`, and `bun run lint`
 - Consumes: the exact Task 2 code/test commit SHA.
 - Produces: maintained documentation for immutable action pins, structural policy, hosted Pullfrog OIDC, environment approval, Dependabot review, credential rotation, and emergency disablement.
 
-- [ ] **Step 1: Update maintained documentation**
+- [x] **Step 1: Update maintained documentation**
 
 In `README.md`, add `bun run check:workflows` to Development and explain that CI/Pullfrog action references are immutable, workflow policy follows local wrappers, and Pullfrog uses a branch-restricted protected environment with hosted OIDC rather than repository provider secrets. Document that `push: disabled` prevents git pushes and that the local CLI switch prevents the mutable Pullfrog-core bootstrap.
 
@@ -318,7 +318,7 @@ In `docs/contract.md`, add a `## Workflow Trust Boundary` section specifying:
 
 In the approved design, append the same exact implementation provenance under Stack A. In this plan, mark completed checkboxes and add an Implementation Evidence section with focused/full gate results and that same SHA. Do not edit historical completed plans or claim that GitHub settings are applied before the external rollout succeeds.
 
-- [ ] **Step 2: Run the complete local release matrix**
+- [x] **Step 2: Run the complete local release matrix**
 
 Run:
 
@@ -338,7 +338,7 @@ node dist/cli.mjs validate --root /Users/isaac/Code/open-source/encephalon
 
 Expected: every command exits zero; the full suite has zero failures with only the established capability skips; the already-published 0.2.0 refusal remains the accepted publish-contract result; Encephalon reports zero validation errors.
 
-- [ ] **Step 3: Audit scope and generated state**
+- [x] **Step 3: Audit scope and generated state**
 
 Verify:
 
@@ -351,7 +351,7 @@ git diff -- .github docs README.md scripts test
 
 Expected: the only dependency change is exact development-only `@types/bun@1.3.1` plus its lockfile entry; there is no runtime dependency or generated-version change. The branch otherwise contains only the approved programme spec, MAR-2574 plan, policy/tests, workflow/Dependabot/package-script configuration, and maintained documentation.
 
-- [ ] **Step 4: Commit documentation**
+- [x] **Step 4: Commit documentation**
 
 Run:
 
@@ -361,6 +361,16 @@ git commit -m "[MAR-2574] Document workflow trust boundaries"
 ```
 
 Before committing, rerun `bun run test`, `bun run typecheck`, and `bun run lint`.
+
+---
+
+## Implementation Evidence
+
+- Task 1's structural policy and behavioural tests were committed at `16266f47db0c802d818d85db139472616aa930e7`. Task 2's exact repository-controlled workflow, policy, configuration, and behavioural-test snapshot is `a2bb85a7b28aefedbcb13b4c61d16bbce3f76c57`; that full SHA is the reviewed implementation provenance consumed by Task 3.
+- Fresh Task 3 workflow policy validation passed all 13 tests with zero failures, and the recursive policy CLI returned no findings. Lint checked 117 files with no fixes, all four TypeScript projects passed, and the full suite reported 563 tests: 561 passed, zero failed, and two established capability skips.
+- Frozen installation checked 39 installs across 66 packages with no changes. CI benchmark budgets, build, package validation, and the publish contract all exited zero. The publish contract accepted npm's expected refusal to overwrite already-published version `0.2.0`; no publication occurred.
+- `git diff --check origin/main...HEAD` returned no findings. Encephalon validation checked 38 records with zero errors. The origin/main scope audit found no `src/generated/version.ts` change or runtime dependency change; exact `@types/bun@1.3.1` is the sole direct dependency addition, is development-only, and contributes only its declaration lockfile closure. Bun types and `skipLibCheck` remain scripts-project-only, the handwritten Bun declaration is removed, and the Node consumer/runtime boundary is unchanged.
+- The local repository work does not complete the external rollout. The live `pullfrog-review` environment is absent, repository `sha_pinning_required` remains false, and no push, pull request, workflow dispatch, Linear mutation, or GitHub settings change was performed. v0.1.60's internal MCP token still has `contents: write` despite `push: disabled`, and its later exact-version agent-runtime production dependencies still resolve outside the action lock; both remain upstream MAR-2574 acceptance blockers.
 
 ---
 

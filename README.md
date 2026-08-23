@@ -211,12 +211,19 @@ Without `root`, Encephalon walks upward to the nearest valid Git repository mark
 
 ```bash
 bun install --frozen-lockfile
+bun run check:workflows
 bun run typecheck
 bun run test
 bun run build
 bun run check:package
 bun run check:publish
 ```
+
+CI and Pullfrog external actions are identified by reviewed immutable commit SHAs with adjacent release comments. Package assertions and normal dependency review maintain those comments because the structural YAML parser does not consume comments. `bun run check:workflows` parses the workflow YAML and recursively follows repository-local reusable workflows and composite actions, so a local wrapper cannot conceal a mutable external reference. The workflows keep repository permissions read-only, disable checkout credential persistence, and map no provider secrets to Pullfrog. Pullfrog targets the `pullfrog-review` environment and uses hosted OIDC; that live environment is currently absent. Creating and protecting it for exact `main` and the exact ticket branch under review remains a maintainer-operated external rollout step, and repository `sha_pinning_required` remains false until the pinned workflow reaches `main`.
+
+Pullfrog runs with `push: disabled`, which prevents git pushes, and `PULLFROG_FORCE_LOCAL_CLI: '1'`, which prevents the pinned v0.1.60 action from bootstrapping the mutable `pullfrog@^0.1.60` core range. Those controls do not make the complete upstream execution least-authority or lock-bound: v0.1.60 still mints an internal MCP installation token with `contents: write` despite disabled pushes, and its later exact-version agent-runtime installations resolve production dependencies outside the action lock. Both are upstream acceptance blockers; the repository hardening does not claim that MAR-2574 is accepted until a reviewed upstream release removes them and the protected-environment rollout is verified.
+
+Workflow tooling uses official exact `@types/bun@1.3.1` only as a development dependency. Bun types and `skipLibCheck` are limited to the scripts TypeScript project, the historical handwritten Bun declaration has been removed, and the published Node consumer/runtime boundary is unchanged.
 
 Performance benchmarks are separate from correctness tests:
 
