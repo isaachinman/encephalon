@@ -27,13 +27,13 @@
 ## Task 4: Document and review
 
 - [x] Update README, changelog, maintained contract, and exact implementation provenance.
-- Open the stacked PR against the MAR-2553 branch.
-- Run Pullfrog and six parallel role reviews against main.
-- Fix accepted high/medium-confidence findings, rerun proportionate gates, and leave the PR unmerged.
+- [x] Open the initial stacked PR against the MAR-2553 branch before rebasing onto main.
+- [x] Run Pullfrog and six parallel role reviews against main.
+- [x] Fix accepted high/medium-confidence findings and rerun proportionate gates.
 
 ## Implementation evidence
 
 - RED: the focused public-read and forced-writer cases failed 0/2 because bounded non-canonical and invalidly encoded FTS text was accepted without recovery.
 - GREEN: the focused semantic cases pass 3/3 and the cache suite passes 144/144.
-- Review remediation added one shared existing-generation validation transaction before writer PRAGMAs, reuses the same authority after `BEGIN IMMEDIATE`, requires bounded emptiness probes for exact newly claimed primaries across repository-change retries, and adds complementary metadata-less, retry-injection, post-initialisation mutation, and two-record ID-binding coverage.
-- The compact full suite, lint, all four TypeScript projects, build, package and publish-contract checks, frozen install, baseline benchmark, and CI budget benchmark pass at code/test commit `ce00a6095270fe421361b2595d06622c194e7e4b`.
+- Review remediation added one shared existing-generation validation transaction before writer PRAGMAs, reuses the same authority after `BEGIN IMMEDIATE`, requires bounded emptiness probes for exact newly claimed primaries across repository-change retries, and adds complementary metadata-less, retry-injection, post-initialisation mutation, textual-ID boundary, and two-record ID-binding coverage.
+- The compact full suite, lint, all four TypeScript projects, build, package and publish-contract checks, frozen install, baseline benchmark, and CI budget benchmark pass at code/test commit `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`.
