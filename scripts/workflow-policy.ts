@@ -432,7 +432,10 @@ const inspectWorkflowJobs = (document: ParsedObject, file: string, findings: Wor
 }
 
 export const inspectWorkflowPolicy = (root: string): readonly WorkflowPolicyFinding[] => {
-  const nativeRoot = realpathSync.native(resolve(root))
+  const nativeRoot = readRealPath(resolve(root))
+  if (nativeRoot === undefined) {
+    return [{ file: '.github/workflows', location: '$', rule: 'local-reference' }]
+  }
   const findings: WorkflowPolicyFinding[] = []
   const parsedPaths = new Set<string>()
 

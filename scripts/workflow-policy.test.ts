@@ -11,6 +11,7 @@ const temporaryRoots: string[] = []
 const policyPath = fileURLToPath(new URL('./workflow-policy.ts', import.meta.url))
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url))
 const directorySymlinkType = process.platform === 'win32' ? 'junction' : 'dir'
+const windowsOnlyTest = process.platform === 'win32' ? test : test.skip
 
 type PullfrogStep = Record<string, unknown> & {
   env?: unknown
@@ -139,6 +140,21 @@ test('treats only an absent workflow directory as an empty workflow set', () => 
   assert.deepEqual(inspectWorkflowPolicy(absentGithubRoot), [])
   assert.deepEqual(inspectWorkflowPolicy(absentWorkflowsRoot), [])
   assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'local-reference',
+    },
+  ])
+})
+
+// Mutation caught: leaving root realpath errors unguarded would expose filesystem exceptions instead of policy diagnostics.
+test('reports an invalid missing repository root as a local-reference finding', () => {
+  const root = createFixture({
+    'README.md': 'fixture\n',
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(join(root, 'missing-root')), [
     {
       file: '.github/workflows',
       location: '$',
@@ -550,6 +566,17 @@ jobs:
     steps:
       - run: echo allowed
 `,
+    '.github/workflows/root-oidc.yml': `name: Root OIDC
+on: workflow_dispatch
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  inherited:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inherited
+`,
   })
 
   assert.deepEqual(inspectWorkflowPolicy(root), [
@@ -611,6 +638,16 @@ jobs:
     {
       file: '.github/workflows/pullfrog.yml',
       location: 'jobs.pullfrog.permissions.issues',
+      rule: 'permission',
+    },
+    {
+      file: '.github/workflows/root-oidc.yml',
+      location: 'jobs.inherited.environment',
+      rule: 'credential-environment',
+    },
+    {
+      file: '.github/workflows/root-oidc.yml',
+      location: 'permissions.id-token',
       rule: 'permission',
     },
   ])
@@ -687,9 +724,37 @@ jobs:
   ])
 })
 
+// Windows paths are case-insensitive and accept either separator; this must not alter the stricter POSIX test above.
+windowsOnlyTest('accepts Windows local actions through case and separator spelling differences', () => {
+  const root = createFixture({
+    '.github/actions/MiXeD/ActionDirectory/action.yml': `name: Checked
+runs:
+  using: composite
+  steps: []
+`,
+    '.github/workflows/windows-path.yml': `name: Windows path
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: ./.github\\actions/mixed\\actiondirectory
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [])
+})
+
 // Mutation caught: trusting lexical paths, directory defaults, or raw parsing would accept unsafe targets or crash on malformed YAML.
 test('accepts only unambiguous regular local YAML targets within the native repository path', () => {
   const root = createFixture({
+    '.github/actions/ambiguous/action.yaml': `name: Ambiguous YAML
+runs:
+  using: composite
+  steps: []
+`,
     '.github/actions/ambiguous/action.yml': `name: Ambiguous YML
 runs:
   using: composite
@@ -718,7 +783,6 @@ runs:
   steps: []
 `,
   })
-  symlinkSync(join(outside, 'action/action.yml'), join(root, '.github/actions/ambiguous/action.yaml'))
   symlinkSync(join(outside, 'action'), join(root, '.github/actions/symlinked'), directorySymlinkType)
 
   assert.deepEqual(inspectWorkflowPolicy(root), [
@@ -759,12 +823,7 @@ permissions:
   contents: read
 jobs: {}
 `,
-    'linked.yml': `name: Linked
-on: workflow_dispatch
-permissions:
-  contents: read
-jobs: {}
-`,
+    'linked-directory/placeholder': 'outside\n',
   })
   const symlinkedDirectoryRoot = createFixture({
     '.github/placeholder': 'fixture\n',
@@ -784,7 +843,11 @@ permissions:
 jobs: {}
 `,
   })
-  symlinkSync(join(outside, 'linked.yml'), join(candidateRoot, '.github/workflows/linked.yml'))
+  symlinkSync(
+    join(outside, 'linked-directory'),
+    join(candidateRoot, '.github/workflows/linked.yml'),
+    directorySymlinkType,
+  )
 
   assert.deepEqual(inspectWorkflowPolicy(symlinkedDirectoryRoot), [
     {
@@ -1071,6 +1134,30 @@ test('repository workflows obey immutable action and credential boundaries', () 
   assert.equal(
     ciCheckoutSteps.every(step => step.with?.['persist-credentials'] === false),
     true,
+  )
+
+  // Bun's YAML parser discards comments, so raw lines deliberately bind each reviewed SHA to its adjacent release.
+  const ciWorkflowSource = readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8')
+  assert.deepEqual(
+    ciWorkflowSource.split('\n').filter(line => /^\s+(?:- )?uses:/u.test(line)),
+    [
+      '      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1',
+      '      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0',
+      '      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0',
+      '      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1',
+      '      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0',
+      '      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0',
+      '        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2',
+    ],
+  )
+
+  const pullfrogWorkflowSource = readFileSync(join(repositoryRoot, '.github/workflows/pullfrog.yml'), 'utf8')
+  assert.deepEqual(
+    pullfrogWorkflowSource.split('\n').filter(line => /^\s+(?:- )?uses:/u.test(line)),
+    [
+      '        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0',
+      '        uses: pullfrog/pullfrog@c4d0ca6f15d12382ddd20d2010bc596b405f42f0 # v0.1.60',
+    ],
   )
 
   const dependabotConfiguration = Bun.YAML.parse(readFileSync(join(repositoryRoot, '.github/dependabot.yml'), 'utf8'))
