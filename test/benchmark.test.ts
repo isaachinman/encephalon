@@ -36,6 +36,7 @@ import { createTestRepository, removeTestRepository } from './helpers.ts'
 
 const fixtureWorker = join(import.meta.dirname, 'fixtures', 'benchmark-worker.ts')
 const realWorker = join(import.meta.dirname, '..', 'scripts', 'benchmark-worker.ts')
+const realWorkerExitTimeoutMilliseconds = process.platform === 'win32' ? 10_000 : 5000
 const benchmarkScript = join(import.meta.dirname, '..', 'scripts', 'benchmark.ts')
 const privateRenameGuard = join(import.meta.dirname, 'fixtures', 'require-private-benchmark-rename.ts')
 
@@ -426,14 +427,14 @@ describe('isolated benchmark authority', () => {
         operation: 'coldHydrate',
         records: 0,
         root,
-        timeoutMilliseconds: 5000,
+        timeoutMilliseconds: realWorkerExitTimeoutMilliseconds,
         workerPath: realWorker,
       })
       const unchanged = await runBenchmarkWorker({
         operation: 'unchangedPrepare',
         records: 0,
         root,
-        timeoutMilliseconds: 5000,
+        timeoutMilliseconds: realWorkerExitTimeoutMilliseconds,
         workerPath: realWorker,
       })
       for (const result of [cold, unchanged]) {
@@ -445,14 +446,14 @@ describe('isolated benchmark authority', () => {
         operation: 'fullSearch',
         records: 0,
         root,
-        timeoutMilliseconds: 5000,
+        timeoutMilliseconds: realWorkerExitTimeoutMilliseconds,
         workerPath: realWorker,
       })
       const second = await runBenchmarkWorker({
         operation: 'fullSearch',
         records: 0,
         root,
-        timeoutMilliseconds: 5000,
+        timeoutMilliseconds: realWorkerExitTimeoutMilliseconds,
         workerPath: realWorker,
       })
       assert.notEqual(first.processId, second.processId)
