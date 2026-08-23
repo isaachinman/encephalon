@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-23 for code and behavioural-test snapshot `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
+Last reviewed: 2026-08-23 for code and behavioural-test snapshot `9b5821d59999215f975d613edf4a9c252fb6258d`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -148,7 +148,7 @@ The exact code and behavioural-test snapshot implementing the MAR-2566 benchmark
 
 MAR-2568 behavioural hot-scan work bounds: `de66f6ab7e10696fc878e380dd5417d194d60fe8`.
 
-MAR-2552 single-pass cache reads and identity-bound recovery: `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`.
+MAR-2552 single-pass cache reads and identity-bound recovery: `9b5821d59999215f975d613edf4a9c252fb6258d`.
 
 ## Package and Release Gates
 

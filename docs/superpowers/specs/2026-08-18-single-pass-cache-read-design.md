@@ -46,4 +46,4 @@ The stripped benchmark instrumentation reports a complete validation boundary in
 
 ## Reviewed implementation provenance
 
-The exact code and behavioural-test snapshot implementing this design is `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`. Documentation changes do not alter runtime behaviour, package exports, cache schema, or generated declarations.
+The exact code and behavioural-test snapshot implementing this design is `9b5821d59999215f975d613edf4a9c252fb6258d`. Documentation changes do not alter runtime behaviour, package exports, cache schema, or generated declarations.

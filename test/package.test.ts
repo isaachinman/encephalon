@@ -107,16 +107,16 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `eae98315e53ce568c62f6854a8542b285b7f9e4f`\./,
+      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `9b5821d59999215f975d613edf4a9c252fb6258d`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
       contract,
-      /MAR-2552 single-pass cache reads and identity-bound recovery: `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`\./,
+      /MAR-2552 single-pass cache reads and identity-bound recovery: `9b5821d59999215f975d613edf4a9c252fb6258d`\./,
     )
     assert.match(
       singlePassCacheReadDesign,
-      /The exact code and behavioural-test snapshot implementing this design is `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`\./,
+      /The exact code and behavioural-test snapshot implementing this design is `9b5821d59999215f975d613edf4a9c252fb6258d`\./,
     )
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /implementing the MAR-2566 benchmark guarantees above/)

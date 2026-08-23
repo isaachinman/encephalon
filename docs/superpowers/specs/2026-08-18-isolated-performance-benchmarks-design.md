@@ -72,7 +72,7 @@ A failed check names the corpus size, operation or cache, metric, statistic, act
 
 ## Reviewed implementation provenance
 
-The exact MAR-2566 implementation and behavioural-test snapshot is `eae98315e53ce568c62f6854a8542b285b7f9e4f`; MAR-2552 extends its stripped read instrumentation at `5f0b8e53381d8308a5d1e46a0b0f4626d11aa47c`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
+The exact MAR-2566 implementation and behavioural-test snapshot is `eae98315e53ce568c62f6854a8542b285b7f9e4f`; MAR-2552 extends its stripped read instrumentation at `9b5821d59999215f975d613edf4a9c252fb6258d`. Documentation, the generated baseline, and the CI budget do not change the public runtime API, package exports, canonical record format, or SQLite schema.
 
 ## Acceptance coverage
 
