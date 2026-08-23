@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-23 for code and behavioural-test snapshot `aa1a2596f4ca5be42b8896beedc802040eb57161`.
+Last reviewed: 2026-08-23 for code and behavioural-test snapshot `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -131,6 +131,18 @@ This document is the concise contract maintainers should update when public beha
 - After the numeric FTS probe succeeds, validation derives the expected search document from each bounded, parsed cached record and compares raw UTF-8 ID and text bytes for every `record_search` row. IDs must match exactly once, and missing, duplicate, orphaned, invalidly encoded, or non-canonical search rows are recoverable cache incompatibilities. The validated cached `record_json` projection is the authority; equality between cached JSON and canonical files remains MAR-2571.
 - Row-text equality does not claim integrity of FTS posting or shadow indexes. Beyond the NFC normalization of derived search documents defined above, no whitespace, JSON, compatibility, or additional token normalization is applied, and bounded posting-index integrity remains outside this contract.
 
+## Performance Evidence
+
+- Benchmark report and budget files use schema version 2. Old versions, unknown fields, malformed finite limits, budget cases without at least one cache or operation limit, zero-record amplification limits, duplicate corpus cases, and missing requested corpus cases fail before benchmark repository creation.
+- `ci` measures 0 and 100 records with no warmup and one measured sample; default `baseline` uses one warmup and three measured samples for 0 and 100; `full` uses two warmups and five measured samples for 0, 100, and 1,000. Explicit record counts label the report `custom`.
+- Every warmup and measured operation runs in a fresh Node child against a parent-restored repository state. Because copying changes canonical filesystem metadata, the parent re-prepares every restored non-cold sample outside the measured child and applies the stale mutation only after that preparation. The parent accepts exactly one nonce-bound IPC result followed by a clean close, kills and awaits timed-out or cancelled children, and attempts every owned sample and template repository cleanup on success, cancellation, or setup/worker failure while retaining the primary or first cleanup failure.
+- Measured samples retain invocation order and report count, maximum, median, and nearest-rank p95. Warmups are excluded. Public read totals are split by stripped internal boundaries into preparation/integrity, query/projection, and bounded return overhead; unrounded sample phases add to the total.
+- Peak RSS is the isolated child's lifetime `process.resourceUsage().maxRSS` converted from KiB to bytes. Current-RSS delta is signed and diagnostic. CI budgets p95 total duration and maximum cache size or amplification rather than phase timings or RSS deltas.
+- Zero-record stale preparation is unavailable and represented as `null`. Stale samples use a valid different-length canonical record variant so rapid runs cannot mistake unchanged timestamp/size metadata for a changed corpus.
+- Report output is written at mode `0600` inside a private `0700` staging directory beside the destination. The retained descriptor, rather than the replaceable destination pathname, applies an existing regular report's permission mode or the normal process-umask mode for a new report before close and atomic rename. Rename is the publication commit; later best-effort removal of the now-empty private staging directory cannot turn a successful publication into a reported failure. On platforms that deliver handled `SIGINT` and `SIGTERM`, signals cancel the active child, await closure, clean temporary repositories, and return a non-zero status without publishing a report. Windows force-terminates Node children for `SIGTERM`, so that CLI signal-cleanup guarantee does not apply there; platform-neutral `AbortController` cancellation cleanup remains covered everywhere.
+
+The exact code and behavioural-test snapshot implementing these guarantees is `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
+
 ## Package and Release Gates
 
 - Runtime consumers require Node.js 24.15.0 or newer and do not require Bun.
@@ -163,6 +175,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
+- MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 - MAR-2554 bounded full, compact, and gather read responses: `b43daf795de35d34602d1018ad509f68e494fe3d`.
 - MAR-2550 exact cached FTS row-text projection validation, bounded pre-mutation writer validation, and recovery: `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`.
 - MAR-2559 Unicode-preserving literal FTS query construction, derived search-document NFC normalization and bounded expansion recovery: `aa1a2596f4ca5be42b8896beedc802040eb57161`.

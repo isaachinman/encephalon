@@ -95,7 +95,12 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `aa1a2596f4ca5be42b8896beedc802040eb57161`\./,
+      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `eae98315e53ce568c62f6854a8542b285b7f9e4f`\./,
+    )
+    assert.match(contract, /## Performance Evidence/)
+    assert.match(
+      contract,
+      /MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `eae98315e53ce568c62f6854a8542b285b7f9e4f`\./,
     )
     assert.match(
       contract,
