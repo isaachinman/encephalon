@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make every Encephalon GitHub Actions execution use reviewed immutable action code and give Pullfrog only its required hosted-OIDC authority behind an explicit environment boundary.
+**Goal:** Make every Encephalon `uses` target identify reviewed immutable action code, remove provider-secret fan-out, and put Pullfrog's required hosted-OIDC authority behind an explicit environment boundary while proving or recording any authority that v0.1.60 cannot narrow from repository configuration.
 
-**Architecture:** A dependency-free structural policy parses workflow and local action YAML with `Bun.YAML`, follows repository-contained local references cycle-safely, and returns deterministic rule findings. The existing CI and Pullfrog workflows then use exact reviewed SHAs, minimal permissions, no provider-secret fan-out, and a protected Pullfrog environment; Dependabot proposes reviewed SHA updates without merging them automatically.
+**Architecture:** A dependency-free structural policy parses workflow and local action YAML with `Bun.YAML`, follows repository-contained local references cycle-safely, and returns deterministic rule findings. The existing CI and Pullfrog workflows then use exact reviewed SHAs, minimal YAML permissions, no provider-secret fan-out, a protected Pullfrog environment, disabled credential persistence/push, and the SHA-pinned local Pullfrog core path; Dependabot proposes reviewed SHA updates without merging them automatically. Upstream authority that cannot be narrowed in v0.1.60 remains an explicit acceptance blocker rather than being hidden by workflow prose.
 
 **Tech Stack:** TypeScript 7, Bun 1.3.1 YAML parser and test runner, GitHub Actions YAML, Dependabot.
 
@@ -13,13 +13,16 @@
 ## Global Constraints
 
 - Preserve all documented valid public inputs, public TypeScript signatures, synchronous behaviour, result shapes, ordering, CLI framing, existing subsystem error codes, canonical data, and repository formats.
-- Add no runtime or development dependency.
+- Add no runtime dependency. Use exact `@types/bun@1.3.1` only as a development dependency for the scripts TypeScript project; remove the historical handwritten Bun runtime declarations.
 - The workflow policy must parse YAML structurally; source regexes are not an acceptable substitute.
-- External `uses` references must end in one lowercase 40-character commit SHA; a trailing comment records the human-readable release.
-- Repository-local reusable workflows and composite actions must be resolved beneath the repository root and scanned recursively with cycle detection.
-- Credential-bearing jobs include `${{ secrets.* }}`, `secrets: inherit`, or `id-token: write`; each requires an environment.
+- External `uses` references must have an owner/repository[/path] shape and end in one lowercase 40-character commit SHA; a trailing comment records the human-readable release.
+- Repository-local reusable workflows and composite actions must be resolved through `lstat` and native real paths beneath the repository root, reject symlinks/non-regular/ambiguous targets, and be scanned recursively with cycle detection.
+- Credential-bearing jobs include workflow- or job-level secret-context expressions across dotted, bracket, and whitespace forms, `secrets: inherit`, or `id-token: write`; each requires the exact `pullfrog-review` environment.
+- Every workflow must declare exactly the top-level permission map `{ contents: read }`; job permissions remain read-only except for the single protected Pullfrog OIDC exception.
 - Only `.github/workflows/pullfrog.yml` job `pullfrog`, attached to `pullfrog-review`, may request `id-token: write`; repository permissions otherwise remain read-only.
-- Pullfrog uses hosted OIDC. Remove provider-secret mappings, retain only its narrowly scoped OIDC permission, and preserve manual inputs and run naming.
+- Pullfrog uses hosted OIDC. Remove provider-secret mappings, retain only its narrowly scoped OIDC permission, set `push: disabled`, force the pinned local CLI path, and preserve manual inputs and run naming.
+- Do not claim complete Pullfrog execution immutability: v0.1.60 installs exact-version agent runtimes whose production dependency resolution is outside the action lock.
+- Do not claim `push: disabled` removes every write token: v0.1.60 still hardcodes an internal contents-write MCP installation token. Repository acceptance remains blocked until an upstream release scopes MCP contents to `read` while retaining Pullfrog review identity.
 - Use the local repository clone and branch switching only; do not create a worktree.
 - Commit titles use `[MAR-2574] Plain English title` with British English prose.
 - Do not merge this or any other batch pull request until all 13 release-hardening tickets are ready.
@@ -32,6 +35,10 @@
 
 - Create: `scripts/workflow-policy.ts`
 - Create: `scripts/workflow-policy.test.ts`
+- Modify: `package.json`
+- Modify: `bun.lock`
+- Modify: `tsconfig.scripts.json`
+- Delete: `scripts/bun-runtime.d.ts`
 
 **Interfaces:**
 
@@ -115,9 +122,9 @@ const localReference = /^\.\//u
 - Track parsed absolute paths in a `Set<string>` before following local references.
 - Resolve local references against the repository root, reject any resolved path outside it, and load only `.yml`, `.yaml`, `action.yml`, or `action.yaml` targets.
 - Scan every string-valued `uses` field. Local references recurse; all other action/reusable-workflow references require the full commit pattern.
-- Treat a job as credential-bearing when its subtree contains a string with the literal GitHub expression prefix `${{ secrets.`; when its `secrets` property is `inherit`; or when effective job permissions contain `id-token: write`.
-- Require a non-empty string environment or an object with a non-empty string `name` for credential-bearing jobs.
-- Require top-level and job `contents` permission to be absent or `read`. Reject every other `write` permission except `id-token: write` for `.github/workflows/pullfrog.yml`, job `pullfrog`, environment `pullfrog-review`.
+- Treat every job as credential-bearing when workflow-level `env` or its own subtree contains a secret-context expression with optional expression/accessor whitespace and dotted or bracket access; when its `secrets` property is `inherit`; or when effective job permissions contain `id-token: write`.
+- Require the exact string environment `pullfrog-review` or an object whose exact non-empty `name` is `pullfrog-review` for every credential-bearing job.
+- Require the top-level permission map to be exactly `{ contents: read }`. Require job permissions to remain read-only and reject every other `write` permission except `id-token: write` for `.github/workflows/pullfrog.yml`, job `pullfrog`, environment `pullfrog-review`.
 - Sort findings by `file`, `location`, then `rule` with ordinal string ordering.
 - Keep CLI execution behind `if (import.meta.main)` so tests import without exiting.
 
@@ -166,7 +173,7 @@ Before committing, rerun `bun run test`, `bun run typecheck`, and `bun run lint`
 
 - [ ] **Step 1: Add the checked-in repository RED**
 
-Add one integration test:
+Add one integration test and exact checked-in workflow-shape assertions:
 
 ```ts
 test('repository workflows obey immutable action and credential boundaries', () => {
@@ -175,6 +182,8 @@ test('repository workflows obey immutable action and credential boundaries', () 
 ```
 
 The production mutation it catches is any checked-in mutable action, hidden local wrapper, unprotected credential authority, or write permission.
+
+Parse the checked-in workflows with `Bun.YAML.parse`. Require exactly one Pullfrog action step and one Pullfrog checkout; require exact read-only/OIDC job permissions, exact protected environment, exact action-step environment, and literal `push: disabled`. Require every checkout in both workflows to set `persist-credentials: false`. These assertions catch duplicate unsafe steps and provider-secret reintroduction that the general permission policy cannot observe.
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
@@ -214,7 +223,24 @@ Keep workflow-level `contents: read`. Keep job-level `contents: read` and the do
 environment: pullfrog-review
 ```
 
-Add `persist-credentials: false` to Pullfrog checkout. Delete the entire provider `env` mapping, including commented BYOK templates; the repository has no provider secrets and successful current runs use hosted OIDC. Preserve `prompt`, `name`, `run-name`, manual dispatch, and `fetch-depth: 1`.
+Add `persist-credentials: false` to every checkout step. Delete the entire provider `env` mapping, including commented BYOK templates; the repository has no provider secrets and successful current runs use hosted OIDC. Preserve `prompt`, `name`, `run-name`, manual dispatch, and `fetch-depth: 1`.
+
+Set the Pullfrog step's entire environment to:
+
+```yaml
+env:
+  PULLFROG_FORCE_LOCAL_CLI: '1'
+```
+
+This prevents the SHA-pinned action from bootstrapping mutable `pullfrog@^0.1.60`; it does not bind the later agent-runtime dependency installations to the action lock.
+
+Set Pullfrog's action input explicitly:
+
+```yaml
+push: disabled
+```
+
+The review job must not push repository content or workflows. Record that v0.1.60 nevertheless mints a separate internal MCP token with contents-write authority; no workflow-only configuration can remove it without breaking the read-only acceptance criteria or Pullfrog review identity.
 
 - [ ] **Step 5: Add reviewed action updates and the CI gate**
 
@@ -273,7 +299,7 @@ Before committing, rerun `bun run test`, `bun run typecheck`, and `bun run lint`
 
 - [ ] **Step 1: Update maintained documentation**
 
-In `README.md`, add `bun run check:workflows` to Development and explain that CI/Pullfrog action references are immutable, workflow policy follows local wrappers, and Pullfrog uses a protected environment with hosted OIDC rather than repository provider secrets.
+In `README.md`, add `bun run check:workflows` to Development and explain that CI/Pullfrog action references are immutable, workflow policy follows local wrappers, and Pullfrog uses a branch-restricted protected environment with hosted OIDC rather than repository provider secrets. Document that `push: disabled` prevents git pushes and that the local CLI switch prevents the mutable Pullfrog-core bootstrap.
 
 In `docs/contract.md`, add a `## Workflow Trust Boundary` section specifying:
 
@@ -281,7 +307,11 @@ In `docs/contract.md`, add a `## Workflow Trust Boundary` section specifying:
 - recursive structural validation of local reusable workflows/composite actions;
 - read-only repository permissions;
 - the sole `pullfrog-review` OIDC exception;
+- exact environment branch policies for `main` and the ticket branch currently being reviewed;
 - no provider-secret fan-out;
+- explicit `push: disabled` plus forced local CLI execution;
+- the v0.1.60 residuals: internal MCP contents-write authority and agent-runtime production dependencies outside the action lock;
+- the upstream least-authority release required before MAR-2574 can satisfy acceptance;
 - weekly reviewed Dependabot updates;
 - credential rotation by revoking hosted/OIDC trust and emergency disablement by disabling the Pullfrog workflow;
 - the exact Task 2 code/test commit SHA as implementation provenance.
@@ -319,7 +349,7 @@ git diff -- package.json bun.lock src/generated/version.ts
 git diff -- .github docs README.md scripts test
 ```
 
-Expected: no dependency or generated-version change; the branch contains only the approved programme spec, MAR-2574 plan, policy/tests, workflow/Dependabot/package-script configuration, and maintained documentation.
+Expected: the only dependency change is exact development-only `@types/bun@1.3.1` plus its lockfile entry; there is no runtime dependency or generated-version change. The branch otherwise contains only the approved programme spec, MAR-2574 plan, policy/tests, workflow/Dependabot/package-script configuration, and maintained documentation.
 
 - [ ] **Step 4: Commit documentation**
 
@@ -340,9 +370,9 @@ After all implementation tasks and task reviews are clean:
 
 1. Push with explicit refspec `origin mar-2574-ci-pin-secret-bearing-actions-and-minimize-workflow:mar-2574-ci-pin-secret-bearing-actions-and-minimize-workflow`, then set and verify upstream `origin/mar-2574-ci-pin-secret-bearing-actions-and-minimize-workflow`.
 2. Open the MAR-2574 pull request against `main` with the repository template and British English prose; attach it to Linear and move the issue to In Review.
-3. Create the `pullfrog-review` GitHub environment with Isaac Hinman as reviewer and `prevent_self_review: false`; do not restrict ticket branches because every ticket requires Pullfrog review.
-4. Enable repository `sha_pinning_required` only after the pushed workflows are fully pinned.
-5. Dispatch Pullfrog on the exact branch head, approve the pending environment deployment, and verify the pinned action succeeds with hosted OIDC.
+3. Create the `pullfrog-review` GitHub environment with required reviewer user ID `10575782` and `prevent_self_review: false`. Use custom deployment branch policies for exact `main` and exact `mar-2574-ci-pin-secret-bearing-actions-and-minimize-workflow`; never leave the environment unrestricted. As the batch advances, add the exact ticket branch under review and remove obsolete ticket policies.
+4. Keep repository `sha_pinning_required` disabled while default `main` still contains tag references. Enable and verify it only immediately after MAR-2574 is the first batch pull request merged, then verify an approved Pullfrog dispatch from pinned `main` before proceeding with the remaining merge sequence.
+5. Dispatch Pullfrog on the exact branch head, approve the pending environment deployment, and verify the pinned local core succeeds with hosted OIDC. This integration run does not clear the upstream MCP-token acceptance blocker.
 6. Wait for the complete GitHub CI matrix.
 7. Run six parallel branch-against-main reviews: security, correctness, data consistency/races, test coverage, maintainability, and UX/API regression where relevant.
 8. Fix every high- or medium-confidence finding, rerun affected local gates, push only the explicit ticket refspec, and repeat exact-head CI/Pullfrog/review gates.
