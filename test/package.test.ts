@@ -63,6 +63,10 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-17-fts-text-integrity-design.md'),
       'utf8',
     )
+    const responseByteBudgetsDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-17-response-byte-budgets-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -78,7 +82,15 @@ describe('package contract', () => {
     assert.match(contract, /## Historical Plan Divergence Checklist/)
     assert.match(
       contract,
-      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`\./,
+      /Stable response-budget names are `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes`\./,
+    )
+    assert.match(
+      contract,
+      /MAR-2554 bounded full, compact, and gather read responses: `b43daf795de35d34602d1018ad509f68e494fe3d`\./,
+    )
+    assert.match(
+      contract,
+      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `b43daf795de35d34602d1018ad509f68e494fe3d`\./,
     )
     assert.match(
       contract,
@@ -108,6 +120,10 @@ describe('package contract', () => {
     assert.match(
       ftsTextIntegrityDesign,
       /The exact reviewed code and behavioural-test snapshot implementing this design is `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`\./,
+    )
+    assert.match(
+      responseByteBudgetsDesign,
+      /The exact reviewed code and behavioural-test snapshot implementing this design is `b43daf795de35d34602d1018ad509f68e494fe3d`\./,
     )
     assert.match(
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),

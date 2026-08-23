@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-23 for code and behavioural-test snapshot `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`.
+Last reviewed: 2026-08-23 for code and behavioural-test snapshot `b43daf795de35d34602d1018ad509f68e494fe3d`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -19,10 +19,15 @@ This document is the concise contract maintainers should update when public beha
 
 - `list` and full `search` accept result limits from 1 through 50. Compact `search` and each `gather` search accept result limits from 1 through 100. The default remains 20.
 - A `gather` input contains at most 16 searches and 64 shows. An add-record input contains at most 1,000 supersession targets.
-- Every search query contains at most 1,024 UTF-8 bytes and 32 literal terms. Full-record responses from list, show, and full search contain at most 4 MiB of aggregate record JSON. One gather shares that aggregate budget across all requested full shown records; its compact search results do not consume the full-response budget.
+- Every search query contains at most 1,024 UTF-8 bytes and 32 literal terms.
+- `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes` each have a fixed 4 MiB maximum and use `field: 'response'`. Full-record list, show, and search responses charge `fullResponseBytes` by exact cached canonical JSON bytes.
+- Compact and gather responses use deterministic logical accounting: every string value and object key contributes its UTF-8 bytes; every number, boolean, null, array, and object contributes eight bytes; and nested values are counted recursively. JSON whitespace, escaping, and property insertion order do not affect this authority.
+- Standalone compact search owns one `compactResponseBytes` ledger per database read attempt. It lazily consumes SQLite rows with `StatementSync.iterate()`, validates each compact record before charging it, and retains the record only after a successful charge.
+- One complete gather owns one shared `gatherResponseBytes` ledger covering root metadata, show and search envelopes, full shown records, nulls, compact-result arrays, and compact records. Repeated show IDs and repeated queries are charged on every occurrence. Request order and result shapes remain unchanged.
+- A response whose charge equals 4 MiB succeeds. The first fragment that would exceed 4 MiB fails before retention; Encephalon never truncates or returns a partial response.
 - An oversized result limit, gather input count, or supersedes input count fails with `INVALID_ARGUMENT` before item validation, repository discovery, cache-location inspection, SQLite access, hydration, or other repository/cache hooks. Both gather arrays are structurally checked and count-checked before either array's items are validated or mapped. The CLI preflights raw repeated-option counts before option-value normalisation. Cache execution retains matching defensive checks for internal callers and future refactors.
-- Budget failures contain exactly the bounded details `{ field, budget, maximum }`. Stable budget names are `fullResultLimit`, `compactResultLimit`, `queryBytes`, `queryTerms`, `gatherSearches`, `gatherShows`, `supersessionEdges`, and `fullResponseBytes`; details exclude arrays, individual values, queries, paths, and other input content.
-- The fixed budget authority is internal. It is not exported by `src/index.ts` and does not change the public TypeScript input or result shapes.
+- Budget failures use `INVALID_ARGUMENT` and contain exactly the bounded details `{ field, budget, maximum }`. Stable budget names are `fullResultLimit`, `compactResultLimit`, `queryBytes`, `queryTerms`, `gatherSearches`, `gatherShows`, `supersessionEdges`, `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes`; details exclude arrays, individual values, queries, paths, and other input content. Stable response-budget names are `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes`.
+- The fixed budget and logical-accounting authorities are internal. They are not exported by `src/index.ts` and do not change public API inputs, outputs, or exported TypeScript types.
 
 ## Canonical Storage
 
@@ -149,6 +154,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
+- MAR-2554 bounded full, compact, and gather read responses: `b43daf795de35d34602d1018ad509f68e494fe3d`.
 - MAR-2550 exact cached FTS row-text projection validation, bounded pre-mutation writer validation, and recovery: `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`.
 - MAR-2553 semantic SQLite schema validation and exact incompatible-generation recovery: `f539720542a3302dd849002652e958da4a6063bf`.
 - MAR-2549 bounded disposable cache validation and exact-generation recovery: `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`.
