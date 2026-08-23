@@ -130,6 +130,8 @@ Provide one shared evidence packet to the six required parallel reviewers: secur
 
 Evidence: all six final reviewers returned `SHIP` with no findings against current `main`. Two initial reports were withdrawn after checking the recursive show accounting and the actual branch diff; neither required a production change.
 
-- [ ] **Step 7: Publish without merging**
+- [x] **Step 7: Publish without merging**
 
 Push explicitly to `origin mar-2554-api-bound-compact-search-and-gather-response-bytes:mar-2554-api-bound-compact-search-and-gather-response-bytes`, refresh the existing ticket PR against `main`, request the bot review, and merge only after the branch and resulting `main` CI are green in the ordered queue.
+
+Evidence: the rebased ticket branch and existing PR were refreshed against `main`, the latest-head bot review was requested, and merge remains gated on clean PR checks followed by clean post-merge `main` CI.
