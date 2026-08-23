@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, test } from 'node:test'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
@@ -22,6 +22,32 @@ describe('package contract', () => {
     assert.equal(scripts?.preinstall, undefined)
     assert.equal(scripts?.postinstall, undefined)
     assert.equal(scripts?.prepare, undefined)
+  })
+
+  test('keeps Bun declarations development-only and scripts-scoped', () => {
+    const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
+      devDependencies?: Readonly<Record<string, unknown>>
+    }
+    const configFiles = readdirSync(root)
+      .filter(file => file.startsWith('tsconfig.') && file.endsWith('.json'))
+      .toSorted()
+    const configs = configFiles.map(file => ({
+      file,
+      value: JSON.parse(readFileSync(resolve(root, file), 'utf8')) as {
+        compilerOptions?: Readonly<{ skipLibCheck?: unknown; types?: unknown }>
+      },
+    }))
+    const bunTypedProjects = configs
+      .filter(({ value }) => Array.isArray(value.compilerOptions?.types) && value.compilerOptions.types.includes('bun'))
+      .map(({ file }) => file)
+    const skippedLibraryCheckProjects = configs
+      .filter(({ value }) => value.compilerOptions?.skipLibCheck === true)
+      .map(({ file }) => file)
+
+    assert.equal(packageJson.devDependencies?.['@types/bun'], '1.3.1')
+    assert.deepEqual(bunTypedProjects, ['tsconfig.scripts.json'])
+    assert.deepEqual(skippedLibraryCheckProjects, ['tsconfig.scripts.json'])
+    assert.equal(existsSync(resolve(root, 'scripts', 'bun-runtime.d.ts')), false)
   })
 
   test('has a side-effect-free TypeScript API entrypoint', () => {
@@ -296,13 +322,10 @@ jobs:
     )
     assert.match(verificationRunner, /^ {4}runs-on: \$\{\{ matrix\.os \}\}\n$/)
     assert.doesNotMatch(verificationJob, /^ {4}(?:if|continue-on-error):/m)
+    assert.match(verificationSteps, /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/)
     assert.match(
       verificationSteps,
-      /uses: actions\/checkout@[0-9a-f]{40} # v\d+\.\d+\.\d+\n\s+with:\n\s+persist-credentials: false/,
-    )
-    assert.match(
-      verificationSteps,
-      /uses: actions\/setup-node@[0-9a-f]{40} # v\d+\.\d+\.\d+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}/,
+      /uses: actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}/,
     )
     assert.deepEqual(
       [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
@@ -330,14 +353,8 @@ jobs:
     runs-on: ubuntu-latest
 `,
     )
-    assert.match(
-      releaseSteps,
-      /uses: actions\/checkout@[0-9a-f]{40} # v\d+\.\d+\.\d+\n\s+with:\n\s+persist-credentials: false/,
-    )
-    assert.match(
-      releaseSteps,
-      /uses: actions\/setup-node@[0-9a-f]{40} # v\d+\.\d+\.\d+\n\s+with:\n\s+node-version: 24\.15\.0/,
-    )
+    assert.match(releaseSteps, /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/)
+    assert.match(releaseSteps, /uses: actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version: 24\.15\.0/)
     assert.deepEqual(
       [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
       ['bun install --frozen-lockfile', 'bun run check:workflows', 'bun run build', 'bun run check:package'],

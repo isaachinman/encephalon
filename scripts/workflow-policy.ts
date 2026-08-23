@@ -21,6 +21,12 @@ export type WorkflowPolicyFinding = Readonly<{
 
 type ParsedObject = Record<string, unknown>
 
+type ExecutableReference = Readonly<{
+  kind: 'action' | 'workflow'
+  location: string
+  reference: string
+}>
+
 // Scripts keep local witness/error semantics instead of importing runtime BrainError modules.
 type DirectoryObservation =
   | Readonly<{ kind: 'directory'; stats: BigIntStats }>
@@ -65,14 +71,6 @@ const isPlainObject = (value: unknown): value is ParsedObject => {
     plain = prototype === Object.prototype || prototype === null
   }
   return plain
-}
-
-const objectLocation = (location: string, key: string) => {
-  let childLocation = key
-  if (location.length > 0) {
-    childLocation = `${location}.${key}`
-  }
-  return childLocation
 }
 
 const relativeFile = (root: string, path: string) => relative(root, path).split(sep).join('/')
@@ -228,17 +226,16 @@ const readValidatedNativeFile = (root: string, path: string) => {
   return contents
 }
 
-const resolveLocalTarget = (root: string, reference: string) => {
+const resolveLocalTarget = (root: string, reference: string, kind: ExecutableReference['kind']) => {
   const repositoryRelativeReference = reference.startsWith('$/') ? `./${reference.slice(2)}` : reference
   const candidate = resolve(root, repositoryRelativeReference)
   let target: string | undefined
   if (isContainedPath(root, candidate)) {
-    const extension = extname(candidate)
-    if (extension === '.yml' || extension === '.yaml') {
+    if (kind === 'workflow' && (extname(candidate) === '.yml' || extname(candidate) === '.yaml')) {
       if (isRegularNativeFile(root, candidate)) {
         target = candidate
       }
-    } else {
+    } else if (kind === 'action') {
       const directoryStats = readStats(candidate)
       const nativeDirectory = readRealPath(candidate)
       const nativeDirectoryIsValid =
@@ -263,6 +260,55 @@ const resolveLocalTarget = (root: string, reference: string) => {
     }
   }
   return target
+}
+
+const stepReferences = (value: unknown, location: string): readonly ExecutableReference[] => {
+  let references: readonly ExecutableReference[] = []
+  if (Array.isArray(value)) {
+    references = value.flatMap((step, index) => {
+      let stepReference: readonly ExecutableReference[] = []
+      if (isPlainObject(step) && typeof step.uses === 'string') {
+        stepReference = [
+          {
+            kind: 'action',
+            location: `${location}[${String(index)}].uses`,
+            reference: step.uses,
+          },
+        ]
+      }
+      return stepReference
+    })
+  }
+  return references
+}
+
+const executableReferences = (
+  document: ParsedObject,
+  kind: ExecutableReference['kind'],
+): readonly ExecutableReference[] => {
+  let references: readonly ExecutableReference[] = []
+  if (kind === 'workflow' && isPlainObject(document.jobs)) {
+    references = Object.entries(document.jobs).flatMap(([jobName, job]) => {
+      let jobReferences: readonly ExecutableReference[] = []
+      if (isPlainObject(job)) {
+        const reusableWorkflow =
+          typeof job.uses === 'string'
+            ? [
+                {
+                  kind: 'workflow' as const,
+                  location: `jobs.${jobName}.uses`,
+                  reference: job.uses,
+                },
+              ]
+            : []
+        jobReferences = [...reusableWorkflow, ...stepReferences(job.steps, `jobs.${jobName}.steps`)]
+      }
+      return jobReferences
+    })
+  } else if (kind === 'action' && isPlainObject(document.runs)) {
+    references = stepReferences(document.runs.steps, 'runs.steps')
+  }
+  return references
 }
 
 const hasProtectedEnvironment = (value: unknown) => {
@@ -444,7 +490,7 @@ export const inspectWorkflowPolicy = (root: string): readonly WorkflowPolicyFind
   const findings: WorkflowPolicyFinding[] = []
   const parsedPaths = new Set<string>()
 
-  const inspectFile = (path: string, rootWorkflow: boolean) => {
+  const inspectFile = (path: string, kind: ExecutableReference['kind']) => {
     const parsedPath = comparablePath(path)
     if (!parsedPaths.has(parsedPath)) {
       parsedPaths.add(parsedPath)
@@ -463,37 +509,26 @@ export const inspectWorkflowPolicy = (root: string): readonly WorkflowPolicyFind
       if (document === undefined) {
         findings.push({ file, location: '$', rule: 'local-reference' })
       } else {
-        if (rootWorkflow || isPlainObject(document.jobs)) {
+        if (kind === 'workflow') {
           inspectWorkflowPermissions(document, file, findings)
           inspectWorkflowJobs(document, file, findings)
         }
 
-        const inspectValue = (value: unknown, location: string) => {
-          if (Array.isArray(value)) {
-            for (const [index, child] of value.entries()) {
-              inspectValue(child, `${location}[${String(index)}]`)
+        for (const reference of executableReferences(document, kind)) {
+          if (localReference.test(reference.reference)) {
+            const workspaceRelativeAction = reference.kind === 'action' && reference.reference.startsWith('./')
+            const target = workspaceRelativeAction
+              ? undefined
+              : resolveLocalTarget(nativeRoot, reference.reference, reference.kind)
+            if (target === undefined) {
+              findings.push({ file, location: reference.location, rule: 'local-reference' })
+            } else {
+              inspectFile(target, reference.kind)
             }
-          } else if (isPlainObject(value)) {
-            for (const [key, child] of Object.entries(value)) {
-              const childLocation = objectLocation(location, key)
-              if (key === 'uses' && typeof child === 'string') {
-                if (localReference.test(child)) {
-                  const target = resolveLocalTarget(nativeRoot, child)
-                  if (target === undefined) {
-                    findings.push({ file, location: childLocation, rule: 'local-reference' })
-                  } else {
-                    inspectFile(target, false)
-                  }
-                } else if (!fullCommitReference.test(child)) {
-                  findings.push({ file, location: childLocation, rule: 'external-action-sha' })
-                }
-              }
-              inspectValue(child, childLocation)
-            }
+          } else if (!fullCommitReference.test(reference.reference)) {
+            findings.push({ file, location: reference.location, rule: 'external-action-sha' })
           }
         }
-
-        inspectValue(document, '')
       }
     }
   }
@@ -534,7 +569,7 @@ export const inspectWorkflowPolicy = (root: string): readonly WorkflowPolicyFind
           }
           workflowPaths.sort(compareStrings)
           for (const path of workflowPaths) {
-            inspectFile(path, true)
+            inspectFile(path, 'workflow')
           }
 
           const finalWorkflowsDirectory = observeNativeDirectory(nativeRoot, workflowsDirectory)

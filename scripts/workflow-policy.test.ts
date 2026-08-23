@@ -172,7 +172,7 @@ runs:
   using: composite
   steps:
     - uses: owner/action@0123456789abcdef0123456789abcdef01234567
-    - uses: ./.github/actions/nested
+    - uses: $/.github/actions/nested
 `,
     '.github/actions/nested/action.yaml': `name: Nested
 runs:
@@ -188,7 +188,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: ./.github/actions/checked
+      - uses: $/.github/actions/checked
 `,
   })
 
@@ -219,12 +219,54 @@ on: workflow_dispatch
 permissions:
   contents: read
 jobs:
-  call:
+  call-dollar:
     uses: $/.github/workflows/called.yml
+  call-relative:
+    uses: ./.github/workflows/called.yml
   verify:
     runs-on: ubuntu-latest
     steps:
       - uses: $/.github/actions/checked
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [])
+})
+
+test('inspects only executable uses positions', () => {
+  const root = createFixture({
+    '.github/actions/checked/action.yml': `name: Checked
+inputs:
+  uses:
+    description: Data named like an executable key
+runs:
+  using: composite
+  steps:
+    - uses: owner/action@0123456789abcdef0123456789abcdef01234567
+      with:
+        uses: owner/input@v1
+`,
+    '.github/workflows/called.yml': `name: Called
+on: workflow_call
+permissions:
+  contents: read
+jobs: {}
+`,
+    '.github/workflows/caller.yml': `name: Caller
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: $/.github/workflows/called.yml
+    with:
+      uses: owner/input@v1
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/checked
+        with:
+          uses: owner/input@v1
 `,
   })
 
@@ -685,13 +727,13 @@ jobs:
 })
 
 // Mutation caught: removing containment or cycle handling would let a local reference escape the repository or recurse forever.
-test('rejects escaping local references and terminates self-referencing local actions', () => {
+test('rejects escaping and workspace-relative actions while terminating self-references', () => {
   const root = createFixture({
     '.github/actions/self/action.yml': `name: Self
 runs:
   using: composite
   steps:
-    - uses: ./.github/actions/self
+    - uses: $/.github/actions/self
 `,
     '.github/workflows/boundary.yml': `name: Boundary
 on: workflow_dispatch
@@ -701,7 +743,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: ./../outside/action
+      - uses: $/../outside/action
+      - uses: $/.github/actions/self
       - uses: ./.github/actions/self
 `,
   })
@@ -718,6 +761,11 @@ runs:
     {
       file: '.github/workflows/boundary.yml',
       location: 'jobs.verify.steps[0].uses',
+      rule: 'local-reference',
+    },
+    {
+      file: '.github/workflows/boundary.yml',
+      location: 'jobs.verify.steps[2].uses',
       rule: 'local-reference',
     },
   ])
@@ -739,7 +787,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: ./.github/actions/slash\\path/checked
+      - uses: $/.github/actions/slash\\path/checked
 `,
   })
   symlinkSync(join(root, '.github/actions/slash/path'), join(root, '.github/actions/slash\\path'), directorySymlinkType)
@@ -769,7 +817,7 @@ jobs:
   verify:
     runs-on: windows-latest
     steps:
-      - uses: ./.github\\actions/mixed\\actiondirectory
+      - uses: $/.github\\actions/mixed\\actiondirectory
 `,
   })
 
@@ -799,10 +847,10 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: ./.github/actions/ambiguous
-      - uses: ./.github/actions/symlinked
-      - uses: ./.github/actions/missing
-      - uses: ./.github/actions/invalid
+      - uses: $/.github/actions/ambiguous
+      - uses: $/.github/actions/symlinked
+      - uses: $/.github/actions/missing
+      - uses: $/.github/actions/invalid
 `,
   })
   const outside = createFixture({
@@ -854,7 +902,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: ./.github/actions/linked
+      - uses: $/.github/actions/linked
 `,
   })
   const outside = createFixture({
@@ -1100,7 +1148,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: ./.github/actions/checked
+      - uses: $/.github/actions/checked
 `,
   })
   const failingRoot = createFixture({
