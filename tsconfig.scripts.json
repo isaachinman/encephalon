@@ -1,7 +1,8 @@
 {
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
-    "types": ["node"]
+    "skipLibCheck": true,
+    "types": ["node", "bun"]
   },
   "include": ["scripts/**/*.d.ts", "scripts/**/*.ts"]
 }
