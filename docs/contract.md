@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-23 for code and behavioural-test snapshot `f0f625bfdf43ba69925087b53b93d913c67403bf`.
+Last reviewed: 2026-08-23 for code and behavioural-test snapshot `006c3101a00b6c27d2191cd7acdcefca69d23270`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -180,7 +180,7 @@ MAR-2565 validated mutation cache construction, deterministic disk fallback, and
 - MAR-2574 cannot satisfy its least-authority acceptance criteria until a reviewed upstream Pullfrog release removes the internal MCP contents-write authority and makes the agent-runtime production dependency closure lock-verifiable, followed by the protected-environment rollout and an approved exact-head dispatch. This contract does not claim acceptance, rollout, or GitHub settings completion.
 - The workflow tooling uses official exact `@types/bun@1.3.1` declarations only as a development dependency. Bun types and `skipLibCheck` are limited to `tsconfig.scripts.json`, the historical handwritten `scripts/bun-runtime.d.ts` declaration is removed, and the Node consumer/runtime remains unchanged with zero published runtime dependencies.
 
-The preceding repository-controlled implementation and behavioural-test snapshot for this boundary is `a8367f56ccab83755ef27e7636de2efc94f70538`. It retains Windows-safe native-path comparison, junction-aware fixtures, parser trigger-key normalisation, invalid-root diagnostics, inherited OIDC environment enforcement, exact pin/comment binding coverage, single-link workflow inputs, and portable platform fixtures. It also limits `uses` enforcement to executable schema positions, requires commit-bound `$/` references for repository-owned action execution, preserves both valid same-commit forms for reusable workflows, and mechanically verifies that exact Bun declarations remain development-only and scripts-scoped. This provenance is additive to the older change provenance below.
+The exact reviewed repository-controlled code and behavioural-test snapshot for this boundary is `006c3101a00b6c27d2191cd7acdcefca69d23270`. Remediation lineage: `f0f625bfdf43ba69925087b53b93d913c67403bf` corrected reusable-caller credential semantics, `8dd6d14fe43731276f8f34293adbcec19bc3f7da` added role-keyed traversal and final source-witness revalidation, and `006c3101a00b6c27d2191cd7acdcefca69d23270` minimised external caller authority and made diagnostics actionable. At that snapshot the focused workflow policy passed 31 tests with one Windows-only skip and no failures; lint checked 117 files, all four TypeScript projects passed, the full suite passed 562 of 564 tests with two established skips and no failures, and the policy CLI and 38-record validation were clean. These repository-policy changes do not alter the runtime API, package exports, canonical data, cache schema, or generated declarations.
 
 ## Package and Release Gates
 
