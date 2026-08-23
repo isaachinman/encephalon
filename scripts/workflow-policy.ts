@@ -28,7 +28,7 @@ type DirectoryObservation =
   | Readonly<{ kind: 'missing' }>
 
 const fullCommitReference = /^[^\s@/]+\/[^\s@/]+(?:\/[^\s@/]+)*@[0-9a-f]{40}$/u
-const localReference = /^\.\//u
+const localReference = /^(?:\.|\$)\//u
 const identifierStart = /[A-Za-z_]/u
 const identifierCharacter = /[A-Za-z0-9_-]/u
 const expressionOpening = '${{'
@@ -229,7 +229,8 @@ const readValidatedNativeFile = (root: string, path: string) => {
 }
 
 const resolveLocalTarget = (root: string, reference: string) => {
-  const candidate = resolve(root, reference)
+  const repositoryRelativeReference = reference.startsWith('$/') ? `./${reference.slice(2)}` : reference
+  const candidate = resolve(root, repositoryRelativeReference)
   let target: string | undefined
   if (isContainedPath(root, candidate)) {
     const extension = extname(candidate)

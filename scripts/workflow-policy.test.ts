@@ -201,6 +201,36 @@ jobs:
   ])
 })
 
+test('accepts self-repository action and reusable-workflow references', () => {
+  const root = createFixture({
+    '.github/actions/checked/action.yml': `name: Checked
+runs:
+  using: composite
+  steps: []
+`,
+    '.github/workflows/called.yml': `name: Called
+on: workflow_call
+permissions:
+  contents: read
+jobs: {}
+`,
+    '.github/workflows/caller.yml': `name: Caller
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: $/.github/workflows/called.yml
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/checked
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [])
+})
+
 // Mutation caught: removing credential detection would allow dot, bracket, inherited, or OIDC credentials without the protected environment.
 test('requires the exact protected environment for every credential-bearing job shape', () => {
   const root = createFixture({
