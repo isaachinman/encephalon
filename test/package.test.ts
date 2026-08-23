@@ -334,6 +334,7 @@ jobs:
       [
         'bun install --frozen-lockfile',
         'bun run check:workflows',
+        'bun run check:generated',
         'bun run typecheck',
         'bun run test',
         'bun run lint',
@@ -342,7 +343,8 @@ jobs:
         'bun run check:package',
       ],
     )
-    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 8)
+    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 9)
+    assert.match(verificationSteps, /- name: Check committed package version\n\s+run: bun run check:generated/)
     assert.doesNotMatch(verificationSteps, /^\s{8}(?:if|continue-on-error):/m)
 
     assert.equal(
@@ -350,7 +352,6 @@ jobs:
       `
   release:
     name: Release-equivalent package gate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: verify
     runs-on: ubuntu-latest
 `,
@@ -361,8 +362,10 @@ jobs:
       [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
       ['bun install --frozen-lockfile', 'bun run check:workflows', 'bun run build', 'bun run check:package'],
     )
-    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 6)
-    assert.doesNotMatch(releaseSteps, /^\s{8}(?:if|continue-on-error):/m)
+    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
+    assert.match(releaseSteps, /- name: Check committed package version\n\s+run: bun run check:generated/)
+    assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length, 1)
+    assert.doesNotMatch(releaseSteps, /^\s{8}continue-on-error:/m)
     assert.match(
       releaseJob,
       /- name: Create release-equivalent package artifact\n\s+shell: bash\n\s+run: \|\n\s+mkdir -p package-artifacts\n\s+npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts > package-artifacts\/npm-pack\.json/,
@@ -377,7 +380,8 @@ jobs:
         .filter(line => !line.includes('uses: actions/upload-artifact@'))
         .slice(1)
         .join('\n'),
-      `        with:
+      `        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
           name: encephalon-npm-package
           path: package-artifacts/*
           if-no-files-found: error
@@ -385,7 +389,14 @@ jobs:
 `,
     )
     assert.equal(
-      ['bun run build', 'bun run check:package', 'npm pack', 'bun run check:publish', 'actions/upload-artifact']
+      [
+        'bun run check:generated',
+        'bun run build',
+        'bun run check:package',
+        'npm pack',
+        'bun run check:publish',
+        'actions/upload-artifact',
+      ]
         .map(step => releaseJob.indexOf(step))
         .every(
           (position, index, positions) =>
