@@ -26,12 +26,12 @@ describe('package contract', () => {
 
   test('has a side-effect-free TypeScript API entrypoint', () => {
     assert.equal(existsSync(resolve(root, 'src/index.ts')), true)
-    const declarations = ['index.d.ts', 'baseline.d.ts', 'canonical-layout.d.ts', 'records.d.ts']
+    const declarations = ['index.d.ts', 'baseline.d.ts', 'cache.d.ts', 'canonical-layout.d.ts', 'records.d.ts']
       .map(file => readFileSync(resolve(root, 'dist', file), 'utf8'))
       .join('\n')
     assert.doesNotMatch(
       declarations,
-      /BaselineWork|RecordWork|WorkObserver|onEntry|onWork|scanBaselineWithHooks|validateRecordsResolved/,
+      /BaselineWork|RecordWork|WorkObserver|afterGatherSearchEvaluation|cacheReadTestHooks|onEntry|onWork|scanBaselineWithHooks|validateRecordsResolved/,
     )
   })
 
@@ -83,6 +83,10 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-single-pass-cache-read-design.md'),
       'utf8',
     )
+    const gatherDeduplicationDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-gather-deduplication-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -94,6 +98,7 @@ describe('package contract', () => {
     assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
     assert.match(contract, /## Bounded Disposable Cache Validation/)
+    assert.match(contract, /## Gather Deduplication/)
     assert.match(contract, /Cache schema compatibility requires the exact owned ordinary-table semantics/)
     assert.match(contract, /## Package and Release Gates/)
     assert.match(contract, /## Historical Plan Divergence Checklist/)
@@ -107,7 +112,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `9b5821d59999215f975d613edf4a9c252fb6258d`\./,
+      /Last reviewed: 2026-08-23 for code and behavioural-test snapshot `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
@@ -117,6 +122,14 @@ describe('package contract', () => {
     assert.match(
       singlePassCacheReadDesign,
       /The exact code and behavioural-test snapshot implementing this design is `9b5821d59999215f975d613edf4a9c252fb6258d`\./,
+    )
+    assert.match(
+      gatherDeduplicationDesign,
+      /The exact implementation and behavioural-test snapshot is `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`\./,
+    )
+    assert.match(
+      contract,
+      /MAR-2560 snapshot-local exact-key gather deduplication: `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`\./,
     )
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /implementing the MAR-2566 benchmark guarantees above/)

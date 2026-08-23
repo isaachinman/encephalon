@@ -31,7 +31,9 @@ import {
   summarizeDistribution,
 } from '../scripts/benchmark-model.ts'
 import { runBenchmarkWorker } from '../scripts/benchmark-process.ts'
+import { gatherBenchmarkInput, shownIdForBenchmarkCase } from '../scripts/benchmark-workload.ts'
 import { hydrate, prepare } from '../src/index.ts'
+import { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
 import { createTestRepository, removeTestRepository } from './helpers.ts'
 
 const fixtureWorker = join(import.meta.dirname, 'fixtures', 'benchmark-worker.ts')
@@ -117,6 +119,41 @@ const waitForBenchmarkActivity = (temporaryParent: string, child: ReturnType<typ
 }
 
 describe('isolated benchmark authority', () => {
+  test('builds the gather workload from authoritative maxima with two repeated exact keys', () => {
+    const input = gatherBenchmarkInput(0)
+    const frequencies = (values: readonly string[]) =>
+      values.reduce((counts, value) => counts.set(value, (counts.get(value) ?? 0) + 1), new Map<string, number>())
+
+    assert.equal(input.searches.length, OPERATION_BUDGETS.gatherSearches.maximum)
+    assert.equal(input.shows.length, OPERATION_BUDGETS.gatherShows.maximum)
+    assert.deepEqual(input.searches.slice(0, 4), [
+      'benchmark needle',
+      'large payload',
+      'benchmark needle',
+      'large payload',
+    ])
+    assert.deepEqual(input.shows.slice(0, 4), ['missing', 'benchmark-missing', 'missing', 'benchmark-missing'])
+    assert.deepEqual(
+      frequencies(input.searches),
+      new Map([
+        ['benchmark needle', OPERATION_BUDGETS.gatherSearches.maximum / 2],
+        ['large payload', OPERATION_BUDGETS.gatherSearches.maximum / 2],
+      ]),
+    )
+    assert.deepEqual(
+      frequencies(input.shows),
+      new Map([
+        ['missing', OPERATION_BUDGETS.gatherShows.maximum / 2],
+        ['benchmark-missing', OPERATION_BUDGETS.gatherShows.maximum / 2],
+      ]),
+    )
+  })
+
+  test('targets the last active chain record in populated benchmark workloads', () => {
+    assert.equal(shownIdForBenchmarkCase(100), 'chain-00009')
+    assert.deepEqual(gatherBenchmarkInput(100).shows.slice(0, 2), ['chain-00009', 'benchmark-missing'])
+  })
+
   test('excludes warmups and reports deterministic distributions', async () => {
     const invocations = [999, 998, 40, 10, 30, 20]
     const measured = await collectMeasuredSamples(2, 4, index => sample(invocations[index] ?? -1))

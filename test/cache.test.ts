@@ -81,6 +81,7 @@ afterEach(() => {
   cacheLocationTestHooks.regularFileRealpath = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
+  cacheReadTestHooks.afterGatherSearchEvaluation = undefined
   cacheReadTestHooks.afterIntegrityProbe = undefined
   cacheReadTestHooks.afterManifestKindEnumeration = undefined
   cacheReadTestHooks.afterManifestEntryLstat = undefined
@@ -2544,17 +2545,26 @@ describe('SQLite cache and reads', () => {
       payload: { summary: 'Snapshot generation one' },
       root,
       source: 'agent',
-      subject: 'cache.snapshot',
+      subject: 'cache.snapshot.first',
+    })
+    const secondId = 'snapshot-v2'
+    addRecord({
+      id: secondId,
+      kind: 'context',
+      payload: { summary: 'Snapshot generation two' },
+      root,
+      source: 'agent',
+      subject: 'cache.snapshot.second',
     })
     const replacement = {
       createdAt: '2026-08-08T00:00:01.000Z',
-      id: 'snapshot-v2',
+      id: 'snapshot-v3',
       kind: 'context',
-      path: 'encephalon/context/snapshot-v2.json',
-      payload: { summary: 'Snapshot generation two' },
+      path: 'encephalon/context/snapshot-v3.json',
+      payload: { summary: 'Snapshot generation three' },
       source: 'agent',
-      subject: 'cache.snapshot',
-      supersedes: [firstId],
+      subject: 'cache.snapshot.second',
+      supersedes: [secondId],
     }
     let mutatedBetweenItems = false
 
@@ -2564,7 +2574,7 @@ describe('SQLite cache and reads', () => {
         const database = new DatabaseSync(cacheDatabasePath(root))
         try {
           database.exec('BEGIN IMMEDIATE')
-          database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
+          database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(secondId)
           database
             .prepare(`
               INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
@@ -2578,12 +2588,12 @@ describe('SQLite cache and reads', () => {
               replacement.createdAt,
               replacement.path,
               1,
-              'Snapshot generation two',
+              'Snapshot generation three',
               JSON.stringify(replacement),
             )
           database
             .prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
-            .run(replacement.id, 'Snapshot generation two')
+            .run(replacement.id, 'Snapshot generation three')
           database.exec('COMMIT')
         } catch (error) {
           try {
@@ -2599,7 +2609,7 @@ describe('SQLite cache and reads', () => {
     try {
       const gatherRecords =
         functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
-      const gathered = gatherRecords({ root, shows: [firstId, firstId] }) as {
+      const gathered = gatherRecords({ root, shows: [firstId, secondId] }) as {
         records: Array<{ id: string; record: { id: string } | null }>
       }
       assert.equal(mutatedBetweenItems, true)
@@ -2607,7 +2617,7 @@ describe('SQLite cache and reads', () => {
         gathered.records.map(entry => [entry.id, entry.record?.id ?? null]),
         [
           [firstId, firstId],
-          [firstId, firstId],
+          [secondId, secondId],
         ],
       )
     } finally {
@@ -2684,7 +2694,7 @@ describe('SQLite cache and reads', () => {
         functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
       const gathered = gatherRecords({
         root,
-        searches: ['snapshot searchable', 'snapshot searchable'],
+        searches: ['snapshot searchable', 'snapshot   searchable'],
       }) as {
         searches: Array<{ results: Array<{ id: string }> }>
       }
@@ -2698,7 +2708,7 @@ describe('SQLite cache and reads', () => {
     }
   })
 
-  test('gather preserves duplicate order while reusing show and search statements', () => {
+  test('gather deduplicates exact database work while preserving order and independent results', () => {
     const root = createRoot()
     const addRecord = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('addRecord')
     const first = addRecord({
@@ -2712,7 +2722,7 @@ describe('SQLite cache and reads', () => {
     const second = addRecord({
       id: 'reuse-v2',
       kind: 'decision',
-      payload: { summary: 'Second reusable decision' },
+      payload: { detail: { markers: ['second'] }, summary: 'Second reusable decision' },
       root,
       searchText: 'statement reuse marker',
       source: 'agent',
@@ -2723,6 +2733,10 @@ describe('SQLite cache and reads', () => {
     let searchPrepareCount = 0
     let compactSearchSelectedRecordJson = false
     let showSelectedRecordBytes = false
+    const searchEvaluationCounts = new Map<string, number>()
+    const searchReadCounts = new Map<string, number>()
+    const showReadCounts = new Map<string, number>()
+    const count = (counts: Map<string, number>, key: string) => counts.set(key, (counts.get(key) ?? 0) + 1)
 
     cacheReadTestHooks.onShowPrepare = source => {
       showPrepareCount += 1
@@ -2732,43 +2746,185 @@ describe('SQLite cache and reads', () => {
       searchPrepareCount += 1
       compactSearchSelectedRecordJson ||= source.includes('records.record_json')
     }
+    cacheReadTestHooks.afterGatherSearchEvaluation = query => count(searchEvaluationCounts, query)
+    cacheReadTestHooks.afterCompactSearchRead = query => count(searchReadCounts, query)
+    cacheReadTestHooks.afterShowRead = id => count(showReadCounts, id)
 
     try {
       const gatherRecords =
         functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
+      const exactQuery = 'statement reuse marker'
+      const equivalentQuery = 'statement   reuse marker'
+      const missingId = 'reuse-missing'
       const gathered = gatherRecords({
         root,
-        searches: ['statement reuse marker', 'statement reuse marker', '   '],
-        shows: [second.id, second.id, first.id],
+        searches: [exactQuery, equivalentQuery, exactQuery, '   ', equivalentQuery, '   '],
+        shows: [second.id, missingId, second.id, missingId, first.id],
       }) as {
-        records: Array<{ id: string; record: { id: string } | null }>
-        searches: Array<{ query: string; results: Array<{ id: string }> }>
+        records: Array<{
+          id: string
+          record: { id: string; payload: { detail?: { markers?: string[] }; summary?: string } } | null
+        }>
+        searches: Array<{ query: string; results: Array<{ id: string; snippet: string }> }>
       }
       assert.deepEqual(
         gathered.records.map(entry => [entry.id, entry.record?.id ?? null]),
         [
           [second.id, second.id],
+          [missingId, null],
           [second.id, second.id],
+          [missingId, null],
           [first.id, null],
         ],
       )
       assert.deepEqual(
         gathered.searches.map(entry => [entry.query, entry.results.map(result => result.id)]),
         [
-          ['statement reuse marker', [second.id]],
-          ['statement reuse marker', [second.id]],
+          [exactQuery, [second.id]],
+          [equivalentQuery, [second.id]],
+          [exactQuery, [second.id]],
+          ['   ', []],
+          [equivalentQuery, [second.id]],
           ['   ', []],
         ],
       )
+      assert.deepEqual(
+        showReadCounts,
+        new Map([
+          [second.id, 1],
+          [missingId, 1],
+          [first.id, 1],
+        ]),
+      )
+      assert.deepEqual(
+        searchReadCounts,
+        new Map([
+          [exactQuery, 1],
+          [equivalentQuery, 1],
+        ]),
+      )
+      assert.deepEqual(
+        searchEvaluationCounts,
+        new Map([
+          [exactQuery, 1],
+          [equivalentQuery, 1],
+          ['   ', 1],
+        ]),
+      )
+
+      const [firstShownEntry, , repeatedShownEntry] = gathered.records
+      const [firstSearch, , repeatedSearch, firstEmptySearch, , repeatedEmptySearch] = gathered.searches
+      const firstShownRecord = firstShownEntry?.record
+      const repeatedShownRecord = repeatedShownEntry?.record
+      assert.ok(firstShownRecord !== null && firstShownRecord !== undefined)
+      assert.ok(repeatedShownRecord !== null && repeatedShownRecord !== undefined)
+      assert.ok(firstSearch !== undefined)
+      assert.ok(repeatedSearch !== undefined)
+      assert.ok(firstEmptySearch !== undefined)
+      assert.ok(repeatedEmptySearch !== undefined)
+      assert.notStrictEqual(firstShownRecord, repeatedShownRecord)
+      assert.notStrictEqual(firstShownRecord.payload, repeatedShownRecord.payload)
+      assert.notStrictEqual(firstShownRecord.payload.detail, repeatedShownRecord.payload.detail)
+      assert.notStrictEqual(firstSearch.results, repeatedSearch.results)
+      assert.notStrictEqual(firstSearch.results[0], repeatedSearch.results[0])
+      assert.notStrictEqual(firstEmptySearch.results, repeatedEmptySearch.results)
+
+      firstShownRecord.payload.detail?.markers?.push('mutated')
+      assert.deepEqual(repeatedShownRecord.payload.detail?.markers, ['second'])
+      const [firstCompactResult] = firstSearch.results
+      assert.ok(firstCompactResult !== undefined)
+      firstCompactResult.snippet = 'mutated'
+      firstSearch.results.splice(0)
+      assert.equal(repeatedSearch.results.length, 1)
+      assert.notEqual(repeatedSearch.results[0]?.snippet, 'mutated')
     } finally {
       cacheReadTestHooks.onShowPrepare = undefined
       cacheReadTestHooks.onCompactSearchPrepare = undefined
+      cacheReadTestHooks.afterGatherSearchEvaluation = undefined
+      cacheReadTestHooks.afterCompactSearchRead = undefined
+      cacheReadTestHooks.afterShowRead = undefined
     }
 
     assert.equal(showPrepareCount, 1)
     assert.equal(searchPrepareCount, 1)
     assert.equal(compactSearchSelectedRecordJson, false)
     assert.equal(showSelectedRecordBytes, false)
+  })
+
+  test('gather resets partially populated exact-work memos before a recovery retry', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'memo-retry',
+      kind: 'context',
+      payload: { summary: 'Memo generation one' },
+      root,
+      searchText: 'retry memo alpha beta',
+      source: 'agent',
+      subject: 'cache.memo-retry',
+    })
+    const firstQuery = 'retry memo'
+    const secondQuery = 'alpha beta'
+    const searchReadCounts = new Map<string, number>()
+    let recoveryRebuilds = 0
+    let showReads = 0
+    let writerInitialisations = 0
+    let faulted = false
+
+    cacheReadTestHooks.afterShowRead = () => {
+      showReads += 1
+    }
+    cacheReadTestHooks.afterCompactSearchRead = query => {
+      searchReadCounts.set(query, (searchReadCounts.get(query) ?? 0) + 1)
+      if (query === secondQuery && !faulted) {
+        faulted = true
+        rewriteRecordSummary(root, record.path, 'Memo generation two')
+        throw Object.assign(new Error('private rejected gather generation'), { code: 'SQLITE_CORRUPT' })
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    try {
+      const gathered = api.gatherRecords({
+        root,
+        searches: [firstQuery, firstQuery, secondQuery, secondQuery],
+        shows: [record.id, record.id],
+      }) as {
+        records: Array<{ record: { payload: { summary: string } } | null }>
+        searches: Array<{ results: Array<{ summary: string | null }> }>
+      }
+      assert.deepEqual(
+        gathered.records.map(entry => entry.record?.payload.summary ?? null),
+        ['Memo generation two', 'Memo generation two'],
+      )
+      assert.deepEqual(
+        gathered.searches.map(entry => entry.results.map(result => result.summary)),
+        [['Memo generation two'], ['Memo generation two'], ['Memo generation two'], ['Memo generation two']],
+      )
+    } finally {
+      cacheReadTestHooks.afterShowRead = undefined
+      cacheReadTestHooks.afterCompactSearchRead = undefined
+      cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
+      cacheReadTestHooks.duringDatabaseInitialisation = undefined
+    }
+
+    assert.equal(faulted, true)
+    assert.equal(showReads, 2)
+    assert.deepEqual(
+      searchReadCounts,
+      new Map([
+        [firstQuery, 2],
+        [secondQuery, 2],
+      ]),
+    )
+    assert.equal(recoveryRebuilds, 1)
+    assert.equal(writerInitialisations, 1)
   })
 
   test('tracks record and referenced-artifact freshness', () => {
