@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-22 for code and behavioural-test snapshot `4fcc7a4d1b76d1ca05c8f2d94d01d590fd3d237d`.
+Last reviewed: 2026-08-23 for code and behavioural-test snapshot `30104a049f72ba2e87f51af95d5da11b55045cc3`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -160,7 +160,7 @@ MAR-2552 single-pass cache reads and identity-bound recovery: `9b5821d59999215f9
 
 MAR-2560 snapshot-local exact-key gather deduplication: `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`.
 
-MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `4fcc7a4d1b76d1ca05c8f2d94d01d590fd3d237d`.
+MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `30104a049f72ba2e87f51af95d5da11b55045cc3`.
 
 ## Package and Release Gates
 
