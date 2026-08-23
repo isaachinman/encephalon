@@ -211,6 +211,7 @@ Without `root`, Encephalon walks upward to the nearest valid Git repository mark
 
 ```bash
 bun install --frozen-lockfile
+bun run check:generated
 bun run check:workflows
 bun run typecheck
 bun run test
@@ -244,7 +245,7 @@ Correctness tests enforce deterministic bounded-work counts without reading prod
 
 The full profile runs every operation in fresh child processes with two discarded warmups and five measured samples at 0, 100, and 1,000 records. `benchmark:check` keeps CI to a single 0/100 sample with generous schema-version 2 p95 and cache-size ceilings. See [docs/performance.md](./docs/performance.md) for phase semantics, memory sources, profiles, budgets, baseline distributions, and scale guidance.
 
-`check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything. CI runs four verification lanes: Node 24.15.0 on Ubuntu, macOS, and Windows, plus Node 26 on Ubuntu. Only trusted pushes to `main` run the separate release-equivalent package gate, which validates the publish dry run before uploading the generated `npm pack` tarball for inspection.
+`bun run check:generated` checks the committed source without modifying it and rejects stale package-version metadata before a build can repair it. Both workflow jobs run this non-mutating check before any build. `check:package` inspects the npm tarball, installs it with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything. CI runs four verification lanes: Node 24.15.0 on Ubuntu, macOS, and Windows, plus Node 26 on Ubuntu. The release-equivalent package gate runs without secrets on pull requests and trusted pushes to `main`, and validates the publish dry run in both cases. Only trusted pushes to `main` upload its bounded `npm pack` tarball for inspection.
 
 ## Licence
 

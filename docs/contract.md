@@ -189,9 +189,23 @@ The exact reviewed repository-controlled code and behavioural-test snapshot for 
 
 - Runtime consumers require Node.js 24.15.0 or newer and do not require Bun.
 - The npm package has no runtime dependencies and no install, preinstall, postinstall, or prepare lifecycle scripts.
+- `bun run check:generated` checks stale generated source non-mutatively before any build can repair the committed package-version metadata. Both GitHub Actions jobs run this check before their first build.
 - The tarball whitelist is intentionally small and checked by `bun run check:package`.
 - `bun run check:package` must build, pack, install the actual tarball into a temporary Git repository with scripts disabled, import the API, typecheck consumer declarations, and execute the packed CLI through Node.
 - `bun run check:publish` is a dry-run release gate only. Publishing is manual maintainer work and must not be performed by agents.
+- The release-equivalent package gate runs without secrets on pull requests and trusted pushes to `main`. Only trusted pushes to `main` upload the bounded tarball; pull requests build and inspect runner-local artifacts only.
+
+After the guarded rollout, strict branch protection must require exactly `verify (ubuntu-latest)`, `verify (macos-latest)`, `verify (windows-latest)`, `verify (ubuntu-current)`, and `Release-equivalent package gate`. Required checks govern ordinary merges; they do not remove the existing administrator bypass or direct force-push capability.
+
+The rollout order is mandatory:
+
+1. Keep MAR-2640 stacked on MAR-2574. Do not mutate `main` protection while PR #66 can emit only a skipped release context: requiring that context now would deadlock the predecessor that must merge first.
+2. After MAR-2574 merges, rebase MAR-2640 onto current `origin/main`, retarget its pull request to `main`, and wait for all five required contexts to succeed at the exact retargeted head.
+3. Inspect the complete current settings with the read-only command `gh api repos/isaachinman/encephalon/branches/main/protection`. Only after step 2, update the `required_status_checks` subresource to strict mode with the five exact GitHub Actions contexts above; do not replace the complete protection resource.
+4. Run `gh api repos/isaachinman/encephalon/branches/main/protection` again and verify the exact required-context set. The narrow mutation must preserve `enforce_admins: false`, `allow_force_pushes: true`, and every unrelated field, including deletion, signature, linear-history, and conversation-resolution settings.
+5. Before removing any obsolete context, use a temporary non-`main` pull-request commit to verify that an intentionally failing current-Node check or release-equivalent check blocks an ordinary merge. Revert the temporary failure and rerun every required context at the exact clean head; never merge the deliberately failing revision.
+
+This contract describes a future maintainer-operated rollout. It does not claim that MAR-2574 has merged, MAR-2640 has been retargeted, or GitHub branch protection has been changed.
 
 ## Contract Change Process
 

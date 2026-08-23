@@ -249,6 +249,7 @@ describe('package contract', () => {
   test('runs pull-request and current-Node package checks with a trusted release gate', () => {
     const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
     const readme = readFileSync(resolve(root, 'README.md'), 'utf8')
+    const contract = readFileSync(resolve(root, 'docs', 'contract.md'), 'utf8')
     const publishCheck = readFileSync(resolve(root, 'scripts', 'check-publish.ts'), 'utf8')
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       scripts?: Record<string, unknown>
@@ -405,8 +406,23 @@ jobs:
       true,
     )
     assert.match(readme, /four verification lanes/)
-    assert.match(readme, /trusted pushes to `main`/)
-    assert.match(readme, /release-equivalent package gate/)
+    assert.match(
+      readme,
+      /release-equivalent package gate runs without secrets on pull requests and trusted pushes to `main`/,
+    )
+    assert.match(readme, /Only trusted pushes to `main` upload its bounded `npm pack` tarball/)
+    assert.match(readme, /`bun run check:generated` checks the committed source without modifying it/)
+    assert.match(readme, /Both workflow jobs run this non-mutating check before any build/)
+    assert.match(
+      contract,
+      /release-equivalent package gate runs without secrets on pull requests and trusted pushes to `main`/,
+    )
+    assert.match(contract, /Only trusted pushes to `main` upload the bounded tarball/)
+    assert.match(contract, /stale generated source non-mutatively before any build/)
+    assert.match(
+      contract,
+      /`verify \(ubuntu-latest\)`, `verify \(macos-latest\)`, `verify \(windows-latest\)`, `verify \(ubuntu-current\)`, and `Release-equivalent package gate`/,
+    )
     assert.equal(workflowCheckScript, 'bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts')
     assert.equal(publishScript, 'bun run scripts/check-publish.ts')
     assert.equal(publishCheck.includes("'--dry-run'"), true)
