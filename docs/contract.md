@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-18 for code and behavioural-test snapshot `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`.
+Last reviewed: 2026-08-23 for code and behavioural-test snapshot `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -144,7 +144,7 @@ This document is the concise contract maintainers should update when public beha
 
 The exact code and behavioural-test snapshot implementing these guarantees is `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 
-MAR-2568 behavioural hot-scan work bounds: `dbe77b5742d9891ee1d6de1bd0676ae166a076d7`.
+MAR-2568 behavioural hot-scan work bounds: `7304c07b0fd1554470a25307ff028c03b3653274`.
 
 ## Package and Release Gates
 
