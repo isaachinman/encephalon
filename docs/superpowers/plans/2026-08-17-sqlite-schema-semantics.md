@@ -83,13 +83,4 @@
 - [x] Run lint, all four typechecks, full tests, both benchmarks, build, package, publish-contract, and frozen-install gates.
 - [x] Audit public declarations, package contents, Bun files, diff hygiene, dead hooks, stale assumptions, SoC boundaries, and documentation accuracy.
 
-Implementation and behavioural coverage are captured by `fb17790ac01031aa37d903ec9a3feb3a271e9d05`. The review-remediated release matrix passed with 491 tests, two established filesystem-capability skips, clean lint and four-project typechecking, both benchmark profiles, build, packed-package and publish-contract checks, frozen dependency installation, unchanged Bun/package configuration, no new public declarations, and clean diff hygiene.
-
-### Task 5: Pull request and branch review
-
-- [ ] Push the exact Linear branch with explicit `origin branch:branch` and verify upstream.
-- [ ] Open a PR based on the reviewed MAR-2549 branch so the ticket diff remains focused; include British-English title/body and leave it unmerged.
-- [ ] Review the complete branch against `origin/main` with Security, Correctness, Data consistency/races, Test coverage, Maintainability, and UX/API reviewers in parallel.
-- [ ] Fix every accepted High/Medium-confidence issue with focused RED/GREEN evidence and rerun proportionate gates.
-- [ ] Repeat broad review at most three waves, then run the main-thread SoC/tidy/stale-assumption/dead-code/docs audit.
-- [ ] Run final cross-platform CI and bot review, fix actionable findings, update Linear, and leave the reviewed PR open for the ordered merge.
+Implementation and behavioural coverage are captured by `f539720542a3302dd849002652e958da4a6063bf`.
