@@ -16,6 +16,8 @@ All notable changes to Encephalon are documented here.
 
 - Isolated every benchmark operation sample in a fresh child process and replaced single timings with schema-versioned latency, phase, and memory distributions.
 - Assigned record creation timestamps under the repository operation lock so new records and generated baseline batches remain strictly ordered after canonical history.
+- Validated canonical reads, mutation planning, initialisation, and cache rebuilding against one exact generation, with one records-owned three-attempt/60-second retry ledger and settled-generation-only results.
+- Rebuilt disposable cache state from the same sealed canonical snapshot used for graph and artifact validation, preserving cache schema version `1`, exact manifest bytes, logical rows, FTS projection, and cache recovery identity.
 - Made canonical record staging, publication, instruction-file writes, and post-commit recovery safer across filesystem failures.
 - Made cache hydration and gather reads transactional, snapshot-consistent, and resilient to malformed disposable state.
 - Validated disposable SQLite table, constraint, index, and FTS5 semantics before reads or writer mutation, with exact one-generation recovery for incompatible caches.
@@ -39,6 +41,7 @@ All notable changes to Encephalon are documented here.
 - Made multi-resource initialisation report bounded monotonic commit progress while preserving subsystem errors, with inspect-or-rerun guidance and same-options convergence after partial baseline, cache, instruction, refresh, and removal failures.
 - Finalised managed instruction writes and removals with fixed-root authority, descriptor-bound private staging and durable recovery, canonical hard-link commit aggregation, concurrent-successor preservation, zero operation-owned aliases on success, and bounded safe post-commit phases and repository-relative recovery paths.
 - Made generated baseline refreshes converge on one canonical snapshot.
+- Replanned add and initialisation only before their first canonical link, then reported post-link canonical races with the exact bounded committed prefix and deterministic validation-and-reconciliation recovery instead of retrying after commit.
 - Rejected multiply linked mutable SQLite primaries, operation gates, and sidecars before use or identity-specific cleanup.
 - Made completed operation-gate recovery durably reclaimable across processes while preserving live recovering and phase-less legacy owners.
 - Deflaked instruction replacement identity checks across supported platforms.

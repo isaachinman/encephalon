@@ -632,7 +632,15 @@ Tests cover contention and deadline behaviour; corrupt-gate recovery; durable re
 
 Every `list`, `show`, `search`, and `gather` operation calls `prepare()` automatically. Callers never need to remember to hydrate first.
 
-### 11.7 Transactional hydration
+### 11.7 Transactional hydration (historical v0.1 design)
+
+Current MAR-2575 divergence: the numbered sequence below records the original cache-owned v0.1 design and is not the maintained hydration algorithm. The current implementation accepts one records-owned canonical snapshot containing the validated records, artifacts, exact manifest, repository identity, and current-generation assertion. A bounded optimistic manifest probe may run only to decide freshness before the operation lock; once validation or rebuilding begins, cache code performs no parallel full-corpus scan, graph pass, or retry loop.
+
+Before any canonical record commits, acquisition, graph/artifact validation, cache writing, missing-primary handling, and disposable-corruption recovery share one records-owned maximum of three total attempts and one non-resetting 60-second deadline. The same sealed snapshot is asserted immediately before rebuild DML and immediately before `COMMIT`; generation churn rolls back and closes before a complete retry and never quarantines a valid cache solely for that churn. One writer/recovery session remains bound to the exact claimed database identity throughout those attempts.
+
+After a canonical hard link commits, no canonical retry occurs. A cleanup or direct-snapshot-eligibility fallback may reacquire current records exactly once, bracketed by the accepted committed-generation authority; it cannot adopt a predecessor or successor. A mismatch returns the committed `REPOSITORY_CHANGED` publication-verification envelope with the bounded frozen committed prefix and deterministic validate-and-reconcile recovery. Cache/read and no-add init return ordinary validation for a settled invalid successor, while record-producing add/init retain their established path-free mutation classification after an observed pre-link race. Manifest JSON/hash bytes, schema version `1`, logical rows and FTS projection, public results and existing error fields, and all persisted canonical formats remain unchanged.
+
+The original v0.1 sequence was:
 
 Hydration uses one stable database and one transaction:
 
@@ -652,7 +660,7 @@ Hydration uses one stable database and one transaction:
 14. Commit only if the pre- and post-hydration manifests match.
 15. Roll back on any parsing, validation, insertion, manifest, or commit failure.
 
-If external files changed, retry the entire validated hydration up to three times. After the third failure, return `REPOSITORY_CHANGED`. A failed command must not query the preserved older cache.
+Under that historical design, external file changes retried the cache-owned hydration up to three times. MAR-2575 supersedes that retry ownership as described above. A failed command still must not query the preserved older cache.
 
 ### 11.8 Add consistency
 

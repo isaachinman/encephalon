@@ -82,6 +82,22 @@ MAR-2565 removes the second canonical JSON parse and graph validation from stabl
 
 The deterministic work counts are the regression authority: every measured snapshot run visited each pre-existing canonical entry once, performed one strict graph validation, performed no disk cache validation, and left the next `prepare` fresh. Behavioural tests separately prove logical metadata, record-row, and FTS equivalence with a forced disk hydrate. The permanent schema-version 2 benchmark remains unchanged because it measures public hydrate, prepare, and read operations rather than mutation orchestration.
 
+## Stable canonical generation work
+
+MAR-2575 extends the deterministic work-count authority from mutation snapshots to every canonical consumer. Stable validation and a generation change detected after graph validation have these exact test-measured counts:
+
+| Canonical records | Stable entry visits | Stable scans / graph validations | One-retry entry visits | One-retry scans / graph validations |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 0 | 1 / 1 | 0 | 2 / 2 |
+| 100 | 100 | 1 / 1 | 200 | 2 / 2 |
+| 1,000 | 1,000 | 1 / 1 | 2,000 | 2 / 2 |
+
+The retry is operation-scoped rather than repeated per directory. A change rejected during scanning contributes no graph validation for that attempt: continuous scan-time churn stops at three scans and zero graph validations, while continuous post-validation churn stops at three scans and three graph validations. Failed attempts expose no records.
+
+Rebuilding a missing or stale cache for `prepare`, forced `hydrate`, list, show, search, gather, post-add hydration, and byte-eligible record-producing init performs one records-owned canonical scan and one graph validation with no second cache-owned canonical pass. A fresh-cache fast path may perform zero canonical scans. Byte-ineligible post-commit init deliberately performs its one expected-generation-bound reacquisition instead. Persistent pre-commit, read, or no-add churn during cache writing consumes the same three total scans and graph validations, rolls back every attempted transaction, leaves an existing valid cache unchanged, and performs no valid-cache quarantine; post-commit work never retries canonical acquisition or replanning.
+
+These are behavioural phase counts, not timing claims. MAR-2575 adds no latency, memory, cache-size, benchmark-schema, or CI-budget threshold; `benchmark:check` and the committed schema-version 2 distributions remain the wall-clock and resource authorities.
+
 ## Scale guidance
 
 The current full-rebuild cache is suitable for repository knowledge bases up to the product limit of 1,000 canonical records. On the baseline machine, cold hydration remained near a quarter second at that limit; unchanged prepare, list, show, and search remained near or below two tenths of a second, stale rebuilding remained below half a second, and the maximum-envelope duplicate-heavy gather remained the expensive path because it still constructs and charges every requested output occurrence.
