@@ -57,6 +57,8 @@ MAR-2640 runs the existing stable release-equivalent job on pull requests and tr
 
 MAR-2641 remains a scalar schema correction. MAR-2576 introduces a small guarded property-inspection primitive and retains iterative payload traversal without materialising whole-object descriptor maps. MAR-2572 reuses that primitive for public envelope parsing and dense-array validation while retaining operation-budget precedence and ignoring unknown ordinary data properties.
 
+The exact reviewed MAR-2641 code and behavioural-test snapshot is `58c01dc1ff263b8aa80a3cfaac610296233ed7e1`. It normalises only numeric negative-zero confidence at the existing schema boundary, preserving the accepted range, ordinary numeric values, errors, public shapes, canonical storage, and cache format. Coverage proves immediate mutation results, package-produced canonical bytes, existing raw canonical `-0`, rebuilt-cache reads, and CLI output converge on positive zero.
+
 Property inspection never intentionally invokes getters or setters. JavaScript proxy traps cannot be made inert; trap failures are caught and normalised to bounded `INVALID_ARGUMENT` errors.
 
 ### Stack C: filesystem, cache, locking, records, and baseline integrity
