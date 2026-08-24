@@ -82,17 +82,21 @@ Create `scripts/package-version.ts`:
 const staleGeneratedVersionMessage =
   'Generated runtime package version is stale. Run `bun run build` and commit src/generated/version.ts.'
 
+export const createStaleGeneratedVersionError = (): Error => new Error(staleGeneratedVersionMessage)
+
 export const renderPackageVersionSource = (version: string): string =>
   `// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = ${JSON.stringify(version)}\n`
 
 export const assertPackageVersionSource = (version: string, source: string): void => {
-  if (source.replaceAll('\r\n', '\n') !== renderPackageVersionSource(version)) {
-    throw new Error(staleGeneratedVersionMessage)
+  const expectedSource = renderPackageVersionSource(version)
+  const expectedWindowsSource = expectedSource.replaceAll('\n', '\r\n')
+  if (source !== expectedSource && source !== expectedWindowsSource) {
+    throw createStaleGeneratedVersionError()
   }
 }
 ```
 
-CRLF normalisation is limited to checkout-equivalent line endings. Wrappers, extra content, lone carriage returns, stale versions, and every other byte-level content change remain rejected.
+The checker accepts only the complete native LF rendering or its complete checkout-equivalent CRLF rendering. Mixed line endings, wrappers, extra content, lone carriage returns, stale versions, and every other byte-level content change remain rejected.
 
 Create `scripts/check-generated-version.ts` as the non-mutating adapter:
 

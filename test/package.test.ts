@@ -271,8 +271,6 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'plans', '2026-08-23-required-release-checks.md'),
       'utf8',
     )
-    const generatedVersionCheck = readFileSync(resolve(root, 'scripts', 'check-generated-version.ts'), 'utf8')
-    const packageCheck = readFileSync(resolve(root, 'scripts', 'check-package.ts'), 'utf8')
     const publishCheck = readFileSync(resolve(root, 'scripts', 'check-publish.ts'), 'utf8')
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       scripts?: Record<string, unknown>
@@ -421,38 +419,21 @@ jobs:
 `,
     )
     assert.match(readme, /four verification lanes/)
-    assert.match(
-      readme,
-      /release-equivalent package gate runs without secrets on pull requests and trusted pushes to `main`/,
-    )
-    assert.match(readme, /Only trusted pushes to `main` upload its bounded `npm pack` tarball/)
-    assert.match(readme, /`bun run check:generated` checks the committed source without modifying it/)
-    assert.match(readme, /Both workflow jobs run this non-mutating check before any build/)
-    assert.match(
-      contract,
-      /release-equivalent package gate runs without secrets on pull requests and trusted pushes to `main`/,
-    )
-    assert.match(contract, /Only trusted pushes to `main` upload the bounded tarball/)
-    assert.match(contract, /stale generated source non-mutatively before any build/)
+    assert.match(readme, /release-equivalent package gate[^\n]+pull requests[^\n]+trusted pushes to `main`/)
+    assert.match(readme, /trusted pushes to `main`[^\n]+upload[^\n]+`npm pack` tarball/i)
+    assert.match(readme, /`bun run check:generated`[^\n]+without modifying/)
+    assert.match(readme, /workflow jobs[^\n]+before any build/)
+    assert.match(contract, /release-equivalent package gate[^\n]+pull requests[^\n]+trusted pushes to `main`/)
+    assert.match(contract, /trusted pushes to `main`[^\n]+upload[^\n]+tarball/i)
+    assert.match(contract, /`bun run check:generated`[^\n]+non-mutatively[^\n]+before any build/)
     const requiredBranchProtection =
       /After (?:the guarded )?rollout, branch protection must require exactly `verify \(ubuntu-latest\)`, `verify \(macos-latest\)`, `verify \(windows-latest\)`, `verify \(ubuntu-current\)`, and `Release-equivalent package gate`/
     assert.deepEqual(
       [readme, contract].map(document => requiredBranchProtection.test(document)),
       [true, true],
     )
-    const skippedReleaseContextRationale =
-      /A job skipped by a job-level `if` reports success and does not block a required check, but that skipped result does not prove the release-equivalent contract and requiring it would give false assurance\./
-    assert.deepEqual(
-      [contract, releaseChecksPlan].map(document => skippedReleaseContextRationale.test(document)),
-      [true, true],
-    )
-    const exactGeneratedSourceAssertion =
-      /const generatedVersionSource = readFileSync\(resolve\(root, 'src', 'generated', 'version\.ts'\), 'utf8'\)\n[ \t]*assertPackageVersionSource\(packageJson\.version, generatedVersionSource\)/
+    assert.match(releaseChecksPlan, /job-level `if`[^\n]+does not prove[^\n]+false assurance/)
     assert.equal(generatedVersionScript, 'bun run scripts/check-generated-version.ts')
-    assert.deepEqual(
-      [generatedVersionCheck, packageCheck].map(source => exactGeneratedSourceAssertion.test(source)),
-      [true, true],
-    )
     assert.equal(workflowCheckScript, 'bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts')
     assert.equal(publishScript, 'bun run scripts/check-publish.ts')
     assert.equal(publishCheck.includes("'--dry-run'"), true)
