@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -62,6 +62,53 @@ test('keeps build and package checks on the shared generated-source authority', 
     ),
     [true, true],
   )
+})
+
+test('build regenerates the exact package-version source in an isolated repository', () => {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), 'encephalon-package-version-build-'))
+  try {
+    mkdirSync(resolve(temporaryRoot, 'scripts'))
+    mkdirSync(resolve(temporaryRoot, 'src'))
+    for (const filename of ['build.ts', 'package-version.ts']) {
+      writeFileSync(
+        resolve(temporaryRoot, 'scripts', filename),
+        readFileSync(resolve(root, 'scripts', filename), 'utf8'),
+        'utf8',
+      )
+    }
+    symlinkSync(resolve(root, 'node_modules'), resolve(temporaryRoot, 'node_modules'), 'junction')
+    writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module","version":"1.2.3-fixture"}\n', 'utf8')
+    writeFileSync(resolve(temporaryRoot, 'src', 'index.ts'), 'export const fixture = true\n', 'utf8')
+    writeFileSync(resolve(temporaryRoot, 'src', 'cli.ts'), '#!/usr/bin/env node\nexport {}\n', 'utf8')
+    writeFileSync(
+      resolve(temporaryRoot, 'tsconfig.build.json'),
+      `${JSON.stringify({
+        compilerOptions: {
+          declaration: true,
+          declarationDir: './dist',
+          emitDeclarationOnly: true,
+          module: 'NodeNext',
+          moduleResolution: 'NodeNext',
+          noEmit: false,
+          rootDir: './src',
+          target: 'ES2024',
+        },
+        include: ['src/**/*.ts'],
+      })}\n`,
+      'utf8',
+    )
+    const result = spawnSync('bun', ['run', resolve(temporaryRoot, 'scripts', 'build.ts')], {
+      cwd: temporaryRoot,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+    assert.equal(
+      readFileSync(resolve(temporaryRoot, 'src', 'generated', 'version.ts'), 'utf8'),
+      renderPackageVersionSource('1.2.3-fixture'),
+    )
+  } finally {
+    rmSync(temporaryRoot, { force: true, recursive: true })
+  }
 })
 
 test('generated-version check adapters reject stale or missing source with recovery guidance', () => {

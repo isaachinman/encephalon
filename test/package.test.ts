@@ -278,6 +278,9 @@ describe('package contract', () => {
     const generatedVersionScript = String(packageJson.scripts?.['check:generated'])
     const publishScript = String(packageJson.scripts?.['check:publish'])
     const workflowCheckScript = String(packageJson.scripts?.['check:workflows'])
+    const readmeProse = readme.replaceAll(/\s+/g, ' ')
+    const contractProse = contract.replaceAll(/\s+/g, ' ')
+    const releaseChecksPlanProse = releaseChecksPlan.replaceAll(/\s+/g, ' ')
     const eventsStart = workflow.indexOf('\non:\n') + 1
     const permissionsStart = workflow.indexOf('\npermissions:\n', eventsStart)
     const jobsStart = workflow.indexOf('\njobs:\n')
@@ -419,20 +422,20 @@ jobs:
 `,
     )
     assert.match(readme, /four verification lanes/)
-    assert.match(readme, /release-equivalent package gate[^\n]+pull requests[^\n]+trusted pushes to `main`/)
-    assert.match(readme, /trusted pushes to `main`[^\n]+upload[^\n]+`npm pack` tarball/i)
-    assert.match(readme, /`bun run check:generated`[^\n]+without modifying/)
-    assert.match(readme, /workflow jobs[^\n]+before any build/)
-    assert.match(contract, /release-equivalent package gate[^\n]+pull requests[^\n]+trusted pushes to `main`/)
-    assert.match(contract, /trusted pushes to `main`[^\n]+upload[^\n]+tarball/i)
-    assert.match(contract, /`bun run check:generated`[^\n]+non-mutatively[^\n]+before any build/)
+    assert.match(readmeProse, /release-equivalent package gate[^.]+pull requests[^.]+trusted pushes to `main`/)
+    assert.match(readmeProse, /trusted pushes to `main`[^.]+upload[^.]+`npm pack` tarball/i)
+    assert.match(readmeProse, /`bun run check:generated`[^.]+without modifying/)
+    assert.match(readmeProse, /workflow jobs[^.]+before any build/)
+    assert.match(contractProse, /release-equivalent package gate[^.]+pull requests[^.]+trusted pushes to `main`/)
+    assert.match(contractProse, /trusted pushes to `main`[^.]+upload[^.]+tarball/i)
+    assert.match(contractProse, /`bun run check:generated`[^.]+non-mutatively[^.]+before any build/)
     const requiredBranchProtection =
       /After (?:the guarded )?rollout, branch protection must require exactly `verify \(ubuntu-latest\)`, `verify \(macos-latest\)`, `verify \(windows-latest\)`, `verify \(ubuntu-current\)`, and `Release-equivalent package gate`/
     assert.deepEqual(
-      [readme, contract].map(document => requiredBranchProtection.test(document)),
+      [readmeProse, contractProse].map(document => requiredBranchProtection.test(document)),
       [true, true],
     )
-    assert.match(releaseChecksPlan, /job-level `if`[^\n]+does not prove[^\n]+false assurance/)
+    assert.match(releaseChecksPlanProse, /job-level `if`[^.]+does not prove[^.]+false assurance/)
     assert.equal(generatedVersionScript, 'bun run scripts/check-generated-version.ts')
     assert.equal(workflowCheckScript, 'bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts')
     assert.equal(publishScript, 'bun run scripts/check-publish.ts')
