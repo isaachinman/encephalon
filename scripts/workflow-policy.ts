@@ -10,6 +10,7 @@ import {
   realpathSync,
 } from 'node:fs'
 import { extname, relative, resolve, sep } from 'node:path'
+import { parseDocument } from 'yaml'
 import { sameStableEntryMetadata } from '../src/filesystem-entry.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 
@@ -40,6 +41,11 @@ type ExecutableSource = Readonly<{
   kind: ExecutableReference['kind']
   path: string
   visitKey: string
+}>
+
+type ExecutableReferencesResult = Readonly<{
+  accepted: boolean
+  references: readonly ExecutableReference[]
 }>
 
 type WorkflowPolicyLimits = Readonly<{
@@ -212,6 +218,31 @@ const isPlainObject = (value: unknown): value is ParsedObject => {
     plain = prototype === Object.prototype || prototype === null
   }
   return plain
+}
+
+/** @internal */
+export const parseWorkflowDocument = (source: string) => {
+  let parsed: ParsedObject | undefined
+  try {
+    const document = parseDocument(source, {
+      logLevel: 'error',
+      merge: false,
+      schema: 'core',
+      strict: true,
+      stringKeys: true,
+      uniqueKeys: true,
+      version: '1.2',
+    })
+    if (document.errors.length === 0 && document.warnings.length === 0) {
+      const value: unknown = document.toJS({ maxAliasCount: 100 })
+      if (isPlainObject(value)) {
+        parsed = value
+      }
+    }
+  } catch {
+    parsed = undefined
+  }
+  return parsed
 }
 
 const relativeFile = (root: string, path: string) => relative(root, path).split(sep).join('/')
@@ -602,31 +633,81 @@ const revalidateWorkflowDiscovery = (
   return accepted
 }
 
-const stepReferences = (value: unknown, location: string): readonly ExecutableReference[] => {
-  let references: readonly ExecutableReference[] = []
-  if (Array.isArray(value)) {
-    references = value.flatMap((step, index) => {
-      let stepReference: readonly ExecutableReference[] = []
-      if (isPlainObject(step) && typeof step.uses === 'string') {
-        stepReference = [
-          {
-            kind: 'action',
-            location: `${location}[${String(index)}].uses`,
-            reference: step.uses,
-          },
-        ]
+type StepReferenceFrame =
+  | Readonly<{ kind: 'enter'; location: string; value: unknown }>
+  | Readonly<{ kind: 'exit'; value: object }>
+
+type StructuralObjectBudget = {
+  maximum: number
+  objects: number
+  visited: WeakSet<object>
+}
+
+const stepReferences = (
+  value: unknown,
+  location: string,
+  supportsParallel: boolean,
+  budget: StructuralObjectBudget,
+): ExecutableReferencesResult => {
+  const active = new WeakSet<object>()
+  const references: ExecutableReference[] = []
+  const stack: StepReferenceFrame[] = [{ kind: 'enter', location, value }]
+  let accepted = true
+  while (accepted && stack.length > 0) {
+    const frame = stack.pop()
+    if (frame?.kind === 'exit') {
+      active.delete(frame.value)
+    } else if (frame?.kind === 'enter') {
+      const structural = Array.isArray(frame.value) || isPlainObject(frame.value)
+      if (structural) {
+        const object = frame.value
+        if (active.has(object)) {
+          accepted = false
+        } else {
+          if (!budget.visited.has(object)) {
+            budget.visited.add(object)
+            budget.objects += 1
+            accepted = budget.objects <= budget.maximum
+          }
+          if (accepted) {
+            active.add(object)
+            stack.push({ kind: 'exit', value: object })
+            if (Array.isArray(object)) {
+              for (let index = object.length - 1; index >= 0; index -= 1) {
+                stack.push({ kind: 'enter', location: `${frame.location}[${String(index)}]`, value: object[index] })
+              }
+            } else {
+              if (typeof object.uses === 'string') {
+                references.push({
+                  kind: 'action',
+                  location: `${frame.location}.uses`,
+                  reference: object.uses,
+                })
+              }
+              if (supportsParallel && Array.isArray(object.parallel)) {
+                stack.push({ kind: 'enter', location: `${frame.location}.parallel`, value: object.parallel })
+              }
+            }
+          }
+        }
       }
-      return stepReference
-    })
+    }
   }
-  return references
+  return { accepted, references }
 }
 
 const executableReferences = (
   document: ParsedObject,
   kind: ExecutableReference['kind'],
-): readonly ExecutableReference[] => {
+  maximumStructuralObjects: number,
+): ExecutableReferencesResult => {
+  let accepted = true
   let references: readonly ExecutableReference[] = []
+  const structuralObjectBudget: StructuralObjectBudget = {
+    maximum: maximumStructuralObjects,
+    objects: 0,
+    visited: new WeakSet<object>(),
+  }
   if (kind === 'workflow' && isPlainObject(document.jobs)) {
     references = Object.entries(document.jobs).flatMap(([jobName, job]) => {
       let jobReferences: readonly ExecutableReference[] = []
@@ -641,7 +722,9 @@ const executableReferences = (
                 },
               ]
             : []
-        jobReferences = [...reusableWorkflow, ...stepReferences(job.steps, `jobs.${jobName}.steps`)]
+        const steps = stepReferences(job.steps, `jobs.${jobName}.steps`, true, structuralObjectBudget)
+        accepted = accepted && steps.accepted
+        jobReferences = [...reusableWorkflow, ...steps.references]
       }
       return jobReferences
     })
@@ -651,9 +734,16 @@ const executableReferences = (
       document.runs.using === 'docker' && typeof dockerImage === 'string' && dockerImage.startsWith('docker://')
         ? [{ kind: 'action' as const, location: 'runs.image', reference: dockerImage }]
         : []
-    references = [...dockerImageReference, ...stepReferences(document.runs.steps, 'runs.steps')]
+    const { accepted: stepsAccepted, references: stepActionReferences } = stepReferences(
+      document.runs.steps,
+      'runs.steps',
+      false,
+      structuralObjectBudget,
+    )
+    accepted = stepsAccepted
+    references = [...dockerImageReference, ...stepActionReferences]
   }
-  return references
+  return { accepted, references }
 }
 
 const hasProtectedEnvironment = (value: unknown) => {
@@ -955,14 +1045,7 @@ export const inspectWorkflowPolicy = (
       }
 
       if (traversalIntegrityAccepted && validatedFile !== undefined) {
-        try {
-          const parsed = Bun.YAML.parse(validatedFile.contents)
-          if (isPlainObject(parsed)) {
-            document = parsed
-          }
-        } catch {
-          document = undefined
-        }
+        document = parseWorkflowDocument(validatedFile.contents)
       }
 
       if (traversalIntegrityAccepted) {
@@ -975,7 +1058,10 @@ export const inspectWorkflowPolicy = (
           }
 
           if (traversalIntegrityAccepted) {
-            for (const reference of executableReferences(document, source.kind)) {
+            // Executable traversal shares the parsed-tree ceiling used by workflow secret scanning.
+            const executable = executableReferences(document, source.kind, limits.maximumSecretTreeNodes)
+            traversalIntegrityAccepted = executable.accepted
+            for (const reference of executable.references) {
               if (traversalIntegrityAccepted) {
                 if (localReference.test(reference.reference)) {
                   const workspaceRelativeAction = reference.kind === 'action' && reference.reference.startsWith('./')

@@ -21,6 +21,7 @@ import {
   formatWorkflowPolicyFindings,
   inspectWorkflowPolicy,
   isContainedComparablePath,
+  parseWorkflowDocument,
   readValidatedNativeFile,
 } from './workflow-policy.ts'
 
@@ -50,7 +51,6 @@ type PullfrogWorkflow = Record<string, unknown> & {
   permissions?: unknown
   'run-name'?: unknown
   on?: unknown
-  true?: unknown
 }
 
 type WorkflowStep = Readonly<{
@@ -97,18 +97,11 @@ const assertExactPullfrogJob = (job: PullfrogJob) => {
 }
 
 const assertExactPullfrogWorkflow = (workflow: PullfrogWorkflow) => {
-  const triggerKeys = Object.keys(workflow).filter(key => key === 'on' || key === 'true')
-  assert.equal(triggerKeys.length, 1)
-  assert.deepEqual(
-    Object.keys(workflow)
-      .filter(key => key !== 'on' && key !== 'true')
-      .toSorted(),
-    ['jobs', 'name', 'permissions', 'run-name'],
-  )
+  assert.deepEqual(Object.keys(workflow).toSorted(), ['jobs', 'name', 'on', 'permissions', 'run-name'])
   assert.equal(workflow.name, 'Pullfrog')
   assert.equal(workflow['run-name'], `${'$'}{{ inputs.name || github.workflow }}`)
   assert.deepEqual(workflow.permissions, { contents: 'read' })
-  assert.deepEqual(workflow.on ?? workflow.true, {
+  assert.deepEqual(workflow.on, {
     workflow_dispatch: {
       inputs: {
         name: {
@@ -870,6 +863,227 @@ jobs:
   })
 
   assert.deepEqual(inspectWorkflowPolicy(root), [])
+})
+
+// Mutation caught: YAML 1.1 boolean-key coercion would merge distinct valid GitHub job identifiers.
+test('preserves YAML 1.2 job identifiers in block and flow mappings', () => {
+  const jobNames = ['on', 'yes', 'no', 'off', 'true', 'false'] as const
+  const blockJobs = jobNames
+    .map(
+      jobName => `  ${jobName}:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/action@v1`,
+    )
+    .join('\n')
+  const flowJobs = jobNames
+    .map(jobName => `${jobName}: { runs-on: ubuntu-latest, steps: [ { uses: owner/action@v1 } ] }`)
+    .join(', ')
+  const root = createFixture({
+    '.github/workflows/block.yml': `name: Block keys
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+${blockJobs}
+`,
+    '.github/workflows/flow.yml': `name: Flow keys
+on: workflow_dispatch
+permissions: { contents: read }
+jobs: { ${flowJobs} }
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    { file: '.github/workflows/block.yml', location: 'jobs.false.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/block.yml', location: 'jobs.no.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/block.yml', location: 'jobs.off.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/block.yml', location: 'jobs.on.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/block.yml', location: 'jobs.true.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/block.yml', location: 'jobs.yes.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/flow.yml', location: 'jobs.false.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/flow.yml', location: 'jobs.no.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/flow.yml', location: 'jobs.off.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/flow.yml', location: 'jobs.on.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/flow.yml', location: 'jobs.true.steps[0].uses', rule: 'external-reference-sha' },
+    { file: '.github/workflows/flow.yml', location: 'jobs.yes.steps[0].uses', rule: 'external-reference-sha' },
+  ])
+})
+
+// Mutation caught: rejecting all aliases or quoted keys would exclude unambiguous YAML 1.2 workflow documents.
+test('accepts quoted keys and bounded simple aliases', () => {
+  const root = createFixture({
+    '.github/workflows/aliases.yml': `name: Aliases
+"on": workflow_dispatch
+permissions: &read
+  contents: read
+jobs:
+  "on": &job
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/action@0123456789abcdef0123456789abcdef01234567
+  "yes": *job
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [])
+})
+
+// Mutation caught: permissive parsing would silently overwrite ambiguous keys, accept extra documents, or expand aliases without a ceiling.
+test('rejects ambiguous or unsafe YAML documents as source integrity failures', () => {
+  const aliases = Array.from({ length: 100 }, () => '  - *item').join('\n')
+  const root = createFixture({
+    '.github/workflows/boolean-equivalent.yml': `name: Boolean equivalent
+on: workflow_dispatch
+permissions: { contents: read }
+jobs:
+  true: {}
+  "true": {}
+`,
+    '.github/workflows/escaped-equivalent.yml': `name: Escaped equivalent
+on: workflow_dispatch
+permissions: { contents: read }
+jobs:
+  "verify": {}
+  "\\x76erify": {}
+`,
+    '.github/workflows/exact-duplicate.yml': `name: Exact duplicate
+on: workflow_dispatch
+permissions: {}
+permissions: { contents: read }
+jobs: {}
+`,
+    '.github/workflows/excessive-aliases.yml': `name: Excessive aliases
+on: workflow_dispatch
+permissions: { contents: read }
+item: &item value
+items:
+${aliases}
+jobs: {}
+`,
+    '.github/workflows/flow-duplicate.yml': `name: Flow duplicate
+on: workflow_dispatch
+permissions: { contents: read }
+jobs: { verify: {}, verify: {} }
+`,
+    '.github/workflows/multiple-documents.yml': `name: First
+on: workflow_dispatch
+permissions: { contents: read }
+jobs: {}
+---
+name: Second
+on: workflow_dispatch
+permissions: { contents: read }
+jobs: {}
+`,
+    '.github/workflows/non-scalar-key.yml': `name: Non-scalar key
+on: workflow_dispatch
+permissions: { contents: read }
+? [jobs, alias]
+: {}
+jobs: {}
+`,
+    '.github/workflows/quoted-equivalent.yml': `name: Quoted equivalent
+on: workflow_dispatch
+permissions: { contents: read }
+jobs:
+  verify: {}
+  "verify": {}
+`,
+    '.github/workflows/unknown-tag.yml': `name: !unknown Tagged
+on: workflow_dispatch
+permissions: { contents: read }
+jobs: {}
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    { file: '.github/workflows/boolean-equivalent.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/escaped-equivalent.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/exact-duplicate.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/excessive-aliases.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/flow-duplicate.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/multiple-documents.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/non-scalar-key.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/quoted-equivalent.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/unknown-tag.yml', location: '$', rule: 'source-integrity' },
+  ])
+})
+
+// Mutation caught: inspecting only direct workflow steps would allow parallel groups to conceal mutable actions and wrappers.
+test('inspects nested workflow parallel groups without treating composite or data fields as executable', () => {
+  const root = createFixture({
+    '.github/actions/composite-data/action.yml': `name: Composite data
+runs:
+  using: composite
+  steps:
+    - parallel:
+        - uses: owner/composite-data@v1
+`,
+    '.github/actions/wrapper/action.yml': `name: Wrapper
+runs:
+  using: composite
+  steps:
+    - uses: owner/wrapped@v1
+`,
+    '.github/workflows/parallel.yml': `name: Parallel
+on: workflow_dispatch
+permissions: { contents: read }
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    metadata:
+      parallel:
+        - uses: owner/job-data@v1
+    steps:
+      - uses: $/.github/actions/composite-data
+        with:
+          parallel:
+            - uses: owner/input-data@v1
+      - parallel:
+          - uses: owner/direct@v1
+          - uses: $/.github/actions/wrapper
+          - parallel:
+              - uses: owner/nested@v2
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/actions/wrapper/action.yml',
+      location: 'runs.steps[0].uses',
+      rule: 'external-reference-sha',
+    },
+    {
+      file: '.github/workflows/parallel.yml',
+      location: 'jobs.verify.steps[1].parallel[0].uses',
+      rule: 'external-reference-sha',
+    },
+    {
+      file: '.github/workflows/parallel.yml',
+      location: 'jobs.verify.steps[1].parallel[2].parallel[0].uses',
+      rule: 'external-reference-sha',
+    },
+  ])
+})
+
+// Mutation caught: recursively following a cyclic parallel alias would loop or overflow instead of failing closed once.
+test('rejects cyclic workflow parallel groups without recursive stack growth', () => {
+  const root = createFixture({
+    '.github/workflows/cyclic-parallel.yml': `name: Cyclic parallel
+on: workflow_dispatch
+permissions: { contents: read }
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps: &steps
+      - parallel: *steps
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    { file: '.github/workflows', location: '$', rule: 'source-integrity' },
+  ])
 })
 
 test('inspects only executable uses positions', () => {
@@ -2132,14 +2346,14 @@ test('repository workflows obey immutable action and credential boundaries', () 
   assert.deepEqual(inspectWorkflowPolicy(repositoryRoot), [])
 
   // Mutation caught: removing push: disabled would restore Pullfrog's write-capable Git token and push tools.
-  const pullfrogWorkflow = Bun.YAML.parse(
+  const parsedPullfrogWorkflow = parseWorkflowDocument(
     readFileSync(join(repositoryRoot, '.github/workflows/pullfrog.yml'), 'utf8'),
-  ) as PullfrogWorkflow
+  )
+  assert.notEqual(parsedPullfrogWorkflow, undefined)
+  const pullfrogWorkflow = parsedPullfrogWorkflow as PullfrogWorkflow
   const pullfrogJob = pullfrogWorkflow.jobs.pullfrog
   assertExactPullfrogWorkflow(pullfrogWorkflow)
-  const { true: bunTrigger, ...stablePullfrogWorkflow } = pullfrogWorkflow
-  assertExactPullfrogWorkflow({ ...stablePullfrogWorkflow, on: bunTrigger })
-  assert.throws(() => assertExactPullfrogWorkflow({ ...pullfrogWorkflow, on: pullfrogWorkflow.true }))
+  assert.throws(() => assertExactPullfrogWorkflow({ ...pullfrogWorkflow, on: undefined }))
 
   // Mutations caught: credentials cannot be inherited from workflow scope and action families cannot hide in sibling jobs.
   assert.throws(() =>
@@ -2179,9 +2393,9 @@ test('repository workflows obey immutable action and credential boundaries', () 
     }),
   )
 
-  const ciWorkflow = Bun.YAML.parse(
-    readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8'),
-  ) as CiWorkflow
+  const parsedCiWorkflow = parseWorkflowDocument(readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8'))
+  assert.notEqual(parsedCiWorkflow, undefined)
+  const ciWorkflow = parsedCiWorkflow as CiWorkflow
   assert.deepEqual(
     ciWorkflow.jobs.verify.steps.filter(step => step.uses !== undefined).map(step => step.uses),
     [
@@ -2208,7 +2422,7 @@ test('repository workflows obey immutable action and credential boundaries', () 
     true,
   )
 
-  // Bun's YAML parser discards comments, so raw lines deliberately bind each reviewed SHA to its adjacent release.
+  // Structural YAML parsing discards comments, so raw lines deliberately bind each reviewed SHA to its adjacent release.
   const ciWorkflowSource = readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8')
   assert.deepEqual(
     ciWorkflowSource.split('\n').filter(line => /^\s+(?:- )?uses:/u.test(line)),
@@ -2232,7 +2446,9 @@ test('repository workflows obey immutable action and credential boundaries', () 
     ],
   )
 
-  const dependabotConfiguration = Bun.YAML.parse(readFileSync(join(repositoryRoot, '.github/dependabot.yml'), 'utf8'))
+  const dependabotConfiguration = parseWorkflowDocument(
+    readFileSync(join(repositoryRoot, '.github/dependabot.yml'), 'utf8'),
+  )
   assert.deepEqual(dependabotConfiguration, {
     updates: [
       {

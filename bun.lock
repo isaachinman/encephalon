@@ -9,6 +9,7 @@
         "@types/node": "24.13.3",
         "typescript": "7.0.2",
         "ultracite": "7.10.1",
+        "yaml": "2.9.0",
       },
     },
   },

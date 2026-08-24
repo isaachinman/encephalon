@@ -16,6 +16,7 @@ describe('package contract', () => {
     assert.deepEqual(packageJson.engines, { node: '>=24.15.0' })
     assert.deepEqual(packageJson.bin, { encephalon: 'dist/cli.mjs' })
     assert.equal(packageJson.dependencies, undefined)
+    assert.equal((packageJson.files as readonly unknown[]).includes('scripts'), false)
 
     const scripts = packageJson.scripts as Record<string, unknown> | undefined
     assert.equal(scripts?.install, undefined)
@@ -24,7 +25,7 @@ describe('package contract', () => {
     assert.equal(scripts?.prepare, undefined)
   })
 
-  test('keeps Bun declarations development-only and scripts-scoped', () => {
+  test('keeps workflow tooling development-only and scripts-scoped', () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       devDependencies?: Readonly<Record<string, unknown>>
     }
@@ -45,6 +46,7 @@ describe('package contract', () => {
       .map(({ file }) => file)
 
     assert.equal(packageJson.devDependencies?.['@types/bun'], '1.3.1')
+    assert.equal(packageJson.devDependencies?.yaml, '2.9.0')
     assert.deepEqual(bunTypedProjects, ['tsconfig.scripts.json'])
     assert.deepEqual(skippedLibraryCheckProjects, ['tsconfig.scripts.json'])
     assert.equal(existsSync(resolve(root, 'scripts', 'bun-runtime.d.ts')), false)
