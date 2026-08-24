@@ -260,6 +260,59 @@ describe('lock candidate maintenance', () => {
     }
   })
 
+  test('stops maintenance when candidate quarantine failure reveals current-lock replacement', () => {
+    const root = createRoot()
+    const token = tokenFor(0x2_10)
+    const path = candidatePath(root, token)
+    const lockPath = join(cacheDirectory(root), 'operation.lock')
+    const displaced = join(root, 'displaced-quarantine-failure-lock')
+    const successorBytes = 'successor installed during candidate quarantine'
+    const entries = [entryFor(token), entryFor(tokenFor(0x2_11))]
+    let operationEntered = false
+    let reads = 0
+    let successorIdentity: Readonly<{ dev: bigint; ino: bigint }> | undefined
+    mkdirSync(path, { recursive: true })
+    age(path)
+    cacheLocationTestHooks.beforeQuarantineRename = current => {
+      if (basename(current) === basename(path)) {
+        cacheLocationTestHooks.beforeQuarantineRename = undefined
+        renameSync(lockPath, displaced)
+        mkdirSync(lockPath)
+        writeFileSync(join(lockPath, 'successor'), successorBytes)
+        successorIdentity = identityOf(lockPath)
+        throw Object.assign(new Error('candidate quarantine failed after lock replacement'), { code: 'EIO' })
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(
+          root,
+          () => {
+            operationEntered = true
+          },
+          {
+            openCandidateDirectory: () => ({
+              closeSync: () => undefined,
+              readSync: () => {
+                const entry = entries[reads] ?? null
+                reads += 1
+                return entry
+              },
+            }),
+          },
+        ),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(reads, 1)
+    assert.equal(operationEntered, false)
+    assert.deepEqual(identityOf(lockPath), successorIdentity)
+    assert.equal(readFileSync(join(lockPath, 'successor'), 'utf8'), successorBytes)
+  })
+
   test('resumes a retained reader until a reclaimable suffix is reached', () => {
     const root = createRoot()
     const token = '00000000-0000-4000-8000-000000000001'

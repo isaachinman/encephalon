@@ -209,6 +209,7 @@ const reclaimCandidate = (
   token: string,
   evidence: CandidateEvidence,
   now: number,
+  assertCurrentLock: (() => void) | undefined,
 ) => {
   let moved = false
   const remainsAbandoned = () => {
@@ -226,6 +227,7 @@ const reclaimCandidate = (
       },
     })
   } catch {
+    assertCurrentLock?.()
     assertCacheLocation(location)
   }
   return moved
@@ -274,7 +276,16 @@ export const maintainLockCandidates = (
           const token = match[1] as string
           if (evidence !== undefined && candidateIsAbandoned(location, evidence, token, (options.now ?? Date.now)())) {
             stats.reclamationAttempts += 1
-            if (reclaimCandidate(location, entry.name, token, evidence, (options.now ?? Date.now)())) {
+            if (
+              reclaimCandidate(
+                location,
+                entry.name,
+                token,
+                evidence,
+                (options.now ?? Date.now)(),
+                options.assertCurrentLock,
+              )
+            ) {
               stats.candidatesReclaimed += 1
             }
           }
