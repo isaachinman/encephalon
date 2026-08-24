@@ -6,6 +6,7 @@ import {
   DirectoryWitnessError,
   revalidateDirectoryWitness,
 } from './directory-witness.ts'
+import { sameEntryIdentity } from './filesystem-entry.ts'
 import { ordinalStringCompare } from './order.ts'
 
 export const MAX_CANONICAL_BRAIN_ROOT_ENTRIES = 1002
@@ -83,6 +84,7 @@ export const isCanonicalDirectoryReplacementError = (error: unknown) => {
 
 export type CanonicalDirectorySnapshot = {
   entries: Dirent[]
+  maximum: number
   overflow: boolean
   witness: DirectoryWitness
 }
@@ -99,7 +101,7 @@ export const captureCanonicalDirectory = (
     const collected = collectBoundedDirectoryEntries(witness.canonicalPath, maximum, undefined, onEntry)
     afterEnumeration?.(path)
     revalidateDirectoryWitness(witness)
-    return { ...collected, witness }
+    return { ...collected, maximum, witness }
   } catch (error) {
     if (isCanonicalDirectoryReplacementError(error)) {
       throw new CanonicalDirectoryChangedError(path, { cause: error })
@@ -107,6 +109,39 @@ export const captureCanonicalDirectory = (
     throw error
   }
 }
+
+type CanonicalEntryType = 'directory' | 'file' | 'other' | 'symlink'
+
+const canonicalEntryType = (entry: Dirent): CanonicalEntryType => {
+  if (entry.isSymbolicLink()) {
+    return 'symlink'
+  }
+  if (entry.isDirectory()) {
+    return 'directory'
+  }
+  if (entry.isFile()) {
+    return 'file'
+  }
+  return 'other'
+}
+
+export const sameCanonicalDirectoryGeneration = (
+  first: CanonicalDirectorySnapshot,
+  second: CanonicalDirectorySnapshot,
+) =>
+  first.witness.path === second.witness.path &&
+  first.witness.canonicalPath === second.witness.canonicalPath &&
+  sameEntryIdentity(first.witness.pathMetadata, second.witness.pathMetadata) &&
+  sameEntryIdentity(first.witness.canonicalMetadata, second.witness.canonicalMetadata) &&
+  first.overflow === second.overflow &&
+  first.entries.length === second.entries.length &&
+  first.entries.every((entry, index) => {
+    const other = second.entries[index]
+    return other !== undefined && entry.name === other.name && canonicalEntryType(entry) === canonicalEntryType(other)
+  })
+
+export const recaptureCanonicalDirectoryGeneration = (snapshot: CanonicalDirectorySnapshot) =>
+  captureCanonicalDirectory(snapshot.witness.path, snapshot.maximum)
 
 export const revalidateCanonicalDirectory = (snapshot: CanonicalDirectorySnapshot) => {
   try {
