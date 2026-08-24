@@ -34,16 +34,50 @@ export type ArtifactObservation = Readonly<{
   path: string
 }>
 
+type ArtifactDirectoryEvidence = Readonly<{
+  canonicalMetadata: BigIntStats
+  canonicalPath: string
+  path: string
+  pathMetadata: BigIntStats
+}>
+
+type ArtifactInvalidReason =
+  | 'ancestor-canonical-path'
+  | 'ancestor-missing'
+  | 'ancestor-type'
+  | 'artifact-missing'
+  | 'artifact-name'
+  | 'artifact-type'
+  | 'brain-missing'
+  | 'brain-type'
+
+type ArtifactInvalidEvidence = Readonly<{
+  entryMetadata?: BigIntStats
+  parent?: ArtifactDirectoryEvidence
+  reason: ArtifactInvalidReason
+}>
+
 export type ArtifactInspectionResult =
-  | Readonly<{ error: ArtifactInvalidError; kind: 'invalid'; path: string }>
+  | Readonly<{
+      error: ArtifactInvalidError
+      evidence: ArtifactInvalidEvidence
+      kind: 'invalid'
+      path: string
+    }>
   | Readonly<{ kind: 'stable'; observation: ArtifactObservation }>
 
 type StableArtifactInspection = Extract<ArtifactInspectionResult, { kind: 'stable' }>
 
 export class ArtifactInvalidError extends Error {
-  constructor(message = 'Artifact must be an existing regular non-symlink file.') {
+  readonly evidence: ArtifactInvalidEvidence
+
+  constructor(
+    message = 'Artifact must be an existing regular non-symlink file.',
+    evidence: ArtifactInvalidEvidence = Object.freeze({ reason: 'artifact-missing' }),
+  ) {
     super(message)
     this.name = 'ArtifactInvalidError'
+    this.evidence = evidence
   }
 }
 
@@ -59,12 +93,67 @@ const nonBlockFlag = typeof constants.O_NONBLOCK === 'number' ? constants.O_NONB
 const noControllingTerminalFlag = typeof constants.O_NOCTTY === 'number' ? constants.O_NOCTTY : 0
 const artifactOpenFlags = constants.O_RDONLY | noFollowFlag | nonBlockFlag | noControllingTerminalFlag
 
+const directoryEvidence = (witness: DirectoryWitness): ArtifactDirectoryEvidence =>
+  Object.freeze({
+    canonicalMetadata: Object.freeze(witness.canonicalMetadata),
+    canonicalPath: witness.canonicalPath,
+    path: witness.path,
+    pathMetadata: Object.freeze(witness.pathMetadata),
+  })
+
+const invalidEvidence = (
+  reason: ArtifactInvalidReason,
+  parent?: DirectoryWitness,
+  entryMetadata?: BigIntStats,
+): ArtifactInvalidEvidence =>
+  Object.freeze({
+    ...(entryMetadata === undefined ? {} : { entryMetadata: Object.freeze(entryMetadata) }),
+    ...(parent === undefined ? {} : { parent: directoryEvidence(parent) }),
+    reason,
+  })
+
+const sameDirectoryEvidence = (first: ArtifactDirectoryEvidence, second: ArtifactDirectoryEvidence) =>
+  first.path === second.path &&
+  first.canonicalPath === second.canonicalPath &&
+  sameStableEntryMetadata(first.pathMetadata, second.pathMetadata) &&
+  sameStableEntryMetadata(first.canonicalMetadata, second.canonicalMetadata)
+
+const sameOptionalDirectoryEvidence = (
+  first: ArtifactDirectoryEvidence | undefined,
+  second: ArtifactDirectoryEvidence | undefined,
+) => (first === undefined ? second === undefined : second !== undefined && sameDirectoryEvidence(first, second))
+
+const sameOptionalMetadata = (first: BigIntStats | undefined, second: BigIntStats | undefined) =>
+  first === undefined ? second === undefined : second !== undefined && sameStableEntryMetadata(first, second)
+
+const sameInvalidEvidence = (first: ArtifactInvalidEvidence, second: ArtifactInvalidEvidence) =>
+  first.reason === second.reason &&
+  sameOptionalDirectoryEvidence(first.parent, second.parent) &&
+  sameOptionalMetadata(first.entryMetadata, second.entryMetadata)
+
+const artifactInspectionPath = (result: ArtifactInspectionResult) =>
+  result.kind === 'stable' ? result.observation.path : result.path
+
+export const sameArtifactInspectionResult = (first: ArtifactInspectionResult, second: ArtifactInspectionResult) =>
+  artifactInspectionPath(first) === artifactInspectionPath(second) &&
+  (first.kind === 'stable'
+    ? second.kind === 'stable' && sameStableEntryMetadata(first.observation.metadata, second.observation.metadata)
+    : second.kind === 'invalid' &&
+      first.error.name === second.error.name &&
+      first.error.message === second.error.message &&
+      sameInvalidEvidence(first.evidence, second.evidence))
+
 const changed = (): never => {
   throw new ArtifactChangedError()
 }
 
-const invalid = (): never => {
-  throw new ArtifactInvalidError()
+const invalid = (evidence: ArtifactInvalidEvidence): never => {
+  throw new ArtifactInvalidError(undefined, evidence)
+}
+
+const invalidResult = (path: string, evidence: ArtifactInvalidEvidence) => {
+  const error = new ArtifactInvalidError(undefined, evidence)
+  return Object.freeze({ error, evidence, kind: 'invalid' as const, path })
 }
 
 const isReplacementError = (error: unknown) => {
@@ -96,7 +185,7 @@ const captureAncestor = (
     const metadata = lstatSync(path, { bigint: true })
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
       revalidateDirectoryWitness(parent)
-      return invalid()
+      return invalid(invalidEvidence('ancestor-type', parent, metadata))
     }
     hooks.fault?.('after-ancestor-lstat', artifact)
     const witness = captureDirectoryWitness(path, { allowLink: false })
@@ -106,7 +195,7 @@ const captureAncestor = (
     }
     if (witness.canonicalPath !== path) {
       revalidateDirectories([parent, witness])
-      return invalid()
+      return invalid(invalidEvidence('ancestor-canonical-path', parent, witness.pathMetadata))
     }
     revalidateDirectoryWitness(parent)
     return witness
@@ -117,7 +206,7 @@ const captureAncestor = (
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       try {
         revalidateDirectoryWitness(parent)
-        return invalid()
+        return invalid(invalidEvidence('ancestor-missing', parent))
       } catch (revalidationError) {
         if (revalidationError instanceof DirectoryWitnessError || isReplacementError(revalidationError)) {
           return changed()
@@ -158,7 +247,7 @@ const inspectFinalFile = (
   }
   const name = artifact.split('/').at(-1)
   if (name === undefined || name.length === 0) {
-    return invalid()
+    return invalid(invalidEvidence('artifact-name', parent))
   }
   const path = resolve(parent.canonicalPath, name)
   let pathMetadata: BigIntStats
@@ -167,13 +256,13 @@ const inspectFinalFile = (
   } catch (error) {
     if (isReplacementError(error)) {
       revalidateDirectories(directories)
-      return invalid()
+      return invalid(invalidEvidence('artifact-missing', parent))
     }
     throw error
   }
   if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink()) {
     revalidateDirectories(directories)
-    return invalid()
+    return invalid(invalidEvidence('artifact-type', parent, pathMetadata))
   }
   hooks.fault?.('after-artifact-lstat', artifact)
 
@@ -276,16 +365,14 @@ export const inspectArtifactFiles = (
     brainMetadata = lstatSync(brainDirectory, { bigint: true })
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return Object.freeze(
-        artifacts.map(path => Object.freeze({ error: new ArtifactInvalidError(), kind: 'invalid' as const, path })),
-      )
+      const evidence = invalidEvidence('brain-missing')
+      return Object.freeze(artifacts.map(path => invalidResult(path, evidence)))
     }
     throw error
   }
   if (!brainMetadata.isDirectory() || brainMetadata.isSymbolicLink()) {
-    return Object.freeze(
-      artifacts.map(path => Object.freeze({ error: new ArtifactInvalidError(), kind: 'invalid' as const, path })),
-    )
+    const evidence = invalidEvidence('brain-type', undefined, brainMetadata)
+    return Object.freeze(artifacts.map(path => invalidResult(path, evidence)))
   }
   effectiveHooks.fault?.('after-brain-lstat', '')
   let brain: DirectoryWitness
@@ -305,7 +392,7 @@ export const inspectArtifactFiles = (
       return inspectFinalFile(captureAncestors(brain, artifact, effectiveHooks), artifact, effectiveHooks)
     } catch (error) {
       if (error instanceof ArtifactInvalidError) {
-        return Object.freeze({ error, kind: 'invalid' as const, path: artifact })
+        return Object.freeze({ error, evidence: error.evidence, kind: 'invalid' as const, path: artifact })
       }
       throw error
     }
@@ -314,14 +401,7 @@ export const inspectArtifactFiles = (
   results.reduce<undefined>((verified, result) => {
     const path = result.kind === 'stable' ? result.observation.path : result.path
     const verification = inspectArtifact(path)
-    if (result.kind !== verification.kind) {
-      changed()
-    }
-    if (
-      result.kind === 'stable' &&
-      verification.kind === 'stable' &&
-      !sameStableEntryMetadata(result.observation.metadata, verification.observation.metadata)
-    ) {
+    if (!sameArtifactInspectionResult(result, verification)) {
       changed()
     }
     return verified

@@ -21,6 +21,7 @@ import {
   type ArtifactInspectionResult,
   type ArtifactObservation,
   inspectArtifactFiles,
+  sameArtifactInspectionResult,
 } from './artifact-inspection.ts'
 import {
   hydrateResolvedMutationSnapshot,
@@ -98,6 +99,7 @@ type RecordObservation = {
 }
 
 type ValidatedRecordScan = {
+  artifactEvidence: readonly ArtifactInspectionResult[]
   artifacts: readonly ArtifactObservation[]
   result: ValidateResult
 }
@@ -409,29 +411,29 @@ const fsyncDirectory = (path: string) => {
   }
 }
 
-const assertParentIdentity = (root: string, path: string, expected: EntryIdentity) => {
+const assertParentIdentity = (path: string, expected: EntryIdentity) => {
   const metadata = lstatSync(path, { bigint: true })
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameEntryIdentity(metadata, expected)) {
-    return fail('INVALID_ARGUMENT', 'Record parent directory changed while canonical records were being read.', {
-      path: posixRelative(root, path),
-    })
+    canonicalGenerationChanged()
   }
 }
 
-const readBoundedDescriptor = (descriptor: number, size: bigint) => {
+const invalidRecordReadChange = (): never => fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
+
+const readBoundedDescriptor = (descriptor: number, size: bigint, changed: () => never = invalidRecordReadChange) => {
   const boundedSize = Number(size)
   const buffer = Buffer.alloc(boundedSize)
   let offset = 0
   while (offset < boundedSize) {
     const bytesRead = readSync(descriptor, buffer, offset, boundedSize - offset, offset)
     if (bytesRead === 0) {
-      return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
+      return changed()
     }
     offset += bytesRead
   }
   const extra = Buffer.alloc(1)
   if (readSync(descriptor, extra, 0, 1, boundedSize) > 0) {
-    return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
+    return changed()
   }
   return buffer
 }
@@ -460,23 +462,27 @@ const readRecord = (
   hooks?: RecordReadHooks,
 ): { bytes: Buffer; observation: RecordObservation } => {
   const relativePath = posixRelative(root, path)
-  const pathMetadata = lstatSync(path, { bigint: true })
+  let pathMetadata: BigIntStats
+  try {
+    pathMetadata = lstatSync(path, { bigint: true })
+  } catch (error) {
+    if (isCanonicalDirectoryReplacementError(error)) {
+      return canonicalGenerationChanged()
+    }
+    throw error
+  }
   readFault(hooks, 'after-record-lstat', path)
   let descriptor: number | undefined
   try {
     descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
     readFault(hooks, 'after-record-open', path)
     const metadata = fstatSync(descriptor, { bigint: true })
-    assertParentIdentity(root, kindPath, kindIdentity)
+    assertParentIdentity(kindPath, kindIdentity)
     if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink() || !metadata.isFile()) {
-      return fail('INVALID_ARGUMENT', 'Record file must be a regular non-symlink JSON file.', {
-        path: relativePath,
-      })
+      return canonicalGenerationChanged()
     }
     if (!sameStableEntryMetadata(pathMetadata, metadata)) {
-      return fail('INVALID_ARGUMENT', 'Record file changed while canonical records were being read.', {
-        path: relativePath,
-      })
+      return canonicalGenerationChanged()
     }
     if (metadata.size > BigInt(MAX_RECORD_BYTES)) {
       return fail('INVALID_ARGUMENT', 'Record file exceeds the 1 MiB limit.', {
@@ -484,12 +490,10 @@ const readRecord = (
       })
     }
     readFault(hooks, 'after-record-fstat', path)
-    const bytes = readBoundedDescriptor(descriptor, metadata.size)
+    const bytes = readBoundedDescriptor(descriptor, metadata.size, canonicalGenerationChanged)
     const finalMetadata = fstatSync(descriptor, { bigint: true })
     if (!sameStableEntryMetadata(metadata, finalMetadata)) {
-      return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.', {
-        path: relativePath,
-      })
+      return canonicalGenerationChanged()
     }
     return {
       bytes,
@@ -500,8 +504,14 @@ const readRecord = (
       }),
     }
   } catch (error) {
+    if (error instanceof CanonicalGenerationChanged) {
+      throw error
+    }
     if (error instanceof EncephalonError) {
       throw error
+    }
+    if (isCanonicalDirectoryReplacementError(error)) {
+      return canonicalGenerationChanged()
     }
     return fail('INVALID_ARGUMENT', 'Record file must be a readable regular non-symlink JSON file.', {
       path: relativePath,
@@ -554,12 +564,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       )
     } catch (error) {
       if (error instanceof CanonicalDirectoryChangedError) {
-        return {
-          bytes: 0,
-          errors: [issue('INVALID_RECORD_LAYOUT', 'encephalon changed while it was being validated.', 'encephalon')],
-          observations: [],
-          records: [],
-        }
+        return canonicalGenerationChanged()
       }
       throw error
     }
@@ -589,18 +594,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
         snapshot = captureCanonicalDirectory(kindPath, MAX_CANONICAL_KIND_ENTRIES, options.hooks?.afterKindEnumeration)
       } catch (error) {
         if (error instanceof CanonicalDirectoryChangedError) {
-          return {
-            bytes: 0,
-            errors: [
-              issue(
-                'INVALID_RECORD_LAYOUT',
-                `${relativeKindPath} changed while it was being validated.`,
-                relativeKindPath,
-              ),
-            ],
-            observations: [],
-            records: [],
-          }
+          return canonicalGenerationChanged()
         }
         throw error
       }
@@ -728,6 +722,9 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
                 }
                 scanned.records.push(record)
               } catch (error) {
+                if (error instanceof CanonicalGenerationChanged) {
+                  throw error
+                }
                 const message = error instanceof Error ? error.message : 'Record could not be parsed.'
                 addScanError(issue('INVALID_RECORD', message, relativePath))
               }
@@ -760,20 +757,9 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       revalidateCanonicalDirectory(rootEntries)
     } catch (error) {
       if (error instanceof CanonicalDirectoryChangedError) {
-        if (scanned.errors.length === 0) {
-          const relativePath = posixRelative(root, error.path)
-          return {
-            bytes: 0,
-            errors: [
-              issue('INVALID_RECORD_LAYOUT', `${relativePath} changed while it was being validated.`, relativePath),
-            ],
-            observations: [],
-            records: [],
-          }
-        }
-      } else {
-        throw error
+        return canonicalGenerationChanged()
       }
+      throw error
     }
     options.hooks?.afterBrainRootSnapshot?.()
     ;[...kindSnapshots.values()].reduce<undefined>((verified, snapshot) => {
@@ -964,6 +950,7 @@ const artifactIssues = (root: string, records: BrainRecord[]) => {
           `Canonical corpus may contain at most ${MAX_ARTIFACT_REFERENCES} artifact references.`,
         ),
       ],
+      evidence: Object.freeze([] as ArtifactInspectionResult[]),
       observations: [] as readonly ArtifactObservation[],
     }
   }
@@ -971,15 +958,13 @@ const artifactIssues = (root: string, records: BrainRecord[]) => {
   const paths = new Map<string, string>()
   const errors: ValidationIssue[] = []
   const artifactPaths = [...new Set(records.flatMap(record => record.artifacts ?? []))].sort(ordinalStringCompare)
-  const inspectionResults =
+  const evidence =
     artifactPaths.length === 0
-      ? new Map<string, ArtifactInspectionResult>()
-      : new Map(
-          inspectArtifactFiles(brainDirectory, artifactPaths).map(result => [
-            result.kind === 'stable' ? result.observation.path : result.path,
-            result,
-          ]),
-        )
+      ? Object.freeze([] as ArtifactInspectionResult[])
+      : inspectArtifactFiles(brainDirectory, artifactPaths)
+  const inspectionResults = new Map(
+    evidence.map(result => [result.kind === 'stable' ? result.observation.path : result.path, result]),
+  )
   for (const record of records) {
     for (const artifact of record.artifacts ?? []) {
       const collisionKey = artifact.normalize('NFC').toLowerCase()
@@ -998,12 +983,8 @@ const artifactIssues = (root: string, records: BrainRecord[]) => {
   }
   return {
     errors,
-    observations: Object.freeze(
-      artifactPaths.flatMap(path => {
-        const result = inspectionResults.get(path)
-        return result?.kind === 'stable' ? [result.observation] : []
-      }),
-    ),
+    evidence,
+    observations: Object.freeze(evidence.flatMap(result => (result.kind === 'stable' ? [result.observation] : []))),
   }
 }
 
@@ -1071,6 +1052,7 @@ const validateScannedSnapshot = (root: string, scan: RecordScan, hooks: RecordRe
   ]
   const { errors, truncated } = truncateValidationIssues(collectedErrors)
   return {
+    artifactEvidence: artifactValidation.evidence,
     artifacts: artifactValidation.observations,
     result: {
       errors,
@@ -1218,24 +1200,21 @@ const reinspectRecordObservation = (observation: RecordObservation, changed: () 
   return result ?? changed()
 }
 
-const assertArtifactObservationsCurrent = (
+const artifactEvidencePath = (evidence: ArtifactInspectionResult) =>
+  evidence.kind === 'stable' ? evidence.observation.path : evidence.path
+
+const assertArtifactEvidenceCurrent = (
   root: string,
-  artifacts: readonly ArtifactObservation[],
+  evidence: readonly ArtifactInspectionResult[],
   changed: () => never,
 ) => {
-  if (artifacts.length > 0) {
+  if (evidence.length > 0) {
     try {
-      const current = inspectArtifactFiles(
-        resolve(root, 'encephalon'),
-        artifacts.map(artifact => artifact.path),
-      ).flatMap(result => (result.kind === 'stable' ? [result.observation] : []))
+      const current = inspectArtifactFiles(resolve(root, 'encephalon'), evidence.map(artifactEvidencePath))
       if (
-        current.length !== artifacts.length ||
-        !artifacts.every(
-          (artifact, index) =>
-            current[index] !== undefined &&
-            artifact.path === current[index].path &&
-            sameStableEntryMetadata(artifact.metadata, current[index].metadata),
+        current.length !== evidence.length ||
+        !evidence.every(
+          (expected, index) => current[index] !== undefined && sameArtifactInspectionResult(expected, current[index]),
         )
       ) {
         changed()
@@ -1252,7 +1231,7 @@ const assertArtifactObservationsCurrent = (
 const assertCanonicalSnapshotCurrent = (
   root: string,
   scan: RecordScan,
-  artifacts: readonly ArtifactObservation[],
+  artifactEvidence: readonly ArtifactInspectionResult[],
   changed: () => never,
 ) => {
   if (scan.layout !== undefined) {
@@ -1263,7 +1242,7 @@ const assertCanonicalSnapshotCurrent = (
       reinspectRecordObservation(observation, changed)
       return verified
     }, undefined)
-    assertArtifactObservationsCurrent(root, artifacts, changed)
+    assertArtifactEvidenceCurrent(root, artifactEvidence, changed)
     if (!sameCanonicalLayoutGeneration(root, scan.layout)) {
       changed()
     }
@@ -1296,7 +1275,7 @@ const readStableCanonicalSnapshot = (root: string, hooks: RecordReadHooks = {}):
     hooks.canonicalScan?.()
     const scan = scanCanonicalRecords(root, { hooks })
     const validation = validateScannedSnapshot(root, scan, hooks)
-    assertCanonicalSnapshotCurrent(root, scan, validation.artifacts, canonicalGenerationChanged)
+    assertCanonicalSnapshotCurrent(root, scan, validation.artifactEvidence, canonicalGenerationChanged)
     return { scan, validation }
   })
 
@@ -1373,7 +1352,7 @@ const readRecordScanResolvedUnchecked = (root: string, hooks: RecordReadHooks = 
   const { result } = validation
   if (allowed === undefined) {
     if (result.valid) {
-      return { artifacts: validation.artifacts, scan }
+      return { artifactEvidence: validation.artifactEvidence, artifacts: validation.artifacts, scan }
     }
     return fail('VALIDATION_FAILED', 'Canonical records are invalid.', {
       errors: result.errors.map(error => ({
@@ -1388,7 +1367,7 @@ const readRecordScanResolvedUnchecked = (root: string, hooks: RecordReadHooks = 
       !(error.code === 'MULTIPLE_ACTIVE_HEADS' && error.recordId !== undefined && allowedIds.has(error.recordId)),
   )
   if (blockingErrors.length === 0) {
-    return { artifacts: validation.artifacts, scan }
+    return { artifactEvidence: validation.artifactEvidence, artifacts: validation.artifacts, scan }
   }
   return fail('VALIDATION_FAILED', 'Canonical records are invalid.', {
     errors: blockingErrors.map(error => ({
@@ -1411,12 +1390,12 @@ const canonicalPublicationAuthority = (
   root: string,
   initialLayout: CanonicalLayoutWitness,
   initialObservations: readonly RecordObservation[],
-  initialArtifacts: readonly ArtifactObservation[],
+  initialArtifactEvidence: readonly ArtifactInspectionResult[],
   cacheLocation?: CacheLocation,
 ): CanonicalPublicationAuthority => {
   let layout = initialLayout
   let observations = [...initialObservations]
-  const artifacts = [...initialArtifacts]
+  const artifactEvidence = [...initialArtifactEvidence]
   const currentObservationMetadata = (path: string) => {
     try {
       return lstatSync(path, { bigint: true })
@@ -1566,7 +1545,7 @@ const canonicalPublicationAuthority = (
       assertCanonicalSnapshotCurrent(
         root,
         { bytes: 0, errors: [], layout, observations, records: [] },
-        artifacts,
+        artifactEvidence,
         repositoryChangedBeforePublication,
       )
       if (cacheLocation !== undefined) {
@@ -1585,7 +1564,7 @@ export const readRecordPlanningSnapshotResolved = (
   cacheLocation?: CacheLocation,
 ): RecordPlanningSnapshot => {
   const scan = readStableCanonicalPlanningScan(root, hooks)
-  let artifacts: readonly ArtifactObservation[] = []
+  let artifactEvidence: readonly ArtifactInspectionResult[] = []
   let publicationAuthority: CanonicalPublicationAuthority | undefined
   const authority = () => {
     if (scan.layout === undefined) {
@@ -1595,7 +1574,7 @@ export const readRecordPlanningSnapshotResolved = (
       root,
       scan.layout,
       scan.observations,
-      artifacts,
+      artifactEvidence,
       cacheLocation,
     )
     return publicationAuthority
@@ -1615,8 +1594,8 @@ export const readRecordPlanningSnapshotResolved = (
       },
       hooks,
     )
-    const { artifacts: validatedArtifacts } = validation
-    assertCanonicalSnapshotCurrent(root, scan, validatedArtifacts, repositoryChangedBeforePublication)
+    const { artifactEvidence: validatedArtifactEvidence, artifacts: validatedArtifacts } = validation
+    assertCanonicalSnapshotCurrent(root, scan, validatedArtifactEvidence, repositoryChangedBeforePublication)
     const blockingErrors = (() => {
       if (allowed === undefined) {
         return validation.result.errors
@@ -1628,7 +1607,7 @@ export const readRecordPlanningSnapshotResolved = (
       )
     })()
     if (blockingErrors.length === 0) {
-      artifacts = validatedArtifacts
+      artifactEvidence = validatedArtifactEvidence
       return validatedArtifacts
     }
     return fail('VALIDATION_FAILED', message, {
@@ -1671,12 +1650,12 @@ export const readRecordSnapshotResolved = (
   allowed?: AllowedMultiHead[],
   cacheLocation?: CacheLocation,
 ) => {
-  const { artifacts, scan } = readRecordScanResolved(root, hooks, allowed)
+  const { artifactEvidence, scan } = readRecordScanResolved(root, hooks, allowed)
   if (scan.layout === undefined) {
     return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')
   }
   return {
-    authority: canonicalPublicationAuthority(root, scan.layout, scan.observations, artifacts, cacheLocation),
+    authority: canonicalPublicationAuthority(root, scan.layout, scan.observations, artifactEvidence, cacheLocation),
     records: freezeAcceptedRecords(scan.records),
   }
 }
