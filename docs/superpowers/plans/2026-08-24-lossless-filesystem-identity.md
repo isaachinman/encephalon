@@ -190,3 +190,12 @@
 - Spec coverage: the plan covers one shared pure authority, BigInt/nanosecond precision, exact/parent/post-rename/manifest projections, records, instructions, cache, preserved errors, and cross-platform regression gates.
 - Placeholder scan: no deferred implementation or unspecified test work remains.
 - Type consistency: all later tasks consume the Task 1 `EntryIdentity`, `EntryMetadata`, and manifest projection names; cache keeps its compatibility export while records and instructions use shared internal types.
+
+## Implementation Evidence
+
+- The exact reviewed code and behavioural-test snapshot is `849542580e4caa4746bbeed5523a0af65a9df63e`. Earlier task commits remain implementation milestones rather than final provenance.
+- Synthetic tests prove lossless device/inode comparison, nanosecond metadata changes, exact post-rename omissions, instruction-specific mode omissions, and byte-compatible manifest projection. Integration tests prove same-inode mutation rejection between record pathname and descriptor observations and the permitted ctime-only instruction quarantine transition.
+- Six pinned branch reviewers covered security, correctness, races, tests, maintainability, and UX/API compatibility. The security, coverage, and maintainability findings were fixed; four focused fix-round reviewers returned PASS with no remaining findings.
+- Frozen install, generated/workflow checks, lint, all four TypeScript projects, the full Node suite with only the established capability skips, CI benchmark budgets, build, packed-package validation, publish-contract validation, repository validation, and diff hygiene all passed. The publish check recognised the expected refusal to overwrite published version `0.2.0`; no publication occurred.
+- The initial packed-package gate exposed a private `BigIntStats` declaration path through `cache-location.d.ts`. Marking the runtime-only projections and instruction-only comparators `@internal` removed that private dependency from the consumer declaration graph while retaining the structural identity declarations needed by emitted internal types.
+- The implementation is backwards-compatible: the root export surface, public TypeScript signatures, synchronous behaviour, errors, CLI framing, canonical JSON, cache schema and bytes, manifest and instruction formats, and repository layout are unchanged.
