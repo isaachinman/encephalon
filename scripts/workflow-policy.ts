@@ -9,7 +9,7 @@ import {
   readSync,
   realpathSync,
 } from 'node:fs'
-import { extname, relative, resolve, sep } from 'node:path'
+import { dirname, extname, relative, resolve, sep } from 'node:path'
 import { parseDocument } from 'yaml'
 import { sameStableEntryMetadata } from '../src/filesystem-entry.ts'
 import { ordinalStringCompare } from '../src/order.ts'
@@ -41,6 +41,7 @@ type ParsedObject = Record<string, unknown>
 
 type ExecutableReference = Readonly<{
   dockerImage?: true
+  dockerfile?: true
   kind: 'action' | 'workflow'
   location: string
   path: readonly (number | string)[]
@@ -800,12 +801,12 @@ const executableReferences = (
     })
   } else if (kind === 'action' && isPlainObject(document.runs)) {
     const dockerImage = document.runs.image
-    const localDockerfileImage = typeof dockerImage === 'string' && isDockerfileImage(dockerImage)
+    const dockerAction = typeof document.runs.using === 'string' && document.runs.using.toLowerCase() === 'docker'
     const dockerImageReference =
-      document.runs.using === 'docker' && typeof dockerImage === 'string' && !localDockerfileImage
+      dockerAction && typeof dockerImage === 'string'
         ? [
             {
-              dockerImage: true as const,
+              ...(isDockerfileImage(dockerImage) ? { dockerfile: true as const } : { dockerImage: true as const }),
               kind: 'action' as const,
               location: 'runs.image',
               path: ['runs', 'image'],
@@ -1156,7 +1157,24 @@ export const inspectWorkflowPolicy = (
             traversalIntegrityAccepted = executable.accepted
             for (const reference of executable.references) {
               if (traversalIntegrityAccepted) {
-                if (
+                if (reference.kind === 'action' && reference.dockerfile === true) {
+                  const dockerfilePath = resolve(dirname(source.path), reference.reference)
+                  const observation = observeNativeFile(nativeRoot, dockerfilePath)
+                  if (observation.kind === 'missing') {
+                    findings.push({ file, location: reference.location, rule: 'local-reference' })
+                  } else if (observation.kind === 'invalid') {
+                    findings.push({ file, location: reference.location, rule: 'source-integrity' })
+                  } else {
+                    const witnessKey = `dockerfile\0${comparablePath(dockerfilePath)}`
+                    const witness = { metadata: observation.metadata, path: dockerfilePath }
+                    const existingWitness = fileWitnesses.get(witnessKey)
+                    if (existingWitness === undefined) {
+                      fileWitnesses.set(witnessKey, witness)
+                    } else if (!sameStableEntryMetadata(existingWitness.metadata, witness.metadata)) {
+                      traversalIntegrityAccepted = false
+                    }
+                  }
+                } else if (
                   reference.kind === 'action' &&
                   (reference.dockerImage === true || reference.reference.startsWith('docker://'))
                 ) {

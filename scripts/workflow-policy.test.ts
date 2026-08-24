@@ -2620,6 +2620,21 @@ jobs:
 // Mutations caught: local docker:// images remain inspected, while mutable repository Dockerfile FROM chains stay outside proof.
 test('inspects reachable local Docker images while accepting repository Dockerfiles', () => {
   const root = createFixture({
+    '.github/actions/dockerfile-absolute/action.yml': `name: Absolute Dockerfile
+runs:
+  using: docker
+  image: /outside/Dockerfile
+`,
+    '.github/actions/dockerfile-escaping/action.yml': `name: Escaping Dockerfile
+runs:
+  using: docker
+  image: ../../../../Dockerfile
+`,
+    '.github/actions/dockerfile-missing/action.yml': `name: Missing Dockerfile
+runs:
+  using: docker
+  image: images/Dockerfile
+`,
     '.github/actions/dockerfile-nested/action.yml': `name: Nested Dockerfile
 runs:
   using: docker
@@ -2644,6 +2659,11 @@ runs:
   image: Dockerfile
 `,
     '.github/actions/dockerfile/Dockerfile': 'FROM alpine:3.20\n',
+    '.github/actions/mixed-case/action.yml': `name: Mixed-case Docker runtime
+runs:
+  using: Docker
+  image: alpine:3.20
+`,
     '.github/actions/mutable-hub/action.yml': `name: Mutable Hub image
 runs:
   using: docker
@@ -2681,11 +2701,35 @@ jobs:
       - uses: $/.github/actions/dockerfile-relative
       - uses: $/.github/actions/dockerfile-nested
       - uses: $/.github/actions/dockerfile-suffixed
+      - uses: $/.github/actions/dockerfile-absolute
+      - uses: $/.github/actions/dockerfile-escaping
+      - uses: $/.github/actions/dockerfile-missing
+      - uses: $/.github/actions/mixed-case
       - uses: $/.github/actions/non-docker
 `,
   })
 
   assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/actions/dockerfile-absolute/action.yml',
+      location: 'runs.image',
+      rule: 'local-reference',
+    },
+    {
+      file: '.github/actions/dockerfile-escaping/action.yml',
+      location: 'runs.image',
+      rule: 'local-reference',
+    },
+    {
+      file: '.github/actions/dockerfile-missing/action.yml',
+      location: 'runs.image',
+      rule: 'local-reference',
+    },
+    {
+      file: '.github/actions/mixed-case/action.yml',
+      location: 'runs.image',
+      rule: 'external-image-digest',
+    },
     {
       file: '.github/actions/mutable-hub/action.yml',
       location: 'runs.image',
@@ -2695,6 +2739,42 @@ jobs:
       file: '.github/actions/mutable/action.yml',
       location: 'runs.image',
       rule: 'external-image-digest',
+    },
+  ])
+})
+
+// Mutation caught: accepting a Dockerfile path without retaining its identity would allow replacement before policy acceptance.
+test('rejects a repository Dockerfile replaced after action traversal', () => {
+  const root = createFixture({
+    '.github/actions/docker/action.yml': `name: Docker action
+runs:
+  using: docker
+  image: Dockerfile
+`,
+    '.github/actions/docker/Dockerfile': 'FROM alpine:3.20\n',
+    '.github/workflows/docker.yml': `name: Docker action
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/docker
+`,
+  })
+
+  const findings = inspectWorkflowPolicy(root, {
+    beforeFinalRevalidation: () => {
+      writeFileSync(join(root, '.github/actions/docker/Dockerfile'), 'FROM alpine:latest\n', 'utf8')
+    },
+  })
+
+  assert.deepEqual(findings, [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
     },
   ])
 })
