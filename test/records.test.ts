@@ -4238,6 +4238,8 @@ describe('canonical records', () => {
       subject: 'record.same-size-change-after-open',
     })
     const path = join(root, record.path)
+    const originalMetadata = statSync(path)
+    const forcedMtime = new Date(Math.floor(originalMetadata.mtimeMs / 1000) * 1000 - 60_000)
     let changed = false
 
     const result = validateRecordsResolved(root, {
@@ -4249,7 +4251,10 @@ describe('canonical records', () => {
             const replacement = original.replace('Original', 'Mutated!')
             assert.notEqual(replacement, original)
             assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(original))
+            assert.doesNotThrow(() => JSON.parse(replacement))
             writeFileSync(path, replacement)
+            utimesSync(path, originalMetadata.atime, forcedMtime)
+            assert.notEqual(statSync(path).mtimeMs, originalMetadata.mtimeMs)
           }
         },
       },
