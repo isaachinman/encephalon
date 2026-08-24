@@ -97,7 +97,10 @@ describe('hot scan performance regressions', () => {
     assert.equal(acceptedDescriptorMap.retainedDescriptorCount, acceptedDescriptorMap.propertyCount)
     assert.equal(acceptedBounded.retainedResultKeyCount, acceptedBounded.propertyCount)
     assert.equal(acceptedDescriptorMap.retainedResultKeyCount, acceptedDescriptorMap.propertyCount)
-    assert.ok(acceptedDescriptorMap.heapGrowthBytes > acceptedBounded.heapGrowthBytes + 512 * 1024)
+    assert.ok(
+      acceptedDescriptorMap.heapGrowthBytes >
+        acceptedBounded.heapGrowthBytes + acceptedDescriptorMap.propertyCount * 32,
+    )
     for (const report of [bounded, descriptorMap, acceptedBounded, acceptedDescriptorMap]) {
       assert.equal(Number.isFinite(report.elapsedMilliseconds), true)
       assert.equal(Number.isSafeInteger(report.peakRssBytes), true)
