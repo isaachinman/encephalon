@@ -136,6 +136,10 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-22-validated-mutation-cache-design.md'),
       'utf8',
     )
+    const releaseBacklogHardeningDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-23-release-backlog-hardening-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -162,6 +166,10 @@ describe('package contract', () => {
     assert.match(
       contract,
       /Last reviewed: 2026-08-24 for code and behavioural-test snapshot `58c01dc1ff263b8aa80a3cfaac610296233ed7e1`\./,
+    )
+    assert.match(
+      releaseBacklogHardeningDesign,
+      /The exact reviewed MAR-2641 code and behavioural-test snapshot is `58c01dc1ff263b8aa80a3cfaac610296233ed7e1`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
