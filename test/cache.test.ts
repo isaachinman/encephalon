@@ -7310,6 +7310,54 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
   })
 
+  test('preserves established IO errors for fixed lock and recovery-marker extra children', () => {
+    const cases = [
+      {
+        create: (root: string) => {
+          const path = join(cacheDirectoryPath(root), 'operation.lock')
+          mkdirSync(path, { recursive: true })
+          writeFileSync(join(path, 'owner.json'), '{malformed fixed lock owner')
+          writeFileSync(join(path, 'extra'), 'fixed lock extra child')
+        },
+        name: 'fixed operation lock',
+      },
+      {
+        create: (root: string) => {
+          const path = join(cacheDirectoryPath(root), 'operation-lock.recovery')
+          const owner = {
+            acquiredAt: '2026-08-24T10:00:00.000Z',
+            phase: 'recovering',
+            pid: process.pid,
+            token: 'fixed-recovery-extra-child',
+          } as const
+          mkdirSync(path, { recursive: true })
+          writeFileSync(join(path, 'owner.json'), `${JSON.stringify(owner)}\n`)
+          writeFileSync(join(path, 'owner.recovered.json'), `${JSON.stringify({ ...owner, phase: 'recovered' })}\n`)
+          writeFileSync(join(path, 'extra'), 'fixed recovery extra child')
+        },
+        name: 'fixed recovery marker',
+      },
+    ] as const
+
+    for (const fixedCase of cases) {
+      const root = createRoot()
+      fixedCase.create(root)
+      let operationEntered = false
+
+      assert.throws(
+        () =>
+          withOperationLock(root, () => {
+            operationEntered = true
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'IO_ERROR', fixedCase.name)
+          return true
+        },
+      )
+      assert.equal(operationEntered, false, fixedCase.name)
+    }
+  })
+
   test('ignores stale owner metadata with a reused live PID after acquiring the gate', () => {
     const root = createRoot()
     const lockPath = join(root, 'node_modules', '.cache', 'encephalon', 'operation.lock')

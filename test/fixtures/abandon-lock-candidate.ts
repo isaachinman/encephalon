@@ -1,4 +1,4 @@
-import { writeFileSync } from 'node:fs'
+import { renameSync, writeFileSync } from 'node:fs'
 import { basename } from 'node:path'
 import { withOperationLock } from '../../src/lock.ts'
 
@@ -9,7 +9,9 @@ if (root === undefined || barrierPath === undefined || (mode !== 'before-owner' 
 }
 
 const pause = (path: string) => {
-  writeFileSync(barrierPath, basename(path))
+  const stagingPath = `${barrierPath}.${process.pid}.tmp`
+  writeFileSync(stagingPath, basename(path))
+  renameSync(stagingPath, barrierPath)
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0)
 }
 

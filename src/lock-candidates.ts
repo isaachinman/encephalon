@@ -232,6 +232,7 @@ const reclaimCandidate = (
 }
 
 export type LockCandidateMaintenanceOptions = Readonly<{
+  assertCurrentLock?: (() => void) | undefined
   now?: (() => number) | undefined
   openDirectory?: OpenLockCandidateDirectory | undefined
 }>
@@ -278,6 +279,7 @@ export const maintainLockCandidates = (
             }
           }
         } catch {
+          options.assertCurrentLock?.()
           assertCacheLocation(location)
         }
       }
@@ -286,6 +288,7 @@ export const maintainLockCandidates = (
     if (cursor !== undefined) {
       closeCursor(location.directory, cursor)
     }
+    options.assertCurrentLock?.()
     assertCacheLocation(location)
   }
   return Object.freeze({ ...stats })
