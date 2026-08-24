@@ -4227,6 +4227,41 @@ describe('canonical records', () => {
     )
   })
 
+  test('rejects a same-size record mutation after descriptor verification', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'same-size-change-after-open',
+      kind: 'decision',
+      payload: { summary: 'Original' },
+      root,
+      source: 'agent',
+      subject: 'record.same-size-change-after-open',
+    })
+    const path = join(root, record.path)
+    let changed = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: point => {
+          if (point === 'after-record-fstat' && !changed) {
+            changed = true
+            const original = readFileSync(path, 'utf8')
+            const replacement = original.replace('Original', 'Mutated!')
+            assert.notEqual(replacement, original)
+            assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(original))
+            writeFileSync(path, replacement)
+          }
+        },
+      },
+    })
+
+    assertInvalidRecord(result, record.path)
+    assert.equal(
+      result.errors.some(error => error.message === 'Record file changed while it was being read.'),
+      true,
+    )
+  })
+
   test('reports malformed JSON without echoing source content', () => {
     const root = createRoot()
     const record = api.addRecord({
