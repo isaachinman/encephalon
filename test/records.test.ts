@@ -141,7 +141,12 @@ const causeChainText = (value: unknown, seen = new Set<object>()): string => {
   return String(value)
 }
 
-const assertCommittedRepositoryChange = (operation: () => unknown, path: string, recordId: string) => {
+const assertCommittedRepositoryChange = (
+  operation: () => unknown,
+  path: string,
+  recordId: string,
+  forbiddenCauseText?: string,
+) => {
   assert.throws(operation, (error: unknown) => {
     const actual = error as {
       code?: unknown
@@ -164,6 +169,10 @@ const assertCommittedRepositoryChange = (operation: () => unknown, path: string,
     assert.equal(cause.message, 'Canonical layout changed before publication.')
     assert.equal(cause.cause, undefined)
     assert.equal(cause.name, 'EncephalonError')
+    if (forbiddenCauseText !== undefined) {
+      assert.equal(causeChainText(error).includes(forbiddenCauseText), false)
+      assert.equal(JSON.stringify(error).includes(forbiddenCauseText), false)
+    }
     return true
   })
 }
@@ -1268,6 +1277,78 @@ describe('canonical records', () => {
     assert.deepEqual(work, { canonicalScans: 2, links: 0 })
     assert.equal(readFileSync(malformedPath, 'utf8'), '{ malformed stable successor')
   })
+
+  for (const successorType of ['directory', 'symlink'] as const) {
+    test(`classifies a retained sibling replaced by a same-name ${successorType} after linking as a committed canonical race`, () => {
+      const root = createRoot()
+      const siblingId = `99-postlink-type-swap-sibling-${successorType}`
+      const siblingPath = join(root, 'encephalon', 'decision', `${siblingId}.json`)
+      const id = `candidate-before-postlink-${successorType}-swap`
+      const relativePath = `encephalon/decision/${id}.json`
+      const symlinkTarget = join(root, 'postlink-type-swap-target')
+      let postLinkSiblingLstats = 0
+      let replaced = false
+      prepareEmptyCanonicalDirectories(root)
+      writeCanonicalRecord(root, {
+        id: siblingId,
+        subject: `generation.${siblingId}`,
+      })
+      writeFileSync(symlinkTarget, 'same-name successor target\n')
+      const originalLstat = fs.lstatSync
+      const mutableFs = fs as { lstatSync: typeof fs.lstatSync }
+      mutableFs.lstatSync = ((path, options) => {
+        if (replaced && String(path) === siblingPath) {
+          postLinkSiblingLstats += 1
+        }
+        return originalLstat(path, options as never)
+      }) as typeof fs.lstatSync
+      syncBuiltinESMExports()
+
+      try {
+        assertCommittedRepositoryChange(
+          () =>
+            addRecordResolved(
+              root,
+              {
+                id,
+                kind: 'decision',
+                payload: {},
+                source: 'agent',
+                subject: `generation.${id}`,
+              },
+              {
+                hooks: {
+                  fault: point => {
+                    if (point === 'after-canonical-link' && !replaced) {
+                      rmSync(siblingPath)
+                      if (successorType === 'directory') {
+                        mkdirSync(siblingPath)
+                      } else {
+                        symlinkSync(symlinkTarget, siblingPath, 'file')
+                      }
+                      replaced = true
+                    }
+                  },
+                },
+                hydrate: false,
+              },
+            ),
+          relativePath,
+          id,
+          root,
+        )
+      } finally {
+        mutableFs.lstatSync = originalLstat
+        syncBuiltinESMExports()
+      }
+
+      assert.equal(replaced, true)
+      assert.equal(postLinkSiblingLstats, 0)
+      assert.equal(existsSync(join(root, relativePath)), true)
+      assert.equal(fs.lstatSync(siblingPath).isDirectory(), successorType === 'directory')
+      assert.equal(fs.lstatSync(siblingPath).isSymbolicLink(), successorType === 'symlink')
+    })
+  }
 
   for (const hydrate of [true, false] as const) {
     test(`add committed canonical generation race ${hydrate ? 'with' : 'without'} hydration`, () => {

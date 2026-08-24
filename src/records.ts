@@ -1955,8 +1955,6 @@ const canonicalPublicationAuthority = (
     expected.witness.canonicalPath === current.witness.canonicalPath &&
     sameEntryIdentity(expected.witness.pathMetadata, current.witness.pathMetadata) &&
     sameEntryIdentity(expected.witness.canonicalMetadata, current.witness.canonicalMetadata)
-  const sameEntryNames = (first: readonly { name: string }[], second: readonly { name: string }[]) =>
-    first.length === second.length && first.every((entry, index) => entry.name === second[index]?.name)
   const sameEntryType = (first: Dirent, second: Dirent) =>
     first.isSymbolicLink() === second.isSymbolicLink() &&
     first.isDirectory() === second.isDirectory() &&
@@ -2036,10 +2034,16 @@ const canonicalPublicationAuthority = (
         }
         revalidateCanonicalDirectory(rootSnapshot)
         const nextKind = captureCanonicalDirectory(kindSnapshot.witness.path, MAX_CANONICAL_KIND_ENTRIES)
-        const expectedEntries = [...kindSnapshot.entries, { name: recordName }].sort((first, second) =>
-          ordinalStringCompare(first.name, second.name),
-        )
-        if (!(sameDirectoryGeneration(kindSnapshot, nextKind) && sameEntryNames(expectedEntries, nextKind.entries))) {
+        const retainedKindEntries = nextKind.entries.filter(entry => entry.name !== recordName)
+        const publishedEntries = nextKind.entries.filter(entry => entry.name === recordName)
+        const [publishedEntry] = publishedEntries
+        const kindEntriesAccepted =
+          !nextKind.overflow &&
+          sameEntryNamesAndTypes(kindSnapshot.entries, retainedKindEntries) &&
+          publishedEntries.length === 1 &&
+          publishedEntry?.isFile() === true &&
+          !publishedEntry.isSymbolicLink()
+        if (!(sameDirectoryGeneration(kindSnapshot, nextKind) && kindEntriesAccepted)) {
           return changed()
         }
         const recordPath = resolve(root, 'encephalon', kind, recordName)

@@ -273,3 +273,41 @@ This addendum supersedes the earlier final statement that no maintained document
 - `git diff --check` — passed.
 
 The independent read-only review found the final-authority operational privacy gap after the lifetime changes and otherwise passed the immediate post-`BEGIN` boundary, full-session gate identity, cleanup precedence, strict optional-sidecar presence, and single-pass writer close. The operational failure normalisation and its RED/GREEN regressions close that final finding; the reviewer rechecked the resulting path-safe envelopes before commit.
+
+## Post-link entry-type review addendum
+
+### Finding closure
+
+Post-link publication acceptance no longer constructs a name-only expected list. It filters the captured successor kind snapshot into the retained pre-link entries and the candidate `recordName`, requires the retained entries to match every pre-link name and `Dirent` type in order, and requires exactly one candidate entry that is a regular non-symlink file. The captured snapshot must also be within its entry bound and retain the exact kind-directory witness. A removal, addition, duplicate candidate, overflow, or same-name file/directory/symlink type swap therefore enters the existing private changed authority before the mutated layout can be accepted. The already-established descriptor metadata check for the linked candidate remains unchanged.
+
+The shared `acceptPublication` authority is used by add and init record publication. Existing init coverage already proves the committed full-prefix envelope, frozen IDs, safe cause, and suppression of later work after a post-link generation change, so no duplicate init-specific type-swap case was added.
+
+### TDD evidence
+
+- Deterministic add regressions replace a retained record sibling with a same-name directory and symlink at `after-canonical-link`, before acceptance. The exact old name-only predicate was re-run against the final tests and failed 0/2: it accepted the mixed `Dirent` snapshot and reached a later `lstat` of the swapped sibling (`1 !== 0`).
+- Both regressions pass with the exact entry-delta predicate and reject from the captured directory evidence before that later sibling inspection. They retain the committed candidate, preserve the concurrent successor type, and assert the existing committed `REPOSITORY_CHANGED` `publicationVerification` envelope, exact frozen committed ID, relative path, recovery action, path-free public cause, and absence of repository-root text from both the cause chain and JSON projection.
+
+### Compatibility and security review
+
+- No public API/export, canonical or cache format, schema/version, manifest/FTS row, validation code, message, detail field, retry rule, recovery instruction, or persisted data changed.
+- No authority was added. The fix tightens the existing post-link canonical publication authority with the same name/type comparison already used by preparation.
+- `RECORD_EXISTS`, committed-prefix handling, no-post-link-retry behaviour, safe public causes, and private identity evidence remain unchanged.
+
+### Verification gates
+
+- Focused post-link directory/symlink type-swap regressions — 2 passed, 0 failed after the exact old-code RED 0/2.
+- `node --test test/records.test.ts` — 162 passed, 0 failed.
+- `node --test test/init.test.ts` — 177 passed, 0 failed, 2 expected filesystem-platform skips.
+- `bun run test` — 772 total, 770 passed, 0 failed, 2 expected skips; includes build.
+- `bun run lint` — 131 files checked, no diagnostics.
+- `bun run typecheck` — source, scripts, tests, and runtime-guard configurations passed.
+- `bun run benchmark:check` — schema-version 2 CI profile completed within maintained budgets.
+- `bun run build` — passed.
+- `bun run check:package` — passed.
+- `bun run check:generated` — passed.
+- `bun run check:workflows` — 63 passed, 0 failed, 1 expected Windows-only skip; policy command passed.
+- `bun run check:publish` — passed its expected already-published-version preflight classification for `0.2.0`.
+- `node dist/cli.mjs validate --root .` — valid, 38 records checked, no errors.
+- `git diff --check` — passed.
+
+An independent final read-only review passed the exact retained-entry/name/type proof, candidate regular-file delta, overflow and directory-identity checks, committed error/privacy assertions, shared init coverage, and test instrumentation. It found no remaining issue and reported no CodeRabbit finding.
