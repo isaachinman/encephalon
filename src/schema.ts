@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { CANONICAL_BUDGETS } from './canonical-budgets.ts'
 import { ARTIFACTS_DIRECTORY_NAME } from './canonical-layout.ts'
+import { inspectDenseDataArray, readDenseDataArray } from './dense-data-array.ts'
 import { fail, failBudget } from './errors.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import {
@@ -77,9 +78,9 @@ export const validateKind = (value: unknown) => {
   return assertPortableSegment(kind, 'kind', KIND_PATTERN)
 }
 
-export const validateId = (value: unknown) => {
-  const id = requiredText(value, 'id')
-  return assertPortableSegment(id, 'id', ID_PATTERN)
+export const validateId = (value: unknown, field = 'id') => {
+  const id = requiredText(value, field)
+  return assertPortableSegment(id, field, ID_PATTERN)
 }
 
 const validateTimestamp = (value: unknown) => {
@@ -103,8 +104,8 @@ const validateConfidence = (value: unknown) => {
   })
 }
 
-const validateStringArray = (value: unknown, field: string, item: (value: unknown) => string) => {
-  if (Array.isArray(value) && value.length > 0) {
+const validateStringArray = (value: unknown[], field: string, item: (value: unknown, index: number) => string) => {
+  if (value.length > 0) {
     const normalized = value.map(item)
     if (new Set(normalized).size === normalized.length) {
       return normalized
@@ -484,10 +485,10 @@ export const validateJsonValue = (value: unknown, hooks: PayloadValidationHooks 
   }
 }
 
-const portableArtifactSegments = (value: unknown) => {
-  const path = requiredText(value, 'artifact')
+const portableArtifactSegments = (value: unknown, field: string) => {
+  const path = requiredText(value, field)
   if (byteLength(path) > MAX_TEXT_BYTES || path.includes('\\') || path.startsWith('/') || /^[A-Za-z]:/.test(path)) {
-    return fail('INVALID_ARGUMENT', 'artifact is not a portable relative path.', { field: 'artifact' })
+    return fail('INVALID_ARGUMENT', `${field} is not a portable relative path.`, { field })
   }
   const segments = path.split('/')
   if (
@@ -508,13 +509,11 @@ const portableArtifactSegments = (value: unknown) => {
   ) {
     return { path, segments }
   }
-  return fail('INVALID_ARGUMENT', 'artifact contains an unsafe path segment.', {
-    field: 'artifact',
-  })
+  return fail('INVALID_ARGUMENT', `${field} contains an unsafe path segment.`, { field })
 }
 
-export const validateArtifactPath = (value: unknown, kind: string, id: string) => {
-  const artifact = portableArtifactSegments(value)
+export const validateArtifactPath = (value: unknown, kind: string, id: string, field = 'artifact') => {
+  const artifact = portableArtifactSegments(value, field)
   if (
     artifact.segments[0] === ARTIFACTS_DIRECTORY_NAME &&
     artifact.segments[1] === kind &&
@@ -522,9 +521,7 @@ export const validateArtifactPath = (value: unknown, kind: string, id: string) =
   ) {
     return artifact.path
   }
-  return fail('INVALID_ARGUMENT', 'artifact must remain beneath the matching record artifact directory.', {
-    field: 'artifact',
-  })
+  return fail('INVALID_ARGUMENT', `${field} must remain beneath the matching record artifact directory.`, { field })
 }
 
 const normalizeOptionalText = (value: unknown, field: string, maximumBytes: number) => {
@@ -535,42 +532,51 @@ const normalizeOptionalText = (value: unknown, field: string, maximumBytes: numb
 }
 
 const validateSupersedes = (value: unknown) => {
-  if (Array.isArray(value) && value.length > OPERATION_BUDGETS.supersessionEdges.maximum) {
+  const inspection = inspectDenseDataArray(value, 'supersedes', 'supersedes must be an array of strings.')
+  if (inspection.length > OPERATION_BUDGETS.supersessionEdges.maximum) {
     return failBudget(
       'supersessionEdges',
       `supersedes may contain at most ${OPERATION_BUDGETS.supersessionEdges.maximum} record ids.`,
     )
   }
-  return validateStringArray(value, 'supersedes', validateId)
+  return validateStringArray(readDenseDataArray(inspection), 'supersedes', (entry, index) =>
+    validateId(entry, `supersedes[${index}]`),
+  )
 }
 
 const optionalSupersedes = (value: unknown) => {
   if (value === undefined) {
     return
   }
-  if (!Array.isArray(value)) {
-    return fail('INVALID_ARGUMENT', 'supersedes must be an array of strings.', { field: 'supersedes' })
+  const inspection = inspectDenseDataArray(value, 'supersedes', 'supersedes must be an array of strings.')
+  if (inspection.length > OPERATION_BUDGETS.supersessionEdges.maximum) {
+    return failBudget(
+      'supersessionEdges',
+      `supersedes may contain at most ${OPERATION_BUDGETS.supersessionEdges.maximum} record ids.`,
+    )
   }
-  if (value.length === 0) {
+  const items = readDenseDataArray(inspection)
+  if (items.length === 0) {
     return
   }
-  return validateSupersedes(value)
+  return validateStringArray(items, 'supersedes', (entry, index) => validateId(entry, `supersedes[${index}]`))
 }
 
 const optionalArtifacts = (value: unknown, kind: string, id: string) => {
   if (value === undefined) {
     return
   }
-  if (!Array.isArray(value)) {
-    return fail('INVALID_ARGUMENT', 'artifacts must be an array of strings.', { field: 'artifacts' })
-  }
-  if (value.length === 0) {
-    return
-  }
-  if (value.length > MAX_ARTIFACTS) {
+  const inspection = inspectDenseDataArray(value, 'artifacts', 'artifacts must be an array of strings.')
+  if (inspection.length > MAX_ARTIFACTS) {
     return fail('INVALID_ARGUMENT', 'artifacts may contain at most 256 paths.', { field: 'artifacts' })
   }
-  return validateStringArray(value, 'artifacts', entry => validateArtifactPath(entry, kind, id))
+  const items = readDenseDataArray(inspection)
+  if (items.length === 0) {
+    return
+  }
+  return validateStringArray(items, 'artifacts', (entry, index) =>
+    validateArtifactPath(entry, kind, id, `artifacts[${index}]`),
+  )
 }
 
 /** @internal */
@@ -655,15 +661,15 @@ export const parseRecordFile = (value: unknown): BrainRecordFile => {
     subject: requiredText(object.subject, 'subject'),
   }
   if (object.artifacts !== undefined) {
-    if (Array.isArray(object.artifacts) && object.artifacts.length <= MAX_ARTIFACTS) {
-      record.artifacts = validateStringArray(object.artifacts, 'artifacts', entry =>
-        validateArtifactPath(entry, kind, id),
-      )
-    } else {
-      fail('INVALID_ARGUMENT', 'artifacts may contain at most 256 paths.', {
+    const inspection = inspectDenseDataArray(object.artifacts, 'artifacts', 'artifacts must be an array of strings.')
+    if (inspection.length > MAX_ARTIFACTS) {
+      return fail('INVALID_ARGUMENT', 'artifacts may contain at most 256 paths.', {
         field: 'artifacts',
       })
     }
+    record.artifacts = validateStringArray(readDenseDataArray(inspection), 'artifacts', (entry, index) =>
+      validateArtifactPath(entry, kind, id, `artifacts[${index}]`),
+    )
   }
   if (object.confidence !== undefined) {
     record.confidence = validateConfidence(object.confidence)

@@ -45,6 +45,11 @@ This document is the concise contract maintainers should update when public beha
 - Public duplicate occurrences preserve caller order and count but do not share mutable records, nested payloads, result arrays, or compact result objects. Every show envelope, search envelope, shown value or null, result array, and compact result remains charged for each emitted occurrence through the one shared `gatherResponseBytes` ledger.
 - Shows still precede searches and first occurrences execute in input order. Ranking, snippets, active filtering, response failure order, the empty-only no-cache path, exact-generation recovery, and the public API and CLI shapes remain unchanged.
 
+## Public API Inputs
+
+- Public API input envelopes accept ordinary cross-realm or null-prototype objects and snapshot recognised own data properties through guarded reflection before repository, cache, lock, or mutation work. Up to 64 unknown ordinary string data properties remain ignored for structural compatibility. Accessors, symbol properties, custom prototypes, excess properties, and reflection failures produce bounded `INVALID_ARGUMENT` errors without invoking getters or exposing trap text.
+- Gather searches and shows, record supersession targets, and artifact paths are copied from dense own data indices, including non-enumerable indices and cross-realm arrays. Sparse arrays, indexed or extra accessors, symbol properties, excess properties, and reflection failures are rejected. Up to 64 unknown ordinary string data properties remain ignored. Existing count budgets are checked from the guarded length descriptor before own-key enumeration, element inspection, or output allocation; valid dense arrays preserve their order, duplicates, and existing empty-array semantics.
+
 ## Canonical Storage
 
 - Canonical knowledge is append-only JSON under `encephalon/<kind>/<id>.json`.
