@@ -1,12 +1,24 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, renameSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import {
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
+import { basename, dirname, join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
 import type { DirectoryReader } from '../src/bounded-directory.ts'
 import { cacheLocationTestHooks } from '../src/cache-location.ts'
 import { withOperationLock } from '../src/lock.ts'
+import { classifySQLiteError, type SQLiteErrorCategory } from '../src/sqlite-error.ts'
 import { createTestRepository, removeTestRepository } from './helpers.ts'
 
 type Entry = Readonly<{ name: string }>
@@ -21,8 +33,16 @@ const createRoot = () => {
 
 const cacheDirectory = (root: string) => join(root, 'node_modules', '.cache', 'encephalon')
 const candidatePath = (root: string, token: string) => join(cacheDirectory(root), `operation.lock.${token}`)
+const tokenFor = (index: number) => `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`
+const entryFor = (token: string) => ({ name: `operation.lock.${token}` })
+const identityOf = (path: string) => {
+  const metadata = lstatSync(path, { bigint: true })
+  return { dev: metadata.dev, ino: metadata.ino }
+}
+const age = (path: string) => utimesSync(path, new Date(0), new Date(0))
 
 afterEach(() => {
+  cacheLocationTestHooks.beforeCacheOwnerOpen = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
@@ -77,7 +97,9 @@ const assertAbandonedCandidateConverges = async (mode: 'after-owner' | 'before-o
 describe('lock candidate maintenance', () => {
   test('runs under the gate and visits at most 64 lazy entries without private diagnostics', () => {
     const root = createRoot()
-    let gateHeld = false
+    const gatePath = join(cacheDirectory(root), 'operation-lock.sqlite')
+    let gateProbes = 0
+    let gateProbeCategory: SQLiteErrorCategory | 'acquired' | undefined
     let reads = 0
     let closes = 0
     let reported: Readonly<Record<string, unknown>> | undefined
@@ -86,7 +108,21 @@ describe('lock candidate maintenance', () => {
         closes += 1
       },
       readSync: () => {
-        assert.equal(gateHeld, true)
+        if (gateProbes === 0) {
+          const contender = new DatabaseSync(gatePath, { timeout: 0 })
+          try {
+            try {
+              contender.exec('BEGIN IMMEDIATE')
+              gateProbeCategory = 'acquired'
+              contender.exec('ROLLBACK')
+            } catch (error) {
+              gateProbeCategory = classifySQLiteError(error)
+            }
+          } finally {
+            contender.close()
+          }
+          gateProbes += 1
+        }
         reads += 1
         if (reads === 65) {
           throw new Error('candidate discovery crossed its raw-entry budget')
@@ -99,15 +135,14 @@ describe('lock candidate maintenance', () => {
       afterCandidateMaintenance: stats => {
         reported = stats
       },
-      beforeCandidateMaintenance: () => {
-        gateHeld = true
-      },
       openCandidateDirectory: () => reader,
     })
 
     assert.equal(result, 'entered')
     assert.equal(reads, 64)
     assert.equal(closes, 0)
+    assert.equal(gateProbes, 1)
+    assert.equal(gateProbeCategory === 'busy' || gateProbeCategory === 'locked', true)
     assert.ok(reported)
     assert.equal(Number(reported.directoryEntriesVisited) <= 64, true)
     assert.equal(Number(reported.candidatesInspected) <= 16, true)
@@ -116,6 +151,113 @@ describe('lock candidate maintenance', () => {
       Object.values(reported).some(value => typeof value === 'string'),
       false,
     )
+  })
+
+  test('enforces exact inspection and reclamation-attempt budgets', () => {
+    const inspectionRoot = createRoot()
+    const inspectionEntries = Array.from({ length: 17 }, (_, index) => entryFor(tokenFor(0x1_00 + index)))
+    let inspectionIndex = 0
+    let inspectionStats: Readonly<Record<string, unknown>> | undefined
+    withOperationLock(inspectionRoot, () => 'entered', {
+      afterCandidateMaintenance: stats => {
+        inspectionStats = stats
+      },
+      openCandidateDirectory: () => ({
+        closeSync: () => undefined,
+        readSync: () => {
+          const entry = inspectionEntries[inspectionIndex] ?? null
+          inspectionIndex += 1
+          return entry
+        },
+      }),
+    })
+    assert.deepEqual(inspectionStats, {
+      candidatesInspected: 16,
+      candidatesReclaimed: 0,
+      cursorExhausted: false,
+      directoryEntriesVisited: 16,
+      reclamationAttempts: 0,
+    })
+
+    const attemptRoot = createRoot()
+    const attemptTokens = Array.from({ length: 5 }, (_, index) => tokenFor(0x2_00 + index))
+    for (const token of attemptTokens) {
+      const path = candidatePath(attemptRoot, token)
+      mkdirSync(path, { recursive: true })
+      age(path)
+    }
+    let attemptIndex = 0
+    let attemptStats: Readonly<Record<string, unknown>> | undefined
+    withOperationLock(attemptRoot, () => 'entered', {
+      afterCandidateMaintenance: stats => {
+        attemptStats = stats
+      },
+      openCandidateDirectory: () => ({
+        closeSync: () => undefined,
+        readSync: () => {
+          const token = attemptTokens[attemptIndex]
+          attemptIndex += 1
+          return token === undefined ? null : entryFor(token)
+        },
+      }),
+    })
+    assert.deepEqual(attemptStats, {
+      candidatesInspected: 4,
+      candidatesReclaimed: 4,
+      cursorExhausted: false,
+      directoryEntriesVisited: 4,
+      reclamationAttempts: 4,
+    })
+    assert.equal(existsSync(candidatePath(attemptRoot, attemptTokens[4] as string)), true)
+  })
+
+  test('rejects exact current-lock replacements during maintenance and at its reporting boundary', () => {
+    const boundaries = ['reader failure', 'statistics hook'] as const
+    for (const boundary of boundaries) {
+      const root = createRoot()
+      const lockPath = join(cacheDirectory(root), 'operation.lock')
+      const displaced = join(root, `displaced-${boundary.replace(' ', '-')}`)
+      const successorBytes = `successor at ${boundary}`
+      let successorIdentity: Readonly<{ dev: bigint; ino: bigint }> | undefined
+      let operationEntered = false
+      const replaceCurrentLock = () => {
+        renameSync(lockPath, displaced)
+        mkdirSync(lockPath)
+        writeFileSync(join(lockPath, 'successor'), successorBytes)
+        successorIdentity = identityOf(lockPath)
+      }
+
+      assert.throws(
+        () =>
+          withOperationLock(
+            root,
+            () => {
+              operationEntered = true
+            },
+            boundary === 'reader failure'
+              ? {
+                  openCandidateDirectory: () => ({
+                    closeSync: () => undefined,
+                    readSync: () => {
+                      replaceCurrentLock()
+                      throw Object.assign(new Error('candidate reader failed after lock replacement'), { code: 'EIO' })
+                    },
+                  }),
+                }
+              : {
+                  afterCandidateMaintenance: replaceCurrentLock,
+                  openCandidateDirectory: () => ({ closeSync: () => undefined, readSync: () => null }),
+                },
+          ),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+      assert.equal(operationEntered, false)
+      assert.deepEqual(identityOf(lockPath), successorIdentity)
+      assert.equal(readFileSync(join(lockPath, 'successor'), 'utf8'), successorBytes)
+    }
   })
 
   test('resumes a retained reader until a reclaimable suffix is reached', () => {
@@ -280,6 +422,143 @@ describe('lock candidate maintenance', () => {
     assert.equal(readFileSync(join(candidatePath(root, liveOwner), 'owner.json'), 'utf8'), liveBytes)
     assert.equal(existsSync(candidatePath(root, malformed)), true)
     assert.equal(readFileSync(join(candidatePath(root, extraChild), 'extra'), 'utf8'), 'preserve')
+  })
+
+  test('reclaims aged malformed and oversized owner evidence', () => {
+    const root = createRoot()
+    const cases = [
+      { bytes: '{malformed', token: tokenFor(0x3_00) },
+      { bytes: 'x'.repeat(4097), token: tokenFor(0x3_01) },
+    ] as const
+    for (const ownerCase of cases) {
+      const path = candidatePath(root, ownerCase.token)
+      mkdirSync(path, { recursive: true })
+      writeFileSync(join(path, 'owner.json'), ownerCase.bytes)
+      age(join(path, 'owner.json'))
+      age(path)
+    }
+    let index = 0
+    withOperationLock(root, () => 'entered', {
+      openCandidateDirectory: () => ({
+        closeSync: () => undefined,
+        readSync: () => {
+          const ownerCase = cases[index]
+          index += 1
+          return ownerCase === undefined ? null : entryFor(ownerCase.token)
+        },
+      }),
+    })
+
+    for (const ownerCase of cases) {
+      assert.equal(existsSync(candidatePath(root, ownerCase.token)), false)
+    }
+  })
+
+  test('preserves unsupported and ambiguous candidates with exact evidence', () => {
+    const root = createRoot()
+    const regularToken = tokenFor(0x4_00)
+    const hardLinkToken = tokenFor(0x4_01)
+    const witnessToken = tokenFor(0x4_02)
+    const sharingToken = tokenFor(0x4_03)
+    const regularPath = candidatePath(root, regularToken)
+    mkdirSync(cacheDirectory(root), { recursive: true })
+    writeFileSync(regularPath, 'candidate file bytes')
+
+    const hardLinkPath = candidatePath(root, hardLinkToken)
+    mkdirSync(hardLinkPath)
+    const hardLinkOwner = join(hardLinkPath, 'owner.json')
+    writeFileSync(hardLinkOwner, '{hard-linked malformed owner')
+    const hardLinkAlias = join(root, 'hard-linked-owner.alias')
+    linkSync(hardLinkOwner, hardLinkAlias)
+    age(hardLinkOwner)
+    age(hardLinkPath)
+
+    const witnessPath = candidatePath(root, witnessToken)
+    mkdirSync(witnessPath)
+    writeFileSync(join(witnessPath, 'owner.recovered.json'), 'recovery witness bytes')
+    age(witnessPath)
+
+    const sharingPath = candidatePath(root, sharingToken)
+    mkdirSync(sharingPath)
+    const sharingOwner = join(sharingPath, 'owner.json')
+    writeFileSync(sharingOwner, '{sharing failure owner')
+    age(sharingOwner)
+    age(sharingPath)
+
+    const preserved = [
+      { bytes: readFileSync(regularPath), identity: identityOf(regularPath), path: regularPath },
+      { bytes: readFileSync(hardLinkOwner), identity: identityOf(hardLinkOwner), path: hardLinkOwner },
+      {
+        bytes: readFileSync(join(witnessPath, 'owner.recovered.json')),
+        identity: identityOf(join(witnessPath, 'owner.recovered.json')),
+        path: join(witnessPath, 'owner.recovered.json'),
+      },
+      { bytes: readFileSync(sharingOwner), identity: identityOf(sharingOwner), path: sharingOwner },
+    ]
+    cacheLocationTestHooks.beforeCacheOwnerOpen = path => {
+      if (basename(dirname(path)) === `operation.lock.${sharingToken}`) {
+        throw Object.assign(new Error('persistent candidate sharing failure'), { code: 'EBUSY' })
+      }
+    }
+    const entries = [regularToken, hardLinkToken, witnessToken, sharingToken].map(entryFor)
+    for (const _ of Array.from({ length: 2 })) {
+      let index = 0
+      withOperationLock(root, () => 'entered', {
+        openCandidateDirectory: () => ({
+          closeSync: () => undefined,
+          readSync: () => {
+            const entry = entries[index] ?? null
+            index += 1
+            return entry
+          },
+        }),
+      })
+    }
+
+    for (const evidence of preserved) {
+      assert.deepEqual(identityOf(evidence.path), evidence.identity)
+      assert.deepEqual(readFileSync(evidence.path), evidence.bytes)
+    }
+    assert.equal(existsSync(hardLinkAlias), true)
+  })
+
+  test('converges after a transient candidate sharing failure', () => {
+    const root = createRoot()
+    const token = tokenFor(0x5_00)
+    const path = candidatePath(root, token)
+    const ownerPath = join(path, 'owner.json')
+    mkdirSync(path, { recursive: true })
+    writeFileSync(ownerPath, '{transient sharing owner')
+    age(ownerPath)
+    age(path)
+    const originalIdentity = identityOf(ownerPath)
+    const originalBytes = readFileSync(ownerPath)
+    let failures = 0
+    cacheLocationTestHooks.beforeCacheOwnerOpen = current => {
+      if (basename(dirname(current)) === `operation.lock.${token}` && failures === 0) {
+        failures += 1
+        throw Object.assign(new Error('transient candidate sharing failure'), { code: 'EBUSY' })
+      }
+    }
+    const hooks = {
+      openCandidateDirectory: () => {
+        let read = false
+        return {
+          closeSync: () => undefined,
+          readSync: () => {
+            const entry = read ? null : entryFor(token)
+            read = true
+            return entry
+          },
+        }
+      },
+    }
+
+    withOperationLock(root, () => 'first', hooks)
+    assert.deepEqual(identityOf(ownerPath), originalIdentity)
+    assert.deepEqual(readFileSync(ownerPath), originalBytes)
+    withOperationLock(root, () => 'second', hooks)
+    assert.equal(existsSync(path), false)
   })
 
   test('preserves candidate symlinks and their external targets', () => {

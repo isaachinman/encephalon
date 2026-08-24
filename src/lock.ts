@@ -311,7 +311,6 @@ const releaseOwnedRecoveryMarker = (
         const expectedOwner: CacheOwnedFileObservation = marker.ownerFile
         const expectedWitness: CacheOwnedFileObservation = marker.recovered ?? { kind: 'missing' }
         quarantineCacheOwnedDirectory(location, marker.directory, markerRemainsCurrent, {
-          expectedChildren: marker.recovered === undefined ? ['owner.json'] : ['owner.json', 'owner.recovered.json'],
           expectedFiles: {
             owner: expectedOwner,
             recoveryWitness: expectedWitness,
@@ -478,10 +477,6 @@ export const withOperationLock = <Result>(
             observation.directory,
             () => recoveryMarkerRemainsStale(observation),
             {
-              expectedChildren: [
-                ...(observation.ownerFile.kind === 'missing' ? [] : ['owner.json']),
-                ...(observation.witness.kind === 'missing' ? [] : ['owner.recovered.json']),
-              ],
               expectedFiles: {
                 owner: observation.ownerFile,
                 recoveryWitness: observation.witness,
@@ -888,24 +883,7 @@ export const withOperationLock = <Result>(
     // must still hold that gate, so any directory metadata seen here is orphaned.
     const staleLock = inspectCacheOwnedDirectory(location, lockName)
     if (staleLock !== undefined) {
-      const staleOwner = observeCacheOwner(location, staleLock)
-      const staleWitness = observeCacheRecoveryWitness(location, staleLock)
-      const expectedChildren = staleOwner.kind === 'missing' ? [] : ['owner.json']
-      const actualChildren = observeExactCacheOwnedDirectoryChildren(location, staleLock, expectedChildren.length + 1)
-      const exactChildren =
-        staleWitness.kind === 'missing' &&
-        actualChildren.length === expectedChildren.length &&
-        actualChildren.every((name, index) => name === expectedChildren[index])
-      if (!exactChildren) {
-        return fail('VALIDATION_FAILED', 'The Encephalon cache layout is unsafe.', {
-          entry: 'node_modules/.cache/encephalon/operation.lock',
-          invariant: 'exact-child-set',
-        })
-      }
-      quarantineCacheOwnedDirectory(location, staleLock, undefined, {
-        expectedChildren,
-        expectedFiles: { owner: staleOwner, recoveryWitness: staleWitness },
-      })
+      quarantineCacheOwnedDirectory(location, staleLock)
     }
 
     const expectedOwner = candidateOwnerFile
@@ -928,13 +906,31 @@ export const withOperationLock = <Result>(
       expectedFiles: { owner: expectedOwner, recoveryWitness: expectedWitness },
       ownershipIsCurrent: candidateRemainsExact,
     })
+    const currentLock = ownedLockDirectory
     candidateDirectory = undefined
+    const assertCurrentLock = () => {
+      const children = observeExactCacheOwnedDirectoryChildren(location, currentLock, 2)
+      const current =
+        children.length === 1 &&
+        children[0] === 'owner.json' &&
+        sameCacheOwnedFileObservation(observeCacheOwner(location, currentLock), expectedOwner) &&
+        sameCacheOwnedFileObservation(observeCacheRecoveryWitness(location, currentLock), expectedWitness)
+      if (current) {
+        return
+      }
+      return fail('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
+        entry: 'node_modules/.cache/encephalon/operation.lock',
+        invariant: 'stable-owner-evidence',
+      })
+    }
     testHooks.beforeCandidateMaintenance?.()
     const maintenanceStats = maintainLockCandidates(location, {
+      assertCurrentLock,
       now,
       openDirectory: testHooks.openCandidateDirectory,
     })
     testHooks.afterCandidateMaintenance?.(maintenanceStats)
+    assertCurrentLock()
     try {
       operationOutcome = { value: operation(location) }
     } finally {
