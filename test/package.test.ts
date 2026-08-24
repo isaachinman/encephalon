@@ -207,7 +207,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-25 for code and behavioural-test snapshot `58ba821f4b655fad1b1e79be9df57600e7409381`\./,
+      /Last reviewed: 2026-08-25 for code and behavioural-test snapshot `e9583df8f9cc3615630ef76eab19d55ff986c288`\./,
     )
     assert.match(
       contract,
