@@ -150,6 +150,10 @@ describe('package contract', () => {
     assert.match(contract, /## Canonical Storage/)
     assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
+    assert.match(
+      contract,
+      /When rebuilding, cache preparation, forced hydration, public reads, post-add hydration, record-producing and no-add initialisation, and disposable-corruption recovery consume the records-owned sealed snapshot/,
+    )
     assert.match(contract, /## Bounded Disposable Cache Validation/)
     assert.match(contract, /## Gather Deduplication/)
     assert.match(contract, /Cache schema compatibility requires the exact owned ordinary-table semantics/)
