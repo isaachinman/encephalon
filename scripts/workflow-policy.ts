@@ -29,11 +29,20 @@ export type WorkflowPolicyFinding = Readonly<{
   rule: WorkflowPolicyRule
 }>
 
+/** @internal */
+export type ExternalReferenceObservation = Readonly<{
+  file: string
+  location: string
+  reference: string
+  releaseComment?: string
+}>
+
 type ParsedObject = Record<string, unknown>
 
 type ExecutableReference = Readonly<{
   kind: 'action' | 'workflow'
   location: string
+  path: readonly (number | string)[]
   reference: string
 }>
 
@@ -68,6 +77,7 @@ type WorkflowPolicyOptions = Readonly<{
   afterFirstFinalRevalidation?: () => void
   beforeFinalRevalidation?: () => void
   limits?: Partial<WorkflowPolicyLimits>
+  onExternalReference?: (observation: ExternalReferenceObservation) => void
   onSourceDescriptorIo?: (path: string, observation: DescriptorIoObservation) => void
   onSourceVisit?: (phase: 'enter' | 'exit', path: string, kind: ExecutableReference['kind']) => void
 }>
@@ -142,6 +152,7 @@ type DirectoryObservation =
   | Readonly<{ kind: 'missing' }>
 
 const fullCommitReference = /^[^\s@/]+\/[^\s@/]+(?:\/[^\s@/]+)*@[0-9a-f]{40}$/u
+const externalRepositoryReference = /^[^\s@/]+\/[^\s@/]+(?:\/[^\s@/]+)*@[^\s@]+$/u
 const fullDockerImageDigest = /^docker:\/\/[^@\s]+@sha256:[0-9a-f]{64}$/u
 const localReference = /^(?:\.|\$)\//u
 const identifierStart = /[A-Za-z_]/u
@@ -152,8 +163,9 @@ const secretsIdentifier = 'secrets'
 const workflowFilename = /\.ya?ml$/u
 const protectedEnvironment = 'pullfrog-review'
 const actionManifestFilenames = ['action.yml', 'action.yaml'] as const
-// Current checked-in policy sources are two workflows totalling 3,720 bytes; these limits leave broad local-wrapper headroom.
-const workflowPolicyLimits: WorkflowPolicyLimits = {
+// These limits bound repository-controlled traversal while leaving headroom for reachable local wrappers.
+/** @internal */
+export const workflowPolicyLimits: WorkflowPolicyLimits = {
   maximumAggregateSourceBytes: 4 * 1024 * 1024,
   maximumSecretTreeNodes: 16_384,
   maximumSourceBytes: 256 * 1024,
@@ -221,9 +233,8 @@ const isPlainObject = (value: unknown): value is ParsedObject => {
   return plain
 }
 
-/** @internal */
-export const parseWorkflowDocument = (source: string) => {
-  let parsed: ParsedObject | undefined
+const parseWorkflowSource = (source: string) => {
+  let parsed: Readonly<{ document: ReturnType<typeof parseDocument>; value: ParsedObject }> | undefined
   try {
     const document = parseDocument(source, {
       logLevel: 'error',
@@ -237,13 +248,28 @@ export const parseWorkflowDocument = (source: string) => {
     if (document.errors.length === 0 && document.warnings.length === 0) {
       const value: unknown = document.toJS({ maxAliasCount: 100 })
       if (isPlainObject(value)) {
-        parsed = value
+        parsed = { document, value }
       }
     }
   } catch {
     parsed = undefined
   }
   return parsed
+}
+
+/** @internal */
+export const parseWorkflowDocument = (source: string) => parseWorkflowSource(source)?.value
+
+const releaseCommentAtPath = (document: ReturnType<typeof parseDocument>, path: readonly (number | string)[]) => {
+  const node: unknown = document.getIn(path, true)
+  let releaseComment: string | undefined
+  if (typeof node === 'object' && node !== null && 'comment' in node && typeof node.comment === 'string') {
+    const comment = node.comment.trim()
+    if (comment.length > 0) {
+      releaseComment = comment
+    }
+  }
+  return releaseComment
 }
 
 const relativeFile = (root: string, path: string) => relative(root, path).split(sep).join('/')
@@ -646,7 +672,7 @@ const revalidateWorkflowPolicyWitnesses = (
   actionDirectoryWitnesses.every(witness => revalidateActionDirectoryWitness(root, witness, options))
 
 type StepReferenceFrame =
-  | Readonly<{ kind: 'enter'; location: string; value: unknown }>
+  | Readonly<{ kind: 'enter'; location: string; path: readonly (number | string)[]; value: unknown }>
   | Readonly<{ kind: 'exit'; value: object }>
 
 type ParsedTreeBudget = {
@@ -657,13 +683,14 @@ type ParsedTreeBudget = {
 const stepReferences = (
   value: unknown,
   location: string,
+  path: readonly (number | string)[],
   supportsParallel: boolean,
   budget: ParsedTreeBudget,
   visited: WeakSet<object>,
 ): ExecutableReferencesResult => {
   const active = new WeakSet<object>()
   const references: ExecutableReference[] = []
-  const stack: StepReferenceFrame[] = [{ kind: 'enter', location, value }]
+  const stack: StepReferenceFrame[] = [{ kind: 'enter', location, path, value }]
   let accepted = true
   while (accepted && stack.length > 0) {
     const frame = stack.pop()
@@ -686,18 +713,29 @@ const stepReferences = (
             stack.push({ kind: 'exit', value: object })
             if (Array.isArray(object)) {
               for (let index = object.length - 1; index >= 0; index -= 1) {
-                stack.push({ kind: 'enter', location: `${frame.location}[${String(index)}]`, value: object[index] })
+                stack.push({
+                  kind: 'enter',
+                  location: `${frame.location}[${String(index)}]`,
+                  path: [...frame.path, index],
+                  value: object[index],
+                })
               }
             } else {
               if (typeof object.uses === 'string') {
                 references.push({
                   kind: 'action',
                   location: `${frame.location}.uses`,
+                  path: [...frame.path, 'uses'],
                   reference: object.uses,
                 })
               }
               if (supportsParallel && Array.isArray(object.parallel)) {
-                stack.push({ kind: 'enter', location: `${frame.location}.parallel`, value: object.parallel })
+                stack.push({
+                  kind: 'enter',
+                  location: `${frame.location}.parallel`,
+                  path: [...frame.path, 'parallel'],
+                  value: object.parallel,
+                })
               }
             }
           }
@@ -726,11 +764,19 @@ const executableReferences = (
                 {
                   kind: 'workflow' as const,
                   location: `jobs.${jobName}.uses`,
+                  path: ['jobs', jobName, 'uses'],
                   reference: job.uses,
                 },
               ]
             : []
-        const steps = stepReferences(job.steps, `jobs.${jobName}.steps`, true, budget, visited)
+        const steps = stepReferences(
+          job.steps,
+          `jobs.${jobName}.steps`,
+          ['jobs', jobName, 'steps'],
+          true,
+          budget,
+          visited,
+        )
         accepted = accepted && steps.accepted
         jobReferences = [...reusableWorkflow, ...steps.references]
       }
@@ -740,11 +786,12 @@ const executableReferences = (
     const dockerImage = document.runs.image
     const dockerImageReference =
       document.runs.using === 'docker' && typeof dockerImage === 'string' && dockerImage.startsWith('docker://')
-        ? [{ kind: 'action' as const, location: 'runs.image', reference: dockerImage }]
+        ? [{ kind: 'action' as const, location: 'runs.image', path: ['runs', 'image'], reference: dockerImage }]
         : []
     const { accepted: stepsAccepted, references: stepActionReferences } = stepReferences(
       document.runs.steps,
       'runs.steps',
+      ['runs', 'steps'],
       false,
       budget,
       visited,
@@ -1028,6 +1075,7 @@ export const inspectWorkflowPolicy = (
     const inspectFile = (source: ExecutableSource) => {
       const file = relativeFile(nativeRoot, source.path)
       let document: ParsedObject | undefined
+      let sourceDocument: ReturnType<typeof parseDocument> | undefined
       let validatedFile: ValidatedNativeFile | undefined
       const remainingAggregateSourceBytes = Math.max(0, limits.maximumAggregateSourceBytes - aggregateSourceBytes)
       const sourceAllowance = Math.max(0, Math.min(limits.maximumSourceBytes, remainingAggregateSourceBytes))
@@ -1050,7 +1098,9 @@ export const inspectWorkflowPolicy = (
       }
 
       if (traversalIntegrityAccepted && validatedFile !== undefined) {
-        document = parseWorkflowDocument(validatedFile.contents)
+        const parsedSource = parseWorkflowSource(validatedFile.contents)
+        document = parsedSource?.value
+        sourceDocument = parsedSource?.document
       }
 
       if (traversalIntegrityAccepted) {
@@ -1095,8 +1145,23 @@ export const inspectWorkflowPolicy = (
                   if (!fullDockerImageDigest.test(reference.reference)) {
                     findings.push({ file, location: reference.location, rule: 'external-image-digest' })
                   }
-                } else if (!fullCommitReference.test(reference.reference)) {
-                  findings.push({ file, location: reference.location, rule: 'external-reference-sha' })
+                } else {
+                  if (
+                    options.onExternalReference !== undefined &&
+                    externalRepositoryReference.test(reference.reference)
+                  ) {
+                    const releaseComment =
+                      sourceDocument === undefined ? undefined : releaseCommentAtPath(sourceDocument, reference.path)
+                    options.onExternalReference({
+                      file,
+                      location: reference.location,
+                      reference: reference.reference,
+                      ...(releaseComment === undefined ? {} : { releaseComment }),
+                    })
+                  }
+                  if (!fullCommitReference.test(reference.reference)) {
+                    findings.push({ file, location: reference.location, rule: 'external-reference-sha' })
+                  }
                 }
               }
             }

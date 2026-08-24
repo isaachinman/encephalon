@@ -353,7 +353,7 @@ bun run build
 bun run check:package
 bun run check:publish
 git diff --check origin/main...HEAD
-node dist/cli.mjs validate --root /Users/isaac/Code/open-source/encephalon
+node dist/cli.mjs validate --root .
 ```
 
 Expected: every command exits zero; the full suite has zero failures with only the established capability skips; the already-published 0.2.0 refusal remains the accepted publish-contract result; Encephalon reports zero validation errors.

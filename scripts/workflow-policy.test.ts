@@ -18,11 +18,13 @@ import { afterEach, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
   type DescriptorIoObservation,
+  type ExternalReferenceObservation,
   formatWorkflowPolicyFindings,
   inspectWorkflowPolicy,
   isContainedComparablePath,
   parseWorkflowDocument,
   readValidatedNativeFile,
+  workflowPolicyLimits,
 } from './workflow-policy.ts'
 
 const temporaryRoots: string[] = []
@@ -186,6 +188,17 @@ test('reports an invalid missing repository root as a source-integrity finding',
       rule: 'source-integrity',
     },
   ])
+})
+
+// Mutation caught: drifting a production default would silently weaken or over-constrain the reviewed policy bounds.
+test('keeps the exact production workflow policy limits', () => {
+  assert.deepEqual(workflowPolicyLimits, {
+    maximumAggregateSourceBytes: 4 * 1024 * 1024,
+    maximumSecretTreeNodes: 16_384,
+    maximumSourceBytes: 256 * 1024,
+    maximumSourceVisits: 512,
+    maximumWorkflowDirectoryEntries: 256,
+  })
 })
 
 // Mutation caught: filtering before counting would let arbitrary raw workflow-directory entries evade the source bound.
@@ -1284,9 +1297,9 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: owner/action@0123456789abcdef0123456789abcdef01234567
+    - uses: owner/action@0123456789abcdef0123456789abcdef01234567 # v1.0.0
       with:
-        uses: owner/input@v1
+        uses: owner/input@v1 # data-only
 `,
     '.github/workflows/called.yml': `name: Called
 on: workflow_call
@@ -1312,7 +1325,23 @@ jobs:
 `,
   })
 
-  assert.deepEqual(inspectWorkflowPolicy(root), [])
+  const externalReferences: ExternalReferenceObservation[] = []
+  assert.deepEqual(
+    inspectWorkflowPolicy(root, {
+      onExternalReference: observation => {
+        externalReferences.push(observation)
+      },
+    }),
+    [],
+  )
+  assert.deepEqual(externalReferences, [
+    {
+      file: '.github/actions/checked/action.yml',
+      location: 'runs.steps[0].uses',
+      reference: 'owner/action@0123456789abcdef0123456789abcdef01234567',
+      releaseComment: 'v1.0.0',
+    },
+  ])
 })
 
 // Mutation caught: removing runner credential detection would allow dotted, bracket, or OIDC credentials without the protected environment.
@@ -2345,7 +2374,7 @@ jobs:
   ])
 })
 
-// Mutation caught: scanning only workflow steps would let a reachable local Docker action hide a mutable base image.
+// Mutations caught: local docker:// images remain inspected, while mutable repository Dockerfile FROM chains stay outside proof.
 test('inspects reachable local Docker images while accepting repository Dockerfiles', () => {
   const root = createFixture({
     '.github/actions/dockerfile-relative/action.yml': `name: Relative Dockerfile
@@ -2353,13 +2382,13 @@ runs:
   using: docker
   image: ./Dockerfile
 `,
-    '.github/actions/dockerfile-relative/Dockerfile': 'FROM scratch\n',
+    '.github/actions/dockerfile-relative/Dockerfile': 'FROM alpine:3.20\n',
     '.github/actions/dockerfile/action.yml': `name: Dockerfile
 runs:
   using: docker
   image: Dockerfile
 `,
-    '.github/actions/dockerfile/Dockerfile': 'FROM scratch\n',
+    '.github/actions/dockerfile/Dockerfile': 'FROM alpine:3.20\n',
     '.github/actions/mutable/action.yml': `name: Mutable image
 runs:
   using: docker
@@ -2532,7 +2561,15 @@ jobs:
 // This suite owns the structural workflow security contract; test/package.test.ts independently guards its CI bootstrap.
 // Mutation caught: mutable actions, hidden local wrappers, unprotected credentials, or write permissions would escape repository policy.
 test('repository workflows obey immutable action and credential boundaries', () => {
-  assert.deepEqual(inspectWorkflowPolicy(repositoryRoot), [])
+  const externalReferences: ExternalReferenceObservation[] = []
+  assert.deepEqual(
+    inspectWorkflowPolicy(repositoryRoot, {
+      onExternalReference: observation => {
+        externalReferences.push(observation)
+      },
+    }),
+    [],
+  )
 
   // Mutation caught: removing push: disabled would restore Pullfrog's write-capable Git token and push tools.
   const parsedPullfrogWorkflow = parseWorkflowDocument(
@@ -2585,6 +2622,15 @@ test('repository workflows obey immutable action and credential boundaries', () 
   const parsedCiWorkflow = parseWorkflowDocument(readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8'))
   assert.notEqual(parsedCiWorkflow, undefined)
   const ciWorkflow = parsedCiWorkflow as CiWorkflow
+  const packageConfiguration = JSON.parse(readFileSync(join(repositoryRoot, 'package.json'), 'utf8')) as Readonly<{
+    devDependencies?: Readonly<Record<string, unknown>>
+    packageManager?: unknown
+  }>
+  assert.equal(typeof packageConfiguration.packageManager, 'string')
+  const packageManagerMatch = /^bun@(\d+\.\d+\.\d+)$/u.exec(packageConfiguration.packageManager as string)
+  assert.notEqual(packageManagerMatch, null)
+  const bunVersion = packageManagerMatch?.[1]
+  assert.equal(packageConfiguration.devDependencies?.['@types/bun'], bunVersion)
   assert.deepEqual(
     ciWorkflow.jobs.verify.steps.filter(step => step.uses !== undefined).map(step => step.uses),
     [
@@ -2602,6 +2648,16 @@ test('repository workflows obey immutable action and credential boundaries', () 
       'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
     ],
   )
+  // Mutation caught: hosted CI must not install a different Bun than the manifest and exact declarations use.
+  const setupBunReference = 'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6'
+  const setupBunSteps = Object.values(ciWorkflow.jobs).flatMap(job =>
+    job.steps.filter(step => step.uses === setupBunReference),
+  )
+  assert.equal(setupBunSteps.length, 2)
+  assert.deepEqual(
+    setupBunSteps.map(step => step.with?.['bun-version']),
+    [bunVersion, bunVersion],
+  )
   const ciCheckoutSteps = Object.values(ciWorkflow.jobs).flatMap(job =>
     job.steps.filter(step => typeof step.uses === 'string' && step.uses.startsWith('actions/checkout@')),
   )
@@ -2611,28 +2667,24 @@ test('repository workflows obey immutable action and credential boundaries', () 
     true,
   )
 
-  // Structural YAML parsing discards comments, so raw lines deliberately bind each reviewed SHA to its adjacent release.
-  const ciWorkflowSource = readFileSync(join(repositoryRoot, '.github/workflows/ci.yml'), 'utf8')
+  // Structurally observed executable references bind to exact adjacent YAML scalar comments without scanning data fields.
+  const reviewedReleaseComments: Readonly<Record<string, string>> = {
+    'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1': 'v7.0.1',
+    'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803': 'v6.1.0',
+    'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020': 'v7.0.0',
+    'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02': 'v4.6.2',
+    'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6': 'v2.2.0',
+    'pullfrog/pullfrog@c4d0ca6f15d12382ddd20d2010bc596b405f42f0': 'v0.1.60',
+  }
   assert.deepEqual(
-    ciWorkflowSource.split('\n').filter(line => /^\s+(?:- )?uses:/u.test(line)),
-    [
-      '      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1',
-      '      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0',
-      '      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0',
-      '      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1',
-      '      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0',
-      '      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0',
-      '        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2',
-    ],
+    [...new Set(externalReferences.map(observation => observation.reference))].toSorted(),
+    Object.keys(reviewedReleaseComments).toSorted(),
   )
-
-  const pullfrogWorkflowSource = readFileSync(join(repositoryRoot, '.github/workflows/pullfrog.yml'), 'utf8')
-  assert.deepEqual(
-    pullfrogWorkflowSource.split('\n').filter(line => /^\s+(?:- )?uses:/u.test(line)),
-    [
-      '        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0',
-      '        uses: pullfrog/pullfrog@c4d0ca6f15d12382ddd20d2010bc596b405f42f0 # v0.1.60',
-    ],
+  assert.equal(
+    externalReferences.every(
+      observation => observation.releaseComment === reviewedReleaseComments[observation.reference],
+    ),
+    true,
   )
 
   const dependabotConfiguration = parseWorkflowDocument(
