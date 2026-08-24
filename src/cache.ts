@@ -36,7 +36,7 @@ import {
   revalidateCanonicalDirectory,
 } from './canonical-layout.ts'
 import { EncephalonError, fail, failBudget, failWithCause, wrapIo } from './errors.ts'
-import { sameStableEntryMetadata } from './filesystem-entry.ts'
+import { manifestEntryMetadataFrom, sameStableEntryMetadata } from './filesystem-entry.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import { withOperationLock } from './lock.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
@@ -940,32 +940,26 @@ const statEntry = (root: string, path: string, missingAllowed = false): Manifest
     }
     throw error
   }
-  let type: ManifestEntry['type']
-  if (metadata.isSymbolicLink()) {
-    type = 'symlink'
-  } else if (metadata.isDirectory()) {
-    type = 'directory'
-  } else if (metadata.isFile()) {
-    type = 'file'
-  } else {
-    type = 'other'
-  }
+  const { ctimeNanoseconds, mtimeNanoseconds, size, type } = manifestEntryMetadataFrom(metadata)
   return {
-    ctimeNanoseconds: metadata.ctimeNs.toString(),
-    mtimeNanoseconds: metadata.mtimeNs.toString(),
+    ctimeNanoseconds,
+    mtimeNanoseconds,
     path: posixRelative(root, path),
-    size: metadata.size.toString(),
+    size,
     type,
   }
 }
 
-const artifactManifestEntry = (observation: ArtifactObservation): ManifestEntry => ({
-  ctimeNanoseconds: observation.metadata.ctimeNs.toString(),
-  mtimeNanoseconds: observation.metadata.mtimeNs.toString(),
-  path: `encephalon/${observation.path}`,
-  size: observation.metadata.size.toString(),
-  type: 'file',
-})
+const artifactManifestEntry = (observation: ArtifactObservation): ManifestEntry => {
+  const { ctimeNanoseconds, mtimeNanoseconds, size, type } = manifestEntryMetadataFrom(observation.metadata)
+  return {
+    ctimeNanoseconds,
+    mtimeNanoseconds,
+    path: `encephalon/${observation.path}`,
+    size,
+    type,
+  }
+}
 
 const recordManifestEntries = (root: string) => {
   const brainDirectory = resolve(root, 'encephalon')
