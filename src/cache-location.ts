@@ -156,6 +156,7 @@ type CacheLocationTestHooks = {
   beforeCacheOwnerOpen?: ((path: string) => void) | undefined
   beforeCacheLocationAssertion?: (() => void) | undefined
   beforeLocationInspection?: (() => void) | undefined
+  beforeOwnedDirectoryPromotionRename?: ((path: string) => void) | undefined
   beforeOwnedDirectoryFinalIdentity?: ((path: string) => void) | undefined
   beforeOwnerRecoveryFsync?: ((path: string) => void) | undefined
   beforeQuarantineRename?: ((path: string) => void) | undefined
@@ -1242,6 +1243,7 @@ export const promoteCacheOwnedDirectory = (
     return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-owner-evidence')
   }
   const targetPath = resolve(location.directory, targetName)
+  cacheLocationTestHooks.beforeOwnedDirectoryPromotionRename?.(directory.path)
   renameSync(directory.path, targetPath)
   assertCacheLocation(location)
   const promoted = observeCacheOwnedDirectory(location, targetName)
