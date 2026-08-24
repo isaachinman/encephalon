@@ -417,8 +417,8 @@ jobs:
   ])
 })
 
-// Mutation caught: recursive, unmetered secret detection would accept a parsed job whose tree exceeds the work budget.
-test('accepts the exact secret-tree work limit and rejects one over', () => {
+// Mutation caught: resetting the budget between secret and executable traversal would exceed the documented shared ceiling.
+test('accepts the exact combined parsed-tree work limit and rejects one over', () => {
   const root = createFixture({
     '.github/workflows/tree.yml': `name: Tree
 on: workflow_dispatch
@@ -431,8 +431,39 @@ jobs:
 `,
   })
 
-  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSecretTreeNodes: 3 } }), [])
-  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSecretTreeNodes: 2 } }), [
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSecretTreeNodes: 4 } }), [])
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSecretTreeNodes: 3 } }), [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: allocating each discovered source a fresh executable budget would let aggregate parsed-tree work overflow.
+test('shares the combined parsed-tree work limit across discovered sources', () => {
+  const root = createFixture({
+    '.github/actions/checked/action.yml': `name: Checked
+runs:
+  using: composite
+  steps:
+    - uses: owner/action@0123456789abcdef0123456789abcdef01234567
+`,
+    '.github/workflows/tree.yml': `name: Tree
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/checked
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSecretTreeNodes: 9 } }), [])
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSecretTreeNodes: 8 } }), [
     {
       file: '.github/workflows',
       location: '$',

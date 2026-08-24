@@ -637,17 +637,17 @@ type StepReferenceFrame =
   | Readonly<{ kind: 'enter'; location: string; value: unknown }>
   | Readonly<{ kind: 'exit'; value: object }>
 
-type StructuralObjectBudget = {
+type ParsedTreeBudget = {
   maximum: number
-  objects: number
-  visited: WeakSet<object>
+  nodes: number
 }
 
 const stepReferences = (
   value: unknown,
   location: string,
   supportsParallel: boolean,
-  budget: StructuralObjectBudget,
+  budget: ParsedTreeBudget,
+  visited: WeakSet<object>,
 ): ExecutableReferencesResult => {
   const active = new WeakSet<object>()
   const references: ExecutableReference[] = []
@@ -664,10 +664,10 @@ const stepReferences = (
         if (active.has(object)) {
           accepted = false
         } else {
-          if (!budget.visited.has(object)) {
-            budget.visited.add(object)
-            budget.objects += 1
-            accepted = budget.objects <= budget.maximum
+          if (!visited.has(object)) {
+            visited.add(object)
+            budget.nodes += 1
+            accepted = budget.nodes <= budget.maximum
           }
           if (accepted) {
             active.add(object)
@@ -699,15 +699,11 @@ const stepReferences = (
 const executableReferences = (
   document: ParsedObject,
   kind: ExecutableReference['kind'],
-  maximumStructuralObjects: number,
+  budget: ParsedTreeBudget,
+  visited: WeakSet<object>,
 ): ExecutableReferencesResult => {
   let accepted = true
   let references: readonly ExecutableReference[] = []
-  const structuralObjectBudget: StructuralObjectBudget = {
-    maximum: maximumStructuralObjects,
-    objects: 0,
-    visited: new WeakSet<object>(),
-  }
   if (kind === 'workflow' && isPlainObject(document.jobs)) {
     references = Object.entries(document.jobs).flatMap(([jobName, job]) => {
       let jobReferences: readonly ExecutableReference[] = []
@@ -722,7 +718,7 @@ const executableReferences = (
                 },
               ]
             : []
-        const steps = stepReferences(job.steps, `jobs.${jobName}.steps`, true, structuralObjectBudget)
+        const steps = stepReferences(job.steps, `jobs.${jobName}.steps`, true, budget, visited)
         accepted = accepted && steps.accepted
         jobReferences = [...reusableWorkflow, ...steps.references]
       }
@@ -738,7 +734,8 @@ const executableReferences = (
       document.runs.steps,
       'runs.steps',
       false,
-      structuralObjectBudget,
+      budget,
+      visited,
     )
     accepted = stepsAccepted
     references = [...dockerImageReference, ...stepActionReferences]
@@ -812,14 +809,9 @@ const stringContainsSecretExpression = (value: string) => {
   return containsSecret
 }
 
-type SecretTreeBudget = {
-  maximum: number
-  nodes: number
-}
-
 type SecretTreeFrame = Readonly<{ kind: 'enter'; value: unknown }> | Readonly<{ kind: 'exit'; value: object }>
 
-const containsSecretExpression = (value: unknown, budget: SecretTreeBudget) => {
+const containsSecretExpression = (value: unknown, budget: ParsedTreeBudget) => {
   const active = new WeakSet<object>()
   const visited = new WeakSet<object>()
   const stack: SecretTreeFrame[] = [{ kind: 'enter', value }]
@@ -948,13 +940,13 @@ const inspectWorkflowJobs = (
   document: ParsedObject,
   file: string,
   findings: WorkflowPolicyFinding[],
-  secretTreeBudget: SecretTreeBudget,
+  parsedTreeBudget: ParsedTreeBudget,
 ) => {
   const { jobs } = document
   let accepted = true
   let workflowEnvironmentContainsSecret = false
   if (document.env !== undefined) {
-    const { accepted: environmentAccepted, containsSecret } = containsSecretExpression(document.env, secretTreeBudget)
+    const { accepted: environmentAccepted, containsSecret } = containsSecretExpression(document.env, parsedTreeBudget)
     accepted = environmentAccepted
     workflowEnvironmentContainsSecret = containsSecret
   }
@@ -973,7 +965,7 @@ const inspectWorkflowJobs = (
           }
         } else {
           inspectJobPermissions(value, jobName, file, findings)
-          const { accepted: jobAccepted, containsSecret } = containsSecretExpression(value, secretTreeBudget)
+          const { accepted: jobAccepted, containsSecret } = containsSecretExpression(value, parsedTreeBudget)
           accepted = jobAccepted
           const credentialBearing =
             workflowEnvironmentContainsSecret ||
@@ -1004,7 +996,8 @@ export const inspectWorkflowPolicy = (
     const fileWitnesses = new Map<string, FileWitness>()
     const actionDirectoryWitnesses = new Map<string, ActionDirectoryWitness>()
     const sourceQueue: ExecutableSource[] = []
-    const secretTreeBudget: SecretTreeBudget = { maximum: limits.maximumSecretTreeNodes, nodes: 0 }
+    const parsedTreeBudget: ParsedTreeBudget = { maximum: limits.maximumSecretTreeNodes, nodes: 0 }
+    const executableTreeObjects = new WeakSet<object>()
     let aggregateSourceBytes = 0
     let traversalIntegrityAccepted = true
 
@@ -1054,12 +1047,12 @@ export const inspectWorkflowPolicy = (
         } else {
           if (source.kind === 'workflow') {
             inspectWorkflowPermissions(document, file, findings)
-            traversalIntegrityAccepted = inspectWorkflowJobs(document, file, findings, secretTreeBudget)
+            traversalIntegrityAccepted = inspectWorkflowJobs(document, file, findings, parsedTreeBudget)
           }
 
           if (traversalIntegrityAccepted) {
             // Executable traversal shares the parsed-tree ceiling used by workflow secret scanning.
-            const executable = executableReferences(document, source.kind, limits.maximumSecretTreeNodes)
+            const executable = executableReferences(document, source.kind, parsedTreeBudget, executableTreeObjects)
             traversalIntegrityAccepted = executable.accepted
             for (const reference of executable.references) {
               if (traversalIntegrityAccepted) {
