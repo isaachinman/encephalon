@@ -229,6 +229,8 @@ afterEach(() => {
 })
 
 describe('initialisation', () => {
+  const canonicalRaceRecoveryAction =
+    'Run validate and reconcile the canonical repository before retrying the operation.'
   const baselinePublicationOrder = [
     ['context', 'encephalon:init/repository-overview'],
     ['architecture', 'encephalon:init/tooling-layout'],
@@ -1302,34 +1304,134 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
 
-  test('rejects a replacement canonical generation before publishing any baseline record', () => {
+  test('replans a replacement canonical generation before publishing the baseline', () => {
     const root = createRoot()
     mkdirSync(join(root, 'encephalon', 'decision'), { recursive: true })
     const brainDirectory = join(root, 'encephalon')
     const displaced = join(root, 'displaced-encephalon-before-init')
     let replaced = false
 
-    assertErrorCode(
+    const result = initEncephalonWithHooks(
+      { root },
+      {
+        recordWriteHooks: {
+          fault: point => {
+            if (point === 'before-directory-preparation' && !replaced) {
+              replaced = true
+              renameSync(brainDirectory, displaced)
+              mkdirSync(join(brainDirectory, 'decision'), { recursive: true })
+            }
+          },
+        },
+      },
+    )
+    assert.equal(replaced, true)
+    assert.equal(result.recordsCreated.length, baselinePublicationOrder.length)
+    assert.equal(api.validateRecords({ root }).valid, true)
+    assert.deepEqual(readdirSync(join(brainDirectory, '_staging')), [])
+    assert.equal(existsSync(join(root, 'AGENTS.md')), true)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), true)
+  })
+
+  test('init replans changed canonical generation before the first baseline link', () => {
+    const root = createRoot()
+    const concurrentId = 'concurrent-repository-overview'
+    const concurrentCreatedAt = new Date(Date.now() + 86_400_000).toISOString()
+    const work = { baselineScans: 0, canonicalScans: 0, graphValidations: 0, links: 0 }
+    let changed = false
+
+    const result = initEncephalonWithHooks(
+      { root },
+      {
+        baselineScan: () => {
+          work.baselineScans += 1
+        },
+        canonicalScan: () => {
+          work.canonicalScans += 1
+        },
+        graphValidation: () => {
+          work.graphValidations += 1
+        },
+        recordWriteHooks: {
+          fault: point => {
+            if (point === 'before-directory-preparation' && !changed) {
+              changed = true
+              writeRecordFile(root, {
+                createdAt: concurrentCreatedAt,
+                id: concurrentId,
+                kind: 'context',
+                payload: { summary: 'Concurrent repository overview' },
+                source: 'test',
+                subject: 'encephalon:init/repository-overview',
+              })
+            }
+            if (point === 'after-canonical-link') {
+              work.links += 1
+            }
+          },
+        },
+      },
+    )
+
+    assert.equal(changed, true)
+    assert.deepEqual(work, { baselineScans: 1, canonicalScans: 2, graphValidations: 2, links: 2 })
+    assert.deepEqual(
+      result.recordsCreated.map(record => [record.subject, record.createdAt]),
+      [
+        ['encephalon:init/tooling-layout', new Date(Date.parse(concurrentCreatedAt) + 1).toISOString()],
+        ['encephalon:init/commands-ci', new Date(Date.parse(concurrentCreatedAt) + 2).toISOString()],
+      ],
+    )
+    assert.deepEqual(result.skippedConflicts, [
+      {
+        activeRecordIds: [concurrentId],
+        kind: 'context',
+        subject: 'encephalon:init/repository-overview',
+      },
+    ])
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('init preserves repository change when the replanned canonical generation settles malformed', () => {
+    const root = createRoot()
+    const malformedPath = join(root, 'encephalon', 'decision', 'malformed-successor.json')
+    let changed = false
+
+    assert.throws(
       () =>
         initEncephalonWithHooks(
           { root },
           {
             recordWriteHooks: {
               fault: point => {
-                if (point === 'before-directory-preparation' && !replaced) {
-                  replaced = true
-                  renameSync(brainDirectory, displaced)
-                  mkdirSync(join(brainDirectory, 'decision'), { recursive: true })
+                if (point === 'before-directory-preparation' && !changed) {
+                  changed = true
+                  ensureParent(malformedPath)
+                  writeFileSync(malformedPath, '{ malformed successor')
                 }
               },
             },
           },
         ),
-      'REPOSITORY_CHANGED',
+      (error: unknown) => {
+        const actual = error as Error & {
+          cause?: unknown
+          code?: unknown
+          details?: { initProgress?: { committedRecordIds?: unknown } }
+        }
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(actual.message, 'Canonical layout changed before publication.')
+        assert.deepEqual(actual.details?.initProgress?.committedRecordIds, [])
+        assert.equal(actual.cause, undefined)
+        assert.equal(JSON.stringify(actual).includes(root), false)
+        return true
+      },
     )
-    assert.equal(replaced, true)
-    assert.deepEqual(readdirSync(join(brainDirectory, 'decision')), [])
-    assert.equal(existsSync(join(brainDirectory, '_staging')), false)
+
+    assert.equal(changed, true)
+    assert.equal(existsSync(malformedPath), true)
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
@@ -2016,6 +2118,168 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('stops a mid-batch canonical generation race at the exact committed prefix', () => {
+    const root = createRoot()
+    const safeCauseMessage = 'Canonical layout changed before publication.'
+    let cacheHooks = 0
+    let instructionHooks = 0
+    let publicationAttempts = 0
+    let publicationLinks = 0
+    let capturedError: unknown
+
+    try {
+      initEncephalonWithHooks(
+        { root },
+        {
+          hydration: () => {
+            cacheHooks += 1
+          },
+          instructionWriteHooks: {
+            fault: () => {
+              instructionHooks += 1
+            },
+          },
+          recordWriteHooks: {
+            fault: point => {
+              if (point === 'before-directory-preparation') {
+                publicationAttempts += 1
+                if (publicationAttempts === 2) {
+                  writeRecordFile(root, {
+                    createdAt: new Date(Date.now() + 86_400_000).toISOString(),
+                    id: 'concurrent-mid-batch-sibling',
+                    kind: 'decision',
+                    payload: {},
+                    source: 'test',
+                    subject: 'generation.concurrent-mid-batch-sibling',
+                  })
+                }
+              }
+              if (point === 'after-canonical-link') {
+                publicationLinks += 1
+              }
+            },
+          },
+        },
+      )
+      assert.fail('Expected the changed canonical generation to stop the batch.')
+    } catch (error) {
+      capturedError = error
+    }
+
+    assert.ok(capturedError instanceof EncephalonError)
+    const committedRecordIds = committedBaselineIds(root)
+    assert.equal(committedRecordIds.length, 1)
+    assert.equal(publicationAttempts, 2)
+    assert.equal(publicationLinks, 1)
+    assert.equal(cacheHooks, 0)
+    assert.equal(instructionHooks, 0)
+    assert.equal(capturedError.code, 'REPOSITORY_CHANGED')
+    assert.equal(
+      capturedError.message,
+      `The canonical repository changed after 1 record was committed. ${canonicalRaceRecoveryAction}`,
+    )
+    const { initProgress, ...raceDetails } = capturedError.details
+    assert.deepEqual(raceDetails, {
+      canonicalCommitted: true,
+      committedRecordIds,
+      postCommitPhase: 'publicationVerification',
+      recoveryAction: canonicalRaceRecoveryAction,
+      repositoryChanged: true,
+    })
+    assert.equal(Object.isFrozen(raceDetails.committedRecordIds), true)
+    assert.deepEqual((initProgress as { committedRecordIds?: unknown }).committedRecordIds, committedRecordIds)
+    assert.deepEqual(initProgress, {
+      cacheState: 'disposable',
+      canonicalCommitted: true,
+      committedInstructionFiles: [],
+      committedRecordIds,
+      phase: 'recordPublication',
+      recoveryAction:
+        'Inspect the reported canonical records, then repeat the same init operation with the same options.',
+      recoveryMode: 'inspectAndRerun',
+    })
+    const cause = capturedError.cause as Error & { code?: unknown }
+    assert.equal(cause.code, 'REPOSITORY_CHANGED')
+    assert.equal(cause.message, safeCauseMessage)
+    assert.equal(cause.cause, undefined)
+    assert.equal(JSON.stringify(capturedError).includes(root), false)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+    assert.equal(existsSync(join(root, 'encephalon', 'architecture')), false)
+    assert.equal(existsSync(join(root, 'encephalon', 'workflow')), false)
+  })
+
+  test('reports the full mid-batch canonical generation prefix after a later hard link', () => {
+    const root = createRoot()
+    let cacheHooks = 0
+    let instructionHooks = 0
+    let publicationLinks = 0
+    let capturedError: unknown
+
+    try {
+      initEncephalonWithHooks(
+        { root },
+        {
+          hydration: () => {
+            cacheHooks += 1
+          },
+          instructionWriteHooks: {
+            fault: () => {
+              instructionHooks += 1
+            },
+          },
+          recordWriteHooks: {
+            fault: point => {
+              if (point === 'after-canonical-link') {
+                publicationLinks += 1
+                if (publicationLinks === 2) {
+                  writeRecordFile(root, {
+                    createdAt: new Date(Date.now() + 86_400_000).toISOString(),
+                    id: 'concurrent-after-second-baseline-link',
+                    kind: 'decision',
+                    payload: {},
+                    source: 'test',
+                    subject: 'generation.concurrent-after-second-baseline-link',
+                  })
+                }
+              }
+            },
+          },
+        },
+      )
+      assert.fail('Expected the changed canonical generation to stop the batch.')
+    } catch (error) {
+      capturedError = error
+    }
+
+    assert.ok(capturedError instanceof EncephalonError)
+    const committedRecordIds = committedBaselineIds(root)
+    assert.equal(committedRecordIds.length, 2)
+    assert.equal(publicationLinks, 2)
+    assert.equal(cacheHooks, 0)
+    assert.equal(instructionHooks, 0)
+    assert.equal(capturedError.code, 'REPOSITORY_CHANGED')
+    assert.deepEqual(capturedError.details.committedRecordIds, committedRecordIds)
+    assert.equal(Object.isFrozen(capturedError.details.committedRecordIds), true)
+    assert.deepEqual(
+      (capturedError.details.initProgress as { committedRecordIds?: unknown }).committedRecordIds,
+      committedRecordIds,
+    )
+    assert.equal(capturedError.details.recordId, committedRecordIds[1])
+    assert.equal(capturedError.details.repositoryChanged, true)
+    assert.equal(capturedError.details.postCommitPhase, 'publicationVerification')
+    assert.equal(capturedError.details.recoveryAction, canonicalRaceRecoveryAction)
+    const cause = capturedError.cause as Error & { code?: unknown }
+    assert.equal(cause.code, 'REPOSITORY_CHANGED')
+    assert.equal(cause.message, 'Canonical layout changed before publication.')
+    assert.equal(cause.cause, undefined)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+    assert.equal(existsSync(join(root, 'encephalon', 'workflow')), false)
   })
 
   test('records package scripts as structured argv data instead of shell strings', () => {

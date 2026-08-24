@@ -270,7 +270,7 @@ const addCacheRecord = (root: string) =>
     subject: 'cache.validation',
   })
 
-test('writes validated mutation snapshots equivalently and falls back after identity changes', () => {
+test('writes validated mutation snapshots equivalently and reports post-link identity changes', () => {
   const cases = [
     { kind: 'stable', name: 'stable snapshot' },
     { kind: 'corrupt', name: 'corrupt cache recovery' },
@@ -339,31 +339,48 @@ test('writes validated mutation snapshots equivalently and falls back after iden
       }
     }
 
-    api.addRecord({
-      id: `snapshot-addition-${entry.kind}`,
-      kind: 'decision',
-      payload: { summary: 'Validated snapshot addition' },
-      root,
-      searchText: 'new searchable snapshot addition',
-      source: 'test',
-      subject: `cache.snapshot.${entry.kind}`,
-      supersedes: [seedId],
-    })
+    const additionId = `snapshot-addition-${entry.kind}`
+    const identityChanged = entry.kind === 'record' || entry.kind === 'writer-record' || entry.kind === 'artifact'
+    let additionError: unknown
+    try {
+      api.addRecord({
+        id: additionId,
+        kind: 'decision',
+        payload: { summary: 'Validated snapshot addition' },
+        root,
+        searchText: 'new searchable snapshot addition',
+        source: 'test',
+        subject: `cache.snapshot.${entry.kind}`,
+        supersedes: [seedId],
+      })
+    } catch (error) {
+      additionError = error
+    }
 
-    assert.equal(
-      diskCacheValidations,
-      entry.kind === 'record' || entry.kind === 'writer-record' || entry.kind === 'artifact' ? 1 : 0,
-      entry.name,
-    )
+    if (identityChanged) {
+      const actual = additionError as Error & { cause?: unknown; code?: unknown; details?: Record<string, unknown> }
+      assert.equal(actual.code, 'REPOSITORY_CHANGED', entry.name)
+      assert.deepEqual(actual.details?.committedRecordIds, [additionId], entry.name)
+      assert.equal(actual.details?.canonicalCommitted, true, entry.name)
+      assert.equal(actual.details?.repositoryChanged, true, entry.name)
+      assert.equal(actual.details?.postCommitPhase, 'publicationVerification', entry.name)
+      assert.equal((actual.cause as { code?: unknown }).code, 'REPOSITORY_CHANGED', entry.name)
+    } else {
+      assert.equal(additionError, undefined, entry.name)
+    }
+
+    assert.equal(diskCacheValidations, 0, entry.name)
     if (entry.kind === 'record' || entry.kind === 'writer-record') {
       const shown = api.showRecord({ activeOnly: false, id: seedId, root })
       assert.ok(shown)
       assert.equal((shown.payload as { summary?: unknown }).summary, 'Current replacement snapshot seed')
     }
-    const snapshotProjection = logicalCacheProjection(root)
+    const snapshotProjection = identityChanged ? undefined : logicalCacheProjection(root)
     cacheReadTestHooks.afterCanonicalValidation = undefined
     assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 2 })
-    assert.deepEqual(logicalCacheProjection(root), snapshotProjection, entry.name)
+    if (snapshotProjection !== undefined) {
+      assert.deepEqual(logicalCacheProjection(root), snapshotProjection, entry.name)
+    }
     assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 2 }, entry.name)
   }
 })

@@ -119,10 +119,18 @@ const assertCommittedRepositoryChange = (operation: () => unknown, path: string,
     }
     assert.equal(actual.code, 'REPOSITORY_CHANGED')
     assert.equal(actual.details?.canonicalCommitted, true)
+    assert.deepEqual(actual.details?.committedRecordIds, [recordId])
     assert.equal(actual.details?.path, path)
     assert.equal(actual.details?.postCommitPhase, 'publicationVerification')
     assert.equal(actual.details?.recordId, recordId)
-    assert.equal(typeof actual.details?.recoveryAction, 'string')
+    assert.equal(actual.details?.recoveryAction, canonicalRaceRecoveryAction)
+    assert.equal(actual.details?.repositoryChanged, true)
+    assert.equal(Object.isFrozen(actual.details?.committedRecordIds), true)
+    const cause = (error as Error & { cause?: unknown }).cause as Error & { cause?: unknown; code?: unknown }
+    assert.equal(cause.code, 'REPOSITORY_CHANGED')
+    assert.equal(cause.message, 'Canonical layout changed before publication.')
+    assert.equal(cause.cause, undefined)
+    assert.equal(cause.name, 'EncephalonError')
     return true
   })
 }
@@ -135,6 +143,8 @@ const postCommitRecoveryAction = {
     'Inspect the canonical directory generation before retrying; the linked record may have been displaced by a concurrent replacement.',
   stagingCleanup: 'Inspect encephalon/_staging and remove only a confirmed leftover from this operation.',
 } as const
+
+const canonicalRaceRecoveryAction = 'Run validate and reconcile the canonical repository before retrying the operation.'
 
 const assertPostCommitError = (
   operation: () => unknown,
@@ -482,6 +492,438 @@ describe('canonical records', () => {
       'REPOSITORY_CHANGED',
     )
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'candidate-after-observed-mutation.json')), false)
+  })
+
+  test('add replans changed canonical generation after an unrelated sibling appears', () => {
+    const root = createRoot()
+    const concurrentCreatedAt = new Date(Date.now() + 86_400_000).toISOString()
+    const work = { canonicalScans: 0, graphValidations: 0, links: 0 }
+    let changed = false
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        work.canonicalScans += 1
+      },
+      graphValidation: () => {
+        work.graphValidations += 1
+      },
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-scan-validation' && !changed) {
+        changed = true
+        writeCanonicalRecord(root, {
+          createdAt: concurrentCreatedAt,
+          id: 'concurrent-unrelated-sibling',
+          subject: 'generation.concurrent-unrelated-sibling',
+        })
+      }
+      if (point === 'after-canonical-link') {
+        work.links += 1
+      }
+    }
+
+    const added = api.addRecord({
+      id: 'replanned-unrelated-candidate',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'generation.replanned-unrelated-candidate',
+    })
+
+    assert.equal(changed, true)
+    assert.equal(added.createdAt, new Date(Date.parse(concurrentCreatedAt) + 1).toISOString())
+    assert.deepEqual(work, { canonicalScans: 2, graphValidations: 2, links: 1 })
+    assert.equal(existsSync(join(root, added.path)), true)
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('add replans changed canonical generation but preserves repository change when the candidate becomes invalid', () => {
+    const root = createRoot()
+    const candidatePath = join(root, 'encephalon', 'decision', 'replanned-invalid-candidate.json')
+    const work = { canonicalScans: 0, graphValidations: 0 }
+    let changed = false
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        work.canonicalScans += 1
+      },
+      graphValidation: () => {
+        work.graphValidations += 1
+      },
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-scan-validation' && !changed) {
+        changed = true
+        writeCanonicalRecord(root, {
+          id: 'concurrent-same-subject-head',
+          subject: 'generation.replanned-invalid-candidate',
+        })
+      }
+    }
+
+    assert.throws(
+      () =>
+        api.addRecord({
+          id: 'replanned-invalid-candidate',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'generation.replanned-invalid-candidate',
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+
+    assert.equal(changed, true)
+    assert.deepEqual(work, { canonicalScans: 2, graphValidations: 2 })
+    assert.equal(existsSync(candidatePath), false)
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('add preserves repository change when the replanned canonical generation settles malformed', () => {
+    const root = createRoot()
+    const malformedPath = join(root, 'encephalon', 'decision', 'settled-malformed-successor.json')
+    const candidatePath = join(root, 'encephalon', 'decision', 'candidate-after-malformed-successor.json')
+    const work = { canonicalScans: 0, graphValidations: 0 }
+    let changed = false
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        work.canonicalScans += 1
+      },
+      graphValidation: () => {
+        work.graphValidations += 1
+      },
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-scan-validation' && !changed) {
+        changed = true
+        ensureParent(malformedPath)
+        writeFileSync(malformedPath, '{"malformed":')
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate-after-malformed-successor',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'generation.candidate-after-malformed-successor',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+
+    assert.equal(changed, true)
+    assert.deepEqual(work, { canonicalScans: 2, graphValidations: 1 })
+    assert.equal(existsSync(candidatePath), false)
+  })
+
+  test('add replans canonical generation changed during graph validation', () => {
+    const root = createRoot()
+    const work = { canonicalScans: 0, graphValidations: 0, links: 0 }
+    let changed = false
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        work.canonicalScans += 1
+      },
+      graphValidation: () => {
+        work.graphValidations += 1
+        if (!changed) {
+          changed = true
+          writeCanonicalRecord(root, {
+            id: 'concurrent-during-graph-validation',
+            subject: 'generation.concurrent-during-graph-validation',
+          })
+        }
+      },
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-canonical-link') {
+        work.links += 1
+      }
+    }
+
+    const added = api.addRecord({
+      id: 'candidate-after-graph-validation-race',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'generation.candidate-after-graph-validation-race',
+    })
+
+    assert.equal(changed, true)
+    assert.equal(added.id, 'candidate-after-graph-validation-race')
+    assert.deepEqual(work, { canonicalScans: 2, graphValidations: 2, links: 1 })
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('bounds continuous precommit canonical generation churn to one retry ledger', () => {
+    const root = createRoot()
+    const siblingPath = join(root, 'encephalon', 'decision', 'continuous-precommit-sibling.json')
+    const candidatePath = join(root, 'encephalon', 'decision', 'continuous-precommit-candidate.json')
+    const work = { canonicalScans: 0, graphValidations: 0, links: 0 }
+    let changes = 0
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        work.canonicalScans += 1
+      },
+      graphValidation: () => {
+        work.graphValidations += 1
+      },
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-scan-validation') {
+        if (existsSync(siblingPath)) {
+          rmSync(siblingPath)
+        } else {
+          writeCanonicalRecord(root, {
+            id: 'continuous-precommit-sibling',
+            subject: 'generation.continuous-precommit-sibling',
+          })
+        }
+        changes += 1
+      }
+      if (point === 'after-canonical-link') {
+        work.links += 1
+      }
+    }
+
+    assert.throws(
+      () =>
+        api.addRecord({
+          id: 'continuous-precommit-candidate',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'generation.continuous-precommit-candidate',
+        }),
+      (error: unknown) => {
+        const actual = error as Error & { code?: unknown; details?: unknown }
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(actual.message, 'The canonical repository changed repeatedly during the operation.')
+        assert.deepEqual(actual.details, {})
+        assert.equal(actual.cause, undefined)
+        assert.equal(JSON.stringify(actual).includes(root), false)
+        return true
+      },
+    )
+
+    assert.equal(changes, 3)
+    assert.deepEqual(work, { canonicalScans: 3, graphValidations: 3, links: 0 })
+    assert.equal(existsSync(candidatePath), false)
+  })
+
+  test('add replans a staging generation changed before the canonical link', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    const displacedStaging = join(root, 'displaced-prelink-staging')
+    const work = { canonicalScans: 0, graphValidations: 0, links: 0 }
+    let changed = false
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        work.canonicalScans += 1
+      },
+      graphValidation: () => {
+        work.graphValidations += 1
+      },
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'before-publication' && !changed) {
+        changed = true
+        renameSync(stagingDirectory, displacedStaging)
+        mkdirSync(stagingDirectory)
+      }
+      if (point === 'after-canonical-link') {
+        work.links += 1
+      }
+    }
+
+    const added = api.addRecord({
+      id: 'candidate-after-prelink-staging-race',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'generation.candidate-after-prelink-staging-race',
+    })
+
+    assert.equal(changed, true)
+    assert.equal(added.id, 'candidate-after-prelink-staging-race')
+    assert.deepEqual(work, { canonicalScans: 2, graphValidations: 2, links: 1 })
+  })
+
+  for (const hydrate of [true, false] as const) {
+    test(`add committed canonical generation race ${hydrate ? 'with' : 'without'} hydration`, () => {
+      const root = createRoot()
+      const id = `committed-generation-race-${hydrate ? 'hydrated' : 'unhydrated'}`
+      const relativePath = `encephalon/decision/${id}.json`
+      const safeCauseMessage = 'Canonical layout changed before publication.'
+      let changed = false
+
+      assert.throws(
+        () =>
+          addRecordResolved(
+            root,
+            {
+              id,
+              kind: 'decision',
+              payload: {},
+              source: 'agent',
+              subject: `generation.${id}`,
+            },
+            {
+              hooks: {
+                fault: point => {
+                  if (point === 'after-canonical-link' && !changed) {
+                    changed = true
+                    writeCanonicalRecord(root, {
+                      id: `concurrent-after-link-${id}`,
+                      subject: `generation.concurrent-after-link-${id}`,
+                    })
+                  }
+                },
+              },
+              hydrate,
+            },
+          ),
+        (error: unknown) => {
+          const actual = error as Error & {
+            cause?: unknown
+            code?: unknown
+            details?: Record<string, unknown>
+          }
+          assert.equal(actual.code, 'REPOSITORY_CHANGED')
+          assert.equal(
+            actual.message,
+            `Record ${id} was linked, but its canonical directory generation changed before verification. ${canonicalRaceRecoveryAction}`,
+          )
+          assert.deepEqual(actual.details, {
+            canonicalCommitted: true,
+            committedRecordIds: [id],
+            path: relativePath,
+            postCommitPhase: 'publicationVerification',
+            recordId: id,
+            recoveryAction: canonicalRaceRecoveryAction,
+            repositoryChanged: true,
+          })
+          assert.equal(Object.isFrozen(actual.details?.committedRecordIds), true)
+          const cause = actual.cause as Error & { code?: unknown }
+          assert.equal(cause.code, 'REPOSITORY_CHANGED')
+          assert.equal(cause.message, safeCauseMessage)
+          assert.equal(cause.cause, undefined)
+          assert.equal(JSON.stringify(actual).includes(root), false)
+          return true
+        },
+      )
+
+      assert.equal(changed, true)
+      assert.equal(existsSync(join(root, relativePath)), true)
+    })
+  }
+
+  test('add committed canonical generation race preserves publication verification priority', () => {
+    for (const competitor of ['publicationFlush', 'stagingCleanup'] as const) {
+      const root = createRoot()
+      const id = `committed-race-priority-${competitor}`
+      const relativePath = `encephalon/decision/${id}.json`
+      const canonicalPath = join(root, relativePath)
+      const displacedPath = join(root, `displaced-${id}.json`)
+      let changed = false
+
+      assertCommittedRepositoryChange(
+        () =>
+          addRecordResolved(
+            root,
+            {
+              id,
+              kind: 'decision',
+              payload: {},
+              source: 'agent',
+              subject: `generation.${id}`,
+            },
+            {
+              hooks: {
+                fault: point => {
+                  if (point === 'after-canonical-link' && !changed) {
+                    changed = true
+                    if (competitor === 'publicationFlush') {
+                      writeCanonicalRecord(root, {
+                        id: `concurrent-${id}`,
+                        subject: `generation.concurrent-${id}`,
+                      })
+                    } else {
+                      renameSync(canonicalPath, displacedPath)
+                      writeCanonicalRecord(root, { id, subject: `generation.${id}` })
+                    }
+                  }
+                  if (point === 'during-publication-flush' && competitor === 'publicationFlush') {
+                    throw Object.assign(new Error('Injected publication flush failure'), { code: 'EIO' })
+                  }
+                  if (point === 'during-cleanup' && competitor === 'stagingCleanup') {
+                    throw Object.assign(new Error('Injected staging cleanup failure'), { code: 'EIO' })
+                  }
+                  if (point === 'during-hydration') {
+                    throw Object.assign(new Error('Injected cache hydration failure'), { code: 'EIO' })
+                  }
+                },
+              },
+            },
+          ),
+        relativePath,
+        id,
+      )
+
+      assert.equal(changed, true)
+    }
+  })
+
+  test('add committed canonical generation race during cache hydration has no private cause', () => {
+    const root = createRoot()
+    const id = 'committed-race-during-cache-hydration'
+    let changed = false
+    recordWriteTestHooks.fault = point => {
+      if (point === 'during-hydration' && !changed) {
+        changed = true
+        writeCanonicalRecord(root, {
+          id: 'concurrent-during-add-cache-hydration',
+          subject: 'generation.concurrent-during-add-cache-hydration',
+        })
+      }
+    }
+
+    assert.throws(
+      () =>
+        api.addRecord({
+          id,
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'generation.committed-race-during-cache-hydration',
+        }),
+      (error: unknown) => {
+        const actual = error as Error & { cause?: unknown; code?: unknown; details?: Record<string, unknown> }
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.deepEqual(actual.details?.committedRecordIds, [id])
+        assert.equal(actual.details?.postCommitPhase, 'publicationVerification')
+        assert.equal(actual.details?.repositoryChanged, true)
+        const cause = actual.cause as Error & { code?: unknown }
+        assert.equal(cause.code, 'REPOSITORY_CHANGED')
+        assert.equal(cause.message, 'Canonical layout changed before publication.')
+        assert.equal(cause.cause, undefined)
+        assert.equal(cause.name, 'EncephalonError')
+        assert.equal(JSON.stringify(actual).includes('CanonicalGenerationChanged'), false)
+        return true
+      },
+    )
+
+    assert.equal(changed, true)
   })
 
   test('record publication outcome returns the canonical record with a post-link failure', () => {
@@ -1413,7 +1855,7 @@ describe('canonical records', () => {
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'after-hard-link-aliases.json')), true)
   })
 
-  test('does not adopt an in-place canonical rewrite during stale staging cleanup', () => {
+  test('replans an in-place canonical rewrite during stale staging cleanup', () => {
     const root = createRoot()
     writeCanonicalRecord(root, { id: 'canonical-during-staging-cleanup' })
     const canonicalPath = join(root, 'encephalon', 'decision', 'canonical-during-staging-cleanup.json')
@@ -1424,29 +1866,30 @@ describe('canonical records', () => {
     utimesSync(canonicalPath, fixedTime, fixedTime)
     const original = readFileSync(canonicalPath, 'utf8')
     const originalMetadata = statSync(canonicalPath)
+    let changed = false
     recordWriteTestHooks.fault = point => {
-      if (point === 'after-staging-cleanup-preflight') {
+      if (point === 'after-staging-cleanup-preflight' && !changed) {
+        changed = true
         writeFileSync(canonicalPath, original.replace('"payload": {}', '"payload": []'))
         utimesSync(canonicalPath, originalMetadata.atime, originalMetadata.mtime)
       }
     }
 
-    assertErrorCode(
-      () =>
-        api.addRecord({
-          id: 'candidate-after-staging-cleanup-rewrite',
-          kind: 'decision',
-          payload: {},
-          root,
-          source: 'agent',
-          subject: 'staging.canonical-rewrite',
-        }),
-      'REPOSITORY_CHANGED',
-    )
-    assert.equal(
-      existsSync(join(root, 'encephalon', 'decision', 'candidate-after-staging-cleanup-rewrite.json')),
-      false,
-    )
+    const added = api.addRecord({
+      id: 'candidate-after-staging-cleanup-rewrite',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'staging.canonical-rewrite',
+    })
+
+    assert.equal(changed, true)
+    assert.equal(added.id, 'candidate-after-staging-cleanup-rewrite')
+    assert.equal(existsSync(join(root, added.path)), true)
+    assert.match(readFileSync(canonicalPath, 'utf8'), /"payload": \[\]/)
+    assert.deepEqual(readdirSync(stagingDirectory), [])
+    assert.equal(api.validateRecords({ root }).valid, true)
   })
 
   test('cleans a stale owned alias of an existing canonical record before publication', () => {
@@ -2669,81 +3112,77 @@ describe('canonical records', () => {
     assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
   })
 
-  test('rejects an existing canonical root replacement before directory preparation', () => {
+  test('replans an existing canonical root replacement before directory preparation', () => {
     const root = createRoot()
     writeCanonicalRecord(root, { id: 'existing-root-before-preparation' })
     const brainDirectory = join(root, 'encephalon')
     let replaced = false
 
-    assertErrorCode(
-      () =>
-        addRecordResolved(
-          root,
-          {
-            id: 'candidate-root-before-preparation',
-            kind: 'decision',
-            payload: {},
-            source: 'test',
-            subject: 'generation.root-before-preparation',
+    const added = addRecordResolved(
+      root,
+      {
+        id: 'candidate-root-before-preparation',
+        kind: 'decision',
+        payload: {},
+        source: 'test',
+        subject: 'generation.root-before-preparation',
+      },
+      {
+        hooks: {
+          fault: point => {
+            if (point === 'before-directory-preparation' && !replaced) {
+              replaced = true
+              renameSync(brainDirectory, join(root, 'displaced-encephalon-before-preparation'))
+              mkdirSync(join(brainDirectory, 'decision'), { recursive: true })
+            }
           },
-          {
-            hooks: {
-              fault: point => {
-                if (point === 'before-directory-preparation' && !replaced) {
-                  replaced = true
-                  renameSync(brainDirectory, join(root, 'displaced-encephalon-before-preparation'))
-                  mkdirSync(join(brainDirectory, 'decision'), { recursive: true })
-                }
-              },
-            },
-            hydrate: false,
-          },
-        ),
-      'REPOSITORY_CHANGED',
+        },
+        hydrate: false,
+      },
     )
+
     assert.equal(replaced, true)
-    assert.equal(existsSync(join(brainDirectory, 'decision', 'candidate-root-before-preparation.json')), false)
-    assert.equal(existsSync(join(brainDirectory, '_staging')), false)
+    assert.equal(added.id, 'candidate-root-before-preparation')
+    assert.equal(existsSync(join(root, added.path)), true)
+    assert.deepEqual(readdirSync(join(brainDirectory, '_staging')), [])
   })
 
-  test('rejects an existing canonical kind replacement before directory preparation', () => {
+  test('replans an existing canonical kind replacement before directory preparation', () => {
     const root = createRoot()
     writeCanonicalRecord(root, { id: 'existing-kind-before-preparation' })
     const kindDirectory = join(root, 'encephalon', 'decision')
     let replaced = false
 
-    assertErrorCode(
-      () =>
-        addRecordResolved(
-          root,
-          {
-            id: 'candidate-kind-before-preparation',
-            kind: 'decision',
-            payload: {},
-            source: 'test',
-            subject: 'generation.kind-before-preparation',
+    const added = addRecordResolved(
+      root,
+      {
+        id: 'candidate-kind-before-preparation',
+        kind: 'decision',
+        payload: {},
+        source: 'test',
+        subject: 'generation.kind-before-preparation',
+      },
+      {
+        hooks: {
+          fault: point => {
+            if (point === 'before-directory-preparation' && !replaced) {
+              replaced = true
+              renameSync(kindDirectory, join(root, 'displaced-decision-before-preparation'))
+              mkdirSync(kindDirectory)
+            }
           },
-          {
-            hooks: {
-              fault: point => {
-                if (point === 'before-directory-preparation' && !replaced) {
-                  replaced = true
-                  renameSync(kindDirectory, join(root, 'displaced-decision-before-preparation'))
-                  mkdirSync(kindDirectory)
-                }
-              },
-            },
-            hydrate: false,
-          },
-        ),
-      'REPOSITORY_CHANGED',
+        },
+        hydrate: false,
+      },
     )
+
     assert.equal(replaced, true)
-    assert.equal(existsSync(join(kindDirectory, 'candidate-kind-before-preparation.json')), false)
-    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+    assert.equal(added.id, 'candidate-kind-before-preparation')
+    assert.equal(existsSync(join(root, added.path)), true)
+    assert.deepEqual(readdirSync(join(root, 'encephalon', '_staging')), [])
   })
 
-  test('does not publish after the validated kind is replaced at the publication boundary', () => {
+  test('replans after the validated kind is replaced at the publication boundary', () => {
     const root = createRoot()
     writeCanonicalRecord(root, { id: 'existing' })
     const kindDirectory = join(root, 'encephalon', 'decision')
@@ -2757,20 +3196,19 @@ describe('canonical records', () => {
       }
     }
 
-    assertErrorCode(
-      () =>
-        api.addRecord({
-          id: 'candidate-before-publication',
-          kind: 'decision',
-          payload: {},
-          root,
-          source: 'test',
-          subject: 'generation.publication',
-        }),
-      'REPOSITORY_CHANGED',
-    )
+    const added = api.addRecord({
+      id: 'candidate-before-publication',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'test',
+      subject: 'generation.publication',
+    })
+
     assert.equal(replaced, true)
-    assert.equal(existsSync(join(kindDirectory, 'candidate-before-publication.json')), false)
+    assert.equal(added.id, 'candidate-before-publication')
+    assert.equal(existsSync(join(root, added.path)), true)
+    assert.deepEqual(readdirSync(join(root, 'encephalon', '_staging')), [])
   })
 
   test('reports a canonical generation replacement after linking as a committed repository change', () => {
@@ -2812,7 +3250,7 @@ describe('canonical records', () => {
     assert.equal(existsSync(join(displaced, 'candidate-after-publication.json')), true)
   })
 
-  test('does not adopt a candidate kind created at the directory preparation boundary', () => {
+  test('replans a candidate kind created at the directory preparation boundary', () => {
     const root = createRoot()
     let created = false
     recordWriteTestHooks.fault = point => {
@@ -2822,21 +3260,19 @@ describe('canonical records', () => {
       }
     }
 
-    assertErrorCode(
-      () =>
-        api.addRecord({
-          id: 'candidate-kind-race',
-          kind: 'new-kind',
-          payload: {},
-          root,
-          source: 'test',
-          subject: 'generation.kind-race',
-        }),
-      'REPOSITORY_CHANGED',
-    )
+    const added = api.addRecord({
+      id: 'candidate-kind-race',
+      kind: 'new-kind',
+      payload: {},
+      root,
+      source: 'test',
+      subject: 'generation.kind-race',
+    })
+
     assert.equal(created, true)
-    assert.deepEqual(readdirSync(join(root, 'encephalon', 'new-kind')), [])
-    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+    assert.equal(added.id, 'candidate-kind-race')
+    assert.deepEqual(readdirSync(join(root, 'encephalon', 'new-kind')), [`${added.id}.json`])
+    assert.deepEqual(readdirSync(join(root, 'encephalon', '_staging')), [])
   })
 
   test('enforces supersedes count before item validation and repository access', () => {

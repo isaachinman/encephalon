@@ -14,13 +14,16 @@ import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import {
   assertCanonicalLayoutAdditions,
+  committedCanonicalRecordPrefixError,
   MAX_CANONICAL_RECORD_BYTES,
   nextRecordCreatedAt,
   planRecordAddition,
   publishPlannedRecordOutcome,
   type RecordReadHooks,
   type RecordWriteHooks,
-  readRecordPlanningSnapshotResolved,
+  rethrowCanonicalGenerationChangeAfterCommit,
+  rethrowInvalidatedCandidateError,
+  withRecordPlanningSnapshotRetryResolved,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import { createRecordFile, validateAddRecordInput } from './schema.ts'
@@ -230,99 +233,126 @@ const initResolved = (
             subject: candidate.subject,
           }))
         : undefined
-      const planning = readRecordPlanningSnapshotResolved(root, hooks, location)
-      const { records } = planning
-      assertCacheLocation(location)
-      const { actions, validatedAdditions } = (() => {
-        try {
-          const plannedActions = baselineActions(records, baseline, refresh)
+      const { actions, cacheSnapshot, hasValidatedAdditions, recordsCreated } = withRecordPlanningSnapshotRetryResolved(
+        root,
+        (planning, repositoryChanged) => {
+          const { records } = planning
+          assertCacheLocation(location)
+          const validateCurrentRecords = () => {
+            try {
+              return planning.validateFinal(
+                records,
+                'Canonical records are invalid.',
+                planning.bytes,
+                allowedGeneratedHeads,
+              )
+            } catch (error) {
+              return rethrowInvalidatedCandidateError(error, repositoryChanged)
+            }
+          }
+          const { actions: plannedActions, validatedAdditions } = (() => {
+            try {
+              const nextActions = baselineActions(records, baseline, refresh)
+              return {
+                actions: nextActions,
+                validatedAdditions: nextActions.additions.map(addition =>
+                  validateAddRecordInput({ ...addition, root }),
+                ),
+              }
+            } catch (error) {
+              validateCurrentRecords()
+              throw error
+            }
+          })()
+          let attemptRecordsCreated: BrainRecord[] = []
+          let attemptCacheSnapshot: ValidatedMutationCacheSnapshot | undefined
+          if (validatedAdditions.length > 0) {
+            const validationPlans = validatedAdditions.map(addition =>
+              planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
+            )
+            const artifacts = (() => {
+              try {
+                return planning.validateFinal(
+                  [...records, ...validationPlans.map(plan => plan.record)],
+                  'The generated baseline would make canonical records invalid.',
+                )
+              } catch (error) {
+                if (error instanceof EncephalonError && error.code === 'VALIDATION_FAILED') {
+                  validateCurrentRecords()
+                  return rethrowInvalidatedCandidateError(error, repositoryChanged)
+                }
+                throw error
+              }
+            })()
+            const { plans } = validatedAdditions.reduce<{
+              cursor: readonly BrainRecord[]
+              plans: readonly ReturnType<typeof planRecordAddition>[]
+            }>(
+              (result, addition) => {
+                const plan = planRecordAddition(root, createRecordFile(addition, nextRecordCreatedAt(result.cursor)))
+                return { cursor: [...result.cursor, plan.record], plans: [...result.plans, plan] }
+              },
+              { cursor: records, plans: [] },
+            )
+            const authority = assertCanonicalLayoutAdditions(
+              plans.map(plan => plan.record.kind),
+              planning.authority(),
+            )
+            const recordWriteOptions = {
+              authority,
+              ...(hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }),
+            }
+            progress.phase = 'recordPublication'
+            for (const plan of plans) {
+              let publication: ReturnType<typeof publishPlannedRecordOutcome>
+              try {
+                publication = publishPlannedRecordOutcome(root, plan, recordWriteOptions)
+              } catch (error) {
+                return rethrowCanonicalGenerationChangeAfterCommit(error, attemptRecordsCreated)
+              }
+              attemptRecordsCreated = [...attemptRecordsCreated, publication.record]
+              progress.committedRecordIds = [...progress.committedRecordIds, publication.record.id]
+              progress.cacheState = 'disposable'
+              if (publication.committedError !== undefined) {
+                throw committedCanonicalRecordPrefixError(publication.committedError, attemptRecordsCreated)
+              }
+            }
+            const mutationBytes =
+              planning.bytes + plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted), 0)
+            if (mutationBytes <= MAX_CANONICAL_RECORD_BYTES) {
+              attemptCacheSnapshot = Object.freeze({
+                artifacts,
+                assertCurrent: authority.assertCurrent,
+                records: Object.freeze([...records, ...attemptRecordsCreated]),
+                repositoryRealpath: location.repository,
+              })
+            }
+          } else {
+            const artifacts = validateCurrentRecords()
+            const authority = planning.authority()
+            if (!refresh) {
+              attemptCacheSnapshot = Object.freeze({
+                artifacts,
+                assertCurrent: authority.assertCurrent,
+                records: Object.freeze([...records]),
+                repositoryRealpath: location.repository,
+              })
+            }
+          }
           return {
             actions: plannedActions,
-            validatedAdditions: plannedActions.additions.map(addition => validateAddRecordInput({ ...addition, root })),
+            cacheSnapshot: attemptCacheSnapshot,
+            hasValidatedAdditions: validatedAdditions.length > 0,
+            recordsCreated: attemptRecordsCreated,
           }
-        } catch (error) {
-          planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
-          throw error
-        }
-      })()
-      let recordsCreated: BrainRecord[] = []
-      let cacheSnapshot: ValidatedMutationCacheSnapshot | undefined
-      if (validatedAdditions.length > 0) {
-        const validationPlans = validatedAdditions.map(addition =>
-          planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
-        )
-        const artifacts = (() => {
-          try {
-            return planning.validateFinal(
-              [...records, ...validationPlans.map(plan => plan.record)],
-              'The generated baseline would make canonical records invalid.',
-            )
-          } catch (error) {
-            if (error instanceof EncephalonError && error.code === 'VALIDATION_FAILED') {
-              planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
-            }
-            throw error
-          }
-        })()
-        const { plans } = validatedAdditions.reduce<{
-          cursor: readonly BrainRecord[]
-          plans: readonly ReturnType<typeof planRecordAddition>[]
-        }>(
-          (result, addition) => {
-            const plan = planRecordAddition(root, createRecordFile(addition, nextRecordCreatedAt(result.cursor)))
-            return { cursor: [...result.cursor, plan.record], plans: [...result.plans, plan] }
-          },
-          { cursor: records, plans: [] },
-        )
-        const authority = assertCanonicalLayoutAdditions(
-          plans.map(plan => plan.record.kind),
-          planning.authority(),
-        )
-        const recordWriteOptions = {
-          authority,
-          ...(hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }),
-        }
-        progress.phase = 'recordPublication'
-        for (const plan of plans) {
-          const publication = publishPlannedRecordOutcome(root, plan, recordWriteOptions)
-          recordsCreated = [...recordsCreated, publication.record]
-          progress.committedRecordIds = [...progress.committedRecordIds, publication.record.id]
-          progress.cacheState = 'disposable'
-          if (publication.committedError !== undefined) {
-            throw publication.committedError
-          }
-        }
-        const mutationBytes =
-          planning.bytes + plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted), 0)
-        if (mutationBytes <= MAX_CANONICAL_RECORD_BYTES) {
-          cacheSnapshot = Object.freeze({
-            artifacts,
-            assertCurrent: authority.assertCurrent,
-            records: Object.freeze([...records, ...recordsCreated]),
-            repositoryRealpath: location.repository,
-          })
-        }
-      } else {
-        const artifacts = planning.validateFinal(
-          records,
-          'Canonical records are invalid.',
-          planning.bytes,
-          allowedGeneratedHeads,
-        )
-        const authority = planning.authority()
-        if (!refresh) {
-          cacheSnapshot = Object.freeze({
-            artifacts,
-            assertCurrent: authority.assertCurrent,
-            records: Object.freeze([...records]),
-            repositoryRealpath: location.repository,
-          })
-        }
-      }
+        },
+        hooks,
+        location,
+      )
       progress.phase = 'cachePreparation'
       progress.cacheState = 'disposable'
       const cacheResult = (() => {
-        if (validatedAdditions.length > 0) {
+        if (hasValidatedAdditions) {
           return cacheSnapshot === undefined
             ? hydrateResolvedRepository(root, 'held', location)
             : hydrateResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)

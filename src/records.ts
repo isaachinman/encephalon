@@ -110,6 +110,7 @@ type CanonicalSnapshotRetryLedger = {
   readonly deadline: number
   readonly maximumAttempts: number
   attempt: number
+  repositoryChanged: boolean
 }
 
 type StableCanonicalSnapshot = {
@@ -137,6 +138,7 @@ type CanonicalPublicationAuthority = {
     kindSnapshot: CanonicalDirectorySnapshot,
     digest: string,
   ) => void
+  changed: () => never
   projection: () => {
     kindCount: number
     kindEntryCounts: ReadonlyMap<string, number>
@@ -266,6 +268,8 @@ const postCommitRecoveryAction = {
   stagingCleanup: 'Inspect encephalon/_staging and remove only a confirmed leftover from this operation.',
 } as const satisfies Record<PostCommitPhase, string>
 
+const canonicalRaceRecoveryAction = 'Run validate and reconcile the canonical repository before retrying the operation.'
+
 const postCommitPriority: Record<PostCommitPhase, number> = {
   cacheHydration: 2,
   publicationFlush: 3,
@@ -290,18 +294,26 @@ const postCommitError = (record: BrainRecord, phase: PostCommitPhase, cause: unk
     { cause },
   )
 
-const publicationVerificationError = (record: BrainRecord, cause: unknown) =>
+const frozenCommittedRecordIds = (records: readonly Pick<BrainRecord, 'id'>[]): string[] => {
+  const committedRecordIds = records.slice(0, MAX_CANONICAL_RECORDS).map(record => record.id)
+  Object.freeze(committedRecordIds)
+  return committedRecordIds
+}
+
+const publicationVerificationError = (record: BrainRecord) =>
   new EncephalonError(
     'REPOSITORY_CHANGED',
-    `Record ${record.id} was linked, but its canonical directory generation changed before verification. ${postCommitRecoveryAction.publicationVerification}`,
+    `Record ${record.id} was linked, but its canonical directory generation changed before verification. ${canonicalRaceRecoveryAction}`,
     {
       canonicalCommitted: true,
+      committedRecordIds: frozenCommittedRecordIds([record]),
       path: record.path,
       postCommitPhase: 'publicationVerification',
       recordId: record.id,
-      recoveryAction: postCommitRecoveryAction.publicationVerification,
+      recoveryAction: canonicalRaceRecoveryAction,
+      repositoryChanged: true,
     },
-    { cause },
+    { cause: repositoryChangedBeforePublicationError() },
   )
 
 class CanonicalPublicationIdentityError extends Error {}
@@ -315,15 +327,74 @@ const assertCanonicalPublicationIdentity = (path: string, descriptor: number) =>
 }
 
 const classifyPublicationVerificationError = (record: BrainRecord, error: unknown) => {
+  if (error instanceof CanonicalGenerationChanged) {
+    return publicationVerificationError(record)
+  }
   if (
     error instanceof CanonicalPublicationIdentityError ||
     error instanceof DirectoryWitnessError ||
     isCanonicalDirectoryReplacementError(error) ||
     (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED')
   ) {
-    return publicationVerificationError(record, error)
+    return publicationVerificationError(record)
   }
   return postCommitError(record, 'publicationVerification', error)
+}
+
+const committedCanonicalGenerationError = (records: readonly BrainRecord[]) => {
+  const committedRecordIds = frozenCommittedRecordIds(records)
+  const noun = committedRecordIds.length === 1 ? 'record was' : 'records were'
+  return new EncephalonError(
+    'REPOSITORY_CHANGED',
+    `The canonical repository changed after ${committedRecordIds.length} ${noun} committed. ${canonicalRaceRecoveryAction}`,
+    {
+      canonicalCommitted: true,
+      committedRecordIds,
+      postCommitPhase: 'publicationVerification',
+      recoveryAction: canonicalRaceRecoveryAction,
+      repositoryChanged: true,
+    },
+    { cause: repositoryChangedBeforePublicationError() },
+  )
+}
+
+/** @internal */
+export const rethrowCanonicalGenerationChangeAfterCommit = (
+  error: unknown,
+  committedRecords: readonly BrainRecord[],
+): never => {
+  if (error instanceof CanonicalGenerationChanged && committedRecords.length > 0) {
+    throw committedCanonicalGenerationError(committedRecords)
+  }
+  throw error
+}
+
+/** @internal */
+export const committedCanonicalRecordPrefixError = (
+  error: EncephalonError,
+  committedRecords: readonly BrainRecord[],
+): EncephalonError => {
+  let result = error
+  if (
+    error.code === 'REPOSITORY_CHANGED' &&
+    error.details.canonicalCommitted === true &&
+    error.details.repositoryChanged === true
+  ) {
+    const cause =
+      error.cause instanceof EncephalonError && error.cause.code === 'REPOSITORY_CHANGED'
+        ? error.cause
+        : repositoryChangedBeforePublicationError()
+    result = new EncephalonError(
+      error.code,
+      error.message,
+      {
+        ...error.details,
+        committedRecordIds: frozenCommittedRecordIds(committedRecords),
+      },
+      { cause },
+    )
+  }
+  return result
 }
 
 const canonicalRecordBytes = (record: BrainRecord) => {
@@ -375,21 +446,46 @@ const assertRealDirectory = (root: string, path: string) => {
   return fail('VALIDATION_FAILED', `${posixRelative(root, path)} must be a real non-symlink directory.`)
 }
 
-const ensurePublicationDirectory = (root: string, path: string, existed: boolean) => {
-  if (existed) {
+const assertPreparedPublicationDirectory = (root: string, path: string, changed: () => never) => {
+  try {
     assertRealDirectory(root, path)
+  } catch (error) {
+    if (
+      isCanonicalDirectoryReplacementError(error) ||
+      (error instanceof EncephalonError && error.code === 'VALIDATION_FAILED')
+    ) {
+      return changed()
+    }
+    throw error
+  }
+}
+
+const ensurePublicationDirectory = (root: string, path: string, existed: boolean, changed: () => never) => {
+  if (existed) {
+    assertPreparedPublicationDirectory(root, path, changed)
     return path
   }
   try {
     mkdirSync(path)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      return repositoryChangedBeforePublication()
+      return changed()
     }
     throw error
   }
-  assertRealDirectory(root, path)
+  assertPreparedPublicationDirectory(root, path, changed)
   return path
+}
+
+const capturePreparedPublicationDirectory = (path: string, maximum: number, changed: () => never) => {
+  try {
+    return captureCanonicalDirectory(path, maximum)
+  } catch (error) {
+    if (isCanonicalDirectoryReplacementError(error)) {
+      return changed()
+    }
+    throw error
+  }
 }
 
 const fsyncDirectory = (path: string) => {
@@ -1077,6 +1173,7 @@ const createCanonicalSnapshotRetryLedger = (): CanonicalSnapshotRetryLedger => (
   attempt: 0,
   deadline: Date.now() + OPERATION_BUDGETS.canonicalSnapshotRetryMilliseconds.maximum,
   maximumAttempts: OPERATION_BUDGETS.canonicalSnapshotAttempts.maximum,
+  repositoryChanged: false,
 })
 
 const canonicalRootMissing = (root: string) => {
@@ -1261,6 +1358,7 @@ const withCanonicalSnapshotRetry = <Result>(
     return operation()
   } catch (error) {
     if (error instanceof CanonicalGenerationChanged) {
+      ledger.repositoryChanged = true
       if (ledger.attempt < ledger.maximumAttempts) {
         return withCanonicalSnapshotRetry(operation, ledger)
       }
@@ -1279,13 +1377,15 @@ const readStableCanonicalSnapshot = (root: string, hooks: RecordReadHooks = {}):
     return { scan, validation }
   })
 
+const readCanonicalPlanningScanAttempt = (root: string, hooks: RecordReadHooks = {}) => {
+  hooks.canonicalScan?.()
+  const scan = scanCanonicalRecords(root, { hooks })
+  assertCanonicalSnapshotCurrent(root, scan, [], canonicalGenerationChanged)
+  return scan
+}
+
 const readStableCanonicalPlanningScan = (root: string, hooks: RecordReadHooks = {}) =>
-  withCanonicalSnapshotRetry(() => {
-    hooks.canonicalScan?.()
-    const scan = scanCanonicalRecords(root, { hooks })
-    assertCanonicalSnapshotCurrent(root, scan, [], canonicalGenerationChanged)
-    return scan
-  })
+  withCanonicalSnapshotRetry(() => readCanonicalPlanningScanAttempt(root, hooks))
 
 const allowedMultiHeadRecordIds = (
   records: readonly BrainRecord[],
@@ -1392,6 +1492,7 @@ const canonicalPublicationAuthority = (
   initialObservations: readonly RecordObservation[],
   initialArtifactEvidence: readonly ArtifactInspectionResult[],
   cacheLocation?: CacheLocation,
+  changed: () => never = repositoryChangedBeforePublication,
 ): CanonicalPublicationAuthority => {
   let layout = initialLayout
   let observations = [...initialObservations]
@@ -1402,7 +1503,7 @@ const canonicalPublicationAuthority = (
     } catch (error) {
       const { code } = error as NodeJS.ErrnoException
       if (code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR') {
-        return repositoryChangedBeforePublication()
+        return changed()
       }
       throw error
     }
@@ -1414,12 +1515,12 @@ const canonicalPublicationAuthority = (
     try {
       const pathMetadata = currentObservationMetadata(observation.path)
       if (!sameStableEntryMetadataExceptCtime(observation.metadata, pathMetadata)) {
-        repositoryChangedBeforePublication()
+        changed()
       }
       descriptor = openSync(observation.path, constants.O_RDONLY | noFollowFlag)
       const descriptorMetadata = fstatSync(descriptor, { bigint: true })
       if (!sameStableEntryMetadata(pathMetadata, descriptorMetadata)) {
-        repositoryChangedBeforePublication()
+        changed()
       }
       const bytes = readBoundedDescriptor(descriptor, descriptorMetadata.size)
       const finalDescriptorMetadata = fstatSync(descriptor, { bigint: true })
@@ -1431,7 +1532,7 @@ const canonicalPublicationAuthority = (
         ) ||
         recordDigest(bytes) !== observation.digest
       ) {
-        repositoryChangedBeforePublication()
+        changed()
       }
       result = { digest: observation.digest, metadata: finalDescriptorMetadata, path: observation.path }
     } catch (error) {
@@ -1448,7 +1549,7 @@ const canonicalPublicationAuthority = (
     if (primaryError !== undefined) {
       const { code } = primaryError as NodeJS.ErrnoException
       if (code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR') {
-        return repositoryChangedBeforePublication()
+        return changed()
       }
       throw primaryError
     }
@@ -1456,7 +1557,7 @@ const canonicalPublicationAuthority = (
       throw closeError
     }
     if (result === undefined) {
-      return repositoryChangedBeforePublication()
+      return changed()
     }
     return result
   }
@@ -1492,10 +1593,17 @@ const canonicalPublicationAuthority = (
           ? kindSnapshot.entries.length === 0
           : sameCanonicalDirectoryGeneration(previousKind, kindSnapshot)
       if (!(rootGenerationAccepted && rootEntriesAccepted && kindGenerationAccepted)) {
-        return repositoryChangedBeforePublication()
+        return changed()
       }
-      for (const snapshot of layout.kinds.values()) {
-        revalidateCanonicalDirectory(snapshot)
+      try {
+        for (const snapshot of layout.kinds.values()) {
+          revalidateCanonicalDirectory(snapshot)
+        }
+      } catch (error) {
+        if (error instanceof CanonicalDirectoryChangedError || isCanonicalDirectoryReplacementError(error)) {
+          return changed()
+        }
+        throw error
       }
       layout = {
         kinds: new Map(layout.kinds).set(kind, kindSnapshot),
@@ -1506,7 +1614,7 @@ const canonicalPublicationAuthority = (
     acceptPublication: (kind, recordName, rootSnapshot, kindSnapshot, digest) => {
       try {
         if (layout.root !== rootSnapshot || layout.kinds.get(kind) !== kindSnapshot) {
-          return repositoryChangedBeforePublication()
+          return changed()
         }
         revalidateCanonicalDirectory(rootSnapshot)
         const nextKind = captureCanonicalDirectory(kindSnapshot.witness.path, MAX_CANONICAL_KIND_ENTRIES)
@@ -1514,7 +1622,7 @@ const canonicalPublicationAuthority = (
           ordinalStringCompare(first.name, second.name),
         )
         if (!(sameDirectoryGeneration(kindSnapshot, nextKind) && sameEntryNames(expectedEntries, nextKind.entries))) {
-          return repositoryChangedBeforePublication()
+          return changed()
         }
         const recordPath = resolve(root, 'encephalon', kind, recordName)
         observations = [
@@ -1529,7 +1637,7 @@ const canonicalPublicationAuthority = (
         authority.assertCurrent()
       } catch (error) {
         if (isCanonicalDirectoryReplacementError(error)) {
-          return repositoryChangedBeforePublication()
+          return changed()
         }
         throw error
       }
@@ -1546,24 +1654,25 @@ const canonicalPublicationAuthority = (
         root,
         { bytes: 0, errors: [], layout, observations, records: [] },
         artifactEvidence,
-        repositoryChangedBeforePublication,
+        changed,
       )
       if (cacheLocation !== undefined) {
         assertCacheLocation(cacheLocation)
       }
     },
+    changed,
     projection,
   }
   return authority
 }
 
-/** @internal */
-export const readRecordPlanningSnapshotResolved = (
+const recordPlanningSnapshot = (
   root: string,
+  scan: RecordScan,
   hooks: RecordReadHooks = {},
   cacheLocation?: CacheLocation,
+  changed: () => never = repositoryChangedBeforePublication,
 ): RecordPlanningSnapshot => {
-  const scan = readStableCanonicalPlanningScan(root, hooks)
   let artifactEvidence: readonly ArtifactInspectionResult[] = []
   let publicationAuthority: CanonicalPublicationAuthority | undefined
   const authority = () => {
@@ -1576,6 +1685,7 @@ export const readRecordPlanningSnapshotResolved = (
       scan.observations,
       artifactEvidence,
       cacheLocation,
+      changed,
     )
     return publicationAuthority
   }
@@ -1595,7 +1705,7 @@ export const readRecordPlanningSnapshotResolved = (
       hooks,
     )
     const { artifactEvidence: validatedArtifactEvidence, artifacts: validatedArtifacts } = validation
-    assertCanonicalSnapshotCurrent(root, scan, validatedArtifactEvidence, repositoryChangedBeforePublication)
+    assertCanonicalSnapshotCurrent(root, scan, validatedArtifactEvidence, changed)
     const blockingErrors = (() => {
       if (allowed === undefined) {
         return validation.result.errors
@@ -1624,6 +1734,43 @@ export const readRecordPlanningSnapshotResolved = (
     records: freezeAcceptedRecords(scan.records),
     validateFinal,
   })
+}
+
+/** @internal */
+export const readRecordPlanningSnapshotResolved = (
+  root: string,
+  hooks: RecordReadHooks = {},
+  cacheLocation?: CacheLocation,
+): RecordPlanningSnapshot =>
+  recordPlanningSnapshot(root, readStableCanonicalPlanningScan(root, hooks), hooks, cacheLocation)
+
+/** @internal */
+export const withRecordPlanningSnapshotRetryResolved = <Result>(
+  root: string,
+  operation: (planning: RecordPlanningSnapshot, repositoryChanged: boolean) => Result,
+  hooks: RecordReadHooks = {},
+  cacheLocation?: CacheLocation,
+): Result => {
+  const ledger = createCanonicalSnapshotRetryLedger()
+  let retryable = true
+  const changed = (): never => {
+    if (retryable) {
+      return canonicalGenerationChanged()
+    }
+    return repositoryChangedBeforePublication()
+  }
+  try {
+    return withCanonicalSnapshotRetry(
+      () =>
+        operation(
+          recordPlanningSnapshot(root, readCanonicalPlanningScanAttempt(root, hooks), hooks, cacheLocation, changed),
+          ledger.repositoryChanged,
+        ),
+      ledger,
+    )
+  } finally {
+    retryable = false
+  }
 }
 
 /** @internal */
@@ -1732,8 +1879,20 @@ export const assertRecordGraph = (
   })
 }
 
-const repositoryChangedBeforePublication = (): never =>
-  fail('REPOSITORY_CHANGED', 'Canonical layout changed before publication.')
+const repositoryChangedBeforePublicationError = () =>
+  new EncephalonError('REPOSITORY_CHANGED', 'Canonical layout changed before publication.')
+
+const repositoryChangedBeforePublication = (): never => {
+  throw repositoryChangedBeforePublicationError()
+}
+
+/** @internal */
+export const rethrowInvalidatedCandidateError = (error: unknown, repositoryChanged: boolean): never => {
+  if (repositoryChanged && error instanceof EncephalonError && error.code === 'VALIDATION_FAILED') {
+    return repositoryChangedBeforePublication()
+  }
+  throw error
+}
 
 /** @internal */
 export const projectedKindDirectoryOverflow = (
@@ -1788,14 +1947,17 @@ type PublishResult = {
   record: BrainRecord
 }
 
-const revalidatePublicationDirectories = (directories: readonly DirectoryWitness[]) => {
+const revalidatePublicationDirectories = (
+  directories: readonly DirectoryWitness[],
+  changed: () => never = repositoryChangedBeforePublication,
+) => {
   try {
     for (const directory of directories) {
       revalidateDirectoryWitness(directory)
     }
   } catch (error) {
     if (error instanceof DirectoryWitnessError || isCanonicalDirectoryReplacementError(error)) {
-      return repositoryChangedBeforePublication()
+      return changed()
     }
     throw error
   }
@@ -1825,13 +1987,26 @@ const publishPlannedRecordInternal = (
     options.authority.assertCurrent()
   }
   options.authority.assertCurrent()
-  ensurePublicationDirectory(root, brainDirectory, projection.rootExists)
+  ensurePublicationDirectory(root, brainDirectory, projection.rootExists, options.authority.changed)
   const kindDirectory = resolve(brainDirectory, recordFile.kind)
-  ensurePublicationDirectory(root, kindDirectory, projection.rootNames.has(recordFile.kind))
+  ensurePublicationDirectory(root, kindDirectory, projection.rootNames.has(recordFile.kind), options.authority.changed)
   const stagingDirectory = resolve(brainDirectory, STAGING_DIRECTORY_NAME)
-  ensurePublicationDirectory(root, stagingDirectory, projection.rootNames.has(STAGING_DIRECTORY_NAME))
-  const publicationRoot = captureCanonicalDirectory(resolve(root, 'encephalon'), MAX_CANONICAL_BRAIN_ROOT_ENTRIES)
-  const publicationKind = captureCanonicalDirectory(kindDirectory, MAX_CANONICAL_KIND_ENTRIES)
+  ensurePublicationDirectory(
+    root,
+    stagingDirectory,
+    projection.rootNames.has(STAGING_DIRECTORY_NAME),
+    options.authority.changed,
+  )
+  const publicationRoot = capturePreparedPublicationDirectory(
+    resolve(root, 'encephalon'),
+    MAX_CANONICAL_BRAIN_ROOT_ENTRIES,
+    options.authority.changed,
+  )
+  const publicationKind = capturePreparedPublicationDirectory(
+    kindDirectory,
+    MAX_CANONICAL_KIND_ENTRIES,
+    options.authority.changed,
+  )
   options.authority.acceptPreparation(recordFile.kind, publicationRoot, publicationKind)
   const stagingName = createOwnedStagingName(process.pid, randomUUID())
   const stagingPath = resolve(stagingDirectory, stagingName)
@@ -1862,27 +2037,27 @@ const publishPlannedRecordInternal = (
     }
   }
   try {
-    assertRealDirectory(root, stagingDirectory)
+    assertPreparedPublicationDirectory(root, stagingDirectory, options.authority.changed)
     descriptor = openSync(stagingPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | noFollowFlag, 0o644)
     fault(options.hooks, 'during-staging-write')
     writeFileSync(descriptor, formatted, 'utf8')
     fsyncSync(descriptor)
     descriptorMetadata = fstatSync(descriptor, { bigint: true })
     if (!descriptorMetadata.isFile()) {
-      return repositoryChangedBeforePublication()
+      return options.authority.changed()
     }
     stagingWitness = inspectCurrentStagingFile(stagingDirectory, stagingName, descriptorMetadata)
     fault(options.hooks, 'before-publication')
     options.authority.assertCurrent()
-    revalidatePublicationDirectories([stagingWitness])
-    assertRealDirectory(root, kindDirectory)
-    assertRealDirectory(root, stagingDirectory)
+    revalidatePublicationDirectories([stagingWitness], options.authority.changed)
+    assertPreparedPublicationDirectory(root, kindDirectory, options.authority.changed)
+    assertPreparedPublicationDirectory(root, stagingDirectory, options.authority.changed)
     try {
       linkSync(stagingPath, path)
       published = true
       try {
         fault(options.hooks, 'after-canonical-link')
-        revalidatePublicationDirectories([stagingWitness])
+        revalidatePublicationDirectories([stagingWitness], options.authority.changed)
         const linkedStagingMetadata = lstatSync(stagingPath, { bigint: true })
         const linkedDescriptorMetadata = fstatSync(descriptor, { bigint: true })
         if (!sameStableEntryMetadata(linkedDescriptorMetadata, linkedStagingMetadata)) {
@@ -1948,7 +2123,7 @@ const publishPlannedRecordInternal = (
         fault(options.hooks, 'before-final-publication-revalidation')
         revalidateCanonicalDirectory(publicationRoot)
         if (stagingWitness !== undefined) {
-          revalidatePublicationDirectories([stagingWitness])
+          revalidatePublicationDirectories([stagingWitness], options.authority.changed)
         }
         if (published && committedErrorPhase === 'publicationVerification' && descriptor !== undefined) {
           assertCanonicalPublicationIdentity(path, descriptor)
@@ -1963,7 +2138,7 @@ const publishPlannedRecordInternal = (
           fault(options.hooks, 'after-publication-accept')
           assertCanonicalPublicationIdentity(path, descriptor)
           if (stagingWitness !== undefined) {
-            revalidatePublicationDirectories([stagingWitness])
+            revalidatePublicationDirectories([stagingWitness], options.authority.changed)
           }
         }
         finalStagingRevalidationSucceeded = committedErrorPhase !== 'publicationVerification' || publicationAccepted
@@ -2042,10 +2217,7 @@ const publishPlannedRecordInternal = (
       capturePublicationVerificationError(error)
     }
   } else if (committedErrorPhase === undefined && descriptor !== undefined) {
-    committedError = publicationVerificationError(
-      record,
-      new CanonicalPublicationIdentityError('The verified empty staging generation is unavailable.'),
-    )
+    committedError = publicationVerificationError(record)
     committedErrorPhase = 'publicationVerification'
   }
   if (descriptor !== undefined) {
@@ -2093,66 +2265,84 @@ const addRecordFileResolved = (
     })
   }
 
-  const planning = readRecordPlanningSnapshotResolved(root, options.readHooks, options.cacheLocation)
-  if (planning.errors.length > 0) {
-    return fail('VALIDATION_FAILED', 'Existing canonical records are invalid.', {
-      errors: planning.errors.map(error => ({
-        code: error.code,
-        message: error.message,
-      })),
-    })
-  }
-  const validationRecordFile = createRecordFile(recordDraft, '2000-01-01T00:00:00.000Z')
-  const validationRecord: BrainRecord = { ...validationRecordFile, path: relativePath }
-  const artifacts = planning.validateFinal(
-    [...planning.records, validationRecord],
-    'The new record would make canonical records invalid.',
-    planning.bytes + Buffer.byteLength(formatRecordFile(validationRecordFile), 'utf8'),
-  )
-  if (options.cacheLocation !== undefined) {
-    assertCacheLocation(options.cacheLocation)
-  }
-  const recordFile = createRecordFile(recordDraft, nextRecordCreatedAt(planning.records))
-  const record: BrainRecord = { ...recordFile, path: relativePath }
-  const formatted = formatRecordFile(recordFile)
-  const plan: PlannedRecord = { formatted, path, record, recordFile, relativePath }
-  fault(options.hooks, 'after-scan-validation')
-  const authority = assertCanonicalLayoutAdditions([plan.record.kind], planning.authority())
-
-  const publishOptions = {
-    authority,
-    ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
-  }
-  const published = publishPlannedRecordInternal(root, plan, publishOptions)
-  let { committedError, committedErrorPhase } = published
-  const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
-    if (committedErrorPhase === undefined || postCommitPriority[phase] > postCommitPriority[committedErrorPhase]) {
-      committedError = postCommitError(published.record, phase, error)
-      committedErrorPhase = phase
-    }
-  }
-  if (committedErrorPhase !== 'publicationFlush' && options.hydrate !== false) {
-    try {
-      fault(options.hooks, 'during-hydration')
-      if (options.cacheLocation === undefined || committedErrorPhase !== undefined) {
-        hydrateResolvedRepository(root, 'held', options.cacheLocation)
-      } else {
-        const snapshot: ValidatedMutationCacheSnapshot = Object.freeze({
-          artifacts,
-          assertCurrent: authority.assertCurrent,
-          records: Object.freeze([...planning.records, published.record]),
-          repositoryRealpath: options.cacheLocation.repository,
-        })
-        hydrateResolvedMutationSnapshot(root, snapshot, 'held', options.cacheLocation)
+  return withRecordPlanningSnapshotRetryResolved(
+    root,
+    (planning, repositoryChanged) => {
+      if (planning.errors.length > 0) {
+        return rethrowInvalidatedCandidateError(
+          new EncephalonError('VALIDATION_FAILED', 'Existing canonical records are invalid.', {
+            errors: planning.errors.map(error => ({
+              code: error.code,
+              message: error.message,
+            })),
+          }),
+          repositoryChanged,
+        )
       }
-    } catch (error) {
-      capturePostCommitError('cacheHydration', error)
-    }
-  }
-  if (committedError !== undefined) {
-    throw committedError
-  }
-  return published.record
+      const validationPlan = planRecordAddition(root, createRecordFile(recordDraft, '2000-01-01T00:00:00.000Z'))
+      const artifacts = (() => {
+        try {
+          return planning.validateFinal(
+            [...planning.records, validationPlan.record],
+            'The new record would make canonical records invalid.',
+            planning.bytes + Buffer.byteLength(validationPlan.formatted, 'utf8'),
+          )
+        } catch (error) {
+          return rethrowInvalidatedCandidateError(error, repositoryChanged)
+        }
+      })()
+      if (options.cacheLocation !== undefined) {
+        assertCacheLocation(options.cacheLocation)
+      }
+      const plan = planRecordAddition(root, createRecordFile(recordDraft, nextRecordCreatedAt(planning.records)))
+      fault(options.hooks, 'after-scan-validation')
+      const authority = assertCanonicalLayoutAdditions([plan.record.kind], planning.authority())
+
+      const publishOptions = {
+        authority,
+        ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
+      }
+      const published = publishPlannedRecordInternal(root, plan, publishOptions)
+      let { committedError, committedErrorPhase } = published
+      const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
+        const capturedPhase = error instanceof CanonicalGenerationChanged ? 'publicationVerification' : phase
+        if (
+          committedErrorPhase === undefined ||
+          postCommitPriority[capturedPhase] > postCommitPriority[committedErrorPhase]
+        ) {
+          committedError =
+            error instanceof CanonicalGenerationChanged
+              ? publicationVerificationError(published.record)
+              : postCommitError(published.record, capturedPhase, error)
+          committedErrorPhase = capturedPhase
+        }
+      }
+      if (committedErrorPhase !== 'publicationFlush' && options.hydrate !== false) {
+        try {
+          fault(options.hooks, 'during-hydration')
+          if (options.cacheLocation === undefined || committedErrorPhase !== undefined) {
+            hydrateResolvedRepository(root, 'held', options.cacheLocation)
+          } else {
+            const snapshot: ValidatedMutationCacheSnapshot = Object.freeze({
+              artifacts,
+              assertCurrent: authority.assertCurrent,
+              records: Object.freeze([...planning.records, published.record]),
+              repositoryRealpath: options.cacheLocation.repository,
+            })
+            hydrateResolvedMutationSnapshot(root, snapshot, 'held', options.cacheLocation)
+          }
+        } catch (error) {
+          capturePostCommitError('cacheHydration', error)
+        }
+      }
+      if (committedError !== undefined) {
+        throw committedError
+      }
+      return published.record
+    },
+    options.readHooks,
+    options.cacheLocation,
+  )
 }
 
 /** @internal */
