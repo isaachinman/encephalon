@@ -88,7 +88,7 @@ const validateTimestamp = (value: unknown) => {
 
 const validateConfidence = (value: unknown) => {
   if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1) {
-    return value
+    return Object.is(value, -0) ? 0 : value
   }
   return fail('INVALID_ARGUMENT', 'confidence must be a finite number between 0 and 1.', {
     field: 'confidence',

@@ -3323,6 +3323,69 @@ describe('canonical records', () => {
     assert.deepEqual(record.payload, persisted.payload)
   })
 
+  test('normalizes negative-zero confidence across validation, publication, and cache reads', () => {
+    const candidate = {
+      confidence: -0,
+      id: 'confidence-negative-zero',
+      kind: 'decision',
+      payload: { summary: 'Canonical confidence' },
+      searchText: 'canonical confidence value',
+      source: 'agent',
+      subject: 'confidence.negative-zero',
+    }
+    const validated = validateAddRecordInput(candidate)
+    const parsed = parseRecordFile({ ...candidate, createdAt: timestampAt(0) })
+    assert.equal(Object.is(validated.confidence, 0), true)
+    assert.equal(Object.is(parsed.confidence, 0), true)
+
+    for (const confidence of [0, 0.375, 1]) {
+      assert.equal(validateAddRecordInput({ ...candidate, confidence }).confidence, confidence)
+    }
+    for (const confidence of [-Number.MIN_VALUE, 1 + Number.EPSILON, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assertErrorCode(() => validateAddRecordInput({ ...candidate, confidence }), 'INVALID_ARGUMENT')
+    }
+
+    const root = createRoot()
+    const added = api.addRecord({ ...candidate, root })
+    assert.equal(Object.is(added.confidence, 0), true)
+
+    const persisted = JSON.parse(readFileSync(join(root, added.path), 'utf8')) as { confidence: number }
+    assert.equal(Object.is(persisted.confidence, 0), true)
+    assert.equal(added.confidence, persisted.confidence)
+
+    const existingId = 'confidence-negative-zero-existing'
+    writeFileSync(
+      join(root, 'encephalon', 'decision', `${existingId}.json`),
+      `{
+  "confidence": -0,
+  "createdAt": "${timestampAt(1)}",
+  "id": "${existingId}",
+  "kind": "decision",
+  "payload": {
+    "summary": "Existing negative-zero confidence"
+  },
+  "searchText": "existing negative-zero confidence value",
+  "source": "agent",
+  "subject": "confidence.negative-zero-existing"
+}\n`,
+    )
+
+    api.hydrate({ root })
+    const cached = [
+      api.showRecord({ id: added.id, root }),
+      api.listRecords({ root }).find(record => record.id === added.id),
+      api.searchRecords({ query: 'canonical confidence', root }).find(record => record.id === added.id),
+      api.showRecord({ id: existingId, root }),
+      api.listRecords({ root }).find(record => record.id === existingId),
+      api.searchRecords({ query: 'existing negative-zero', root }).find(record => record.id === existingId),
+    ]
+    for (const record of cached) {
+      assert.ok(record)
+      assert.equal(Object.is(record.confidence, 0), true)
+      assert.equal(record.confidence, added.confidence)
+    }
+  })
+
   test('enforces portable artifact path component lengths', () => {
     const root = createRoot()
     const validComponent = 'a'.repeat(255)

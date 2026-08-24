@@ -118,6 +118,7 @@ describe('command-line interface', () => {
       'api.style',
       '--source',
       'agent',
+      '--confidence=-0',
       '--data',
       '{"summary":"Use JSON"}',
       '--text',
@@ -126,11 +127,16 @@ describe('command-line interface', () => {
     assert.equal(added.status, 0)
     assert.equal(added.stderr, '')
     assert.equal((outputJson(added) as { id?: unknown }).id, 'cli-decision')
+    assert.equal(Object.is((outputJson(added) as { confidence?: unknown }).confidence, 0), true)
     assert.equal(added.stdout.endsWith('\n'), true)
 
-    const shown = run(root, ['show', '--root', root, '--id', 'missing'])
+    const shown = run(root, ['show', '--root', root, '--id', 'cli-decision'])
     assert.equal(shown.status, 0)
-    assert.equal(outputJson(shown), null)
+    assert.equal(Object.is((outputJson(shown) as { confidence?: unknown }).confidence, 0), true)
+
+    const missing = run(root, ['show', '--root', root, '--id', 'missing'])
+    assert.equal(missing.status, 0)
+    assert.equal(outputJson(missing), null)
 
     const searched = run(root, ['search', '--root', root, 'nothing matches'])
     assert.equal(searched.status, 0)
