@@ -708,6 +708,59 @@ jobs: {}
   ])
 })
 
+// Mutation caught: a single ordered final sweep would let a later source hook rewrite an already accepted source.
+test('rejects an earlier workflow rewritten during later workflow final revalidation', () => {
+  const root = createFixture({
+    '.github/workflows/a.yml': `name: Earlier
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+    '.github/workflows/b.yml': `name: Later
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+  })
+  const nativeRoot = realpathSync.native(root)
+  const earlierWorkflowPath = join(nativeRoot, '.github/workflows/a.yml')
+  const laterWorkflowPath = join(nativeRoot, '.github/workflows/b.yml')
+  let replacementCalls = 0
+
+  const findings = inspectWorkflowPolicy(root, {
+    afterFinalFileRealpath: path => {
+      if (path === laterWorkflowPath && replacementCalls === 0) {
+        replacementCalls += 1
+        writeFileSync(
+          earlierWorkflowPath,
+          `name: Rewritten
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/action@v1
+`,
+          'utf8',
+        )
+      }
+    },
+  })
+
+  assert.equal(replacementCalls, 1)
+  assert.deepEqual(findings, [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
 // Mutation caught: recording the lstat taken before final realpath would let the read primitive return a mixed witness.
 test('rejects a source replaced between its final realpath and closing lstat', () => {
   const root = createFixture({
@@ -770,6 +823,60 @@ jobs: {}
       file: '.github/workflows',
       location: '$',
       rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: omitting either absent discovery state, or retaining callbacks, would weaken the second sweep.
+test('revalidates absent workflow discovery without callbacks in the second final sweep', () => {
+  const absentGithubRoot = createFixture({
+    'README.md': 'No GitHub directory\n',
+  })
+  const absentWorkflowsRoot = createFixture({
+    '.github/placeholder': 'No workflows directory\n',
+  })
+  const cases = [
+    { path: join(absentGithubRoot, '.github'), root: absentGithubRoot },
+    { path: join(absentWorkflowsRoot, '.github/workflows'), root: absentWorkflowsRoot },
+  ]
+
+  const results = cases.map(({ path, root }) => {
+    let firstSweepComplete = false
+    let callbackCallsAfterFirstSweep = 0
+    const findings = inspectWorkflowPolicy(root, {
+      afterFinalDirectoryRealpath: () => {
+        if (firstSweepComplete) {
+          callbackCallsAfterFirstSweep += 1
+        }
+      },
+      afterFirstFinalRevalidation: () => {
+        firstSweepComplete = true
+        mkdirSync(path, { recursive: true })
+      },
+    })
+    return { callbackCallsAfterFirstSweep, findings }
+  })
+
+  assert.deepEqual(results, [
+    {
+      callbackCallsAfterFirstSweep: 0,
+      findings: [
+        {
+          file: '.github/workflows',
+          location: '$',
+          rule: 'source-integrity',
+        },
+      ],
+    },
+    {
+      callbackCallsAfterFirstSweep: 0,
+      findings: [
+        {
+          file: '.github/workflows',
+          location: '$',
+          rule: 'source-integrity',
+        },
+      ],
     },
   ])
 })
@@ -850,6 +957,57 @@ jobs:
         replacementCalls += 1
         renameSync(path, `${path}-original`)
         mkdirSync(path)
+      }
+    },
+  })
+
+  assert.equal(replacementCalls, 1)
+  assert.deepEqual(findings, [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: comparing a candidate only before its post-observation hook would accept rewritten action bytes.
+test('rejects an action manifest rewritten after candidate revalidation', () => {
+  const root = createFixture({
+    '.github/actions/mutable/action.yml': `name: Mutable
+runs:
+  using: composite
+  steps: []
+`,
+    '.github/workflows/action.yml': `name: Action caller
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/mutable
+`,
+  })
+  const actionDirectory = join(realpathSync.native(root), '.github/actions/mutable')
+  const actionManifest = join(actionDirectory, 'action.yml')
+  let replacementCalls = 0
+
+  const findings = inspectWorkflowPolicy(root, {
+    afterActionCandidateRevalidation: (path, index) => {
+      if (path === actionDirectory && index === 0 && replacementCalls === 0) {
+        replacementCalls += 1
+        writeFileSync(
+          actionManifest,
+          `name: Rewritten
+runs:
+  using: composite
+  steps:
+    - uses: owner/action@v1
+`,
+          'utf8',
+        )
       }
     },
   })

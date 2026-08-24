@@ -65,6 +65,7 @@ type WorkflowPolicyOptions = Readonly<{
   afterActionCandidateRevalidation?: (path: string, index: number) => void
   afterFinalDirectoryRealpath?: (path: string) => void
   afterFinalFileRealpath?: (path: string) => void
+  afterFirstFinalRevalidation?: () => void
   beforeFinalRevalidation?: () => void
   limits?: Partial<WorkflowPolicyLimits>
   onSourceDescriptorIo?: (path: string, observation: DescriptorIoObservation) => void
@@ -632,6 +633,17 @@ const revalidateWorkflowDiscovery = (
   }
   return accepted
 }
+
+const revalidateWorkflowPolicyWitnesses = (
+  root: string,
+  discoveryWitness: WorkflowDiscoveryWitness,
+  fileWitnesses: readonly FileWitness[],
+  actionDirectoryWitnesses: readonly ActionDirectoryWitness[],
+  options: WorkflowPolicyOptions = {},
+) =>
+  revalidateWorkflowDiscovery(root, discoveryWitness, options.afterFinalDirectoryRealpath) &&
+  fileWitnesses.every(witness => revalidateFileWitness(root, witness, options.afterFinalFileRealpath)) &&
+  actionDirectoryWitnesses.every(witness => revalidateActionDirectoryWitness(root, witness, options))
 
 type StepReferenceFrame =
   | Readonly<{ kind: 'enter'; location: string; value: unknown }>
@@ -1216,15 +1228,25 @@ export const inspectWorkflowPolicy = (
     let finalIntegrityAccepted = discoveryWitness !== undefined && traversalIntegrityAccepted
     if (finalIntegrityAccepted && discoveryWitness !== undefined) {
       try {
+        const finalFileWitnesses = Array.from(fileWitnesses.values())
+        const finalActionDirectoryWitnesses = Array.from(actionDirectoryWitnesses.values())
         options.beforeFinalRevalidation?.()
-        finalIntegrityAccepted =
-          revalidateWorkflowDiscovery(nativeRoot, discoveryWitness, options.afterFinalDirectoryRealpath) &&
-          Array.from(fileWitnesses.values()).every(witness =>
-            revalidateFileWitness(nativeRoot, witness, options.afterFinalFileRealpath),
-          ) &&
-          Array.from(actionDirectoryWitnesses.values()).every(witness =>
-            revalidateActionDirectoryWitness(nativeRoot, witness, options),
+        finalIntegrityAccepted = revalidateWorkflowPolicyWitnesses(
+          nativeRoot,
+          discoveryWitness,
+          finalFileWitnesses,
+          finalActionDirectoryWitnesses,
+          options,
+        )
+        if (finalIntegrityAccepted) {
+          options.afterFirstFinalRevalidation?.()
+          finalIntegrityAccepted = revalidateWorkflowPolicyWitnesses(
+            nativeRoot,
+            discoveryWitness,
+            finalFileWitnesses,
+            finalActionDirectoryWitnesses,
           )
+        }
       } catch {
         finalIntegrityAccepted = false
       }
