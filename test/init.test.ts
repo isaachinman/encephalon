@@ -16,6 +16,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
   writeSync,
@@ -5175,6 +5176,60 @@ describe('initialisation', () => {
     })
 
     assert.equal(readFileSync(path, 'utf8'), replacement)
+  })
+
+  test('accepts a ctime-only retained-metadata change after deletion quarantine', {
+    skip: process.platform === 'win32' ? 'Windows does not expose portable hard-link ctime semantics.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    let witnessedCtimeChange = false
+
+    applyInstructionChanges(root, [agentsPlan], {
+      fault: point => {
+        if (point === 'after-delete-quarantine') {
+          const [quarantineName] = readdirSync(root).filter(
+            filename => filename.startsWith('.AGENTS.md.') && filename.endsWith('.delete'),
+          )
+          assert.ok(quarantineName)
+          const quarantinePath = join(root, quarantineName)
+          const ctimeLinkPath = join(root, '.AGENTS.md.ctime-link')
+          const before = statSync(quarantinePath, { bigint: true })
+          linkSync(quarantinePath, ctimeLinkPath)
+          unlinkSync(ctimeLinkPath)
+          const after = statSync(quarantinePath, { bigint: true })
+
+          assert.deepEqual(
+            {
+              birthtimeNs: after.birthtimeNs,
+              dev: after.dev,
+              ino: after.ino,
+              mode: after.mode,
+              mtimeNs: after.mtimeNs,
+              size: after.size,
+            },
+            {
+              birthtimeNs: before.birthtimeNs,
+              dev: before.dev,
+              ino: before.ino,
+              mode: before.mode,
+              mtimeNs: before.mtimeNs,
+              size: before.size,
+            },
+          )
+          assert.notEqual(after.ctimeNs, before.ctimeNs)
+          witnessedCtimeChange = true
+        }
+      },
+    })
+
+    assert.equal(witnessedCtimeChange, true)
+    assert.equal(existsSync(path), false)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.startsWith('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
   })
 
   test('does not delete a replacement created after deletion verification', () => {

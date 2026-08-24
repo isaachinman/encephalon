@@ -4011,6 +4011,50 @@ describe('canonical records', () => {
     assertInvalidRecord(result, record.path)
   })
 
+  test('rejects a same-inode record mutation between pathname and descriptor observations', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'record-same-inode-race',
+      kind: 'decision',
+      payload: { summary: 'Original' },
+      root,
+      source: 'agent',
+      subject: 'record.same-inode-race',
+    })
+    const path = join(root, record.path)
+    const originalMetadata = statSync(path, { bigint: true })
+    let changed = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: (point, faultPath) => {
+          if (point === 'after-record-lstat' && faultPath === path && !changed) {
+            changed = true
+            writeFileSync(path, `${readFileSync(path, 'utf8')} `)
+            const changedMetadata = statSync(path, { bigint: true })
+            assert.equal(changedMetadata.dev, originalMetadata.dev)
+            assert.equal(changedMetadata.ino, originalMetadata.ino)
+            assert.notEqual(changedMetadata.size, originalMetadata.size)
+          }
+        },
+      },
+    })
+
+    assert.equal(changed, true)
+    assert.deepEqual(result, {
+      errors: [
+        {
+          code: 'INVALID_RECORD',
+          message: 'Record file changed while canonical records were being read.',
+          path: record.path,
+        },
+      ],
+      recordsChecked: 0,
+      truncated: false,
+      valid: false,
+    })
+  })
+
   test('rejects a brain-root generation replaced after bounded enumeration', () => {
     const root = createRoot()
     const brainDirectory = join(root, 'encephalon')

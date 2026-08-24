@@ -1,33 +1,16 @@
 import assert from 'node:assert/strict'
 import type { BigIntStats } from 'node:fs'
 import { describe, test } from 'node:test'
+import type { EntryIdentity, EntryMetadata, ManifestEntryMetadata } from '../src/filesystem-entry.ts'
 import * as filesystemEntryModule from '../src/filesystem-entry.ts'
-
-type EntryIdentity = {
-  readonly dev: bigint
-  readonly ino: bigint
-}
-
-type EntryMetadata = EntryIdentity & {
-  readonly birthtimeNs: bigint
-  readonly ctimeNs: bigint
-  readonly mode: bigint
-  readonly mtimeNs: bigint
-  readonly size: bigint
-}
-
-type ManifestEntryMetadata = {
-  readonly ctimeNanoseconds: string
-  readonly mtimeNanoseconds: string
-  readonly size: string
-  readonly type: 'directory' | 'file' | 'other' | 'symlink'
-}
 
 type FilesystemEntryModule = typeof filesystemEntryModule & {
   entryIdentityFrom?: (metadata: BigIntStats) => EntryIdentity
   entryMetadataFrom?: (metadata: BigIntStats) => EntryMetadata
   manifestEntryMetadataFrom?: (metadata: BigIntStats) => ManifestEntryMetadata
+  sameStableEntryMetadataExceptCtimeAndMode?: (first: EntryMetadata, second: EntryMetadata) => boolean
   sameStableEntryMetadataExceptCtime?: (first: EntryMetadata, second: EntryMetadata) => boolean
+  sameStableEntryMetadataExceptMode?: (first: EntryMetadata, second: EntryMetadata) => boolean
 }
 
 type EntryType = ManifestEntryMetadata['type']
@@ -75,7 +58,8 @@ const metadata = (
 describe('lossless filesystem entry metadata', () => {
   test('keeps device and inode identities distinct beyond Number precision', () => {
     assert.equal(typeof filesystemEntry.entryIdentityFrom, 'function')
-    const { entryIdentityFrom } = filesystemEntry
+    assert.equal(typeof filesystemEntry.entryMetadataFrom, 'function')
+    const { entryIdentityFrom, entryMetadataFrom } = filesystemEntry
     const roundedCases = [
       {
         first: metadata({ dev: 9_007_199_254_740_992n }),
@@ -94,6 +78,22 @@ describe('lossless filesystem entry metadata', () => {
       assert.deepEqual(entryIdentityFrom(second), { dev: second.dev, ino: second.ino })
       assert.equal(filesystemEntry.sameEntryIdentity(entryIdentityFrom(first), entryIdentityFrom(second)), false)
     }
+
+    assert.equal(
+      filesystemEntry.sameEntryIdentity(
+        entryMetadataFrom(metadata()),
+        entryMetadataFrom(
+          metadata({
+            birthtimeNs: 102n,
+            ctimeNs: 104n,
+            mode: 0o100_600n,
+            mtimeNs: 128n,
+            size: 132n,
+          }),
+        ),
+      ),
+      true,
+    )
   })
 
   test('compares complete stable metadata at nanosecond precision', () => {
@@ -138,6 +138,29 @@ describe('lossless filesystem entry metadata', () => {
       const changed = entryMetadataFrom(metadata(changes))
       assert.equal(sameStableEntryMetadataExceptCtime(baseline, changed), expected)
     }
+  })
+
+  test('instruction comparisons omit only their explicit metadata fields', () => {
+    assert.equal(typeof filesystemEntry.entryMetadataFrom, 'function')
+    assert.equal(typeof filesystemEntry.sameStableEntryMetadataExceptCtimeAndMode, 'function')
+    assert.equal(typeof filesystemEntry.sameStableEntryMetadataExceptMode, 'function')
+    const { entryMetadataFrom, sameStableEntryMetadataExceptCtimeAndMode, sameStableEntryMetadataExceptMode } =
+      filesystemEntry
+    const baseline = entryMetadataFrom(metadata())
+
+    assert.equal(sameStableEntryMetadataExceptMode(baseline, entryMetadataFrom(metadata({ mode: 0o100_600n }))), true)
+    assert.equal(sameStableEntryMetadataExceptMode(baseline, entryMetadataFrom(metadata({ ctimeNs: 104n }))), false)
+    assert.equal(
+      sameStableEntryMetadataExceptCtimeAndMode(
+        baseline,
+        entryMetadataFrom(metadata({ ctimeNs: 104n, mode: 0o100_600n })),
+      ),
+      true,
+    )
+    assert.equal(
+      sameStableEntryMetadataExceptCtimeAndMode(baseline, entryMetadataFrom(metadata({ mtimeNs: 128n }))),
+      false,
+    )
   })
 
   test('projects canonical manifest strings and independently derived entry types', () => {
