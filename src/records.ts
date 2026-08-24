@@ -456,7 +456,7 @@ const readRecord = (
         path: relativePath,
       })
     }
-    if (!sameEntryIdentity(pathMetadata, metadata)) {
+    if (!sameStableEntryMetadata(pathMetadata, metadata)) {
       return fail('INVALID_ARGUMENT', 'Record file changed while canonical records were being read.', {
         path: relativePath,
       })

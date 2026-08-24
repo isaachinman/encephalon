@@ -22,11 +22,13 @@ export type ManifestEntryMetadata = {
   readonly type: EntryType
 }
 
+/** @internal */
 export const entryIdentityFrom = (metadata: BigIntStats): EntryIdentity => ({
   dev: metadata.dev,
   ino: metadata.ino,
 })
 
+/** @internal */
 export const entryMetadataFrom = (metadata: BigIntStats): EntryMetadata => ({
   ...entryIdentityFrom(metadata),
   birthtimeNs: metadata.birthtimeNs,
@@ -49,6 +51,7 @@ const entryTypeFrom = (metadata: BigIntStats): EntryType => {
   return 'other'
 }
 
+/** @internal */
 export const manifestEntryMetadataFrom = (metadata: BigIntStats): ManifestEntryMetadata => ({
   ctimeNanoseconds: metadata.ctimeNs.toString(),
   mtimeNanoseconds: metadata.mtimeNs.toString(),
@@ -59,12 +62,19 @@ export const manifestEntryMetadataFrom = (metadata: BigIntStats): ManifestEntryM
 export const sameEntryIdentity = (first: EntryIdentity, second: EntryIdentity) =>
   first.dev === second.dev && first.ino === second.ino
 
-export const sameStableEntryMetadataExceptCtime = (first: EntryMetadata, second: EntryMetadata) =>
+/** @internal */
+export const sameStableEntryMetadataExceptCtimeAndMode = (first: EntryMetadata, second: EntryMetadata) =>
   sameEntryIdentity(first, second) &&
   first.size === second.size &&
-  first.mode === second.mode &&
   first.birthtimeNs === second.birthtimeNs &&
   first.mtimeNs === second.mtimeNs
+
+/** @internal */
+export const sameStableEntryMetadataExceptMode = (first: EntryMetadata, second: EntryMetadata) =>
+  sameStableEntryMetadataExceptCtimeAndMode(first, second) && first.ctimeNs === second.ctimeNs
+
+export const sameStableEntryMetadataExceptCtime = (first: EntryMetadata, second: EntryMetadata) =>
+  sameStableEntryMetadataExceptCtimeAndMode(first, second) && first.mode === second.mode
 
 export const sameStableEntryMetadata = (first: EntryMetadata, second: EntryMetadata) =>
   sameStableEntryMetadataExceptCtime(first, second) && first.ctimeNs === second.ctimeNs
