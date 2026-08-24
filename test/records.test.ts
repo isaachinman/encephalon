@@ -3323,6 +3323,89 @@ describe('canonical records', () => {
     assert.deepEqual(record.payload, persisted.payload)
   })
 
+  test('normalizes negative-zero confidence across validation, publication, and cache reads', () => {
+    const candidate = {
+      confidence: -0,
+      id: 'confidence-negative-zero',
+      kind: 'decision',
+      payload: { summary: 'Canonical confidence' },
+      searchText: 'canonical confidence value',
+      source: 'agent',
+      subject: 'confidence.negative-zero',
+    }
+    const validated = validateAddRecordInput(candidate)
+    const parsed = parseRecordFile({ ...candidate, createdAt: timestampAt(0) })
+    assert.equal(Object.is(validated.confidence, 0), true)
+    assert.equal(Object.is(parsed.confidence, 0), true)
+
+    for (const confidence of [0, 0.375, 1]) {
+      assert.equal(validateAddRecordInput({ ...candidate, confidence }).confidence, confidence)
+    }
+    for (const confidence of [-Number.MIN_VALUE, 1 + Number.EPSILON, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(
+        () => validateAddRecordInput({ ...candidate, confidence }),
+        (error: unknown) => {
+          const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+          assert.equal(actual.code, 'INVALID_ARGUMENT')
+          assert.equal(actual.message, 'confidence must be a finite number between 0 and 1.')
+          assert.deepEqual(actual.details, { field: 'confidence' })
+          return true
+        },
+      )
+    }
+
+    const root = createRoot()
+    const added = api.addRecord({ ...candidate, root })
+    assert.equal(Object.is(added.confidence, 0), true)
+
+    const persistedBytes = readFileSync(join(root, added.path), 'utf8')
+    assert.match(persistedBytes, /^ {2}"confidence": 0,$/mu)
+    assert.doesNotMatch(persistedBytes, /^ {2}"confidence": -0,$/mu)
+    const persisted = JSON.parse(persistedBytes) as { confidence: number }
+    assert.equal(Object.is(persisted.confidence, 0), true)
+    assert.equal(added.confidence, persisted.confidence)
+
+    const assertCachedConfidence = (records: Array<BrainRecord | null | undefined>) => {
+      for (const record of records) {
+        assert.ok(record)
+        assert.equal(Object.is(record.confidence, 0), true)
+        assert.equal(record.confidence, added.confidence)
+      }
+    }
+    assertCachedConfidence([
+      api.showRecord({ id: added.id, root }),
+      api.listRecords({ root }).find(record => record.id === added.id),
+      api.searchRecords({ query: 'canonical confidence', root }).find(record => record.id === added.id),
+    ])
+
+    const existingId = 'confidence-negative-zero-existing'
+    const existingPath = join(root, 'encephalon', 'decision', `${existingId}.json`)
+    const existingBytes = `{
+  "confidence": -0,
+  "createdAt": "${timestampAt(1)}",
+  "id": "${existingId}",
+  "kind": "decision",
+  "payload": {
+    "summary": "Existing negative-zero confidence"
+  },
+  "searchText": "existing negative-zero confidence value",
+  "source": "agent",
+  "subject": "confidence.negative-zero-existing"
+}\n`
+    writeFileSync(existingPath, existingBytes)
+
+    api.hydrate({ root })
+    assert.equal(readFileSync(existingPath, 'utf8'), existingBytes)
+    assertCachedConfidence([
+      api.showRecord({ id: added.id, root }),
+      api.listRecords({ root }).find(record => record.id === added.id),
+      api.searchRecords({ query: 'canonical confidence', root }).find(record => record.id === added.id),
+      api.showRecord({ id: existingId, root }),
+      api.listRecords({ root }).find(record => record.id === existingId),
+      api.searchRecords({ query: 'existing negative-zero', root }).find(record => record.id === existingId),
+    ])
+  })
+
   test('enforces portable artifact path component lengths', () => {
     const root = createRoot()
     const validComponent = 'a'.repeat(255)

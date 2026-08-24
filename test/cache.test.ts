@@ -5068,6 +5068,48 @@ describe('SQLite cache and reads', () => {
     })
   }
 
+  test('normalises negative-zero confidence from an existing cache row before public reads', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      confidence: -0,
+      id: 'cached-negative-zero-confidence',
+      kind: 'context',
+      payload: { summary: 'Cached negative-zero confidence' },
+      root,
+      searchText: 'cached negative-zero confidence',
+      source: 'agent',
+      subject: 'cache.negative-zero-confidence',
+    })
+    mutateCache(root, database => {
+      const row = database.prepare('SELECT record_json FROM records WHERE id = ?').get(record.id) as
+        | { record_json?: unknown }
+        | undefined
+      assert.ok(row)
+      assert.equal(typeof row.record_json, 'string')
+      const cachedBytes = row.record_json as string
+      const negativeZeroBytes = cachedBytes.replace('"confidence":0', '"confidence":-0')
+      assert.notEqual(negativeZeroBytes, cachedBytes)
+      database.prepare('UPDATE records SET record_json = ? WHERE id = ?').run(negativeZeroBytes, record.id)
+    })
+    let writerInitialisations = 0
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+      }
+    }
+
+    const cached = [
+      api.showRecord({ id: record.id, root }),
+      api.listRecords({ root }).find(candidate => candidate.id === record.id),
+      api.searchRecords({ query: 'cached negative-zero', root }).find(candidate => candidate.id === record.id),
+    ]
+    for (const candidate of cached) {
+      assert.ok(candidate)
+      assert.equal(Object.is(candidate.confidence, 0), true)
+    }
+    assert.equal(writerInitialisations, 0)
+  })
+
   test('quarantines one exact corrupt cache generation before rebuilding', () => {
     const root = createRoot()
     const record = addCacheRecord(root)
