@@ -2619,17 +2619,27 @@ jobs:
 
 // Mutations caught: local docker:// images remain inspected, while mutable repository Dockerfile FROM chains stay outside proof.
 test('inspects reachable local Docker images while accepting repository Dockerfiles', () => {
+  const outside = createFixture({
+    Dockerfile: 'FROM alpine:3.20\n',
+  })
+  const outsideDockerfile = join(outside, 'Dockerfile').replaceAll('\\', '/')
   const root = createFixture({
     '.github/actions/dockerfile-absolute/action.yml': `name: Absolute Dockerfile
 runs:
   using: docker
-  image: /outside/Dockerfile
+  image: ${outsideDockerfile}
 `,
     '.github/actions/dockerfile-escaping/action.yml': `name: Escaping Dockerfile
 runs:
   using: docker
   image: ../../../../Dockerfile
 `,
+    '.github/actions/dockerfile-lower/action.yml': `name: Lower-case Dockerfile
+runs:
+  using: docker
+  image: images/dockerfile.dev
+`,
+    '.github/actions/dockerfile-lower/images/dockerfile.dev': 'FROM alpine:3.20\n',
     '.github/actions/dockerfile-missing/action.yml': `name: Missing Dockerfile
 runs:
   using: docker
@@ -2653,6 +2663,12 @@ runs:
   image: images/Dockerfile.dev
 `,
     '.github/actions/dockerfile-suffixed/images/Dockerfile.dev': 'FROM alpine:3.20\n',
+    '.github/actions/dockerfile-unsafe/action.yml': `name: Unsafe Dockerfile
+runs:
+  using: docker
+  image: Dockerfile
+`,
+    '.github/actions/dockerfile-unsafe/source.txt': 'FROM alpine:3.20\n',
     '.github/actions/dockerfile/action.yml': `name: Dockerfile
 runs:
   using: docker
@@ -2699,8 +2715,10 @@ jobs:
       - uses: $/.github/actions/mutable-hub
       - uses: $/.github/actions/dockerfile
       - uses: $/.github/actions/dockerfile-relative
+      - uses: $/.github/actions/dockerfile-lower
       - uses: $/.github/actions/dockerfile-nested
       - uses: $/.github/actions/dockerfile-suffixed
+      - uses: $/.github/actions/dockerfile-unsafe
       - uses: $/.github/actions/dockerfile-absolute
       - uses: $/.github/actions/dockerfile-escaping
       - uses: $/.github/actions/dockerfile-missing
@@ -2708,6 +2726,10 @@ jobs:
       - uses: $/.github/actions/non-docker
 `,
   })
+  linkSync(
+    join(root, '.github/actions/dockerfile-unsafe/source.txt'),
+    join(root, '.github/actions/dockerfile-unsafe/Dockerfile'),
+  )
 
   assert.deepEqual(inspectWorkflowPolicy(root), [
     {
@@ -2724,6 +2746,11 @@ jobs:
       file: '.github/actions/dockerfile-missing/action.yml',
       location: 'runs.image',
       rule: 'local-reference',
+    },
+    {
+      file: '.github/actions/dockerfile-unsafe/action.yml',
+      location: 'runs.image',
+      rule: 'source-integrity',
     },
     {
       file: '.github/actions/mixed-case/action.yml',

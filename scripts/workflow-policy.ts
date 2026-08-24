@@ -1159,20 +1159,24 @@ export const inspectWorkflowPolicy = (
               if (traversalIntegrityAccepted) {
                 if (reference.kind === 'action' && reference.dockerfile === true) {
                   const dockerfilePath = resolve(dirname(source.path), reference.reference)
-                  const observation = observeNativeFile(nativeRoot, dockerfilePath)
-                  if (observation.kind === 'missing') {
-                    findings.push({ file, location: reference.location, rule: 'local-reference' })
-                  } else if (observation.kind === 'invalid') {
-                    findings.push({ file, location: reference.location, rule: 'source-integrity' })
-                  } else {
-                    const witnessKey = `dockerfile\0${comparablePath(dockerfilePath)}`
-                    const witness = { metadata: observation.metadata, path: dockerfilePath }
-                    const existingWitness = fileWitnesses.get(witnessKey)
-                    if (existingWitness === undefined) {
-                      fileWitnesses.set(witnessKey, witness)
-                    } else if (!sameStableEntryMetadata(existingWitness.metadata, witness.metadata)) {
-                      traversalIntegrityAccepted = false
+                  if (isContainedPath(nativeRoot, dockerfilePath)) {
+                    const observation = observeNativeFile(nativeRoot, dockerfilePath)
+                    if (observation.kind === 'missing') {
+                      findings.push({ file, location: reference.location, rule: 'local-reference' })
+                    } else if (observation.kind === 'invalid') {
+                      findings.push({ file, location: reference.location, rule: 'source-integrity' })
+                    } else {
+                      const witnessKey = `dockerfile\0${comparablePath(dockerfilePath)}`
+                      const witness = { metadata: observation.metadata, path: dockerfilePath }
+                      const existingWitness = fileWitnesses.get(witnessKey)
+                      if (existingWitness === undefined) {
+                        fileWitnesses.set(witnessKey, witness)
+                      } else if (!sameStableEntryMetadata(existingWitness.metadata, witness.metadata)) {
+                        traversalIntegrityAccepted = false
+                      }
                     }
+                  } else {
+                    findings.push({ file, location: reference.location, rule: 'local-reference' })
                   }
                 } else if (
                   reference.kind === 'action' &&
