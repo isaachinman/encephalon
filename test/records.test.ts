@@ -40,7 +40,7 @@ import {
   validateRecordsResolved,
 } from '../src/records.ts'
 import { discoverRepository, repositoryTestHooks } from '../src/repository.ts'
-import { parseRecordFile, validateAddRecordInput, validateKind } from '../src/schema.ts'
+import { MAX_PAYLOAD_NODES, parseRecordFile, validateAddRecordInput, validateKind } from '../src/schema.ts'
 import * as stagingInternals from '../src/staging.ts'
 import type { BrainRecord, ValidateResult } from '../src/types.ts'
 import {
@@ -3230,26 +3230,60 @@ describe('canonical records', () => {
 
   test('returns stable invalid argument errors for hostile payload descriptors', () => {
     const root = createRoot()
-    const throwingDescriptorProxy = new Proxy(
-      { summary: 'Hidden' },
+    const hostilePayloads = [
       {
-        getOwnPropertyDescriptor: () => {
-          throw new Error('descriptor trap must not escape')
-        },
+        payload: new Proxy(
+          { summary: 'Hidden' },
+          {
+            getOwnPropertyDescriptor: () => {
+              throw new Error('PRIVATE_DESCRIPTOR_TRAP')
+            },
+          },
+        ),
+        secret: 'PRIVATE_DESCRIPTOR_TRAP',
       },
-    )
+      {
+        payload: new Proxy(
+          { summary: 'Hidden' },
+          {
+            ownKeys: () => {
+              throw new Error('PRIVATE_OWN_KEYS_TRAP')
+            },
+          },
+        ),
+        secret: 'PRIVATE_OWN_KEYS_TRAP',
+      },
+      {
+        payload: new Proxy(
+          { summary: 'Hidden' },
+          {
+            getPrototypeOf: () => {
+              throw new Error('PRIVATE_PROTOTYPE_TRAP')
+            },
+          },
+        ),
+        secret: 'PRIVATE_PROTOTYPE_TRAP',
+      },
+    ]
 
-    assertErrorCode(
-      () =>
-        api.addRecord({
-          kind: 'decision',
-          payload: throwingDescriptorProxy,
-          root,
-          source: 'agent',
-          subject: 'payload.proxy',
-        }),
-      'INVALID_ARGUMENT',
-    )
+    for (const { payload, secret } of hostilePayloads) {
+      assert.throws(
+        () =>
+          api.addRecord({
+            kind: 'decision',
+            payload,
+            root,
+            source: 'agent',
+            subject: 'payload.proxy',
+          }),
+        (error: unknown) => {
+          const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+          assert.equal(actual.code, 'INVALID_ARGUMENT')
+          assert.equal(JSON.stringify({ details: actual.details, message: actual.message }).includes(secret), false)
+          return true
+        },
+      )
+    }
   })
 
   test('bounds payload depth and total node count', () => {
@@ -3301,6 +3335,164 @@ describe('canonical records', () => {
           subject: 'payload.nodes.invalid',
         }),
       'INVALID_ARGUMENT',
+    )
+  })
+
+  test('applies payload budgets before descriptor work and inspects accepted properties once', () => {
+    const validatePayload = (payload: unknown) =>
+      validateAddRecordInput({
+        kind: 'decision',
+        payload: payload as never,
+        source: 'agent',
+        subject: 'payload.descriptor-budget',
+      }).payload
+
+    const oversizedArrayCalls: string[] = []
+    const oversizedArray = new Proxy(new Array(2 ** 32 - 1), {
+      getOwnPropertyDescriptor: (target, key) => {
+        oversizedArrayCalls.push(`descriptor:${String(key)}`)
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      },
+      ownKeys: target => {
+        oversizedArrayCalls.push('ownKeys')
+        return Reflect.ownKeys(target)
+      },
+    })
+    assertErrorCode(() => validatePayload(oversizedArray), 'INVALID_ARGUMENT')
+    assert.deepEqual(oversizedArrayCalls, ['descriptor:length'])
+
+    const wideObjectCalls = { descriptors: 0, ownKeys: 0 }
+    const wideObject = new Proxy(
+      Object.fromEntries(Array.from({ length: MAX_PAYLOAD_NODES }, (_, index) => [`k${index}`, null])),
+      {
+        getOwnPropertyDescriptor: (target, key) => {
+          wideObjectCalls.descriptors += 1
+          return Reflect.getOwnPropertyDescriptor(target, key)
+        },
+        ownKeys: target => {
+          wideObjectCalls.ownKeys += 1
+          return Reflect.ownKeys(target)
+        },
+      },
+    )
+    assertErrorCode(() => validatePayload(wideObject), 'INVALID_ARGUMENT')
+    assert.deepEqual(wideObjectCalls, { descriptors: MAX_PAYLOAD_NODES, ownKeys: 1 })
+
+    const overBudgetAccessorTarget = Object.fromEntries(
+      Array.from({ length: MAX_PAYLOAD_NODES }, (_, index) => [`k${index}`, null]),
+    )
+    Object.defineProperty(overBudgetAccessorTarget, 'laterAccessor', {
+      enumerable: true,
+      get: () => {
+        throw new Error('accessor must not run')
+      },
+    })
+    assert.throws(
+      () => validatePayload(overBudgetAccessorTarget),
+      (error: unknown) => {
+        assert.equal((error as { message?: unknown }).message, 'payload contains an accessor property.')
+        return true
+      },
+    )
+
+    const boundaryObjectCalls = { descriptors: 0, ownKeys: 0 }
+    const boundaryObject = new Proxy(
+      Object.fromEntries(Array.from({ length: MAX_PAYLOAD_NODES - 1 }, (_, index) => [`k${index}`, null])),
+      {
+        getOwnPropertyDescriptor: (target, key) => {
+          boundaryObjectCalls.descriptors += 1
+          return Reflect.getOwnPropertyDescriptor(target, key)
+        },
+        ownKeys: target => {
+          boundaryObjectCalls.ownKeys += 1
+          return Reflect.ownKeys(target)
+        },
+      },
+    )
+    const boundaryResult = validatePayload(boundaryObject)
+    assert.equal(Object.keys(boundaryResult as Record<string, unknown>).length, MAX_PAYLOAD_NODES - 1)
+    assert.deepEqual(boundaryObjectCalls, { descriptors: MAX_PAYLOAD_NODES - 1, ownKeys: 1 })
+
+    const hiddenWideTarget = { summary: 'Hidden properties do not consume the JSON-node budget' }
+    for (let index = 0; index < MAX_PAYLOAD_NODES; index += 1) {
+      Object.defineProperty(hiddenWideTarget, `hidden${index}`, { value: null })
+    }
+    assert.deepEqual(validatePayload(hiddenWideTarget), {
+      summary: 'Hidden properties do not consume the JSON-node budget',
+    })
+
+    const acceptedObjectCalls = { descriptors: 0, ownKeys: 0 }
+    const acceptedObjectTarget = { nested: { value: true }, summary: 'Accepted once' }
+    Object.defineProperty(acceptedObjectTarget, 'hidden', { value: 'ignored' })
+    const acceptedObject = new Proxy(acceptedObjectTarget, {
+      getOwnPropertyDescriptor: (target, key) => {
+        acceptedObjectCalls.descriptors += 1
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      },
+      ownKeys: target => {
+        acceptedObjectCalls.ownKeys += 1
+        return Reflect.ownKeys(target)
+      },
+    })
+    assert.deepEqual(validatePayload(acceptedObject), {
+      nested: { value: true },
+      summary: 'Accepted once',
+    })
+    assert.deepEqual(acceptedObjectCalls, { descriptors: 3, ownKeys: 1 })
+
+    const acceptedArrayCalls = { descriptors: [] as string[], ownKeys: 0 }
+    const acceptedArrayTarget = ['first', 'second'] as string[] & { metadata?: string }
+    acceptedArrayTarget.metadata = 'ignored'
+    const acceptedArray = new Proxy(acceptedArrayTarget, {
+      getOwnPropertyDescriptor: (target, key) => {
+        acceptedArrayCalls.descriptors.push(String(key))
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      },
+      ownKeys: target => {
+        acceptedArrayCalls.ownKeys += 1
+        return Reflect.ownKeys(target)
+      },
+    })
+    assert.deepEqual(validatePayload(acceptedArray), ['first', 'second'])
+    assert.deepEqual(acceptedArrayCalls, {
+      descriptors: ['length', '0', '1', 'metadata'],
+      ownKeys: 1,
+    })
+
+    const reorderedArray = new Proxy([() => undefined, Symbol('later invalid value')], {
+      ownKeys: () => ['1', '0', 'length'],
+    })
+    assert.throws(
+      () => validatePayload(reorderedArray),
+      (error: unknown) => {
+        assert.deepEqual((error as { details?: unknown }).details, { field: 'payload[0]' })
+        return true
+      },
+    )
+
+    const reorderedObject = new Proxy(
+      { 0: () => undefined, 1: Symbol('later invalid value') },
+      {
+        ownKeys: () => ['1', '0'],
+      },
+    )
+    assert.throws(
+      () => validatePayload(reorderedObject),
+      (error: unknown) => {
+        assert.deepEqual((error as { details?: unknown }).details, { field: 'payload.0' })
+        return true
+      },
+    )
+    assert.deepEqual(
+      validatePayload(
+        new Proxy(
+          { 0: 'zero', 1: 'one' },
+          {
+            ownKeys: () => ['1', '0'],
+          },
+        ),
+      ),
+      { 0: 'zero', 1: 'one' },
     )
   })
 

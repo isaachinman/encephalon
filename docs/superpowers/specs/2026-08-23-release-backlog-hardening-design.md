@@ -55,7 +55,7 @@ MAR-2640 runs the existing stable release-equivalent job on pull requests and tr
 2. MAR-2576 — avoid descriptor-map amplification before payload budgets.
 3. MAR-2572 — reject sparse arrays and accessor-bearing input envelopes.
 
-MAR-2641 remains a scalar schema correction. MAR-2576 introduces a small guarded property-inspection primitive and retains iterative payload traversal without materialising whole-object descriptor maps. MAR-2572 reuses that primitive for public envelope parsing and dense-array validation while retaining operation-budget precedence and ignoring unknown ordinary data properties.
+MAR-2641 remains a scalar schema correction. MAR-2576 introduces dependency-free guarded prototype, own-key, and single-descriptor reads in `src/property-inspection.ts`; `src/schema.ts` retains payload policy, budgets, reconstruction, and iterative traversal without materialising whole-object descriptor maps. MAR-2572 reuses only that inspection primitive for public envelope parsing and dense-array validation, while `src/api-input.ts` retains envelope policy, operation-budget precedence, and unknown ordinary data-property tolerance.
 
 The exact reviewed MAR-2641 code and behavioural-test snapshot is `58c01dc1ff263b8aa80a3cfaac610296233ed7e1`. It normalises only numeric negative-zero confidence at the existing schema boundary, preserving the accepted range, ordinary numeric values, errors, public shapes, canonical storage, and cache format. Coverage proves immediate mutation results, package-produced canonical bytes, existing raw canonical `-0`, rebuilt-cache reads, and CLI output converge on positive zero.
 
