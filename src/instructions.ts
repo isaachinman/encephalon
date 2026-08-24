@@ -19,7 +19,13 @@ import {
 import { basename, dirname, join, resolve } from 'node:path'
 import { TextDecoder } from 'node:util'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
-import { sameEntryIdentity } from './filesystem-entry.ts'
+import {
+  type EntryMetadata,
+  entryMetadataFrom,
+  sameEntryIdentity,
+  sameStableEntryMetadata,
+  sameStableEntryMetadataExceptCtime,
+} from './filesystem-entry.ts'
 import { ordinalStringCompare } from './order.ts'
 
 const FILENAMES = ['AGENTS.md', 'CLAUDE.md'] as const
@@ -43,7 +49,7 @@ type FilePlan = {
   originalBytes: Buffer
   originalContent: string
   originalFileExisted: boolean
-  originalIdentity?: FileIdentity
+  originalIdentity?: EntryMetadata
 }
 
 /** @internal */
@@ -52,17 +58,6 @@ type InstructionAction = {
   action: 'removed' | 'updated'
 }
 
-type FileIdentity = {
-  birthtimeNs: string
-  ctimeNs: string
-  dev: string
-  ino: string
-  mtimeNs: string
-  size: string
-}
-
-type StableFileIdentity = Omit<FileIdentity, 'ctimeNs'>
-
 const ALLOWED_SEPARATORS = new Set(['', '\n', '\n\n', '\r\n', '\r\n\r\n'])
 const MODE_BITS = 0o7777
 const MAX_INSTRUCTION_FILE_BYTES = 1024 * 1024
@@ -70,19 +65,10 @@ const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFO
 const directoryFlag = typeof constants.O_DIRECTORY === 'number' ? constants.O_DIRECTORY : 0
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
-const identityFor = (metadata: BigIntStats): FileIdentity => ({
-  birthtimeNs: metadata.birthtimeNs.toString(),
-  ctimeNs: metadata.ctimeNs.toString(),
-  dev: metadata.dev.toString(),
-  ino: metadata.ino.toString(),
-  mtimeNs: metadata.mtimeNs.toString(),
-  size: metadata.size.toString(),
+const instructionMetadataFrom = (metadata: BigIntStats): EntryMetadata => ({
+  ...entryMetadataFrom(metadata),
+  mode: 0n,
 })
-
-const stableIdentity = ({ ctimeNs: _ctimeNs, ...identity }: FileIdentity): StableFileIdentity => identity
-
-const sameIdentity = <Identity extends Record<string, string>>(left: Identity | undefined, right: Identity) =>
-  left !== undefined && Object.entries(right).every(([key, value]) => left[key] === value)
 
 const lstatIfExists = (path: string) => {
   try {
@@ -111,7 +97,7 @@ const identityForPath = (path: string) => {
   if (metadata === undefined) {
     return
   }
-  return identityFor(metadata)
+  return instructionMetadataFrom(metadata)
 }
 
 const requiredIdentityForPath = (path: string, filename: (typeof FILENAMES)[number]) => {
@@ -582,7 +568,7 @@ type PostCommitPhase =
 
 type DescriptorSnapshot = {
   bytes: Buffer
-  identity: FileIdentity
+  identity: EntryMetadata
   mode: bigint
 }
 
@@ -661,14 +647,14 @@ const snapshotDescriptor = (descriptor: number, filename: (typeof FILENAMES)[num
   const bytes = readDescriptorBytes(descriptor, before.size)
   const after = fstatSync(descriptor, { bigint: true })
   if (
-    !sameIdentity(identityFor(before), identityFor(after)) ||
+    !sameStableEntryMetadata(instructionMetadataFrom(before), instructionMetadataFrom(after)) ||
     (before.mode & BigInt(MODE_BITS)) !== (after.mode & BigInt(MODE_BITS))
   ) {
     return instructionIdentityChanged(filename)
   }
   return {
     bytes,
-    identity: identityFor(after),
+    identity: instructionMetadataFrom(after),
     mode: after.mode & BigInt(MODE_BITS),
   }
 }
@@ -735,12 +721,12 @@ const assertPathIdentifiesDescriptor = (
   if (pathnameMetadata.isSymbolicLink() || !pathnameMetadata.isFile()) {
     return instructionIdentityChanged(filename)
   }
-  if (!sameIdentity(descriptorSnapshot.identity, identityFor(pathnameMetadata))) {
+  if (!sameStableEntryMetadata(descriptorSnapshot.identity, instructionMetadataFrom(pathnameMetadata))) {
     return instructionIdentityChanged(filename)
   }
   if (
     requireHeldState &&
-    (!sameIdentity(stableIdentity(held.identity), stableIdentity(descriptorSnapshot.identity)) ||
+    (!sameStableEntryMetadataExceptCtime(held.identity, descriptorSnapshot.identity) ||
       held.mode !== descriptorSnapshot.mode ||
       !held.bytes.equals(descriptorSnapshot.bytes))
   ) {
@@ -797,8 +783,8 @@ const currentRecoveryPaths = (
         return (
           pathname.isFile() &&
           !pathname.isSymbolicLink() &&
-          sameIdentity(current.identity, identityFor(pathname)) &&
-          sameIdentity(stableIdentity(expected.identity), stableIdentity(current.identity)) &&
+          sameStableEntryMetadata(current.identity, instructionMetadataFrom(pathname)) &&
+          sameStableEntryMetadataExceptCtime(expected.identity, current.identity) &&
           expected.mode === current.mode &&
           expected.bytes.equals(current.bytes)
         )
@@ -1062,7 +1048,10 @@ const assertOriginalDeleteTarget = (path: string, plan: FilePlan) => {
   if (metadata === undefined || metadata.isSymbolicLink() || !metadata.isFile()) {
     return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
   }
-  if (!sameIdentity(plan.originalIdentity, identityFor(metadata))) {
+  if (
+    plan.originalIdentity === undefined ||
+    !sameStableEntryMetadata(plan.originalIdentity, instructionMetadataFrom(metadata))
+  ) {
     return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
   }
   if (!readRegularFileBytes(path, plan.filename).equals(plan.originalBytes)) {
@@ -1075,8 +1064,10 @@ const assertQuarantinedDeleteTarget = (quarantinePath: string, plan: FilePlan) =
   if (metadata === undefined || metadata.isSymbolicLink() || !metadata.isFile()) {
     return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
   }
-  const originalIdentity = plan.originalIdentity === undefined ? undefined : stableIdentity(plan.originalIdentity)
-  if (!sameIdentity(originalIdentity, stableIdentity(identityFor(metadata)))) {
+  if (
+    plan.originalIdentity === undefined ||
+    !sameStableEntryMetadataExceptCtime(plan.originalIdentity, instructionMetadataFrom(metadata))
+  ) {
     return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
   }
   if (!readRegularFileBytes(quarantinePath, plan.filename).equals(plan.originalBytes)) {
@@ -1471,10 +1462,8 @@ const writePlan = (path: string, plan: FilePlan, authority: InstructionRootAutho
       if (
         !(
           backup.bytes.equals(plan.originalBytes) &&
-          sameIdentity(
-            plan.originalIdentity === undefined ? undefined : stableIdentity(plan.originalIdentity),
-            stableIdentity(backup.identity),
-          )
+          plan.originalIdentity !== undefined &&
+          sameStableEntryMetadataExceptCtime(plan.originalIdentity, backup.identity)
         )
       ) {
         return instructionIdentityChanged(plan.filename)
