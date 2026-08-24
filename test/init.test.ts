@@ -2933,15 +2933,16 @@ describe('initialisation', () => {
         }),
       error => {
         assert.equal(error instanceof EncephalonError, true)
+        const encephalonError = error as EncephalonError
+        assert.equal(Object.hasOwn(encephalonError, 'cause'), false)
+        assert.deepEqual(Object.keys(encephalonError).sort(), ['code', 'details', 'name'])
         assert.deepEqual(
           {
-            cause: (error as EncephalonError).cause,
-            code: (error as EncephalonError).code,
-            details: (error as EncephalonError).details,
-            message: (error as EncephalonError).message,
+            code: encephalonError.code,
+            details: encephalonError.details,
+            message: encephalonError.message,
           },
           {
-            cause: undefined,
             code: 'REPOSITORY_CHANGED',
             details: {},
             message: 'The canonical repository changed repeatedly during the operation.',
@@ -2960,6 +2961,7 @@ describe('initialisation', () => {
     roots.push(moved)
     const clock = [0, 60_000]
     let attempts = 0
+    let clockReads = 0
 
     assertErrorCode(
       () =>
@@ -2971,11 +2973,19 @@ describe('initialisation', () => {
               mkdirSync(root)
             }
           },
-          now: () => clock.shift() ?? 60_000,
+          now: () => {
+            const value = clock[clockReads]
+            if (value !== undefined) {
+              clockReads += 1
+              return value
+            }
+            throw new Error('The baseline retry clock was read more than twice.')
+          },
         }),
       'REPOSITORY_CHANGED',
     )
     assert.equal(attempts, 1)
+    assert.equal(clockReads, 2)
   })
 
   test('propagates unexpected failures after collecting baseline sources', () => {
