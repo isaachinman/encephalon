@@ -16,8 +16,14 @@ import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
 import type { DirectoryReader } from '../src/bounded-directory.ts'
-import { cacheLocationTestHooks } from '../src/cache-location.ts'
+import {
+  cacheLocationTestHooks,
+  inspectCacheLocation,
+  observeCacheOwnedDirectoryForMaintenance,
+  observeCacheOwner,
+} from '../src/cache-location.ts'
 import { withOperationLock } from '../src/lock.ts'
+import { maintainLockCandidates } from '../src/lock-candidates.ts'
 import { classifySQLiteError, type SQLiteErrorCategory } from '../src/sqlite-error.ts'
 import { createTestRepository, removeTestRepository } from './helpers.ts'
 
@@ -42,8 +48,10 @@ const identityOf = (path: string) => {
 const age = (path: string) => utimesSync(path, new Date(0), new Date(0))
 
 afterEach(() => {
+  cacheLocationTestHooks.beforeCacheLocationAssertion = undefined
   cacheLocationTestHooks.beforeCacheOwnerOpen = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
+  cacheLocationTestHooks.beforeQuarantinedFileCleanup = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
 
@@ -95,6 +103,110 @@ const assertAbandonedCandidateConverges = async (mode: 'after-owner' | 'before-o
 }
 
 describe('lock candidate maintenance', () => {
+  test('asserts the current lock before opening the maintenance cursor', () => {
+    const root = createRoot()
+    const location = inspectCacheLocation(root)
+    let opens = 0
+    const authorityFailure = Object.assign(new Error('current lock failed before maintenance'), { code: 'EIO' })
+
+    assert.throws(
+      () =>
+        maintainLockCandidates(location, {
+          assertCurrentLock: () => {
+            throw authorityFailure
+          },
+          openDirectory: () => {
+            opens += 1
+            return { closeSync: () => undefined, readSync: () => null }
+          },
+        }),
+      error => error === authorityFailure,
+    )
+    assert.equal(opens, 0)
+  })
+
+  test('preserves the first one-shot current-lock failure at a candidate suppression boundary', () => {
+    const root = createRoot()
+    const token = tokenFor(0x0_10)
+    const path = candidatePath(root, token)
+    let candidateFailureReached = false
+    let currentFailures = 0
+    let operationEntered = false
+    mkdirSync(path, { recursive: true })
+    age(path)
+    cacheLocationTestHooks.beforeQuarantineRename = current => {
+      if (basename(current) === basename(path)) {
+        candidateFailureReached = true
+        throw Object.assign(new Error('candidate quarantine failed'), { code: 'EIO' })
+      }
+    }
+    cacheLocationTestHooks.beforeCacheOwnerOpen = current => {
+      if (candidateFailureReached && basename(dirname(current)) === 'operation.lock' && currentFailures === 0) {
+        currentFailures += 1
+        throw Object.assign(new Error('one-shot current lock failure'), { code: 'EIO' })
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        return true
+      },
+    )
+    assert.equal(currentFailures, 1)
+    assert.equal(operationEntered, false)
+  })
+
+  test('preserves the first one-shot cache-location failure at a candidate suppression boundary', () => {
+    const root = createRoot()
+    const token = tokenFor(0x0_11)
+    const path = candidatePath(root, token)
+    const location = inspectCacheLocation(root)
+    const cacheFailure = Object.assign(new Error('one-shot cache location failure'), { code: 'EIO' })
+    let candidateFailureReached = false
+    let cacheFailures = 0
+    mkdirSync(path, { recursive: true })
+    writeFileSync(join(path, 'owner.json'), '{malformed')
+    age(join(path, 'owner.json'))
+    age(path)
+    cacheLocationTestHooks.beforeCacheOwnerOpen = current => {
+      if (basename(dirname(current)) === basename(path)) {
+        candidateFailureReached = true
+        throw Object.assign(new Error('candidate owner failed'), { code: 'EBUSY' })
+      }
+    }
+    cacheLocationTestHooks.beforeCacheLocationAssertion = () => {
+      if (candidateFailureReached && cacheFailures === 0) {
+        cacheFailures += 1
+        throw cacheFailure
+      }
+    }
+
+    assert.throws(
+      () =>
+        maintainLockCandidates(location, {
+          assertCurrentLock: () => undefined,
+          openDirectory: () => {
+            let read = false
+            return {
+              closeSync: () => undefined,
+              readSync: () => {
+                const entry = read ? null : entryFor(token)
+                read = true
+                return entry
+              },
+            }
+          },
+        }),
+      error => error === cacheFailure,
+    )
+    assert.equal(cacheFailures, 1)
+  })
+
   test('runs under the gate and visits at most 64 lazy entries without private diagnostics', () => {
     const root = createRoot()
     const gatePath = join(cacheDirectory(root), 'operation-lock.sqlite')
@@ -313,6 +425,38 @@ describe('lock candidate maintenance', () => {
     assert.equal(readFileSync(join(lockPath, 'successor'), 'utf8'), successorBytes)
   })
 
+  test('asserts the current lock in the final candidate ownership callback before rename', () => {
+    const root = createRoot()
+    const token = tokenFor(0x2_12)
+    const path = candidatePath(root, token)
+    const lockPath = join(cacheDirectory(root), 'operation.lock')
+    const displaced = join(root, 'displaced-final-ownership-lock')
+    let operationEntered = false
+    mkdirSync(path, { recursive: true })
+    age(path)
+    cacheLocationTestHooks.beforeQuarantineRename = current => {
+      if (basename(current) === basename(path)) {
+        cacheLocationTestHooks.beforeQuarantineRename = undefined
+        renameSync(lockPath, displaced)
+        mkdirSync(lockPath)
+        writeFileSync(join(lockPath, 'successor'), 'replacement current lock')
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.equal(existsSync(path), true)
+  })
+
   test('resumes a retained reader until a reclaimable suffix is reached', () => {
     const root = createRoot()
     const token = '00000000-0000-4000-8000-000000000001'
@@ -421,7 +565,7 @@ describe('lock candidate maintenance', () => {
     assert.equal(identityCloses, 1)
   })
 
-  test('evicts the least-recently-used cursor after the ninth repository', () => {
+  test('refreshes cursor recency and evicts the true least-recently-used repository', () => {
     const closes = new Map<string, number>()
     const openedPaths: string[] = []
     const openDirectory = (path: string): DirectoryReader<Entry> => {
@@ -434,11 +578,14 @@ describe('lock candidate maintenance', () => {
       }
     }
     const repositories = Array.from({ length: 9 }, () => createRoot())
-    for (const root of repositories) {
+    for (const root of repositories.slice(0, 8)) {
       withOperationLock(root, () => 'entered', { openCandidateDirectory: openDirectory })
     }
+    withOperationLock(repositories[0] as string, () => 'refreshed', { openCandidateDirectory: openDirectory })
+    withOperationLock(repositories[8] as string, () => 'entered', { openCandidateDirectory: openDirectory })
 
-    assert.equal(closes.get(openedPaths[0] as string), 1)
+    assert.equal(closes.get(openedPaths[0] as string), undefined)
+    assert.equal(closes.get(openedPaths[1] as string), 1)
   })
 
   test('reclaims only exact abandoned candidates and preserves live or ambiguous evidence', () => {
@@ -463,6 +610,8 @@ describe('lock candidate maintenance', () => {
       token: liveOwner,
     })}\n`
     writeFileSync(join(candidatePath(root, liveOwner), 'owner.json'), liveBytes)
+    age(join(candidatePath(root, liveOwner), 'owner.json'))
+    age(candidatePath(root, liveOwner))
     writeFileSync(join(candidatePath(root, malformed), 'owner.json'), '{malformed')
     writeFileSync(join(candidatePath(root, extraChild), 'extra'), 'preserve')
 
@@ -477,21 +626,24 @@ describe('lock candidate maintenance', () => {
     assert.equal(readFileSync(join(candidatePath(root, extraChild), 'extra'), 'utf8'), 'preserve')
   })
 
-  test('reclaims aged malformed and oversized owner evidence', () => {
+  test('uses a strict malformed-owner grace boundary and preserves oversized owners without exact bytes', () => {
     const root = createRoot()
     const cases = [
-      { bytes: '{malformed', token: tokenFor(0x3_00) },
-      { bytes: 'x'.repeat(4097), token: tokenFor(0x3_01) },
+      { bytes: '{exactly-grace', mtime: 5000, present: true, token: tokenFor(0x3_00) },
+      { bytes: '{older-than-grace', mtime: 4999, present: false, token: tokenFor(0x3_01) },
+      { bytes: 'x'.repeat(4097), mtime: 5000, present: true, token: tokenFor(0x3_02) },
+      { bytes: 'y'.repeat(4097), mtime: 4999, present: true, token: tokenFor(0x3_03) },
     ] as const
     for (const ownerCase of cases) {
       const path = candidatePath(root, ownerCase.token)
       mkdirSync(path, { recursive: true })
       writeFileSync(join(path, 'owner.json'), ownerCase.bytes)
-      age(join(path, 'owner.json'))
-      age(path)
+      utimesSync(join(path, 'owner.json'), new Date(ownerCase.mtime), new Date(ownerCase.mtime))
+      utimesSync(path, new Date(ownerCase.mtime), new Date(ownerCase.mtime))
     }
     let index = 0
     withOperationLock(root, () => 'entered', {
+      now: () => 10_000,
       openCandidateDirectory: () => ({
         closeSync: () => undefined,
         readSync: () => {
@@ -503,7 +655,132 @@ describe('lock candidate maintenance', () => {
     })
 
     for (const ownerCase of cases) {
-      assert.equal(existsSync(candidatePath(root, ownerCase.token)), false)
+      assert.equal(existsSync(candidatePath(root, ownerCase.token)), ownerCase.present)
+    }
+  })
+
+  test('retains exact raw bytes for bounded owner evidence', () => {
+    const root = createRoot()
+    const token = tokenFor(0x3_10)
+    const path = candidatePath(root, token)
+    const bytes = Buffer.from([0x7b, 0x22, 0x80, 0xff, 0x22, 0x7d])
+    const location = inspectCacheLocation(root)
+    mkdirSync(path, { recursive: true })
+    writeFileSync(join(path, 'owner.json'), bytes)
+    const observed = observeCacheOwnedDirectoryForMaintenance(location, basename(path))
+    assert.equal(observed.kind, 'stable')
+    if (observed.kind === 'stable') {
+      const owner = observeCacheOwner(location, observed.directory)
+      assert.equal(owner.kind, 'contents')
+      if (owner.kind === 'contents') {
+        assert.deepEqual(owner.bytes, bytes)
+      }
+    }
+  })
+
+  test('preserves a candidate when its captured directory mtime changes before quarantine', () => {
+    const root = createRoot()
+    const token = tokenFor(0x3_11)
+    const path = candidatePath(root, token)
+    mkdirSync(path, { recursive: true })
+    age(path)
+    cacheLocationTestHooks.beforeQuarantineRename = current => {
+      if (basename(current) === basename(path)) {
+        cacheLocationTestHooks.beforeQuarantineRename = undefined
+        utimesSync(path, new Date(1000), new Date(1000))
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered', { now: () => 10_000 }),
+      'entered',
+    )
+    assert.equal(existsSync(path), true)
+  })
+
+  test('routes unsupported candidate observations through the current-lock authority boundary', () => {
+    const root = createRoot()
+    const token = tokenFor(0x3_12)
+    const location = inspectCacheLocation(root)
+    let assertions = 0
+    writeFileSync(candidatePath(root, token), 'unsupported candidate file')
+
+    maintainLockCandidates(location, {
+      assertCurrentLock: () => {
+        assertions += 1
+      },
+      openDirectory: () => {
+        let read = false
+        return {
+          closeSync: () => undefined,
+          readSync: () => {
+            const entry = read ? null : entryFor(token)
+            read = true
+            return entry
+          },
+        }
+      },
+    })
+    assert.equal(assertions, 2)
+  })
+
+  test('reports current-candidate promotion failures with the fixed public lock entry', () => {
+    const root = createRoot()
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => 'entered', {
+          afterCandidateOwnerPublication: path => {
+            writeFileSync(join(path, 'unexpected'), 'preserve')
+          },
+        }),
+      (error: unknown) => {
+        const candidate = error as { details?: { entry?: unknown } }
+        assert.equal(candidate.details?.entry, 'node_modules/.cache/encephalon/operation.lock')
+        assert.equal(String(candidate.details?.entry).includes('operation.lock.'), false)
+        return true
+      },
+    )
+  })
+
+  test('never unlinks post-validation file successor inodes from candidate quarantine', () => {
+    const cases = [
+      { bytes: undefined, successorName: 'owner.json', token: tokenFor(0x3_20) },
+      { bytes: undefined, successorName: 'owner.recovered.json', token: tokenFor(0x3_21) },
+      { bytes: '{malformed', successorName: 'owner.json', token: tokenFor(0x3_22) },
+    ] as const
+    for (const ownerCase of cases) {
+      const root = createRoot()
+      const path = candidatePath(root, ownerCase.token)
+      let successorIdentity: Readonly<{ dev: bigint; ino: bigint }> | undefined
+      let successorPath: string | undefined
+      mkdirSync(path, { recursive: true })
+      if (ownerCase.bytes !== undefined) {
+        writeFileSync(join(path, 'owner.json'), ownerCase.bytes)
+        age(join(path, 'owner.json'))
+      }
+      age(path)
+      cacheLocationTestHooks.beforeQuarantinedFileCleanup = quarantinePath => {
+        if (quarantinePath.includes(`.operation.lock.${ownerCase.token}.`)) {
+          const successor = join(quarantinePath, ownerCase.successorName)
+          if (existsSync(successor)) {
+            renameSync(successor, join(quarantinePath, `original-${ownerCase.successorName}`))
+          }
+          writeFileSync(successor, 'successor owner bytes')
+          successorIdentity = identityOf(successor)
+          successorPath = successor
+        }
+      }
+
+      assert.equal(
+        withOperationLock(root, () => 'entered'),
+        'entered',
+      )
+      assert.ok(successorPath !== undefined)
+      assert.equal(existsSync(successorPath), true)
+      assert.deepEqual(identityOf(successorPath), successorIdentity)
+      assert.equal(readFileSync(successorPath, 'utf8'), 'successor owner bytes')
+      cacheLocationTestHooks.beforeQuarantinedFileCleanup = undefined
     }
   })
 
@@ -638,7 +915,10 @@ describe('lock candidate maintenance', () => {
     const cases = [
       {
         mutate: (path: string) => {
-          writeFileSync(join(path, 'owner.json'), 'replacement owner bytes')
+          const ownerPath = join(path, 'owner.json')
+          renameSync(ownerPath, join(path, 'original-owner.json'))
+          writeFileSync(ownerPath, '{malformed')
+          return ownerPath
         },
         name: 'owner replacement',
       },
@@ -646,7 +926,9 @@ describe('lock candidate maintenance', () => {
         mutate: (path: string) => {
           renameSync(path, `${path}.displaced`)
           mkdirSync(path)
-          writeFileSync(join(path, 'successor'), 'replacement directory')
+          const ownerPath = join(path, 'owner.json')
+          writeFileSync(ownerPath, '{malformed')
+          return ownerPath
         },
         name: 'directory replacement',
       },
@@ -663,10 +945,11 @@ describe('lock candidate maintenance', () => {
       writeFileSync(join(path, 'owner.json'), '{malformed')
       utimesSync(join(path, 'owner.json'), new Date(0), new Date(0))
       utimesSync(path, new Date(0), new Date(0))
+      let successorIdentity: Readonly<{ dev: bigint; ino: bigint }> | undefined
       cacheLocationTestHooks.beforeQuarantineRename = current => {
         if (basename(current) === basename(path)) {
           cacheLocationTestHooks.beforeQuarantineRename = undefined
-          fixture.mutate(path)
+          successorIdentity = identityOf(fixture.mutate(path))
         }
       }
 
@@ -675,6 +958,8 @@ describe('lock candidate maintenance', () => {
         'entered',
       )
       assert.equal(existsSync(path), true, fixture.name)
+      assert.deepEqual(identityOf(join(path, 'owner.json')), successorIdentity, fixture.name)
+      assert.equal(readFileSync(join(path, 'owner.json'), 'utf8'), '{malformed', fixture.name)
     }
   })
 })
