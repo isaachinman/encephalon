@@ -38,6 +38,7 @@ All notable changes to Encephalon are documented here.
 - Made multi-resource initialisation report bounded monotonic commit progress while preserving subsystem errors, with inspect-or-rerun guidance and same-options convergence after partial baseline, cache, instruction, refresh, and removal failures.
 - Finalised managed instruction writes and removals with fixed-root authority, descriptor-bound private staging and durable recovery, canonical hard-link commit aggregation, concurrent-successor preservation, zero operation-owned aliases on success, and bounded safe post-commit phases and repository-relative recovery paths.
 - Made generated baseline refreshes converge on one canonical snapshot.
+- Rejected multiply linked mutable SQLite primaries, operation gates, and sidecars before use or identity-specific cleanup.
 - Deflaked instruction replacement identity checks across supported platforms.
 
 ### Documentation

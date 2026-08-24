@@ -29,6 +29,7 @@ const CACHE_COMPONENTS = ['node_modules', '.cache', 'encephalon'] as const
 const DATABASE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'] as const
 const OPTIONAL_FILE_OBSERVATION_ATTEMPTS = 3
 const MAX_CACHE_DATABASE_OPEN_ATTEMPTS = 3
+const MAX_CACHE_DATABASE_CLOSE_SAFETY_LATCHES = 4
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0
 
 export type CacheEntryIdentity = EntryIdentity
@@ -127,6 +128,10 @@ class CacheDatabaseSidecarChanged extends EncephalonError {
   }
 }
 
+class UnsafeCacheDatabaseSidecar extends EncephalonError {}
+
+const cacheDatabaseCloseSafetyLatches = new Map<string, { close: () => void }>()
+
 export const failCacheDatabase = (failure: unknown, database: CacheDatabase): never => {
   throw new CacheDatabaseFailure(failure, database, { cause: failure })
 }
@@ -135,13 +140,16 @@ type CacheLocationTestHooks = {
   afterDatabaseLockInitialisation?: ((database: CacheDatabase) => void) | undefined
   afterDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
   afterPrimaryBootstrapClose?: ((path: string) => void) | undefined
+  afterPrimaryBootstrapOpen?: ((path: string) => void) | undefined
   afterQuarantineRename?: ((path: string) => void) | undefined
+  afterRegularFileOpen?: ((path: string) => void) | undefined
   beforeDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
   beforeLocationInspection?: (() => void) | undefined
   beforeOwnedDirectoryFinalIdentity?: ((path: string) => void) | undefined
   beforeQuarantineRename?: ((path: string) => void) | undefined
   duringOwnedDirectoryInspection?: ((path: string) => void) | undefined
   regularFileRealpath?: ((path: string, actual: string) => string) | undefined
+  releaseCloseSafetyLatchesForTests?: (() => void) | undefined
 }
 
 export const cacheLocationTestHooks: CacheLocationTestHooks = {}
@@ -171,6 +179,43 @@ const changedLayout = (relativePath: string, invariant: string): never =>
     entry: relativePath,
     invariant,
   })
+
+const unsafeReplacement = (relativePath: string): never => {
+  throw new UnsafeCacheDatabaseSidecar(
+    'REPOSITORY_CHANGED',
+    'The Encephalon cache layout changed during the operation.',
+    {
+      entry: relativePath,
+      invariant: 'stable-identity',
+    },
+  )
+}
+
+const unsafeSidecarAlias = (relativePath: string): never => {
+  throw new UnsafeCacheDatabaseSidecar('VALIDATION_FAILED', 'The Encephalon cache layout is unsafe.', {
+    entry: relativePath,
+    invariant: 'single-link-file',
+  })
+}
+
+type MutableFileLinkObservation = 'multiple' | 'single' | 'unlinked'
+
+const mutableFileLinkObservation = (...observations: readonly BigIntStats[]): MutableFileLinkObservation => {
+  if (observations.some(metadata => metadata.nlink === 0n)) {
+    return 'unlinked'
+  }
+  return observations.some(metadata => metadata.nlink > 1n) ? 'multiple' : 'single'
+}
+
+const assertSingleLinkMutableFile = (metadata: BigIntStats, relativePath: string, onUnlinked: () => never) => {
+  const links = mutableFileLinkObservation(metadata)
+  if (links === 'unlinked') {
+    return onUnlinked()
+  }
+  if (links === 'multiple') {
+    invalidLayout(relativePath, 'single-link-file')
+  }
+}
 
 const quarantineMetadata = (path: string, relativePath: string) => {
   try {
@@ -286,7 +331,19 @@ type RegularFileInspection =
   | { kind: 'changed' }
   | { kind: 'mismatched-realpath' }
   | { kind: 'missing' }
-  | { file: CacheFile; kind: 'stable' }
+  | { file: CacheFile; kind: 'stable'; links: Exclude<MutableFileLinkObservation, 'unlinked'> }
+
+type RegularFileInspectionOptions = {
+  expected?: CacheEntryIdentity | undefined
+  onUnsafeCurrent?: (() => never) | undefined
+  onUnsafeReplacement?: (() => never) | undefined
+  optional?: boolean
+  requireSingleLink?: boolean
+}
+
+type RegularFileMetadataInspectionOptions = RegularFileInspectionOptions & {
+  requireStableObservation?: boolean
+}
 
 const regularFileRealpath = (path: string) => {
   const actual = realpathSync.native(path)
@@ -329,29 +386,52 @@ const inspectRegularFileOnce = (path: string, relativePath: string): RegularFile
       }
       throw error
     }
+    cacheLocationTestHooks.afterRegularFileOpen?.(path)
     const opened = fstatSync(descriptor, { bigint: true })
     if (!(opened.isFile() && sameCacheEntryIdentity(captured, entryIdentityFrom(opened)))) {
       return { kind: 'changed' }
+    }
+    const links = mutableFileLinkObservation(metadata, opened)
+    if (links === 'unlinked') {
+      return { kind: 'changed' }
+    }
+    return {
+      file: { ...captured, path, relativePath },
+      kind: 'stable',
+      links,
     }
   } finally {
     if (descriptor !== undefined) {
       closeSync(descriptor)
     }
   }
-  return { file: { ...captured, path, relativePath }, kind: 'stable' }
 }
 
-const inspectRegularFile = (path: string, relativePath: string, optional = false): CacheFile | undefined => {
-  const attempts = optional ? OPTIONAL_FILE_OBSERVATION_ATTEMPTS : 1
+const inspectRegularFile = (
+  path: string,
+  relativePath: string,
+  options: RegularFileInspectionOptions = {},
+): CacheFile | undefined => {
+  const attempts = options.optional ? OPTIONAL_FILE_OBSERVATION_ATTEMPTS : 1
   for (const attempt of Array.from({ length: attempts }, (_, index) => index)) {
     const inspection = inspectRegularFileOnce(path, relativePath)
     if (inspection.kind === 'stable') {
+      const expectedChanged =
+        options.expected !== undefined && !sameCacheEntryIdentity(options.expected, inspection.file)
+      if (expectedChanged) {
+        if (inspection.links === 'multiple') {
+          options.onUnsafeReplacement?.()
+        }
+      } else if (options.requireSingleLink && inspection.links === 'multiple') {
+        options.onUnsafeCurrent?.()
+        invalidLayout(relativePath, 'single-link-file')
+      }
       return inspection.file
     }
-    if (inspection.kind === 'missing' && (!optional || attempt === attempts - 1)) {
+    if (inspection.kind === 'missing' && (!options.optional || attempt === attempts - 1)) {
       return
     }
-    if (inspection.kind === 'mismatched-realpath' && (!optional || attempt === attempts - 1)) {
+    if (inspection.kind === 'mismatched-realpath' && (!options.optional || attempt === attempts - 1)) {
       return invalidLayout(relativePath, 'expected-realpath')
     }
   }
@@ -400,43 +480,85 @@ const inspectRegularFileMetadataOnce = (path: string, relativePath: string): Reg
   ) {
     return { kind: 'changed' }
   }
-  return { file: { ...captured, path, relativePath }, kind: 'stable' }
+  const links = mutableFileLinkObservation(initialMetadata, finalMetadata)
+  if (links === 'unlinked') {
+    return { kind: 'changed' }
+  }
+  return {
+    file: { ...captured, path, relativePath },
+    kind: 'stable',
+    links,
+  }
 }
 
-const inspectRegularFileMetadata = (path: string, relativePath: string, optional = false): CacheFile | undefined => {
-  const attempts = optional ? OPTIONAL_FILE_OBSERVATION_ATTEMPTS : 1
+const inspectRegularFileMetadata = (
+  path: string,
+  relativePath: string,
+  options: RegularFileMetadataInspectionOptions,
+): CacheFile | undefined => {
+  const attempts = options.optional ? OPTIONAL_FILE_OBSERVATION_ATTEMPTS : 1
   for (const attempt of Array.from({ length: attempts }, (_, index) => index)) {
     const inspection = inspectRegularFileMetadataOnce(path, relativePath)
+    if (
+      options.requireStableObservation &&
+      (inspection.kind === 'changed' || inspection.kind === 'mismatched-realpath')
+    ) {
+      return changedLayout(relativePath, 'stable-metadata-identity')
+    }
     if (inspection.kind === 'stable') {
+      const expectedChanged =
+        options.expected !== undefined && !sameCacheEntryIdentity(options.expected, inspection.file)
+      if (expectedChanged) {
+        if (inspection.links === 'multiple') {
+          options.onUnsafeReplacement?.()
+        }
+      } else if (options.requireSingleLink && inspection.links === 'multiple') {
+        options.onUnsafeCurrent?.()
+        invalidLayout(relativePath, 'single-link-file')
+      }
       return inspection.file
     }
-    if (inspection.kind === 'missing' && (!optional || attempt === attempts - 1)) {
+    if (inspection.kind === 'missing' && (!options.optional || attempt === attempts - 1)) {
       return
     }
-    if (inspection.kind === 'mismatched-realpath' && (!optional || attempt === attempts - 1)) {
+    if (inspection.kind === 'mismatched-realpath' && (!options.optional || attempt === attempts - 1)) {
       return invalidLayout(relativePath, 'expected-realpath')
     }
   }
   return changedLayout(relativePath, 'stable-metadata-identity')
 }
 
-const inspectSidecars = (location: CacheLocation, name: CacheDatabaseName) =>
+const inspectSidecars = (
+  location: CacheLocation,
+  name: CacheDatabaseName,
+  expected: Partial<Record<CacheDatabaseSidecarSuffix, CacheFile>> = {},
+) =>
   DATABASE_SIDECAR_SUFFIXES.reduce<Partial<Record<CacheDatabaseSidecarSuffix, CacheFile>>>((sidecars, suffix) => {
-    const file = inspectRegularFile(
-      resolve(location.directory, `${name}${suffix}`),
-      `${databaseRelativePath(name)}${suffix}`,
-      true,
-    )
+    const relativePath = `${databaseRelativePath(name)}${suffix}`
+    const file = inspectRegularFile(resolve(location.directory, `${name}${suffix}`), relativePath, {
+      expected: expected[suffix],
+      onUnsafeCurrent: () => unsafeSidecarAlias(relativePath),
+      onUnsafeReplacement: () => unsafeReplacement(relativePath),
+      optional: true,
+      requireSingleLink: true,
+    })
     return file === undefined ? sidecars : { ...sidecars, [suffix]: file }
   }, {})
 
-const inspectSidecarMetadata = (location: CacheLocation, name: CacheDatabaseName) =>
+const inspectSidecarMetadata = (
+  location: CacheLocation,
+  name: CacheDatabaseName,
+  expected: Partial<Record<CacheDatabaseSidecarSuffix, CacheFile>>,
+) =>
   DATABASE_SIDECAR_SUFFIXES.reduce<Partial<Record<CacheDatabaseSidecarSuffix, CacheFile>>>((sidecars, suffix) => {
-    const file = inspectRegularFileMetadata(
-      resolve(location.directory, `${name}${suffix}`),
-      `${databaseRelativePath(name)}${suffix}`,
-      true,
-    )
+    const relativePath = `${databaseRelativePath(name)}${suffix}`
+    const file = inspectRegularFileMetadata(resolve(location.directory, `${name}${suffix}`), relativePath, {
+      expected: expected[suffix],
+      onUnsafeCurrent: () => unsafeSidecarAlias(relativePath),
+      onUnsafeReplacement: () => unsafeReplacement(relativePath),
+      optional: true,
+      requireSingleLink: true,
+    })
     return file === undefined ? sidecars : { ...sidecars, [suffix]: file }
   }, {})
 
@@ -458,10 +580,31 @@ const reconcileSidecarSnapshots = (
 }
 
 const reconcileSidecars = (location: CacheLocation, database: CacheDatabase) =>
-  reconcileSidecarSnapshots(database, inspectSidecars(location, database.name))
+  reconcileSidecarSnapshots(database, inspectSidecars(location, database.name, database.sidecars))
 
 const reconcileSidecarMetadata = (location: CacheLocation, database: CacheDatabase) =>
-  reconcileSidecarSnapshots(database, inspectSidecarMetadata(location, database.name))
+  reconcileSidecarSnapshots(database, inspectSidecarMetadata(location, database.name, database.sidecars))
+
+const cacheDatabaseCloseIsProvenSafe = (location: CacheLocation, database: CacheDatabase) => {
+  try {
+    assertCacheLocation(location)
+    DATABASE_SIDECAR_SUFFIXES.reduce((safe, suffix) => {
+      const relativePath = `${databaseRelativePath(database.name)}${suffix}`
+      inspectRegularFileMetadata(resolve(location.directory, `${database.name}${suffix}`), relativePath, {
+        optional: true,
+        requireSingleLink: true,
+        requireStableObservation: true,
+      })
+      return safe
+    }, true)
+    assertCacheLocation(location)
+    return true
+  } catch {
+    // The authoritative validation path reports this observation failure. SQLite
+    // close is allowed only after containment and every sidecar is proven safe.
+    return false
+  }
+}
 
 const bootstrapPrimary = (
   location: CacheLocation,
@@ -475,7 +618,12 @@ const bootstrapPrimary = (
   try {
     const descriptor = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | NO_FOLLOW, 0o600)
     try {
-      createdIdentity = entryIdentityFrom(fstatSync(descriptor, { bigint: true }))
+      cacheLocationTestHooks.afterPrimaryBootstrapOpen?.(path)
+      const metadata = fstatSync(descriptor, { bigint: true })
+      assertSingleLinkMutableFile(metadata, relativePath, () => {
+        throw new CacheDatabaseCreationConflict(relativePath)
+      })
+      createdIdentity = entryIdentityFrom(metadata)
     } finally {
       closeSync(descriptor)
     }
@@ -490,7 +638,10 @@ const bootstrapPrimary = (
       throw error
     }
   }
-  const identity = inspectRegularFile(path, relativePath)
+  const identity = inspectRegularFile(path, relativePath, {
+    expected: createdIdentity,
+    requireSingleLink: true,
+  })
   if (identity === undefined) {
     if (createdIdentity !== undefined) {
       throw new CacheDatabaseCreationConflict(relativePath)
@@ -511,7 +662,10 @@ const prepareCacheDatabase = (
   assertCacheLocation(location)
   const sidecars = inspectSidecars(location, name)
   const path = resolve(location.directory, name)
-  const existing = mode === 'create-if-missing' ? inspectRegularFile(path, databaseRelativePath(name)) : undefined
+  const existing =
+    mode === 'create-if-missing'
+      ? inspectRegularFile(path, databaseRelativePath(name), { requireSingleLink: true })
+      : undefined
   const prepared =
     existing === undefined ? bootstrapPrimary(location, name, mode) : { identity: existing, primaryCreated: false }
   assertCacheLocation(location)
@@ -525,13 +679,16 @@ export const inspectCacheDatabase = (location: CacheLocation, name: CacheDatabas
   assertCacheLocation(location)
   const sidecars = inspectSidecars(location, name)
   const path = resolve(location.directory, name)
-  const identity = inspectRegularFile(path, databaseRelativePath(name))
+  const identity = inspectRegularFile(path, databaseRelativePath(name), { requireSingleLink: true })
   return identity === undefined ? undefined : { ...identity, name, sidecars }
 }
 
 export const assertCacheDatabase = (location: CacheLocation, database: CacheDatabase, missing?: () => never) => {
   assertCacheLocation(location)
-  const identity = inspectRegularFile(database.path, databaseRelativePath(database.name))
+  const identity = inspectRegularFile(database.path, databaseRelativePath(database.name), {
+    expected: database,
+    requireSingleLink: true,
+  })
   if (identity !== undefined && sameCacheEntryIdentity(database, identity)) {
     return { ...database, sidecars: reconcileSidecars(location, database) }
   }
@@ -545,7 +702,10 @@ const assertCacheDatabaseMetadata = (location: CacheLocation, database: CacheDat
   // Opening and closing any sibling file descriptor after BEGIN can release
   // process-scoped SQLite locks on POSIX, so this boundary observes metadata only.
   assertCacheLocation(location)
-  const identity = inspectRegularFileMetadata(database.path, databaseRelativePath(database.name))
+  const identity = inspectRegularFileMetadata(database.path, databaseRelativePath(database.name), {
+    expected: database,
+    requireSingleLink: true,
+  })
   if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
     return changedLayout(databaseRelativePath(database.name), 'stable-identity')
   }
@@ -557,7 +717,10 @@ const assertCacheDatabaseMetadata = (location: CacheLocation, database: CacheDat
 
 const assertOwnedCacheDatabase = (location: CacheLocation, database: CacheDatabase) => {
   assertCacheLocation(location)
-  const identity = inspectRegularFile(database.path, databaseRelativePath(database.name))
+  const identity = inspectRegularFile(database.path, databaseRelativePath(database.name), {
+    expected: database,
+    requireSingleLink: true,
+  })
   if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
     throw new CacheDatabaseCreationConflict(database.relativePath)
   }
@@ -570,6 +733,38 @@ const closeDatabaseAfterFailure = (database: { close: () => void }) => {
   } catch {
     // Preserve the failure that made the database unusable.
   }
+}
+
+cacheLocationTestHooks.releaseCloseSafetyLatchesForTests = () => {
+  const retainedDatabases = [...cacheDatabaseCloseSafetyLatches.values()]
+  cacheDatabaseCloseSafetyLatches.clear()
+  for (const database of retainedDatabases) {
+    closeDatabaseAfterFailure(database)
+  }
+}
+
+const assertCacheDatabaseOpenAllowed = (path: string, relativePath: string) => {
+  if (
+    cacheDatabaseCloseSafetyLatches.has(path) ||
+    cacheDatabaseCloseSafetyLatches.size >= MAX_CACHE_DATABASE_CLOSE_SAFETY_LATCHES
+  ) {
+    return changedLayout(relativePath, 'stable-identity')
+  }
+}
+
+const suppressUnsafeDatabaseClose = (
+  location: CacheLocation,
+  snapshot: CacheDatabase,
+  database: { close: () => void },
+  errors: readonly unknown[],
+) => {
+  const closeProvenSafe = cacheDatabaseCloseIsProvenSafe(location, snapshot)
+  const markedUnsafeSidecar = errors.some(error => error instanceof UnsafeCacheDatabaseSidecar)
+  const suppressClose = markedUnsafeSidecar || !closeProvenSafe
+  if (suppressClose) {
+    cacheDatabaseCloseSafetyLatches.set(snapshot.path, database)
+  }
+  return suppressClose
 }
 
 const initialCacheDatabase = <Database>(options: VerifiedCacheDatabaseOptions<Database>) => {
@@ -586,6 +781,8 @@ const initialCacheDatabase = <Database>(options: VerifiedCacheDatabaseOptions<Da
 export const openVerifiedCacheDatabase = <Database extends { close: () => void }>(
   options: VerifiedCacheDatabaseOptions<Database>,
 ) => {
+  const databasePath = resolve(options.location.directory, options.name)
+  assertCacheDatabaseOpenAllowed(databasePath, databaseRelativePath(options.name))
   const initial = initialCacheDatabase(options)
   if (initial === undefined) {
     if (options.missing !== undefined) {
@@ -622,12 +819,14 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
       snapshot = assertPrimary(snapshot)
       return failCacheDatabase(error, snapshot)
     }
+    let lockPreservingInitialisationCompleted = false
     try {
       cacheLocationTestHooks.afterDatabaseOpen?.(snapshot)
       snapshot = assertPrimary(snapshot)
       const context = { primaryCreated }
       primaryCreated = false
       options.afterVerifiedOpen?.(database, context)
+      lockPreservingInitialisationCompleted = options.preserveDatabaseLocksAfterInitialisation === true
       if (options.preserveDatabaseLocksAfterInitialisation) {
         cacheLocationTestHooks.afterDatabaseLockInitialisation?.(snapshot)
       }
@@ -637,6 +836,12 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
       return { database, identity: snapshot }
     } catch (error) {
       if (error instanceof CacheDatabaseSidecarChanged) {
+        const closeSuppressed =
+          lockPreservingInitialisationCompleted &&
+          suppressUnsafeDatabaseClose(options.location, snapshot, database, [error])
+        if (closeSuppressed) {
+          throw error
+        }
         closeDatabaseAfterFailure(database)
         snapshot = error.database
         if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
@@ -650,6 +855,15 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
             : assertPrimary(snapshot)
         } catch (candidate) {
           validationError = candidate
+        }
+        const closeSuppressed =
+          lockPreservingInitialisationCompleted &&
+          suppressUnsafeDatabaseClose(options.location, snapshot, database, [error, validationError])
+        if (closeSuppressed) {
+          if (validationError !== undefined) {
+            throw validationError
+          }
+          throw error
         }
         closeDatabaseAfterFailure(database)
         if (validationError !== undefined) {
@@ -666,7 +880,11 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
 }
 
 const quarantineFile = (location: CacheLocation, expected: CacheFile, required: boolean) => {
-  const current = inspectRegularFile(expected.path, expected.relativePath, !required)
+  const current = inspectRegularFile(expected.path, expected.relativePath, {
+    expected,
+    optional: !required,
+    requireSingleLink: true,
+  })
   if (current === undefined) {
     if (required) {
       return changedLayout(expected.relativePath, 'stable-quarantine-source')
@@ -678,7 +896,11 @@ const quarantineFile = (location: CacheLocation, expected: CacheFile, required: 
     assertCacheLocation(location)
     cacheLocationTestHooks.beforeQuarantineRename?.(expected.path)
     assertCacheLocation(location)
-    const verified = inspectRegularFile(expected.path, expected.relativePath, !required)
+    const verified = inspectRegularFile(expected.path, expected.relativePath, {
+      expected,
+      optional: !required,
+      requireSingleLink: true,
+    })
     if (verified === undefined) {
       return changedLayout(expected.relativePath, 'stable-quarantine-source')
     }
@@ -693,6 +915,9 @@ const quarantineFile = (location: CacheLocation, expected: CacheFile, required: 
     if (!(movedMetadata.isFile() && sameCacheEntryIdentity(expected, entryIdentityFrom(movedMetadata)))) {
       return changedLayout(expected.relativePath, 'stable-quarantine-identity')
     }
+    assertSingleLinkMutableFile(movedMetadata, expected.relativePath, () =>
+      changedLayout(expected.relativePath, 'stable-quarantine-identity'),
+    )
     const movedIncarnation = entryMetadataFrom(movedMetadata)
     cacheLocationTestHooks.afterQuarantineRename?.(quarantinePath)
     assertCacheLocation(location)
@@ -700,10 +925,16 @@ const quarantineFile = (location: CacheLocation, expected: CacheFile, required: 
     if (
       !quarantinedMetadata.isFile() ||
       quarantinedMetadata.isSymbolicLink() ||
-      !sameStableEntryMetadata(movedIncarnation, entryMetadataFrom(quarantinedMetadata))
+      !sameCacheEntryIdentity(expected, entryIdentityFrom(quarantinedMetadata))
     ) {
       return changedLayout(expected.relativePath, 'stable-quarantine-identity')
     }
+    if (!sameStableEntryMetadata(movedIncarnation, entryMetadataFrom(quarantinedMetadata))) {
+      return changedLayout(expected.relativePath, 'stable-quarantine-identity')
+    }
+    assertSingleLinkMutableFile(quarantinedMetadata, expected.relativePath, () =>
+      changedLayout(expected.relativePath, 'stable-quarantine-identity'),
+    )
     unlinkSync(quarantinePath)
     assertCacheLocation(location)
   }
@@ -884,6 +1115,8 @@ export const writeCacheOwner = (location: CacheLocation, directory: CacheOwnedDi
     closeSync(descriptor)
   }
   assertOwnedDirectory(location, directory)
+  // owner.json is exclusively created and filled once through its owned descriptor,
+  // then only read or unlinked; it is not a reopened mutable SQLite file.
   inspectRegularFile(path, `${ownedDirectoryRelativePath(directory.name)}/owner.json`)
 }
 
