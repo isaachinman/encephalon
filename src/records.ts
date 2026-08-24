@@ -23,8 +23,8 @@ import {
   inspectArtifactFiles,
   sameArtifactInspectionResult,
 } from './artifact-inspection.ts'
-import { hydrateResolvedCanonicalSnapshot, hydrateResolvedRepository } from './cache.ts'
-import { assertCacheLocation, type CacheLocation } from './cache-location.ts'
+import { hydrateResolvedCanonicalSnapshot } from './cache.ts'
+import { assertCacheLocation, type CacheLocation, inspectCacheLocation } from './cache-location.ts'
 import { CANONICAL_BUDGETS } from './canonical-budgets.ts'
 import {
   CanonicalDirectoryChangedError,
@@ -1983,17 +1983,26 @@ export const createValidatedCanonicalSnapshotRetryResolved = (
 ): ValidatedCanonicalSnapshotRetryRunner => {
   const runner = createRecordPlanningSnapshotRetryResolved(root, hooks, cacheLocation)
   const run = <Result>(operation: (snapshot: ValidatedCanonicalSnapshot) => Result) =>
-    runner.run((planning, repositoryChanged) => {
-      const artifacts = (() => {
-        try {
-          return planning.validateFinal(planning.records, 'Canonical records are invalid.', planning.bytes)
-        } catch (error) {
-          return rethrowInvalidatedCandidateError(error, repositoryChanged)
-        }
-      })()
+    runner.run(planning => {
+      const artifacts = planning.validateFinal(planning.records, 'Canonical records are invalid.', planning.bytes)
       return operation(planning.sealCacheSnapshot(planning.records, artifacts, cacheLocation.repository))
     })
   return Object.freeze({ close: runner.close, run })
+}
+
+/** @internal */
+export const readValidatedCanonicalSnapshotAttemptResolved = (
+  root: string,
+  cacheLocation: CacheLocation,
+  assertExpectedCurrent: () => void,
+  hooks: RecordReadHooks = {},
+) => {
+  assertExpectedCurrent()
+  const scan = readCanonicalPlanningScanAttempt(root, hooks)
+  assertExpectedCurrent()
+  const planning = recordPlanningSnapshot(root, scan, hooks, cacheLocation, canonicalGenerationChanged)
+  const artifacts = planning.validateFinal(planning.records, 'Canonical records are invalid.', planning.bytes)
+  return planning.sealCacheSnapshot(planning.records, artifacts, cacheLocation.repository)
 }
 
 /** @internal */
@@ -2165,6 +2174,7 @@ export const assertCanonicalLayoutAdditions = (
 }
 
 type PublishResult = {
+  assertCommittedCurrent: () => void
   committedError?: EncephalonError
   committedErrorPhase?: PostCommitPhase
   record: BrainRecord
@@ -2459,7 +2469,21 @@ const publishPlannedRecordInternal = (
       capturePublicationVerificationError(error)
     }
   }
+  const assertCommittedCurrent = () => {
+    if (!publicationAccepted) {
+      options.authority.acceptPublication(
+        recordFile.kind,
+        `${recordFile.id}.json`,
+        publicationRoot,
+        publicationKind,
+        recordDigest(formatted),
+      )
+      publicationAccepted = true
+    }
+    options.authority.assertCurrent()
+  }
   return {
+    assertCommittedCurrent,
     record,
     ...(committedError === undefined ? {} : { committedError }),
     ...(committedErrorPhase === undefined ? {} : { committedErrorPhase }),
@@ -2551,7 +2575,14 @@ const addRecordFileResolved = (
         try {
           fault(options.hooks, 'during-hydration')
           if (options.cacheLocation === undefined || committedErrorPhase !== undefined) {
-            hydrateResolvedRepository(root, 'held', options.cacheLocation)
+            const cacheLocation = options.cacheLocation ?? inspectCacheLocation(root)
+            const snapshot = readValidatedCanonicalSnapshotAttemptResolved(
+              root,
+              cacheLocation,
+              published.assertCommittedCurrent,
+              options.readHooks,
+            )
+            hydrateResolvedCanonicalSnapshot(root, snapshot, 'held', cacheLocation)
           } else {
             const snapshot = planning.sealCacheSnapshot(
               [...planning.records, published.record],

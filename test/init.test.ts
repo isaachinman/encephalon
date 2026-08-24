@@ -23,6 +23,7 @@ import {
 } from 'node:fs'
 
 import { dirname, join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
@@ -224,8 +225,10 @@ afterEach(() => {
   artifactInspectionTestHooks.close = undefined
   artifactInspectionTestHooks.fault = undefined
   artifactInspectionTestHooks.open = undefined
+  cacheReadTestHooks.afterCacheRecordInsert = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
+  cacheReadTestHooks.recordReadHooks = undefined
   cacheLocationTestHooks.beforeCacheLocationAssertion = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
@@ -1921,6 +1924,159 @@ describe('initialisation', () => {
     })
   })
 
+  test('idempotent init retries one cache-DML canonical change inside its planning ledger', () => {
+    const root = createRoot()
+    const initialised = api.initEncephalon({ root })
+    rmSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'))
+    const work = { canonicalScans: 0, graphValidations: 0 }
+    let cacheMutation = false
+    cacheReadTestHooks.afterCacheRecordInsert = () => {
+      if (!cacheMutation) {
+        cacheMutation = true
+        writeRecordFile(root, {
+          createdAt: new Date(Date.now() + 86_400_000).toISOString(),
+          id: 'idempotent-cache-dml-successor',
+          kind: 'decision',
+          payload: {},
+          source: 'test',
+          subject: 'generation.idempotent-cache-dml-successor',
+        })
+      }
+    }
+
+    const result = initEncephalonWithHooks(
+      { root },
+      {
+        canonicalScan: () => {
+          work.canonicalScans += 1
+        },
+        graphValidation: () => {
+          work.graphValidations += 1
+        },
+      },
+    )
+
+    assert.deepEqual(result.recordsCreated, [])
+    assert.equal(cacheMutation, true)
+    assert.deepEqual(work, { canonicalScans: 2, graphValidations: 2 })
+    assert.deepEqual(
+      api
+        .listRecords({ includeSuperseded: true, limit: 20, root })
+        .map(record => record.id)
+        .sort(ordinalStringCompare),
+      [...initialised.recordsCreated.map(record => record.id), 'idempotent-cache-dml-successor'].sort(
+        ordinalStringCompare,
+      ),
+    )
+  })
+
+  test('idempotent init returns ordinary validation for a settled malformed cache successor', () => {
+    const root = createRoot()
+    api.initEncephalon({ root })
+    rmSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'))
+    const malformedPath = join(root, 'encephalon', 'decision', 'idempotent-cache-malformed-successor.json')
+    const work = { canonicalScans: 0, graphValidations: 0 }
+    let cacheMutation = false
+    cacheReadTestHooks.afterCacheRecordInsert = () => {
+      if (!cacheMutation) {
+        cacheMutation = true
+        ensureParent(malformedPath)
+        writeFileSync(malformedPath, '{ malformed cache successor')
+      }
+    }
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            canonicalScan: () => {
+              work.canonicalScans += 1
+            },
+            graphValidation: () => {
+              work.graphValidations += 1
+            },
+          },
+        ),
+      (error: unknown) => {
+        const actual = error as Error & {
+          cause?: unknown
+          code?: unknown
+          details?: { errors?: unknown; initProgress?: { committedRecordIds?: unknown } }
+        }
+        assert.equal(actual.code, 'VALIDATION_FAILED')
+        assert.equal(actual.message, 'Canonical records are invalid.')
+        assert.deepEqual(actual.details?.errors, [
+          { code: 'INVALID_RECORD', message: 'Record file contains invalid JSON.' },
+        ])
+        assert.deepEqual(actual.details?.initProgress?.committedRecordIds, [])
+        assert.equal(actual.cause, undefined)
+        assert.equal(JSON.stringify(actual).includes('CanonicalGenerationChanged'), false)
+        assert.equal(JSON.stringify(actual).includes(root), false)
+        return true
+      },
+    )
+
+    assert.equal(cacheMutation, true)
+    assert.deepEqual(work, { canonicalScans: 2, graphValidations: 2 })
+    assert.equal(existsSync(join(root, 'AGENTS.md')), true)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), true)
+  })
+
+  test('unchanged refresh shares exactly three planning and cache churn attempts', () => {
+    const root = createRoot()
+    const [first] = api.initEncephalon({ root }).recordsCreated
+    assert.ok(first)
+    rmSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'))
+    const recordPath = join(root, first.path)
+    const work = { cacheMutations: 0, canonicalScans: 0, graphValidations: 0 }
+    cacheReadTestHooks.afterCacheRecordInsert = record => {
+      if (record.id === first.id) {
+        work.cacheMutations += 1
+        writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+      }
+    }
+    cacheReadTestHooks.recordReadHooks = {
+      canonicalScan: () => {
+        work.canonicalScans += 1
+      },
+      graphValidation: () => {
+        work.graphValidations += 1
+      },
+    }
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { refreshBaseline: true, root },
+          {
+            canonicalScan: () => {
+              work.canonicalScans += 1
+            },
+            graphValidation: () => {
+              work.graphValidations += 1
+              if (work.graphValidations <= 2) {
+                writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+              }
+            },
+          },
+        ),
+      (error: unknown) => {
+        assert.ok(error instanceof EncephalonError)
+        assert.equal(error.code, 'REPOSITORY_CHANGED')
+        assert.equal(error.message, 'The canonical repository changed repeatedly during the operation.')
+        assert.equal(error.cause, undefined)
+        assert.equal(JSON.stringify(error).includes('CanonicalGenerationChanged'), false)
+        assert.equal(JSON.stringify(error).includes(root), false)
+        return true
+      },
+    )
+
+    assert.deepEqual(work, { cacheMutations: 1, canonicalScans: 3, graphValidations: 3 })
+    assert.equal(existsSync(join(root, 'AGENTS.md')), true)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), true)
+  })
+
   test('preserves the canonical-history error before baseline candidate errors', () => {
     const root = createRoot()
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'invalid-history' }))
@@ -2092,6 +2248,104 @@ describe('initialisation', () => {
     )
     assert.equal(api.validateRecords({ root }).valid, false)
     assertErrorCode(() => api.prepare({ root }), 'VALIDATION_FAILED')
+  })
+
+  test('byte-ineligible init fallback rejects a successor before one-shot validation', () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'actual-byte-fallback-churn' }))
+    const directory = join(root, 'encephalon', 'context')
+    mkdirSync(directory, { recursive: true })
+    const bytesPerRecord = 1_048_500
+    const recordFiles = Array.from({ length: 8 }, (_, index) => {
+      const id = `fallback-padding-${index}`
+      const path = join(directory, `${id}.json`)
+      const json = JSON.stringify({
+        createdAt: `2026-01-01T00:00:0${index}.000Z`,
+        id,
+        kind: 'context',
+        payload: {},
+        source: 'test',
+        subject: `fallback-padding.${index}`,
+      })
+      writeFileSync(path, `${json}${' '.repeat(bytesPerRecord - Buffer.byteLength(json))}`)
+      return { json, path }
+    })
+    assert.equal(bytesPerRecord * recordFiles.length, MAX_CANONICAL_RECORD_BYTES - 608)
+    assert.equal(api.validateRecords({ root }).valid, true)
+    const work = { canonicalScans: 0, graphValidations: 0, instructionWrites: 0 }
+    const countCanonicalScan = () => {
+      work.canonicalScans += 1
+      if (work.canonicalScans === 2) {
+        for (const { json, path } of recordFiles) {
+          writeFileSync(path, json)
+        }
+      }
+    }
+    const countGraphValidation = () => {
+      work.graphValidations += 1
+    }
+    cacheReadTestHooks.recordReadHooks = {
+      canonicalScan: countCanonicalScan,
+      graphValidation: countGraphValidation,
+    }
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            canonicalScan: countCanonicalScan,
+            graphValidation: countGraphValidation,
+            instructionWriteHooks: {
+              fault: () => {
+                work.instructionWrites += 1
+              },
+            },
+          },
+        ),
+      (error: unknown) => {
+        assert.ok(error instanceof EncephalonError)
+        const committedRecordIds = committedBaselineIds(root)
+        assert.equal(error.code, 'REPOSITORY_CHANGED')
+        assert.equal(
+          error.message,
+          `The canonical repository changed after 3 records were committed. ${canonicalRaceRecoveryAction}`,
+        )
+        const { initProgress, ...raceDetails } = error.details
+        assert.deepEqual(raceDetails, {
+          canonicalCommitted: true,
+          committedRecordIds,
+          postCommitPhase: 'publicationVerification',
+          recoveryAction: canonicalRaceRecoveryAction,
+          repositoryChanged: true,
+        })
+        assert.equal(Object.isFrozen(raceDetails.committedRecordIds), true)
+        assert.deepEqual(initProgress, {
+          cacheState: 'disposable',
+          canonicalCommitted: true,
+          committedInstructionFiles: [],
+          committedRecordIds,
+          phase: 'cachePreparation',
+          recoveryAction:
+            'Inspect canonical state, run prepare, run validate, then repeat the same init operation with the same options.',
+          recoveryMode: 'inspectAndRerun',
+        })
+        const cause = error.cause as Error & { code?: unknown }
+        assert.equal(cause.code, 'REPOSITORY_CHANGED')
+        assert.equal(cause.message, 'Canonical layout changed before publication.')
+        assert.equal(cause.cause, undefined)
+        assert.equal(cause.name, 'EncephalonError')
+        assert.equal(JSON.stringify(error).includes('CanonicalGenerationChanged'), false)
+        assert.equal(JSON.stringify(error).includes(root), false)
+        return true
+      },
+    )
+
+    assert.deepEqual(work, { canonicalScans: 2, graphValidations: 1, instructionWrites: 0 })
+    assert.equal(committedBaselineIds(root).length, 3)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
   })
 
   test('refreshes one or three changed generated subjects with one planning scan', () => {
@@ -2368,6 +2622,95 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('reports the full committed prefix when canonical generation changes during cache insertion', () => {
+    const root = createRoot()
+    const work = { cacheMutations: 0, canonicalScans: 0, graphValidations: 0, instructionWrites: 0 }
+    cacheReadTestHooks.afterCacheRecordInsert = () => {
+      if (work.cacheMutations === 0) {
+        work.cacheMutations += 1
+        writeRecordFile(root, {
+          createdAt: new Date(Date.now() + 86_400_000).toISOString(),
+          id: 'concurrent-during-init-cache-insert',
+          kind: 'decision',
+          payload: {},
+          source: 'test',
+          subject: 'generation.concurrent-during-init-cache-insert',
+        })
+      }
+    }
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            canonicalScan: () => {
+              work.canonicalScans += 1
+            },
+            graphValidation: () => {
+              work.graphValidations += 1
+            },
+            instructionWriteHooks: {
+              fault: () => {
+                work.instructionWrites += 1
+              },
+            },
+          },
+        ),
+      (error: unknown) => {
+        assert.ok(error instanceof EncephalonError)
+        const committedRecordIds = committedBaselineIds(root)
+        assert.equal(error.code, 'REPOSITORY_CHANGED')
+        assert.equal(
+          error.message,
+          `The canonical repository changed after 3 records were committed. ${canonicalRaceRecoveryAction}`,
+        )
+        const { initProgress, ...raceDetails } = error.details
+        assert.deepEqual(raceDetails, {
+          canonicalCommitted: true,
+          committedRecordIds,
+          postCommitPhase: 'publicationVerification',
+          recoveryAction: canonicalRaceRecoveryAction,
+          repositoryChanged: true,
+        })
+        assert.equal(Object.isFrozen(raceDetails.committedRecordIds), true)
+        assert.deepEqual(initProgress, {
+          cacheState: 'disposable',
+          canonicalCommitted: true,
+          committedInstructionFiles: [],
+          committedRecordIds,
+          phase: 'cachePreparation',
+          recoveryAction:
+            'Inspect canonical state, run prepare, run validate, then repeat the same init operation with the same options.',
+          recoveryMode: 'inspectAndRerun',
+        })
+        const cause = error.cause as Error & { code?: unknown }
+        assert.equal(cause.code, 'REPOSITORY_CHANGED')
+        assert.equal(cause.message, 'Canonical layout changed before publication.')
+        assert.equal(cause.cause, undefined)
+        assert.equal(cause.name, 'EncephalonError')
+        assert.equal(JSON.stringify(error).includes('CanonicalGenerationChanged'), false)
+        assert.equal(JSON.stringify(error).includes(root), false)
+        return true
+      },
+    )
+
+    assert.deepEqual(work, { cacheMutations: 1, canonicalScans: 1, graphValidations: 1, instructionWrites: 0 })
+    assert.equal(committedBaselineIds(root).length, 3)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+    const database = new DatabaseSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'), {
+      readOnly: true,
+    })
+    try {
+      assert.equal(database.prepare('SELECT COUNT(*) AS count FROM records').get()?.count, 0)
+      assert.equal(database.prepare('SELECT COUNT(*) AS count FROM record_search').get()?.count, 0)
+      assert.equal(database.prepare('SELECT COUNT(*) AS count FROM metadata').get()?.count, 0)
+    } finally {
+      database.close()
+    }
   })
 
   test('reports the full mid-batch canonical generation prefix after a later hard link', () => {

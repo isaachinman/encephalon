@@ -1,11 +1,6 @@
 import { parseInitInput } from './api-input.ts'
 import { canonicalPayload, scanBaseline } from './baseline.ts'
-import {
-  hydrateResolvedCanonicalSnapshot,
-  hydrateResolvedRepository,
-  prepareResolvedCanonicalSnapshot,
-  prepareResolvedRepository,
-} from './cache.ts'
+import { hydrateResolvedCanonicalSnapshot, prepareResolvedCanonicalSnapshot } from './cache.ts'
 import { assertCacheLocation } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { applyInstructionChangesOutcome, planInstructionChanges } from './instructions.ts'
@@ -20,9 +15,9 @@ import {
   publishPlannedRecordOutcome,
   type RecordReadHooks,
   type RecordWriteHooks,
+  readValidatedCanonicalSnapshotAttemptResolved,
   rethrowCanonicalGenerationChangeAfterCommit,
   rethrowInvalidatedCandidateError,
-  type ValidatedCanonicalSnapshot,
   withRecordPlanningSnapshotRetryResolved,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
@@ -233,19 +228,16 @@ const initResolved = (
             subject: candidate.subject,
           }))
         : undefined
-      const { actions, cacheSnapshot, hasValidatedAdditions, recordsCreated } = withRecordPlanningSnapshotRetryResolved(
+      const { actions, recordsCreated } = withRecordPlanningSnapshotRetryResolved(
         root,
         (planning, repositoryChanged) => {
           const { records } = planning
           assertCacheLocation(location)
-          const validateCurrentRecords = () => {
+          const validateCurrentRecords = () =>
+            planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
+          const validateMutationCurrentRecords = () => {
             try {
-              return planning.validateFinal(
-                records,
-                'Canonical records are invalid.',
-                planning.bytes,
-                allowedGeneratedHeads,
-              )
+              return validateCurrentRecords()
             } catch (error) {
               return rethrowInvalidatedCandidateError(error, repositoryChanged)
             }
@@ -260,12 +252,11 @@ const initResolved = (
                 ),
               }
             } catch (error) {
-              validateCurrentRecords()
+              validateMutationCurrentRecords()
               throw error
             }
           })()
           let attemptRecordsCreated: BrainRecord[] = []
-          let attemptCacheSnapshot: ValidatedCanonicalSnapshot | undefined
           if (validatedAdditions.length > 0) {
             const validationPlans = validatedAdditions.map(addition =>
               planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
@@ -278,7 +269,7 @@ const initResolved = (
                 )
               } catch (error) {
                 if (error instanceof EncephalonError && error.code === 'VALIDATION_FAILED') {
-                  validateCurrentRecords()
+                  validateMutationCurrentRecords()
                   return rethrowInvalidatedCandidateError(error, repositoryChanged)
                 }
                 throw error
@@ -325,48 +316,38 @@ const initResolved = (
             }
             const mutationBytes =
               planning.bytes + plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted), 0)
-            if (mutationBytes <= MAX_CANONICAL_RECORD_BYTES) {
+            progress.phase = 'cachePreparation'
+            progress.cacheState = 'disposable'
+            const cacheResult = (() => {
               try {
-                attemptCacheSnapshot = planning.sealCacheSnapshot(
-                  [...records, ...attemptRecordsCreated],
-                  artifacts,
-                  location.repository,
-                )
+                const snapshot =
+                  mutationBytes <= MAX_CANONICAL_RECORD_BYTES
+                    ? planning.sealCacheSnapshot([...records, ...attemptRecordsCreated], artifacts, location.repository)
+                    : readValidatedCanonicalSnapshotAttemptResolved(root, location, authority.assertCurrent, hooks)
+                return hydrateResolvedCanonicalSnapshot(root, snapshot, 'held', location)
               } catch (error) {
                 return rethrowCanonicalGenerationChangeAfterCommit(error, attemptRecordsCreated)
               }
-            }
+            })()
+            progress.cacheState = 'prepared'
+            hooks.hydration?.(cacheResult)
           } else {
             const artifacts = validateCurrentRecords()
-            if (!refresh) {
-              attemptCacheSnapshot = planning.sealCacheSnapshot(records, artifacts, location.repository)
-            }
+            const cacheSnapshot = planning.sealCacheSnapshot(records, artifacts, location.repository)
+            progress.phase = 'cachePreparation'
+            progress.cacheState = 'disposable'
+            const cacheResult = prepareResolvedCanonicalSnapshot(root, cacheSnapshot, 'held', location)
+            progress.cacheState = 'prepared'
+            hooks.hydration?.(cacheResult)
           }
           return {
             actions: plannedActions,
-            cacheSnapshot: attemptCacheSnapshot,
-            hasValidatedAdditions: validatedAdditions.length > 0,
             recordsCreated: attemptRecordsCreated,
           }
         },
         hooks,
         location,
       )
-      progress.phase = 'cachePreparation'
-      progress.cacheState = 'disposable'
-      const cacheResult = (() => {
-        if (hasValidatedAdditions) {
-          return cacheSnapshot === undefined
-            ? hydrateResolvedRepository(root, 'held', location)
-            : hydrateResolvedCanonicalSnapshot(root, cacheSnapshot, 'held', location)
-        }
-        if (cacheSnapshot !== undefined) {
-          return prepareResolvedCanonicalSnapshot(root, cacheSnapshot, 'held', location)
-        }
-        return prepareResolvedRepository(root, 'held', location)
-      })()
-      progress.cacheState = 'prepared'
-      hooks.hydration?.(cacheResult)
       progress.phase = 'instructionApplication'
       const instructionOutcome = applyInstructionChangesOutcome(root, instructionPlans, hooks.instructionWriteHooks)
       progress.committedInstructionFiles = [...instructionOutcome.instructionFiles]

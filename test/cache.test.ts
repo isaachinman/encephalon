@@ -619,6 +619,47 @@ test('canonical snapshot cache manifest uses one records pass for every rebuildi
   assert.deepEqual(initWork, { cacheOwnedCanonicalStats: 0, canonicalScans: 1, graphValidations: 1 })
 })
 
+test('cache retry preserves ordinary validation for a settled malformed successor', () => {
+  const root = createRoot()
+  const id = 'cache-retry-settled-malformed'
+  writeCanonicalCacheRecord(root, id)
+  const recordPath = join(root, 'encephalon', 'context', `${id}.json`)
+  const work = { canonicalScans: 0, graphValidations: 0 }
+  let changed = false
+  canonicalCacheTestHooks.recordReadHooks = {
+    canonicalScan: () => {
+      work.canonicalScans += 1
+    },
+    graphValidation: () => {
+      work.graphValidations += 1
+      if (!changed) {
+        changed = true
+        writeFileSync(recordPath, '{ malformed successor')
+      }
+    },
+  }
+
+  assert.throws(
+    () => api.hydrate({ root }),
+    (error: unknown) => {
+      const actual = error as Error & { code?: unknown; details?: unknown }
+      assert.equal(actual.code, 'VALIDATION_FAILED')
+      assert.equal(actual.message, 'Canonical records are invalid.')
+      assert.deepEqual(actual.details, {
+        errors: [{ code: 'INVALID_RECORD', message: 'Record file contains invalid JSON.' }],
+      })
+      assert.equal(actual.cause, undefined)
+      assert.equal(JSON.stringify(actual).includes('CanonicalGenerationChanged'), false)
+      assert.equal(JSON.stringify(actual).includes(root), false)
+      return true
+    },
+  )
+
+  assert.equal(changed, true)
+  assert.deepEqual(work, { canonicalScans: 2, graphValidations: 2 })
+  assert.equal(existsSync(cacheDatabasePath(root)), false)
+})
+
 test('shared canonical retry budget: canonical churn preserves cache without quarantine or mixed rows', () => {
   const root = createRoot()
   const stableId = 'stable-cache-before-churn'
@@ -2988,7 +3029,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(existsSync(cacheDatabasePath(root)), false)
   })
 
-  test('classifies a manifest directory overflow after validation as repository change', () => {
+  test('returns a stable manifest directory overflow after validation', () => {
     const root = createRoot()
     const kindDirectory = join(root, 'encephalon', 'decision')
     mkdirSync(kindDirectory, { recursive: true })
@@ -3016,7 +3057,9 @@ describe('SQLite cache and reads', () => {
     assert.throws(
       () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
       (error: unknown) => {
-        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        const actual = error as { code?: unknown; details?: { errors?: Array<{ code?: unknown }> } }
+        assert.equal(actual.code, 'VALIDATION_FAILED')
+        assert.equal(actual.details?.errors?.[0]?.code, 'CORPUS_DIRECTORY_ENTRY_LIMIT')
         return true
       },
     )
@@ -3156,7 +3199,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(readFileSync(sentinel, 'utf8'), 'outside kind sentinel')
   })
 
-  test('classifies an artifact ancestor replacement after descriptor verification as repository change', {
+  test('returns a stable invalid artifact ancestor after descriptor verification', {
     skip: !renameParentWithOpenChildSupported,
   }, () => {
     const root = createRoot()
@@ -3205,7 +3248,9 @@ describe('SQLite cache and reads', () => {
     assert.throws(
       () => functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }),
       (error: unknown) => {
-        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        const actual = error as { code?: unknown; details?: { errors?: Array<{ code?: unknown }> } }
+        assert.equal(actual.code, 'VALIDATION_FAILED')
+        assert.equal(actual.details?.errors?.[0]?.code, 'INVALID_ARTIFACT')
         return true
       },
     )

@@ -206,9 +206,11 @@ afterEach(() => {
   artifactInspectionTestHooks.fault = undefined
   artifactInspectionTestHooks.open = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
+  cacheReadTestHooks.afterCacheRecordInsert = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.beforeManifestEntryLstat = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
+  cacheReadTestHooks.recordReadHooks = undefined
   recordWriteTestHooks.afterOperationLock = undefined
   recordWriteTestHooks.beforeOperationLock = undefined
   recordWriteTestHooks.fault = undefined
@@ -2864,6 +2866,100 @@ describe('canonical records', () => {
     assert.equal(existsSync(join(root, 'encephalon', 'decision', `${id}.json`)), true)
   })
 
+  test('committed add fallback observes canonical state once and preserves publication verification priority', () => {
+    const root = createRoot()
+    const id = 'committed-fallback-cache-churn'
+    const recordPath = join(root, 'encephalon', 'decision', `${id}.json`)
+    const work = { cacheMutations: 0, canonicalScans: 0, graphValidations: 0 }
+    const countCanonicalScan = () => {
+      work.canonicalScans += 1
+    }
+    const countGraphValidation = () => {
+      work.graphValidations += 1
+    }
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: countCanonicalScan,
+      graphValidation: countGraphValidation,
+    }
+    cacheReadTestHooks.recordReadHooks = {
+      canonicalScan: countCanonicalScan,
+      graphValidation: countGraphValidation,
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'during-cleanup') {
+        throw Object.assign(new Error('Injected staging cleanup failure'), { code: 'EIO' })
+      }
+    }
+    cacheReadTestHooks.afterCacheRecordInsert = inserted => {
+      if (inserted.id === id) {
+        work.cacheMutations += 1
+        writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+      }
+    }
+
+    assertCommittedRepositoryChange(
+      () =>
+        api.addRecord({
+          id,
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'generation.committed-fallback-cache-churn',
+        }),
+      `encephalon/decision/${id}.json`,
+      id,
+    )
+
+    assert.deepEqual(work, { cacheMutations: 1, canonicalScans: 2, graphValidations: 2 })
+    assert.equal(existsSync(recordPath), true)
+    assert.equal(readdirSync(join(root, 'encephalon', '_staging')).length, 1)
+  })
+
+  test('committed add fallback rejects a successor before one-shot validation', () => {
+    const root = createRoot()
+    const id = 'committed-fallback-pre-scan-successor'
+    const recordPath = join(root, 'encephalon', 'decision', `${id}.json`)
+    const work = { cacheMutations: 0, canonicalScans: 0, graphValidations: 0 }
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        work.canonicalScans += 1
+        if (work.canonicalScans === 2) {
+          writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+        }
+      },
+      graphValidation: () => {
+        work.graphValidations += 1
+      },
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'during-cleanup') {
+        throw Object.assign(new Error('Injected staging cleanup failure'), { code: 'EIO' })
+      }
+    }
+    cacheReadTestHooks.afterCacheRecordInsert = () => {
+      work.cacheMutations += 1
+    }
+
+    assertCommittedRepositoryChange(
+      () =>
+        api.addRecord({
+          id,
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'generation.committed-fallback-pre-scan-successor',
+        }),
+      `encephalon/decision/${id}.json`,
+      id,
+    )
+
+    assert.deepEqual(work, { cacheMutations: 0, canonicalScans: 2, graphValidations: 1 })
+    assert.equal(existsSync(recordPath), true)
+    assert.equal(readdirSync(join(root, 'encephalon', '_staging')).length, 1)
+  })
+
   test('preserves operational artifact I/O during mutation-snapshot hydration', () => {
     const root = createRoot()
     const id = 'snapshot-artifact-io'
@@ -2907,7 +3003,7 @@ describe('canonical records', () => {
     assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
   })
 
-  test('rebuilds from disk after committed publication failures', () => {
+  test('rebuilds from one records-owned disk observation after committed publication failures', () => {
     const cases = [
       { id: 'verification-failure-disk-cache', phase: 'publicationVerification', point: 'after-publication-accept' },
       { id: 'cleanup-failure-disk-cache', phase: 'stagingCleanup', point: 'during-cleanup' },
@@ -2915,9 +3011,14 @@ describe('canonical records', () => {
 
     for (const entry of cases) {
       const root = createRoot()
-      let diskCacheValidations = 0
-      cacheReadTestHooks.afterCanonicalValidation = () => {
-        diskCacheValidations += 1
+      const work = { canonicalScans: 0, graphValidations: 0 }
+      mutationRecordWriteTestHooks.readHooks = {
+        canonicalScan: () => {
+          work.canonicalScans += 1
+        },
+        graphValidation: () => {
+          work.graphValidations += 1
+        },
       }
       recordWriteTestHooks.fault = point => {
         if (point === entry.point) {
@@ -2943,8 +3044,7 @@ describe('canonical records', () => {
         },
       )
 
-      assert.equal(diskCacheValidations, 1, entry.phase)
-      cacheReadTestHooks.afterCanonicalValidation = undefined
+      assert.deepEqual(work, { canonicalScans: 2, graphValidations: 2 }, entry.phase)
       assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
     }
   })
