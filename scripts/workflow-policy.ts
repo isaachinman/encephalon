@@ -166,6 +166,14 @@ const secretsIdentifier = 'secrets'
 const workflowFilename = /\.ya?ml$/u
 const protectedEnvironment = 'pullfrog-review'
 const actionManifestFilenames = ['action.yml', 'action.yaml'] as const
+const isDockerfileImage = (image: string) => {
+  let dockerfile = false
+  if (!image.toLowerCase().startsWith('docker://')) {
+    const filename = image.split('/').at(-1)?.toLowerCase() ?? ''
+    dockerfile = filename.startsWith('dockerfile.') || filename.endsWith('dockerfile')
+  }
+  return dockerfile
+}
 // These limits bound repository-controlled traversal while leaving headroom for reachable local wrappers.
 /** @internal */
 export const workflowPolicyLimits: WorkflowPolicyLimits = {
@@ -183,7 +191,7 @@ const sourceIntegrityFinding = {
 const workflowPolicyGuidance: Record<Exclude<WorkflowPolicyRule, 'permission'>, string> = {
   'credential-environment': 'target the exact pullfrog-review environment',
   'credential-forwarding':
-    'pass local credentials through secrets rather than with; remove all credentials from external reusable-workflow calls',
+    'pass local credentials through secrets rather than with; external reusable-workflow calls must omit secrets and direct secret-context inputs',
   'external-image-digest': 'pin the external Docker image to a lowercase 64-character SHA-256 digest',
   'external-reference-sha': 'pin the external reference to a lowercase 40-character commit SHA',
   'local-reference': 'use an existing repository-contained target allowed for this local reference',
@@ -792,7 +800,7 @@ const executableReferences = (
     })
   } else if (kind === 'action' && isPlainObject(document.runs)) {
     const dockerImage = document.runs.image
-    const localDockerfileImage = dockerImage === 'Dockerfile' || dockerImage === './Dockerfile'
+    const localDockerfileImage = typeof dockerImage === 'string' && isDockerfileImage(dockerImage)
     const dockerImageReference =
       document.runs.using === 'docker' && typeof dockerImage === 'string' && !localDockerfileImage
         ? [

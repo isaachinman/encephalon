@@ -1674,7 +1674,12 @@ jobs:
 test('rejects secret-context inputs forwarded to reusable workflows', () => {
   const root = createFixture({
     '.github/workflows/called.yml': `name: Called
-on: workflow_call
+on:
+  workflow_call:
+    inputs:
+      mode:
+        required: false
+        type: string
 permissions:
   contents: read
 jobs: {}
@@ -1684,16 +1689,45 @@ on: workflow_dispatch
 permissions:
   contents: read
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      mode: \${{ steps.select.outputs.mode }}
+    steps:
+      - id: select
+        run: echo "mode=strict" >> "$GITHUB_OUTPUT"
   external:
     uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
     permissions: {}
     with:
       token: \${{ secrets.EXTERNAL_TOKEN }}
+  external-literal:
+    uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
+    permissions: {}
+    with:
+      mode: strict
+  external-dynamic:
+    needs: prepare
+    uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
+    permissions: {}
+    with:
+      mode: \${{ needs.prepare.outputs.mode }}
   local:
     uses: ./.github/workflows/called.yml
     permissions: {}
     with:
       token: \${{ secrets.LOCAL_TOKEN }}
+  local-literal:
+    uses: ./.github/workflows/called.yml
+    permissions: {}
+    with:
+      mode: strict
+  local-dynamic:
+    needs: prepare
+    uses: ./.github/workflows/called.yml
+    permissions: {}
+    with:
+      mode: \${{ needs.prepare.outputs.mode }}
 `,
   })
 
@@ -1709,6 +1743,21 @@ jobs:
       rule: 'credential-forwarding',
     },
   ])
+})
+
+// Mutation caught: generic credential guidance must distinguish omission from an empty external secrets map.
+test('formats actionable reusable-workflow credential remediation', () => {
+  assert.equal(
+    formatWorkflowPolicyFindings([
+      {
+        file: '.github/workflows/external.yml',
+        location: 'jobs.call.secrets',
+        rule: 'credential-forwarding',
+      },
+    ]),
+    `.github/workflows/external.yml:jobs.call.secrets: credential-forwarding: pass local credentials through secrets rather than with; external reusable-workflow calls must omit secrets and direct secret-context inputs
+`,
+  )
 })
 
 // Mutation caught: reusing runner-job permission defaults would give an external reusable workflow configurable repository authority.
@@ -2571,12 +2620,24 @@ jobs:
 // Mutations caught: local docker:// images remain inspected, while mutable repository Dockerfile FROM chains stay outside proof.
 test('inspects reachable local Docker images while accepting repository Dockerfiles', () => {
   const root = createFixture({
+    '.github/actions/dockerfile-nested/action.yml': `name: Nested Dockerfile
+runs:
+  using: docker
+  image: ./images/Dockerfile
+`,
+    '.github/actions/dockerfile-nested/images/Dockerfile': 'FROM alpine:3.20\n',
     '.github/actions/dockerfile-relative/action.yml': `name: Relative Dockerfile
 runs:
   using: docker
   image: ./Dockerfile
 `,
     '.github/actions/dockerfile-relative/Dockerfile': 'FROM alpine:3.20\n',
+    '.github/actions/dockerfile-suffixed/action.yml': `name: Suffixed Dockerfile
+runs:
+  using: docker
+  image: images/Dockerfile.dev
+`,
+    '.github/actions/dockerfile-suffixed/images/Dockerfile.dev': 'FROM alpine:3.20\n',
     '.github/actions/dockerfile/action.yml': `name: Dockerfile
 runs:
   using: docker
@@ -2593,6 +2654,13 @@ runs:
   using: docker
   image: docker://alpine:3.20
 `,
+    '.github/actions/non-docker/action.yml': `name: Non-Docker action
+runs:
+  using: node20
+  main: index.js
+  image: alpine:3.20
+`,
+    '.github/actions/non-docker/index.js': '',
     '.github/actions/pinned/action.yml': `name: Pinned image
 runs:
   using: docker
@@ -2611,6 +2679,9 @@ jobs:
       - uses: $/.github/actions/mutable-hub
       - uses: $/.github/actions/dockerfile
       - uses: $/.github/actions/dockerfile-relative
+      - uses: $/.github/actions/dockerfile-nested
+      - uses: $/.github/actions/dockerfile-suffixed
+      - uses: $/.github/actions/non-docker
 `,
   })
 
