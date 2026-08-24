@@ -28,10 +28,11 @@ import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
 import { DirectoryWitnessError } from '../src/directory-witness.ts'
-import { EncephalonError } from '../src/errors.ts'
+import { EncephalonError, isRecognizedFilesystemError } from '../src/errors.ts'
 import * as api from '../src/index.ts'
 import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
+import { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
 import { ordinalStringCompare } from '../src/order.ts'
 import { MAX_CANONICAL_RECORD_BYTES, type RecordWriteHooks } from '../src/records.ts'
 import { validateAddRecordInput } from '../src/schema.ts'
@@ -226,6 +227,26 @@ afterEach(() => {
   cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   roots.splice(0).forEach(removeTestRepository)
+})
+
+describe('baseline observation policy', () => {
+  test('publishes immutable baseline observation limits', () => {
+    assert.deepEqual(OPERATION_BUDGETS.baselineObservationAttempts, {
+      field: 'baselineObservationAttempts',
+      maximum: 3,
+    })
+    assert.equal(Object.isFrozen(OPERATION_BUDGETS.baselineObservationAttempts), true)
+    assert.deepEqual(OPERATION_BUDGETS.baselineObservationRetryMilliseconds, {
+      field: 'baselineObservationRetryMilliseconds',
+      maximum: 60_000,
+    })
+    assert.equal(Object.isFrozen(OPERATION_BUDGETS.baselineObservationRetryMilliseconds), true)
+  })
+
+  test('recognises the exact filesystem error code set', () => {
+    assert.equal(isRecognizedFilesystemError({ code: 'EPRIVATE' }), false)
+    assert.equal(isRecognizedFilesystemError({ code: 'EIO' }), true)
+  })
 })
 
 describe('initialisation', () => {

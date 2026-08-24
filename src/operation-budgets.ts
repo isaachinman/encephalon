@@ -1,5 +1,10 @@
 /** @internal */
 export const OPERATION_BUDGETS = Object.freeze({
+  baselineObservationAttempts: Object.freeze({ field: 'baselineObservationAttempts', maximum: 3 }),
+  baselineObservationRetryMilliseconds: Object.freeze({
+    field: 'baselineObservationRetryMilliseconds',
+    maximum: 60_000,
+  }),
   canonicalSnapshotAttempts: Object.freeze({ field: 'canonicalSnapshotAttempts', maximum: 3 }),
   canonicalSnapshotRetryMilliseconds: Object.freeze({ field: 'canonicalSnapshotRetryMilliseconds', maximum: 60_000 }),
   compactResponseBytes: Object.freeze({ field: 'response', maximum: 4 * 1024 * 1024 }),
