@@ -23,11 +23,7 @@ import {
   inspectArtifactFiles,
   sameArtifactInspectionResult,
 } from './artifact-inspection.ts'
-import {
-  hydrateResolvedMutationSnapshot,
-  hydrateResolvedRepository,
-  type ValidatedMutationCacheSnapshot,
-} from './cache.ts'
+import { hydrateResolvedCanonicalSnapshot, hydrateResolvedRepository } from './cache.ts'
 import { assertCacheLocation, type CacheLocation } from './cache-location.ts'
 import { CANONICAL_BUDGETS } from './canonical-budgets.ts'
 import {
@@ -50,6 +46,7 @@ import { EncephalonError, fail, wrapIo } from './errors.ts'
 import {
   type EntryIdentity,
   entryIdentityFrom,
+  manifestEntryMetadataFrom,
   sameEntryIdentity,
   sameStableEntryMetadata,
   sameStableEntryMetadataExceptCtime,
@@ -121,6 +118,24 @@ type StableCanonicalSnapshot = {
   validation: ValidatedRecordScan
 }
 
+/** @internal */
+export type CanonicalCacheManifestEntry = Readonly<{
+  ctimeNanoseconds?: string
+  mtimeNanoseconds?: string
+  path: string
+  size?: string
+  type: 'directory' | 'file' | 'missing' | 'other' | 'symlink'
+}>
+
+/** @internal */
+export type ValidatedCanonicalSnapshot = Readonly<{
+  artifacts: readonly ArtifactObservation[]
+  assertCurrent: () => void
+  manifest: string
+  records: readonly BrainRecord[]
+  repositoryRealpath: string
+}>
+
 type CanonicalLayoutWitness = {
   kinds: Map<string, CanonicalDirectorySnapshot>
   root: CanonicalDirectorySnapshot | null
@@ -148,6 +163,11 @@ type CanonicalPublicationAuthority = {
     rootExists: boolean
     rootNames: ReadonlySet<string>
   }
+  sealCacheSnapshot: (
+    records: readonly BrainRecord[],
+    artifacts: readonly ArtifactObservation[],
+    repositoryRealpath: string,
+  ) => ValidatedCanonicalSnapshot
 }
 
 type RecordWriteFault =
@@ -253,6 +273,11 @@ type RecordPlanningSnapshot = Readonly<{
   bytes: number
   errors: readonly ValidationIssue[]
   records: readonly BrainRecord[]
+  sealCacheSnapshot: (
+    records: readonly BrainRecord[],
+    artifacts: readonly ArtifactObservation[],
+    repositoryRealpath: string,
+  ) => ValidatedCanonicalSnapshot
   validateFinal: (
     records: readonly BrainRecord[],
     message?: string,
@@ -425,6 +450,72 @@ export const MAX_VALIDATION_ISSUES = 100
 const decoder = new TextDecoder('utf-8', { fatal: true })
 
 const posixRelative = (root: string, path: string) => relative(root, path).replaceAll('\\', '/')
+
+const cacheManifestEntry = (path: string, metadata: BigIntStats): CanonicalCacheManifestEntry => {
+  const { ctimeNanoseconds, mtimeNanoseconds, size, type } = manifestEntryMetadataFrom(metadata)
+  return {
+    ctimeNanoseconds,
+    mtimeNanoseconds,
+    path,
+    size,
+    type,
+  }
+}
+
+const artifactCacheManifestEntry = (artifact: ArtifactObservation): CanonicalCacheManifestEntry =>
+  cacheManifestEntry(`encephalon/${artifact.path}`, artifact.metadata)
+
+/** @internal */
+export const canonicalCacheManifest = (
+  recordEntries: readonly CanonicalCacheManifestEntry[],
+  artifacts: readonly ArtifactObservation[],
+) => {
+  const entries = [
+    ...recordEntries,
+    ...[...artifacts]
+      .sort((first, second) => ordinalStringCompare(first.path, second.path))
+      .map(artifactCacheManifestEntry),
+  ]
+  return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
+}
+
+const canonicalRecordCacheManifestEntries = (
+  root: string,
+  layout: CanonicalLayoutWitness,
+  observations: readonly RecordObservation[],
+  directoryMetadata: ReadonlyMap<string, BigIntStats>,
+): readonly CanonicalCacheManifestEntry[] => {
+  const rootSnapshot = layout.root
+  if (rootSnapshot !== null) {
+    const observationsByPath = new Map(observations.map(observation => [observation.path, observation]))
+    const cacheDirectoryEntry = (path: string) => {
+      const metadata = directoryMetadata.get(path)
+      if (metadata === undefined) {
+        throw new Error('Validated canonical directory evidence is missing.')
+      }
+      return cacheManifestEntry(posixRelative(root, path), metadata)
+    }
+    const children = rootSnapshot.entries
+      .filter(entry => !isCanonicalReservedDirectory(entry.name))
+      .flatMap(kindEntry => {
+        const kindSnapshot = layout.kinds.get(kindEntry.name)
+        if (kindSnapshot === undefined) {
+          throw new Error('Validated canonical kind evidence is missing.')
+        }
+        const records = kindSnapshot.entries.map(recordEntry => {
+          const path = resolve(kindSnapshot.witness.path, recordEntry.name)
+          const observation = observationsByPath.get(path)
+          if (observation === undefined) {
+            throw new Error('Validated canonical record evidence is missing.')
+          }
+          return cacheManifestEntry(posixRelative(root, path), observation.metadata)
+        })
+        return [cacheDirectoryEntry(kindSnapshot.witness.path), ...records]
+      })
+    return [cacheDirectoryEntry(rootSnapshot.witness.path), ...children]
+  }
+  return [{ path: 'encephalon', type: 'missing' }]
+}
 
 const issue = (code: string, message: string, path?: string, recordId?: string): ValidationIssue => ({
   code,
@@ -1133,20 +1224,28 @@ const corpusBudgetIssues = (scan: RecordScan) => {
   ]
 }
 
-const validatedArtifactIssues = (root: string, records: BrainRecord[]) => {
+const validatedArtifactIssues = (root: string, records: BrainRecord[], changed?: (() => never) | undefined) => {
   try {
     return artifactIssues(root, records)
   } catch (error) {
     if (error instanceof ArtifactChangedError) {
+      if (changed !== undefined) {
+        return changed()
+      }
       return fail('REPOSITORY_CHANGED', 'An artifact changed while canonical records were being validated.')
     }
     throw error
   }
 }
 
-const validateScannedSnapshot = (root: string, scan: RecordScan, hooks: RecordReadHooks = {}): ValidatedRecordScan => {
+const validateScannedSnapshot = (
+  root: string,
+  scan: RecordScan,
+  hooks: RecordReadHooks = {},
+  changed?: (() => never) | undefined,
+): ValidatedRecordScan => {
   hooks.graphValidation?.()
-  const artifactValidation = validatedArtifactIssues(root, scan.records)
+  const artifactValidation = validatedArtifactIssues(root, scan.records, changed)
   const collectedErrors = [
     ...scan.errors,
     ...corpusBudgetIssues(scan),
@@ -1358,7 +1457,7 @@ const withCanonicalSnapshotRetry = <Result>(
   operation: () => Result,
   ledger: CanonicalSnapshotRetryLedger = createCanonicalSnapshotRetryLedger(),
 ): Result => {
-  if (ledger.attempt > 0 && Date.now() >= ledger.deadline) {
+  if (ledger.attempt >= ledger.maximumAttempts || (ledger.attempt > 0 && Date.now() >= ledger.deadline)) {
     return canonicalSnapshotRetryExhausted()
   }
   ledger.attempt += 1
@@ -1597,6 +1696,29 @@ const canonicalPublicationAuthority = (
       const other = second[index]
       return other !== undefined && entry.name === other.name && sameEntryType(entry, other)
     })
+  const captureCacheDirectoryMetadata = () => {
+    const snapshots = layout.root === null ? [] : [layout.root, ...layout.kinds.values()]
+    return new Map(
+      snapshots.map(snapshot => {
+        const metadata = currentObservationMetadata(snapshot.witness.path)
+        if (
+          metadata.isSymbolicLink() ||
+          !metadata.isDirectory() ||
+          !sameEntryIdentity(snapshot.witness.pathMetadata, metadata)
+        ) {
+          return changed()
+        }
+        return [snapshot.witness.path, metadata] as const
+      }),
+    )
+  }
+  const assertCacheDirectoryMetadataCurrent = (expected: ReadonlyMap<string, BigIntStats>) => {
+    for (const [path, metadata] of expected) {
+      if (!sameStableEntryMetadata(metadata, currentObservationMetadata(path))) {
+        return changed()
+      }
+    }
+  }
   const authority: CanonicalPublicationAuthority = {
     acceptPreparation: (kind, rootSnapshot, kindSnapshot) => {
       const currentProjection = projection()
@@ -1687,6 +1809,31 @@ const canonicalPublicationAuthority = (
     },
     changed,
     projection,
+    sealCacheSnapshot: (records, artifacts, repositoryRealpath) => {
+      authority.assertCurrent()
+      const cacheDirectoryMetadata = captureCacheDirectoryMetadata()
+      const assertCurrent = () => {
+        authority.assertCurrent()
+        assertCacheDirectoryMetadataCurrent(cacheDirectoryMetadata)
+        authority.assertCurrent()
+        assertCacheDirectoryMetadataCurrent(cacheDirectoryMetadata)
+      }
+      assertCurrent()
+      const acceptedArtifacts = [...artifacts]
+      const acceptedRecords = [...records]
+      Object.freeze(acceptedArtifacts)
+      Object.freeze(acceptedRecords)
+      return Object.freeze({
+        artifacts: acceptedArtifacts,
+        assertCurrent,
+        manifest: canonicalCacheManifest(
+          canonicalRecordCacheManifestEntries(root, layout, observations, cacheDirectoryMetadata),
+          acceptedArtifacts,
+        ),
+        records: acceptedRecords,
+        repositoryRealpath,
+      })
+    },
   }
   return authority
 }
@@ -1729,6 +1876,7 @@ const recordPlanningSnapshot = (
         records: [...records],
       },
       hooks,
+      changed,
     )
     const { artifactEvidence: validatedArtifactEvidence, artifacts: validatedArtifacts } = validation
     assertCanonicalSnapshotCurrent(root, scan, validatedArtifactEvidence, changed)
@@ -1758,6 +1906,8 @@ const recordPlanningSnapshot = (
     bytes: scan.bytes,
     errors: Object.freeze([...scan.errors]),
     records: freezeAcceptedRecords(scan.records),
+    sealCacheSnapshot: (records, artifacts, repositoryRealpath) =>
+      authority().sealCacheSnapshot(records, artifacts, repositoryRealpath),
     validateFinal,
   })
 }
@@ -1771,12 +1921,16 @@ export const readRecordPlanningSnapshotResolved = (
   recordPlanningSnapshot(root, readStableCanonicalPlanningScan(root, hooks), hooks, cacheLocation)
 
 /** @internal */
-export const withRecordPlanningSnapshotRetryResolved = <Result>(
+type RecordPlanningSnapshotRetryRunner = Readonly<{
+  close: () => void
+  run: <Result>(operation: (planning: RecordPlanningSnapshot, repositoryChanged: boolean) => Result) => Result
+}>
+
+const createRecordPlanningSnapshotRetryResolved = (
   root: string,
-  operation: (planning: RecordPlanningSnapshot, repositoryChanged: boolean) => Result,
   hooks: RecordReadHooks = {},
   cacheLocation?: CacheLocation,
-): Result => {
+): RecordPlanningSnapshotRetryRunner => {
   const ledger = createCanonicalSnapshotRetryLedger()
   let retryable = true
   const changed = (): never => {
@@ -1785,8 +1939,11 @@ export const withRecordPlanningSnapshotRetryResolved = <Result>(
     }
     return repositoryChangedBeforePublication()
   }
-  try {
-    return withCanonicalSnapshotRetry(
+  const close = () => {
+    retryable = false
+  }
+  const run = <Result>(operation: (planning: RecordPlanningSnapshot, repositoryChanged: boolean) => Result) =>
+    withCanonicalSnapshotRetry(
       () =>
         operation(
           recordPlanningSnapshot(root, readCanonicalPlanningScanAttempt(root, hooks), hooks, cacheLocation, changed),
@@ -1794,9 +1951,49 @@ export const withRecordPlanningSnapshotRetryResolved = <Result>(
         ),
       ledger,
     )
+  return Object.freeze({ close, run })
+}
+
+/** @internal */
+export const withRecordPlanningSnapshotRetryResolved = <Result>(
+  root: string,
+  operation: (planning: RecordPlanningSnapshot, repositoryChanged: boolean) => Result,
+  hooks: RecordReadHooks = {},
+  cacheLocation?: CacheLocation,
+): Result => {
+  const runner = createRecordPlanningSnapshotRetryResolved(root, hooks, cacheLocation)
+  try {
+    return runner.run(operation)
   } finally {
-    retryable = false
+    runner.close()
   }
+}
+
+/** @internal */
+export type ValidatedCanonicalSnapshotRetryRunner = Readonly<{
+  close: () => void
+  run: <Result>(operation: (snapshot: ValidatedCanonicalSnapshot) => Result) => Result
+}>
+
+/** @internal */
+export const createValidatedCanonicalSnapshotRetryResolved = (
+  root: string,
+  cacheLocation: CacheLocation,
+  hooks: RecordReadHooks = {},
+): ValidatedCanonicalSnapshotRetryRunner => {
+  const runner = createRecordPlanningSnapshotRetryResolved(root, hooks, cacheLocation)
+  const run = <Result>(operation: (snapshot: ValidatedCanonicalSnapshot) => Result) =>
+    runner.run((planning, repositoryChanged) => {
+      const artifacts = (() => {
+        try {
+          return planning.validateFinal(planning.records, 'Canonical records are invalid.', planning.bytes)
+        } catch (error) {
+          return rethrowInvalidatedCandidateError(error, repositoryChanged)
+        }
+      })()
+      return operation(planning.sealCacheSnapshot(planning.records, artifacts, cacheLocation.repository))
+    })
+  return Object.freeze({ close: runner.close, run })
 }
 
 /** @internal */
@@ -2356,13 +2553,12 @@ const addRecordFileResolved = (
           if (options.cacheLocation === undefined || committedErrorPhase !== undefined) {
             hydrateResolvedRepository(root, 'held', options.cacheLocation)
           } else {
-            const snapshot: ValidatedMutationCacheSnapshot = Object.freeze({
+            const snapshot = planning.sealCacheSnapshot(
+              [...planning.records, published.record],
               artifacts,
-              assertCurrent: authority.assertCurrent,
-              records: Object.freeze([...planning.records, published.record]),
-              repositoryRealpath: options.cacheLocation.repository,
-            })
-            hydrateResolvedMutationSnapshot(root, snapshot, 'held', options.cacheLocation)
+              options.cacheLocation.repository,
+            )
+            hydrateResolvedCanonicalSnapshot(root, snapshot, 'held', options.cacheLocation)
           }
         } catch (error) {
           capturePostCommitError('cacheHydration', error)

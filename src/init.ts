@@ -1,11 +1,10 @@
 import { parseInitInput } from './api-input.ts'
 import { canonicalPayload, scanBaseline } from './baseline.ts'
 import {
-  hydrateResolvedMutationSnapshot,
+  hydrateResolvedCanonicalSnapshot,
   hydrateResolvedRepository,
-  prepareResolvedMutationSnapshot,
+  prepareResolvedCanonicalSnapshot,
   prepareResolvedRepository,
-  type ValidatedMutationCacheSnapshot,
 } from './cache.ts'
 import { assertCacheLocation } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
@@ -23,6 +22,7 @@ import {
   type RecordWriteHooks,
   rethrowCanonicalGenerationChangeAfterCommit,
   rethrowInvalidatedCandidateError,
+  type ValidatedCanonicalSnapshot,
   withRecordPlanningSnapshotRetryResolved,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
@@ -265,7 +265,7 @@ const initResolved = (
             }
           })()
           let attemptRecordsCreated: BrainRecord[] = []
-          let attemptCacheSnapshot: ValidatedMutationCacheSnapshot | undefined
+          let attemptCacheSnapshot: ValidatedCanonicalSnapshot | undefined
           if (validatedAdditions.length > 0) {
             const validationPlans = validatedAdditions.map(addition =>
               planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
@@ -326,23 +326,20 @@ const initResolved = (
             const mutationBytes =
               planning.bytes + plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted), 0)
             if (mutationBytes <= MAX_CANONICAL_RECORD_BYTES) {
-              attemptCacheSnapshot = Object.freeze({
-                artifacts,
-                assertCurrent: authority.assertCurrent,
-                records: Object.freeze([...records, ...attemptRecordsCreated]),
-                repositoryRealpath: location.repository,
-              })
+              try {
+                attemptCacheSnapshot = planning.sealCacheSnapshot(
+                  [...records, ...attemptRecordsCreated],
+                  artifacts,
+                  location.repository,
+                )
+              } catch (error) {
+                return rethrowCanonicalGenerationChangeAfterCommit(error, attemptRecordsCreated)
+              }
             }
           } else {
             const artifacts = validateCurrentRecords()
-            const authority = planning.authority()
             if (!refresh) {
-              attemptCacheSnapshot = Object.freeze({
-                artifacts,
-                assertCurrent: authority.assertCurrent,
-                records: Object.freeze([...records]),
-                repositoryRealpath: location.repository,
-              })
+              attemptCacheSnapshot = planning.sealCacheSnapshot(records, artifacts, location.repository)
             }
           }
           return {
@@ -361,10 +358,10 @@ const initResolved = (
         if (hasValidatedAdditions) {
           return cacheSnapshot === undefined
             ? hydrateResolvedRepository(root, 'held', location)
-            : hydrateResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
+            : hydrateResolvedCanonicalSnapshot(root, cacheSnapshot, 'held', location)
         }
         if (cacheSnapshot !== undefined) {
-          return prepareResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
+          return prepareResolvedCanonicalSnapshot(root, cacheSnapshot, 'held', location)
         }
         return prepareResolvedRepository(root, 'held', location)
       })()

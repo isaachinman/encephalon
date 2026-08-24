@@ -207,6 +207,7 @@ afterEach(() => {
   artifactInspectionTestHooks.open = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
+  cacheReadTestHooks.beforeManifestEntryLstat = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
   recordWriteTestHooks.afterOperationLock = undefined
   recordWriteTestHooks.beforeOperationLock = undefined
@@ -217,9 +218,10 @@ afterEach(() => {
 })
 
 describe('canonical records', () => {
-  test('rebuilds add cache from one validated mutation snapshot', () => {
+  test('canonical snapshot cache manifest rebuilds add cache from one validated snapshot', () => {
     const root = createRoot()
     const counts = {
+      cacheOwnedCanonicalStats: 0,
       canonicalScans: 0,
       diskCacheValidations: 0,
       graphValidations: 0,
@@ -235,6 +237,9 @@ describe('canonical records', () => {
     cacheReadTestHooks.afterCanonicalValidation = () => {
       counts.diskCacheValidations += 1
     }
+    cacheReadTestHooks.beforeManifestEntryLstat = () => {
+      counts.cacheOwnedCanonicalStats += 1
+    }
 
     const added = api.addRecord({
       id: 'validated-mutation-snapshot',
@@ -247,6 +252,7 @@ describe('canonical records', () => {
 
     assert.equal(added.id, 'validated-mutation-snapshot')
     assert.deepEqual(counts, {
+      cacheOwnedCanonicalStats: 0,
       canonicalScans: 1,
       diskCacheValidations: 0,
       graphValidations: 1,

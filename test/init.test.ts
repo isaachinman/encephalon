@@ -2311,6 +2311,65 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'encephalon', 'workflow')), false)
   })
 
+  test('reports the full committed prefix when canonical generation changes during cache snapshot sealing', () => {
+    const root = createRoot()
+    let canonicalScans = 0
+    let graphValidations = 0
+    let sealRaceInjected = false
+    cacheLocationTestHooks.beforeCacheLocationAssertion = () => {
+      if (!sealRaceInjected && new Error('Capture cache snapshot seal stack.').stack?.includes('sealCacheSnapshot')) {
+        sealRaceInjected = true
+        writeRecordFile(root, {
+          createdAt: new Date(Date.now() + 86_400_000).toISOString(),
+          id: 'concurrent-during-cache-snapshot-seal',
+          kind: 'decision',
+          payload: {},
+          source: 'test',
+          subject: 'generation.concurrent-during-cache-snapshot-seal',
+        })
+      }
+    }
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            canonicalScan: () => {
+              canonicalScans += 1
+            },
+            graphValidation: () => {
+              graphValidations += 1
+            },
+          },
+        ),
+      (error: unknown) => {
+        assert.ok(error instanceof EncephalonError)
+        const committedRecordIds = committedBaselineIds(root)
+        assert.equal(error.code, 'REPOSITORY_CHANGED')
+        assert.equal(
+          error.message,
+          `The canonical repository changed after 3 records were committed. ${canonicalRaceRecoveryAction}`,
+        )
+        assert.deepEqual(error.details.committedRecordIds, committedRecordIds)
+        assert.deepEqual(
+          (error.details.initProgress as { committedRecordIds?: unknown }).committedRecordIds,
+          committedRecordIds,
+        )
+        assert.equal(error.cause instanceof EncephalonError, true)
+        assert.equal(JSON.stringify(error).includes(root), false)
+        return true
+      },
+    )
+
+    assert.equal(sealRaceInjected, true)
+    assert.deepEqual({ canonicalScans, graphValidations }, { canonicalScans: 1, graphValidations: 1 })
+    assert.equal(committedBaselineIds(root).length, 3)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
   test('reports the full mid-batch canonical generation prefix after a later hard link', () => {
     const root = createRoot()
     let cacheHooks = 0
