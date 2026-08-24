@@ -39,6 +39,7 @@ All notable changes to Encephalon are documented here.
 - Finalised managed instruction writes and removals with fixed-root authority, descriptor-bound private staging and durable recovery, canonical hard-link commit aggregation, concurrent-successor preservation, zero operation-owned aliases on success, and bounded safe post-commit phases and repository-relative recovery paths.
 - Made generated baseline refreshes converge on one canonical snapshot.
 - Rejected multiply linked mutable SQLite primaries, operation gates, and sidecars before use or identity-specific cleanup.
+- Made completed operation-gate recovery durably reclaimable across processes while preserving live recovering and phase-less legacy owners.
 - Deflaked instruction replacement identity checks across supported platforms.
 
 ### Documentation
