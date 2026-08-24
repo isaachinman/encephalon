@@ -2916,6 +2916,68 @@ describe('initialisation', () => {
     assert.doesNotMatch(JSON.stringify(baseline), /private-project|index\.ts|private\.yml/)
   })
 
+  test('bounds persistent baseline churn to three complete attempts and a fixed error envelope', () => {
+    const root = createRoot()
+    let attempts = 0
+
+    assert.throws(
+      () =>
+        scanBaselineWithHooks(root, {
+          afterBaselineSources: () => {
+            attempts += 1
+            const moved = `${root}-generation-${attempts}`
+            roots.push(moved)
+            renameSync(root, moved)
+            mkdirSync(root)
+          },
+        }),
+      error => {
+        assert.equal(error instanceof EncephalonError, true)
+        assert.deepEqual(
+          {
+            cause: (error as EncephalonError).cause,
+            code: (error as EncephalonError).code,
+            details: (error as EncephalonError).details,
+            message: (error as EncephalonError).message,
+          },
+          {
+            cause: undefined,
+            code: 'REPOSITORY_CHANGED',
+            details: {},
+            message: 'The canonical repository changed repeatedly during the operation.',
+          },
+        )
+        assert.equal(JSON.stringify(error).includes(root), false)
+        return true
+      },
+    )
+    assert.equal(attempts, 3)
+  })
+
+  test('does not complete another baseline attempt at the exact retry deadline', () => {
+    const root = createRoot()
+    const moved = `${root}-generation-1`
+    roots.push(moved)
+    const clock = [0, 60_000]
+    let attempts = 0
+
+    assertErrorCode(
+      () =>
+        scanBaselineWithHooks(root, {
+          afterBaselineSources: () => {
+            attempts += 1
+            if (attempts === 1) {
+              renameSync(root, moved)
+              mkdirSync(root)
+            }
+          },
+          now: () => clock.shift() ?? 60_000,
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(attempts, 1)
+  })
+
   test('propagates unexpected failures after collecting baseline sources', () => {
     const root = createRoot()
     const unexpected = new Error('unexpected test hook failure')

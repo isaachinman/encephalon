@@ -182,6 +182,7 @@ type BaselineScanHooks = {
   beforeWorkflowDirectoryCapture?: (() => void) | undefined
   maximumScannedDirectories?: number | undefined
   maximumScannedFiles?: number | undefined
+  now?: (() => number) | undefined
   onLanguageDirectoryScheduled?: (() => void) | undefined
   onWork?: ((operation: BaselineWork) => void) | undefined
 }
@@ -953,7 +954,7 @@ const scanBaselineAttempt = (root: string, hooks: BaselineScanHooks) => {
 
 /** @internal */
 export const scanBaselineWithHooks = (root: string, hooks: BaselineScanHooks): AddRecordInput[] =>
-  withBaselineObservationRetry(() => scanBaselineAttempt(root, hooks))
+  withBaselineObservationRetry(() => scanBaselineAttempt(root, hooks), createBaselineObservationRetryLedger(hooks.now))
 
 export const scanBaseline = (root: string): AddRecordInput[] => scanBaselineWithHooks(root, {})
 

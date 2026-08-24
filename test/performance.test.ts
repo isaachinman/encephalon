@@ -413,11 +413,21 @@ describe('hot scan performance regressions', () => {
     ensureParent(join(root, '.github', 'workflows', 'ci.yml'))
     writeFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'name: CI')
 
+    const established = scanBaseline(root)
+    let attempts = 0
     const work = new Map<string, number>()
+    const observed = scanBaselineWithHooks(root, {
+      afterBaselineSources: () => {
+        attempts += 1
+      },
+      onWork: operation => work.set(operation, (work.get(operation) ?? 0) + 1),
+    })
+
+    assert.equal(attempts, 1)
+    assert.deepEqual(observed, established)
+    assert.deepEqual(Buffer.from(JSON.stringify(observed)), Buffer.from(JSON.stringify(established)))
     assert.deepEqual(
-      scanBaselineWithHooks(root, {
-        onWork: operation => work.set(operation, (work.get(operation) ?? 0) + 1),
-      }).map(record => {
+      observed.map(record => {
         const payload = record.payload as Record<string, unknown>
         return {
           languageCounts: payload.languageCounts,
