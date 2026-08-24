@@ -17,6 +17,13 @@ import {
 } from 'node:fs'
 import { isAbsolute, relative, resolve } from 'node:path'
 import { EncephalonError, fail } from './errors.ts'
+import {
+  type EntryIdentity,
+  entryIdentityFrom,
+  entryMetadataFrom,
+  sameEntryIdentity,
+  sameStableEntryMetadata,
+} from './filesystem-entry.ts'
 
 const CACHE_COMPONENTS = ['node_modules', '.cache', 'encephalon'] as const
 const DATABASE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'] as const
@@ -24,18 +31,7 @@ const OPTIONAL_FILE_OBSERVATION_ATTEMPTS = 3
 const MAX_CACHE_DATABASE_OPEN_ATTEMPTS = 3
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0
 
-export type CacheEntryIdentity = {
-  dev: bigint
-  ino: bigint
-}
-
-type CacheEntryIncarnation = CacheEntryIdentity & {
-  birthtimeNs: bigint
-  ctimeNs: bigint
-  mode: bigint
-  mtimeNs: bigint
-  size: bigint
-}
+export type CacheEntryIdentity = EntryIdentity
 
 type CacheDirectoryEntry = CacheEntryIdentity & {
   path: string
@@ -151,29 +147,7 @@ type CacheLocationTestHooks = {
 export const cacheLocationTestHooks: CacheLocationTestHooks = {}
 
 export const sameCacheEntryIdentity = (first: CacheEntryIdentity, second: CacheEntryIdentity) =>
-  first.dev === second.dev && first.ino === second.ino
-
-const identityFrom = (metadata: BigIntStats): CacheEntryIdentity => ({
-  dev: metadata.dev,
-  ino: metadata.ino,
-})
-
-const incarnationFrom = (metadata: BigIntStats): CacheEntryIncarnation => ({
-  ...identityFrom(metadata),
-  birthtimeNs: metadata.birthtimeNs,
-  ctimeNs: metadata.ctimeNs,
-  mode: metadata.mode,
-  mtimeNs: metadata.mtimeNs,
-  size: metadata.size,
-})
-
-const sameCacheEntryIncarnation = (first: CacheEntryIncarnation, second: CacheEntryIncarnation) =>
-  sameCacheEntryIdentity(first, second) &&
-  first.birthtimeNs === second.birthtimeNs &&
-  first.ctimeNs === second.ctimeNs &&
-  first.mode === second.mode &&
-  first.mtimeNs === second.mtimeNs &&
-  first.size === second.size
+  sameEntryIdentity(first, second)
 
 const missingPath = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
 
@@ -240,7 +214,7 @@ const inspectDirectory = (
   if (!samePath(actualRealpath, expectedRealpath)) {
     return invalidLayout(relativePath, 'expected-realpath')
   }
-  return { ...identityFrom(metadata), path, relativePath }
+  return { ...entryIdentityFrom(metadata), path, relativePath }
 }
 
 const assertDirectoryEntry = (entry: CacheDirectoryEntry) => {
@@ -256,7 +230,7 @@ const assertDirectoryEntry = (entry: CacheDirectoryEntry) => {
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
     return changedLayout(entry.relativePath, 'real-directory')
   }
-  if (!sameCacheEntryIdentity(entry, identityFrom(metadata))) {
+  if (!sameCacheEntryIdentity(entry, entryIdentityFrom(metadata))) {
     return changedLayout(entry.relativePath, 'stable-identity')
   }
   if (!samePath(realpathSync.native(entry.path), entry.path)) {
@@ -332,7 +306,7 @@ const inspectRegularFileOnce = (path: string, relativePath: string): RegularFile
   if (!metadata.isFile() || metadata.isSymbolicLink()) {
     return invalidLayout(relativePath, 'regular-non-symlink-file')
   }
-  const captured = identityFrom(metadata)
+  const captured = entryIdentityFrom(metadata)
   let actualRealpath: string
   try {
     actualRealpath = regularFileRealpath(path)
@@ -356,7 +330,7 @@ const inspectRegularFileOnce = (path: string, relativePath: string): RegularFile
       throw error
     }
     const opened = fstatSync(descriptor, { bigint: true })
-    if (!(opened.isFile() && sameCacheEntryIdentity(captured, identityFrom(opened)))) {
+    if (!(opened.isFile() && sameCacheEntryIdentity(captured, entryIdentityFrom(opened)))) {
       return { kind: 'changed' }
     }
   } finally {
@@ -397,7 +371,7 @@ const inspectRegularFileMetadataOnce = (path: string, relativePath: string): Reg
   if (!initialMetadata.isFile() || initialMetadata.isSymbolicLink()) {
     return invalidLayout(relativePath, 'regular-non-symlink-file')
   }
-  const captured = identityFrom(initialMetadata)
+  const captured = entryIdentityFrom(initialMetadata)
   let actualRealpath: string
   try {
     actualRealpath = regularFileRealpath(path)
@@ -422,7 +396,7 @@ const inspectRegularFileMetadataOnce = (path: string, relativePath: string): Reg
   if (
     !finalMetadata.isFile() ||
     finalMetadata.isSymbolicLink() ||
-    !sameCacheEntryIdentity(captured, identityFrom(finalMetadata))
+    !sameCacheEntryIdentity(captured, entryIdentityFrom(finalMetadata))
   ) {
     return { kind: 'changed' }
   }
@@ -501,7 +475,7 @@ const bootstrapPrimary = (
   try {
     const descriptor = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | NO_FOLLOW, 0o600)
     try {
-      createdIdentity = identityFrom(fstatSync(descriptor, { bigint: true }))
+      createdIdentity = entryIdentityFrom(fstatSync(descriptor, { bigint: true }))
     } finally {
       closeSync(descriptor)
     }
@@ -716,17 +690,17 @@ const quarantineFile = (location: CacheLocation, expected: CacheFile, required: 
     renameSync(expected.path, quarantinePath)
     assertCacheLocation(location)
     const movedMetadata = quarantineMetadata(quarantinePath, expected.relativePath)
-    if (!(movedMetadata.isFile() && sameCacheEntryIdentity(expected, identityFrom(movedMetadata)))) {
+    if (!(movedMetadata.isFile() && sameCacheEntryIdentity(expected, entryIdentityFrom(movedMetadata)))) {
       return changedLayout(expected.relativePath, 'stable-quarantine-identity')
     }
-    const movedIncarnation = incarnationFrom(movedMetadata)
+    const movedIncarnation = entryMetadataFrom(movedMetadata)
     cacheLocationTestHooks.afterQuarantineRename?.(quarantinePath)
     assertCacheLocation(location)
     const quarantinedMetadata = quarantineMetadata(quarantinePath, expected.relativePath)
     if (
       !quarantinedMetadata.isFile() ||
       quarantinedMetadata.isSymbolicLink() ||
-      !sameCacheEntryIncarnation(movedIncarnation, incarnationFrom(quarantinedMetadata))
+      !sameStableEntryMetadata(movedIncarnation, entryMetadataFrom(quarantinedMetadata))
     ) {
       return changedLayout(expected.relativePath, 'stable-quarantine-identity')
     }
@@ -785,7 +759,7 @@ const observeOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
   if (!initialMetadata.isDirectory() || initialMetadata.isSymbolicLink()) {
     return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
   }
-  const captured = identityFrom(initialMetadata)
+  const captured = entryIdentityFrom(initialMetadata)
   cacheLocationTestHooks.duringOwnedDirectoryInspection?.(path)
   let actualRealpath: string
   try {
@@ -812,7 +786,7 @@ const observeOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
   if (!finalMetadata.isDirectory() || finalMetadata.isSymbolicLink()) {
     return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
   }
-  if (!sameCacheEntryIdentity(captured, identityFrom(finalMetadata))) {
+  if (!sameCacheEntryIdentity(captured, entryIdentityFrom(finalMetadata))) {
     return { kind: 'changed' }
   }
   return { directory: { ...captured, name, path }, kind: 'stable' }
@@ -870,7 +844,7 @@ export const cacheOwnedDirectoryIsCurrent = (location: CacheLocation, directory:
 export const cacheOwnedDirectoryMtimeMilliseconds = (location: CacheLocation, directory: CacheOwnedDirectory) => {
   assertOwnedDirectory(location, directory)
   const metadata = lstatSync(directory.path, { bigint: true })
-  if (!sameCacheEntryIdentity(directory, identityFrom(metadata))) {
+  if (!sameCacheEntryIdentity(directory, entryIdentityFrom(metadata))) {
     return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-metadata-identity')
   }
   return Number(metadata.mtimeMs)
@@ -923,7 +897,7 @@ export const readCacheOwner = (location: CacheLocation, directory: CacheOwnedDir
   const descriptor = openSync(path, constants.O_RDONLY | NO_FOLLOW)
   try {
     const metadata = fstatSync(descriptor, { bigint: true })
-    if (!sameCacheEntryIdentity(captured, identityFrom(metadata))) {
+    if (!sameCacheEntryIdentity(captured, entryIdentityFrom(metadata))) {
       return invalidLayout(`${ownedDirectoryRelativePath(directory.name)}/owner.json`, 'bounded-stable-owner-file')
     }
     if (metadata.size > BigInt(maximumBytes)) {
@@ -954,14 +928,14 @@ export const quarantineCacheOwnedDirectory = (
     renameSync(directory.path, quarantinePath)
     assertCacheLocation(location)
     const movedMetadata = quarantineMetadata(quarantinePath, ownedDirectoryRelativePath(directory.name))
-    if (!(movedMetadata.isDirectory() && sameCacheEntryIdentity(directory, identityFrom(movedMetadata)))) {
+    if (!(movedMetadata.isDirectory() && sameCacheEntryIdentity(directory, entryIdentityFrom(movedMetadata)))) {
       return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-quarantine-identity')
     }
-    const movedIncarnation = incarnationFrom(movedMetadata)
+    const movedIncarnation = entryMetadataFrom(movedMetadata)
     cacheLocationTestHooks.afterQuarantineRename?.(quarantinePath)
     assertCacheLocation(location)
     const metadata = quarantineMetadata(quarantinePath, ownedDirectoryRelativePath(directory.name))
-    if (!(metadata.isDirectory() && sameCacheEntryIncarnation(movedIncarnation, incarnationFrom(metadata)))) {
+    if (!(metadata.isDirectory() && sameStableEntryMetadata(movedIncarnation, entryMetadataFrom(metadata)))) {
       return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-quarantine-identity')
     }
     const ownerPath = resolve(quarantinePath, 'owner.json')

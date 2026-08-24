@@ -5119,16 +5119,17 @@ describe('initialisation', () => {
     assert.equal(agentsPlan?.action, 'delete')
     type LegacyInstructionIdentity = { dev: number; ino: number }
     type StrengthenedInstructionIdentity = {
-      birthtimeNs: string
-      ctimeNs: string
-      dev: string
-      ino: string
-      mtimeNs: string
-      size: string
+      birthtimeNs: bigint
+      ctimeNs: bigint
+      dev: bigint
+      ino: bigint
+      mode: bigint
+      mtimeNs: bigint
+      size: bigint
     }
     type TestInstructionIdentity = LegacyInstructionIdentity | StrengthenedInstructionIdentity
     const isStrengthenedIdentity = (identity: TestInstructionIdentity): identity is StrengthenedInstructionIdentity =>
-      typeof identity.dev === 'string'
+      typeof identity.dev === 'bigint'
     const mutablePlan = agentsPlan as { originalIdentity?: TestInstructionIdentity }
     const plannedIdentity = mutablePlan.originalIdentity
     assert.ok(plannedIdentity)
@@ -5141,8 +5142,9 @@ describe('initialisation', () => {
       mutablePlan.originalIdentity = {
         birthtimeNs: plannedIdentity.birthtimeNs,
         ctimeNs: plannedIdentity.ctimeNs,
-        dev: replacementMetadata.dev.toString(),
-        ino: replacementMetadata.ino.toString(),
+        dev: replacementMetadata.dev,
+        ino: replacementMetadata.ino,
+        mode: plannedIdentity.mode,
         mtimeNs: plannedIdentity.mtimeNs,
         size: plannedIdentity.size,
       }
