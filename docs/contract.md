@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-24 for code and behavioural-test snapshot `d6b0075618da3d90314d0624014f8a896f2c4143`.
+Last reviewed: 2026-08-24 for code and behavioural-test snapshot `b1803d6bd48b24ac6c274a83559e1ed3dad8c1ef`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -199,7 +199,7 @@ After the guarded rollout, branch protection must require exactly `verify (ubunt
 
 Activation is maintainer-operated and may occur only after an exact pull-request head has emitted all five successful contexts. The [MAR-2640 implementation plan](./superpowers/plans/2026-08-23-required-release-checks.md#external-rollout-gate) owns the transient stacked-branch state, settings choreography, and failure-probe procedure. This maintained contract does not claim that rollout is complete.
 
-The exact reviewed MAR-2640 code and behavioural-test snapshot for this boundary is `d6b0075618da3d90314d0624014f8a896f2c4143`. The generated-source authority accepts only its deterministic content with native LF or checkout-equivalent CRLF line endings. These release-gate changes do not alter the runtime API, package exports, canonical data, cache schema, generated declarations, or published dependency set.
+The exact reviewed MAR-2640 code and behavioural-test snapshot for this boundary is `b1803d6bd48b24ac6c274a83559e1ed3dad8c1ef`. The generated-source authority accepts only its complete deterministic content with native LF or complete checkout-equivalent CRLF line endings; mixed endings remain invalid. These release-gate changes do not alter the runtime API, package exports, canonical data, cache schema, generated declarations, or published dependency set.
 
 ## Contract Change Process
 

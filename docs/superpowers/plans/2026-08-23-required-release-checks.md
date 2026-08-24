@@ -308,8 +308,8 @@ Do not update main branch protection from the stacked draft state. PR #66 curren
 - Generated-version authority: `c3fbbbb32c06e104b3a348566afb927e68963e3e` (`[MAR-2640] Check generated package version before builds`).
 - Pull-request release gate: `1f3d217411c161ba4e2aefd172d948ecd9961084` (`[MAR-2640] Run release checks before merge`).
 - Maintained contract and rollout documentation: `899fc7181904b4edfd6e76a20ded3dec0b47bd54` and `bbae03d8bcd6fd6cf6de6567acd3f6884c455044`.
-- Regression hardening: `b8b3476725c80d67788fe3aef3d26b2783d9a9c3` and `d6b0075618da3d90314d0624014f8a896f2c4143`. The final semantic snapshot recognises every top-level workflow step marker, pins both generated-source adapters to the exact checker, accepts checkout-equivalent CRLF, and rejects wrappers or other content drift.
-- The exact MAR-2640 code and behavioural-test snapshot is `d6b0075618da3d90314d0624014f8a896f2c4143`. It is rebased on the final repository-controlled MAR-2574 snapshot `54e5ee87464475b2b37af1af537146a0f006b330`.
+- Regression hardening: `b8b3476725c80d67788fe3aef3d26b2783d9a9c3`, `d6b0075618da3d90314d0624014f8a896f2c4143`, and final-review resolution `b1803d6bd48b24ac6c274a83559e1ed3dad8c1ef`. The final semantic snapshot recognises every top-level workflow step marker, pins build and both generated-source adapters to the shared authority, executes both adapters against stale source, accepts only complete checkout-equivalent CRLF, rejects mixed endings and other content drift, and maps missing generated source to the deterministic recovery guidance without changing unrelated I/O failures.
+- The exact MAR-2640 code and behavioural-test snapshot is `b1803d6bd48b24ac6c274a83559e1ed3dad8c1ef`. It is rebased on the final repository-controlled MAR-2574 snapshot `54e5ee87464475b2b37af1af537146a0f006b330`.
 - The README and maintained contract require the pre-build non-mutating generated-source check, release execution on pull requests and trusted `main` pushes, trusted-`main`-only bounded artifact upload, and the exact five required contexts. They record the guarded post-MAR-2574 rollout, the read-only inspection command, the narrow `required_status_checks` mutation, preservation of `enforce_admins: false`, `allow_force_pushes: true`, and every unrelated setting, without claiming external rollout completion.
 
 ### Red-green evidence
@@ -317,11 +317,12 @@ Do not update main branch protection from the stacked draft state. PR #66 curren
 - RED: `node --test --test-name-pattern "runs pull-request and current-Node package checks" test/package.test.ts` exited 1 with 0 passing and 1 failing test. It failed on the new README assertion because the old text said only trusted `main` pushes ran the release-equivalent gate.
 - GREEN: the same focused command exited 0 with 1 passing and 0 failing tests after the maintained documents were updated.
 - RED: the top-level workflow-marker regression returned `[]` for representative `if`, `shell`, and `id` steps while the new test expected all three markers. GREEN: the widened exact-indentation parser returned all markers and the complete package contract passed.
-- RED: the CRLF-equivalent generated source raised the stale-source error. GREEN: normalising only CRLF to LF accepted the platform-equivalent source while focused tests still rejected stale versions, wrappers, and misleading embedded versions.
+- RED: the CRLF-equivalent generated source raised the stale-source error. GREEN: accepting the exact complete CRLF rendering made the platform-equivalent source pass while focused tests still rejected stale versions, wrappers, and misleading embedded versions.
+- Final-review RED: a mixed LF/CRLF source was incorrectly accepted, and a missing generated file emitted raw `ENOENT`. GREEN: focused tests accepted only complete LF or CRLF renderings, rejected mixed endings, and confirmed both adapters reject stale source while the non-mutating check maps only missing source to the deterministic build-and-commit guidance.
 
 ### Local release gates
 
-Run on 2026-08-24 in the required order at semantic snapshot `d6b0075618da3d90314d0624014f8a896f2c4143`:
+Run on 2026-08-24 in the required order at semantic snapshot `b1803d6bd48b24ac6c274a83559e1ed3dad8c1ef`:
 
 | Command | Result |
 | --- | --- |
@@ -329,7 +330,7 @@ Run on 2026-08-24 in the required order at semantic snapshot `d6b0075618da3d9031
 | `bun run check:generated` | Exit 0; no stale generated source. |
 | `bun run lint` | Exit 0; checked 120 files with no fixes. |
 | `bun run typecheck` | Exit 0 across the source, scripts, test, and runtime-guard TypeScript projects. |
-| `bun run test` | Exit 0; 567 tests, 565 passed, 2 skipped, 0 failed. |
+| `bun run test` | Exit 0; 569 tests, 567 passed, 2 skipped, 0 failed. |
 | `bun run benchmark:check` | Exit 0 for the schema-version 2 CI profile; all timing, memory, and cache-size budgets passed. |
 | `bun run build` | Exit 0 with no generated drift. |
 | `bun run check:package` | The first invocation stopped before validation because the host's default npm cache contains root-owned entries. Re-running with an isolated temporary npm cache exited 0; the repository and user cache were unchanged. |
