@@ -85,6 +85,17 @@ const generatedPayload = (records: readonly { payload: unknown; subject: string 
   return payload as Record<string, unknown>
 }
 
+const assertThrowsExactValue = (callback: () => unknown, expected: unknown) => {
+  let didThrow = false
+  try {
+    callback()
+  } catch (error) {
+    didThrow = true
+    assert.equal(error, expected)
+  }
+  assert.equal(didThrow, true)
+}
+
 type InitCounts = {
   baselineScans: number
   canonicalScans: number
@@ -2716,6 +2727,36 @@ describe('initialisation', () => {
       )
     })
   }
+
+  test('propagates null from the language source unchanged', () => {
+    const root = createRoot()
+
+    assertThrowsExactValue(
+      () =>
+        scanBaselineWithHooks(root, {
+          afterLanguageDirectoryCapture: () => {
+            // biome-ignore lint/style/useThrowOnlyError: This verifies arbitrary JavaScript hook throws retain identity.
+            throw null
+          },
+        }),
+      null,
+    )
+  })
+
+  test('propagates undefined from the workflow source unchanged', () => {
+    const root = createRoot()
+
+    assertThrowsExactValue(
+      () =>
+        scanBaselineWithHooks(root, {
+          beforeWorkflowDirectoryCapture: () => {
+            // biome-ignore lint/style/useThrowOnlyError: This verifies arbitrary JavaScript hook throws retain identity.
+            throw undefined
+          },
+        }),
+      undefined,
+    )
+  })
 
   test('retries top-level facts rejected at final directory revalidation', () => {
     const root = createRoot()

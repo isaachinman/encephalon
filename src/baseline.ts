@@ -219,7 +219,7 @@ const baselineGenerationChanged = (): never => {
 }
 
 const isObservedSourceReplacement = (error: unknown) => {
-  const { code } = error as NodeJS.ErrnoException
+  const code = (error as NodeJS.ErrnoException | null | undefined)?.code
   return (
     error instanceof CanonicalDirectoryChangedError ||
     error instanceof DirectoryWitnessError ||
