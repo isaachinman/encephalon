@@ -385,7 +385,11 @@ test('writes validated mutation snapshots equivalently and reports post-link ide
     }
 
     if (identityChanged) {
-      const actual = additionError as Error & { cause?: unknown; code?: unknown; details?: Record<string, unknown> }
+      const actual = additionError as Error & {
+        cause?: unknown
+        code?: unknown
+        details?: Record<string, unknown>
+      }
       assert.equal(actual.code, 'REPOSITORY_CHANGED', entry.name)
       assert.deepEqual(actual.details?.committedRecordIds, [additionId], entry.name)
       assert.equal(actual.details?.canonicalCommitted, true, entry.name)
@@ -453,6 +457,12 @@ test('canonical snapshot cache manifest preserves exact hash bytes and logical r
   }
   writeCanonicalCacheRecord(root, 'z-manifest-record', 0)
   writeCanonicalCacheRecord(root, 'a-manifest-record', 1)
+  const representativePath = join(root, 'encephalon', 'context', 'a-manifest-record.json')
+  const representativeSource = JSON.parse(readFileSync(representativePath, 'utf8')) as Record<string, unknown>
+  writeFileSync(
+    representativePath,
+    `${JSON.stringify({ ...representativeSource, searchText: 'cafe\u0301 evidence' }, null, 2)}\n`,
+  )
   let cacheOwnedCanonicalStats = 0
   cacheReadTestHooks.beforeManifestEntryLstat = () => {
     cacheOwnedCanonicalStats += 1
@@ -467,6 +477,32 @@ test('canonical snapshot cache manifest preserves exact hash bytes and logical r
     subject: 'cache.artifact-manifest-conversion',
   })
   const snapshotProjection = logicalCacheProjection(root)
+  assert.equal(snapshotProjection.metadata.find(row => row.key === 'schemaVersion')?.value, '1')
+  assert.equal(snapshotProjection.metadata.find(row => row.key === 'recordsIndexed')?.value, '3')
+  const representativeRecord = snapshotProjection.records.find(row => row.id === 'a-manifest-record')
+  assert.ok(representativeRecord)
+  assert.equal(representativeRecord.kind, 'context')
+  assert.equal(representativeRecord.subject, 'cache.fixture.a-manifest-record')
+  assert.equal(representativeRecord.source, 'test')
+  assert.equal(representativeRecord.created_at, '2026-01-01T00:00:00.001Z')
+  assert.equal(representativeRecord.path, 'encephalon/context/a-manifest-record.json')
+  assert.equal(representativeRecord.active, 1)
+  assert.equal(representativeRecord.summary, 'Cache fixture a-manifest-record')
+  assert.equal(
+    representativeRecord.record_json,
+    '{"createdAt":"2026-01-01T00:00:00.001Z","id":"a-manifest-record","kind":"context","payload":{"summary":"Cache fixture a-manifest-record"},"source":"test","subject":"cache.fixture.a-manifest-record","searchText":"cafe\u0301 evidence","path":"encephalon/context/a-manifest-record.json"}',
+  )
+  assert.equal(
+    snapshotProjection.search.find(row => row.id === 'a-manifest-record')?.text,
+    [
+      'context',
+      'cache.fixture.a-manifest-record',
+      'test',
+      'Cache fixture a-manifest-record',
+      '{"summary":"Cache fixture a-manifest-record"}',
+      'café evidence',
+    ].join('\n'),
+  )
 
   const manifestEntry = (path: string, type: 'directory' | 'file') => {
     const metadata = lstatSync(join(root, ...path.split('/')), { bigint: true })
@@ -523,6 +559,118 @@ test('canonical snapshot cache manifest preserves exact hash bytes and logical r
   )
   assert.deepEqual(hydratedProjection.records, snapshotProjection.records)
   assert.deepEqual(hydratedProjection.search, snapshotProjection.search)
+})
+
+test('cache writer rejects primary and sidecar hard links introduced during DML', { skip: hardLinkSkip }, () => {
+  for (const target of ['primary', 'wal'] as const) {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    writeCanonicalCacheRecord(root, `writer-identity-${target}-seed`, 0)
+    assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+    writeCanonicalCacheRecord(root, `writer-identity-${target}-addition`, 1)
+    const databasePath = cacheDatabasePath(root)
+    const targetPath = target === 'primary' ? databasePath : `${databasePath}-wal`
+    const alias = join(outside, `writer-${target}-alias`)
+    let linked = false
+    let quarantines = 0
+    canonicalCacheTestHooks.afterCacheRecordInsert = () => {
+      if (!linked) {
+        linked = true
+        assert.equal(existsSync(targetPath), true)
+        linkSync(targetPath, alias)
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        quarantines += 1
+      }
+    }
+
+    assert.throws(
+      () => api.hydrate({ root }),
+      (error: unknown) => {
+        const actual = error as Error & { code?: unknown; details?: unknown }
+        assert.equal(actual.code, 'VALIDATION_FAILED', target)
+        assert.deepEqual(
+          actual.details,
+          {
+            entry: `node_modules/.cache/encephalon/brain.sqlite${target === 'primary' ? '' : '-wal'}`,
+            invariant: 'single-link-file',
+          },
+          target,
+        )
+        assert.equal(causeChainText(error).includes(root), false, target)
+        assert.equal(causeChainText(error).includes(outside), false, target)
+        return true
+      },
+    )
+    assert.equal(linked, true, target)
+    assert.equal(quarantines, 0, target)
+    assert.equal(existsSync(alias), true, target)
+    canonicalCacheTestHooks.afterCacheRecordInsert = undefined
+    cacheLocationTestHooks.beforeQuarantineRename = undefined
+  }
+})
+
+test('cache writer rejects a same-path primary successor after COMMIT and before close', {
+  skip: process.platform === 'win32' ? 'Windows cannot replace an open SQLite primary deterministically.' : false,
+}, () => {
+  const root = createRoot()
+  writeCanonicalCacheRecord(root, 'writer-post-commit-seed', 0)
+  assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+  const databasePath = cacheDatabasePath(root)
+  const predecessorPath = join(root, 'writer-post-commit-predecessor.sqlite')
+  const successorPath = join(root, 'writer-post-commit-successor.sqlite')
+  const source = new DatabaseSync(databasePath, { readOnly: true })
+  source.prepare('VACUUM INTO ?').run(successorPath)
+  source.close()
+  const successorBytes = readFileSync(successorPath)
+  const successorIdentity = lstatSync(successorPath, { bigint: true })
+  writeCanonicalCacheRecord(root, 'writer-post-commit-addition', 1)
+  let armed = false
+  let replaced = false
+  canonicalCacheTestHooks.afterCacheRecordInsert = record => {
+    if (record.id === 'writer-post-commit-addition') {
+      armed = true
+    }
+  }
+  const originalExec = DatabaseSync.prototype.exec
+  DatabaseSync.prototype.exec = function (sql: string) {
+    const result = originalExec.call(this, sql)
+    if (armed && sql.trim() === 'COMMIT' && !replaced) {
+      replaced = true
+      for (const suffix of ['-wal', '-shm', '-journal']) {
+        const sidecarPath = `${databasePath}${suffix}`
+        if (existsSync(sidecarPath)) {
+          renameSync(sidecarPath, `${predecessorPath}${suffix}`)
+        }
+      }
+      renameSync(databasePath, predecessorPath)
+      renameSync(successorPath, databasePath)
+    }
+    return result
+  }
+
+  try {
+    assert.throws(
+      () => api.hydrate({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          invariant: 'stable-identity',
+        })
+        assert.equal(causeChainText(error).includes(root), false)
+        return true
+      },
+    )
+  } finally {
+    DatabaseSync.prototype.exec = originalExec
+  }
+
+  assert.equal(replaced, true)
+  assert.equal(sameCacheEntryIdentity(successorIdentity, lstatSync(databasePath, { bigint: true })), true)
+  assert.deepEqual(readFileSync(databasePath), successorBytes)
 })
 
 test('canonical snapshot cache manifest uses one records pass for every rebuilding consumer', () => {
@@ -616,7 +764,11 @@ test('canonical snapshot cache manifest uses one records pass for every rebuildi
   )
 
   assert.equal(initialised.recordsCreated.length > 0, true)
-  assert.deepEqual(initWork, { cacheOwnedCanonicalStats: 0, canonicalScans: 1, graphValidations: 1 })
+  assert.deepEqual(initWork, {
+    cacheOwnedCanonicalStats: 0,
+    canonicalScans: 1,
+    graphValidations: 1,
+  })
 })
 
 test('cache retry preserves ordinary validation for a settled malformed successor', () => {
@@ -706,6 +858,126 @@ test('shared canonical retry budget: canonical churn preserves cache without qua
   assert.deepEqual(quarantinePaths, [])
   assert.equal(sameCacheEntryIdentity(stableIdentity, lstatSync(cacheDatabasePath(root), { bigint: true })), true)
   assert.deepEqual(logicalCacheProjection(root), stableProjection)
+})
+
+test('starts the canonical retry deadline after a stale optimistic cache probe', () => {
+  const root = createRoot()
+  writeCanonicalCacheRecord(root, 'lazy-deadline-seed', 0)
+  assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+  writeCanonicalCacheRecord(root, 'lazy-deadline-addition', 1)
+  const changedPath = join(root, 'encephalon', 'context', 'lazy-deadline-seed.json')
+  let clock = 0
+  let manifestRootEnumerations = 0
+  let canonicalValidations = 0
+  const work = { canonicalScans: 0, graphValidations: 0 }
+  cacheReadTestHooks.afterManifestRootEnumeration = () => {
+    manifestRootEnumerations += 1
+    if (manifestRootEnumerations === 1) {
+      clock = 60_000
+    }
+  }
+  cacheReadTestHooks.afterCanonicalValidation = () => {
+    canonicalValidations += 1
+    if (canonicalValidations === 1) {
+      writeFileSync(changedPath, `${readFileSync(changedPath, 'utf8')} `)
+    }
+  }
+  canonicalCacheTestHooks.recordReadHooks = {
+    canonicalScan: () => {
+      work.canonicalScans += 1
+    },
+    graphValidation: () => {
+      work.graphValidations += 1
+    },
+    now: () => clock,
+  }
+
+  assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 2 })
+  assert.equal(manifestRootEnumerations, 1)
+  assert.equal(canonicalValidations, 2)
+  assert.deepEqual(work, { canonicalScans: 2, graphValidations: 2 })
+})
+
+test('stale cache preparation performs one optimistic manifest probe and one canonical graph scan', () => {
+  const root = createRoot()
+  writeCanonicalCacheRecord(root, 'single-stale-probe-seed', 0)
+  assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+  writeCanonicalCacheRecord(root, 'single-stale-probe-addition', 1)
+  const work = { canonicalScans: 0, graphValidations: 0, manifestRootEnumerations: 0 }
+  cacheReadTestHooks.afterManifestRootEnumeration = () => {
+    work.manifestRootEnumerations += 1
+  }
+  canonicalCacheTestHooks.recordReadHooks = {
+    canonicalScan: () => {
+      work.canonicalScans += 1
+    },
+    graphValidation: () => {
+      work.graphValidations += 1
+    },
+  }
+
+  assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 2 })
+  assert.deepEqual(work, { canonicalScans: 1, graphValidations: 1, manifestRootEnumerations: 1 })
+})
+
+test('canonical change after writer initialisation performs zero failed-attempt cache DML', () => {
+  const root = createRoot()
+  writeCanonicalCacheRecord(root, 'pre-dml-assertion-seed', 0)
+  assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+  writeCanonicalCacheRecord(root, 'pre-dml-assertion-addition', 1)
+  const changedPath = join(root, 'encephalon', 'context', 'pre-dml-assertion-seed.json')
+  let canonicalScans = 0
+  let failedAttemptActive = false
+  let failedAttemptExecDml = 0
+  let failedAttemptStatementDml = 0
+  let writerInitialisations = 0
+  canonicalCacheTestHooks.recordReadHooks = {
+    canonicalScan: () => {
+      canonicalScans += 1
+      if (canonicalScans > 1) {
+        failedAttemptActive = false
+      }
+    },
+  }
+  cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+    if (mode === 'writer') {
+      writerInitialisations += 1
+      if (writerInitialisations === 1) {
+        failedAttemptActive = true
+        writeFileSync(changedPath, `${readFileSync(changedPath, 'utf8')} `)
+      }
+    }
+  }
+  const originalExec = DatabaseSync.prototype.exec
+  const originalRun = StatementSync.prototype.run
+  DatabaseSync.prototype.exec = function (sql: string) {
+    if (failedAttemptActive && /\b(?:DELETE|INSERT|UPDATE)\b/u.test(sql)) {
+      failedAttemptExecDml += 1
+    }
+    return originalExec.call(this, sql)
+  }
+  const instrumentedRun = function (this: StatementSync, ...values: unknown[]) {
+    if (failedAttemptActive) {
+      failedAttemptStatementDml += 1
+    }
+    return (originalRun as unknown as (...parameters: unknown[]) => ReturnType<StatementSync['run']>).apply(
+      this,
+      values,
+    )
+  }
+  StatementSync.prototype.run = instrumentedRun as typeof originalRun
+
+  try {
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 2 })
+  } finally {
+    DatabaseSync.prototype.exec = originalExec
+    StatementSync.prototype.run = originalRun
+  }
+
+  assert.equal(writerInitialisations, 2)
+  assert.equal(canonicalScans, 2)
+  assert.equal(failedAttemptExecDml, 0)
+  assert.equal(failedAttemptStatementDml, 0)
 })
 
 test('retries transient artifact mutation and bounds persistent mutation as repository change', () => {
@@ -2438,7 +2710,9 @@ describe('cache filesystem containment', () => {
         linkSync(sidecarPath, alias)
         cacheLocationTestHooks.regularFileRealpath = (path, actual) => {
           if (basename(path) === 'operation-lock.sqlite-journal') {
-            throw Object.assign(new Error('Injected close-safety inspection failure.'), { code: 'EACCES' })
+            throw Object.assign(new Error('Injected close-safety inspection failure.'), {
+              code: 'EACCES',
+            })
           }
           return actual
         }
@@ -2815,7 +3089,10 @@ describe('SQLite cache and reads', () => {
         root => {
           const searches = new Array<string>(2)
           searches[1] = 'ignored'
-          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ root, searches })
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({
+            root,
+            searches,
+          })
         },
       ],
       [
@@ -3057,7 +3334,10 @@ describe('SQLite cache and reads', () => {
     assert.throws(
       () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
       (error: unknown) => {
-        const actual = error as { code?: unknown; details?: { errors?: Array<{ code?: unknown }> } }
+        const actual = error as {
+          code?: unknown
+          details?: { errors?: Array<{ code?: unknown }> }
+        }
         assert.equal(actual.code, 'VALIDATION_FAILED')
         assert.equal(actual.details?.errors?.[0]?.code, 'CORPUS_DIRECTORY_ENTRY_LIMIT')
         return true
@@ -3248,7 +3528,10 @@ describe('SQLite cache and reads', () => {
     assert.throws(
       () => functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }),
       (error: unknown) => {
-        const actual = error as { code?: unknown; details?: { errors?: Array<{ code?: unknown }> } }
+        const actual = error as {
+          code?: unknown
+          details?: { errors?: Array<{ code?: unknown }> }
+        }
         assert.equal(actual.code, 'VALIDATION_FAILED')
         assert.equal(actual.details?.errors?.[0]?.code, 'INVALID_ARTIFACT')
         return true
@@ -3797,11 +4080,19 @@ describe('SQLite cache and reads', () => {
       {
         expected: { budget: 'gatherShows', field: 'shows', maximum: 64 },
         run: root =>
-          gatherRecords({ root, shows: ['not a valid record id', ...Array.from({ length: 64 }, () => 'missing')] }),
+          gatherRecords({
+            root,
+            shows: ['not a valid record id', ...Array.from({ length: 64 }, () => 'missing')],
+          }),
       },
       {
         expected: { budget: 'gatherShows', field: 'shows', maximum: 64 },
-        run: root => gatherRecords({ root, searches: [42], shows: Array.from({ length: 65 }, () => 'missing') }),
+        run: root =>
+          gatherRecords({
+            root,
+            searches: [42],
+            shows: Array.from({ length: 65 }, () => 'missing'),
+          }),
       },
       {
         expected: { budget: 'compactResultLimit', field: 'limit', maximum: 100 },
@@ -4253,7 +4544,10 @@ describe('SQLite cache and reads', () => {
       }) as {
         records: Array<{
           id: string
-          record: { id: string; payload: { detail?: { markers?: string[] }; summary?: string } } | null
+          record: {
+            id: string
+            payload: { detail?: { markers?: string[] }; summary?: string }
+          } | null
         }>
         searches: Array<{ query: string; results: Array<{ id: string; snippet: string }> }>
       }
@@ -4368,7 +4662,9 @@ describe('SQLite cache and reads', () => {
       if (query === secondQuery && !faulted) {
         faulted = true
         rewriteRecordSummary(root, record.path, 'Memo generation two')
-        throw Object.assign(new Error('private rejected gather generation'), { code: 'SQLITE_CORRUPT' })
+        throw Object.assign(new Error('private rejected gather generation'), {
+          code: 'SQLITE_CORRUPT',
+        })
       }
     }
     cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
@@ -4501,7 +4797,10 @@ describe('SQLite cache and reads', () => {
       {
         name: 'forced gather hydration',
         run: root =>
-          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ hydrate: true, root }),
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({
+            hydrate: true,
+            root,
+          }),
         seed: root => {
           addCacheRecord(root)
         },
@@ -4585,7 +4884,10 @@ describe('SQLite cache and reads', () => {
       {
         name: 'forced gather hydration',
         run: root =>
-          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ hydrate: true, root }),
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({
+            hydrate: true,
+            root,
+          }),
         seed: root => {
           addCacheRecord(root)
         },
@@ -4759,7 +5061,9 @@ describe('SQLite cache and reads', () => {
       }
     }
 
-    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({
+      root,
+    })
 
     assert.equal(missingRecoveryObservations, 1)
     assert.equal(primaryQuarantines, 0)
@@ -4866,7 +5170,9 @@ describe('SQLite cache and reads', () => {
       }
     }
 
-    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({
+      root,
+    })
 
     assert.equal(recoveryRebuilds, 1)
     assert.equal(writerInitialisations, 2)
@@ -5328,7 +5634,11 @@ describe('SQLite cache and reads', () => {
   test('recovers a primary that disappears before its first verified open', () => {
     const cases = [
       { expectedHydrated: true, name: 'primary remains absent', successor: false },
-      { expectedHydrated: false, name: 'successor appears after missing observation', successor: true },
+      {
+        expectedHydrated: false,
+        name: 'successor appears after missing observation',
+        successor: true,
+      },
     ] as const
 
     for (const { expectedHydrated, name, successor } of cases) {
@@ -5452,7 +5762,9 @@ describe('SQLite cache and reads', () => {
       }
     }
 
-    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({
+      root,
+    })
 
     assert.equal(recoveryRebuilds, 1)
     assert.equal(writerInitialisations, 1)
@@ -5561,7 +5873,9 @@ describe('SQLite cache and reads', () => {
       }
     }
 
-    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    const result = functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({
+      root,
+    })
     assert.equal(primaryQuarantines, 0)
     assert.equal(writerInitialisations, 0)
     assert.deepEqual(result, { hydrated: false, recordsIndexed: 1 })
@@ -6174,7 +6488,10 @@ describe('SQLite cache and reads', () => {
         expectedReaderInitialisations: 2,
         name: 'forced gather hydration',
         read: (root: string) =>
-          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ hydrate: true, root }),
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({
+            hydrate: true,
+            root,
+          }),
       },
     ]
 
@@ -6219,7 +6536,10 @@ describe('SQLite cache and reads', () => {
       {
         name: 'forced gather hydration',
         read: (root: string) =>
-          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ hydrate: true, root }),
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({
+            hydrate: true,
+            root,
+          }),
       },
     ]
 
@@ -6345,7 +6665,9 @@ describe('SQLite cache and reads', () => {
     cacheReadTestHooks.afterIntegrityProbe = observation => {
       if (observation.name === 'metadata' && queryFailures === 0) {
         queryFailures += 1
-        throw Object.assign(new Error('database disk image is malformed'), { code: 'SQLITE_CORRUPT' })
+        throw Object.assign(new Error('database disk image is malformed'), {
+          code: 'SQLITE_CORRUPT',
+        })
       }
     }
     cacheLocationTestHooks.beforeQuarantineRename = path => {
@@ -6646,7 +6968,12 @@ describe('SQLite cache and reads', () => {
         resultsServed = listRecords({ root }).length
       },
       (error: unknown) => {
-        const publicError = error as { cause?: unknown; code?: unknown; details?: unknown; message?: unknown }
+        const publicError = error as {
+          cause?: unknown
+          code?: unknown
+          details?: unknown
+          message?: unknown
+        }
         assert.ok(publicError.code === 'IO_ERROR' || publicError.code === 'INTERNAL_ERROR')
         assert.doesNotMatch(
           JSON.stringify({
@@ -6661,6 +6988,55 @@ describe('SQLite cache and reads', () => {
     )
     assert.equal(writerAttempts, 1)
     assert.equal(resultsServed, 0)
+  })
+
+  test('shares one recovery latch across a corrupt snapshot read and a recoverable writer failure', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    writeCanonicalCacheRecord(root, 'recovery-session-stale-addition', 1)
+    let canonicalValidated = false
+    let primaryQuarantines = 0
+    let recoveryRebuilds = 0
+    let snapshotReadFailures = 0
+    let writerInitialisations = 0
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      canonicalValidated = true
+    }
+    cacheReadTestHooks.afterIntegrityProbe = observation => {
+      if (canonicalValidated && observation.name === 'metadata' && snapshotReadFailures === 0) {
+        snapshotReadFailures += 1
+        throw Object.assign(new Error('snapshot cache is corrupt'), { code: 'SQLITE_CORRUPT' })
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        primaryQuarantines += 1
+      }
+    }
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveryRebuilds += 1
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer') {
+        writerInitialisations += 1
+        if (writerInitialisations === 1) {
+          throw Object.assign(new Error('recovery writer failed'), { code: 'SQLITE_CORRUPT' })
+        }
+      }
+    }
+
+    assert.throws(
+      () => api.prepare({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        assert.equal(causeChainText(error).includes(root), false)
+        return true
+      },
+    )
+    assert.equal(snapshotReadFailures, 1)
+    assert.equal(primaryQuarantines, 1)
+    assert.equal(writerInitialisations, 1)
+    assert.equal(recoveryRebuilds, 0)
   })
 
   test('normalises malformed cache JSON throughout a terminal retry cause chain', () => {
@@ -6847,8 +7223,12 @@ describe('SQLite cache and reads', () => {
     const location = inspectCacheLocation(root)
     const cacheDatabase = inspectCacheDatabase(location, 'brain.sqlite')
     assert.ok(cacheDatabase)
-    const sqliteFailure = Object.assign(new Error('injected schema-like cause'), { code: 'SQLITE_SCHEMA' })
-    const databaseFailure = new CacheDatabaseFailure(sqliteFailure, cacheDatabase, { cause: sqliteFailure })
+    const sqliteFailure = Object.assign(new Error('injected schema-like cause'), {
+      code: 'SQLITE_SCHEMA',
+    })
+    const databaseFailure = new CacheDatabaseFailure(sqliteFailure, cacheDatabase, {
+      cause: sqliteFailure,
+    })
     const terminalError = new api.EncephalonError(
       'REPOSITORY_CHANGED',
       'Injected terminal cache error.',
@@ -7469,8 +7849,16 @@ describe('SQLite cache and reads', () => {
       { expected: { hydrated: true, recordsIndexed: 1 }, name: 'leading zero', value: '01' },
       { expected: { hydrated: true, recordsIndexed: 1 }, name: 'leading whitespace', value: ' 1' },
       { expected: { hydrated: true, recordsIndexed: 1 }, name: 'trailing whitespace', value: '1 ' },
-      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'SQLite BLOB', value: Buffer.from('1') },
-      { expected: { hydrated: true, recordsIndexed: 1 }, name: 'canonical limit overflow', value: '1001' },
+      {
+        expected: { hydrated: true, recordsIndexed: 1 },
+        name: 'SQLite BLOB',
+        value: Buffer.from('1'),
+      },
+      {
+        expected: { hydrated: true, recordsIndexed: 1 },
+        name: 'canonical limit overflow',
+        value: '1001',
+      },
     ]
 
     for (const { expected, name, value } of cases) {
@@ -7547,7 +7935,10 @@ describe('SQLite cache and reads', () => {
       observation => observation.kind === 'probe' && observation.name === 'record-search' && observation.rows === 1,
     )
     assert.notEqual(corruptProbe, -1)
-    assert.deepEqual(observations.at(corruptProbe + 1), { kind: 'text-read', name: 'record-search' })
+    assert.deepEqual(observations.at(corruptProbe + 1), {
+      kind: 'text-read',
+      name: 'record-search',
+    })
     assert.equal(exactQuarantines, 1)
     assert.equal(readerInitialisations, 2)
     assert.equal(recoveryRebuilds, 1)
@@ -8425,7 +8816,9 @@ describe('SQLite cache and reads', () => {
     const gatePath = join(cachePath, 'operation-lock.sqlite')
     const displacedGatePath = join(root, 'post-publication-operation-lock.sqlite')
     const recoveryPath = join(cachePath, 'operation-lock.recovery')
-    const publicationFailure = Object.assign(new Error('recovery witness fsync failure'), { code: 'EIO' })
+    const publicationFailure = Object.assign(new Error('recovery witness fsync failure'), {
+      code: 'EIO',
+    })
     let operationEntered = false
     cacheLocationTestHooks.beforeOwnerRecoveryFsync = path => {
       if (basename(path) === 'operation-lock.recovery') {
@@ -8753,7 +9146,11 @@ describe('SQLite cache and reads', () => {
   test('preserves owner errors and classifies a recovery witness disappearing before descriptor open', () => {
     const cases = [
       { expectedCode: 'ENOENT', filename: 'owner.json', observe: observeCacheOwner },
-      { expectedCode: 'REPOSITORY_CHANGED', filename: 'owner.recovered.json', observe: observeCacheRecoveryWitness },
+      {
+        expectedCode: 'REPOSITORY_CHANGED',
+        filename: 'owner.recovered.json',
+        observe: observeCacheRecoveryWitness,
+      },
     ] as const
 
     for (const ownerCase of cases) {
@@ -8861,7 +9258,9 @@ describe('SQLite cache and reads', () => {
   test('cleans an exact recovery marker when setup fails after owner publication', () => {
     const root = createRoot()
     const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
-    const setupFailure = Object.assign(new Error('recovery setup fault after owner publication'), { code: 'EIO' })
+    const setupFailure = Object.assign(new Error('recovery setup fault after owner publication'), {
+      code: 'EIO',
+    })
 
     assert.throws(
       () =>
@@ -8885,14 +9284,18 @@ describe('SQLite cache and reads', () => {
   test('publishes reclaimable cleanup debt when recovery setup and initial cleanup both fail', () => {
     const root = createRoot()
     const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
-    const setupFailure = Object.assign(new Error('recovery setup fault with cleanup failure'), { code: 'EIO' })
+    const setupFailure = Object.assign(new Error('recovery setup fault with cleanup failure'), {
+      code: 'EIO',
+    })
     let cleanupAttempts = 0
     let operationEntered = false
     cacheLocationTestHooks.beforeQuarantineRename = path => {
       if (basename(path) === 'operation-lock.recovery') {
         cleanupAttempts += 1
         if (cleanupAttempts <= 3) {
-          throw Object.assign(new Error('recovery cleanup is temporarily unavailable'), { code: 'EPERM' })
+          throw Object.assign(new Error('recovery cleanup is temporarily unavailable'), {
+            code: 'EPERM',
+          })
         }
       }
     }

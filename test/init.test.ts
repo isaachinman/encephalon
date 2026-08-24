@@ -1407,6 +1407,63 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
 
+  test('init reports the full committed prefix when a later canonical link loses its kind directory', () => {
+    const root = createRoot()
+    const stagingDirectory = join(root, 'encephalon', '_staging')
+    let linkBoundaries = 0
+    let displaced = false
+    let committedBeforeFailure: string[] = []
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'before-canonical-link') {
+                  linkBoundaries += 1
+                  if (linkBoundaries === 2) {
+                    const [stagingName] = readdirSync(stagingDirectory)
+                    assert.ok(stagingName)
+                    const staged = JSON.parse(readFileSync(join(stagingDirectory, stagingName), 'utf8')) as {
+                      kind?: unknown
+                    }
+                    assert.equal(typeof staged.kind, 'string')
+                    renameSync(join(root, 'encephalon', staged.kind as string), join(root, 'displaced-later-link-kind'))
+                    displaced = true
+                  }
+                }
+                if (point === 'after-canonical-link' && committedBeforeFailure.length === 0) {
+                  committedBeforeFailure = committedBaselineIds(root)
+                }
+              },
+            },
+          },
+        ),
+      error => {
+        const actual = error as EncephalonError
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.deepEqual(actual.details.initProgress, {
+          cacheState: 'disposable',
+          canonicalCommitted: true,
+          committedInstructionFiles: [],
+          committedRecordIds: committedBeforeFailure,
+          phase: 'recordPublication',
+          recoveryAction:
+            'Inspect the reported canonical records, then repeat the same init operation with the same options.',
+          recoveryMode: 'inspectAndRerun',
+        })
+        assert.equal(JSON.stringify(actual).includes(root), false)
+        return true
+      },
+    )
+
+    assert.equal(displaced, true)
+    assert.equal(linkBoundaries, 2)
+    assert.equal(committedBeforeFailure.length, 1)
+  })
+
   test('replans a replacement canonical generation before publishing the baseline', () => {
     const root = createRoot()
     mkdirSync(join(root, 'encephalon', 'decision'), { recursive: true })
@@ -2375,7 +2432,11 @@ describe('initialisation', () => {
     assert.throws(
       () => api.initEncephalon({ root }),
       (error: unknown) => {
-        const actual = error as { code?: unknown; details?: { errors?: unknown }; message?: unknown }
+        const actual = error as {
+          code?: unknown
+          details?: { errors?: unknown }
+          message?: unknown
+        }
         assert.equal(actual.code, 'VALIDATION_FAILED')
         assert.equal(actual.message, 'Canonical records are invalid.')
         assert.deepEqual(actual.details?.errors, [
@@ -2456,7 +2517,9 @@ describe('initialisation', () => {
       (error: unknown) => {
         const actual = error as {
           code?: unknown
-          details?: { initProgress?: { cacheState?: unknown; committedRecordIds?: unknown; phase?: unknown } }
+          details?: {
+            initProgress?: { cacheState?: unknown; committedRecordIds?: unknown; phase?: unknown }
+          }
           message?: unknown
         }
         assert.equal(actual.code, 'VALIDATION_FAILED')
@@ -2851,7 +2914,12 @@ describe('initialisation', () => {
 
   test('reports the full committed prefix when canonical generation changes during cache insertion', () => {
     const root = createRoot()
-    const work = { cacheMutations: 0, canonicalScans: 0, graphValidations: 0, instructionWrites: 0 }
+    const work = {
+      cacheMutations: 0,
+      canonicalScans: 0,
+      graphValidations: 0,
+      instructionWrites: 0,
+    }
     cacheReadTestHooks.afterCacheRecordInsert = () => {
       if (work.cacheMutations === 0) {
         work.cacheMutations += 1
@@ -2922,7 +2990,12 @@ describe('initialisation', () => {
       },
     )
 
-    assert.deepEqual(work, { cacheMutations: 1, canonicalScans: 1, graphValidations: 1, instructionWrites: 0 })
+    assert.deepEqual(work, {
+      cacheMutations: 1,
+      canonicalScans: 1,
+      graphValidations: 1,
+      instructionWrites: 0,
+    })
     assert.equal(committedBaselineIds(root).length, 3)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)

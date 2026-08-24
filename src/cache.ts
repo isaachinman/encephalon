@@ -12,10 +12,12 @@ import {
 } from './api-input.ts'
 import { ArtifactChangedError, inspectArtifactFiles } from './artifact-inspection.ts'
 import {
+  assertCacheDatabaseMetadata,
   type CacheDatabase,
   CacheDatabaseCreationConflict,
   CacheDatabaseFailure,
   type CacheLocation,
+  closeCacheDatabaseWithMetadataAuthority,
   failCacheDatabase,
   inspectCacheDatabase,
   inspectCacheLocation,
@@ -318,15 +320,6 @@ class NormalizedCacheSchemaFailure extends Error {
 }
 
 class CacheDatabaseObservedMissing extends Error {}
-
-const cacheRecoveryAttemptedFailures = new WeakSet<Error>()
-
-const rethrowAfterCacheRecovery = (failure: unknown): never => {
-  if (failure instanceof Error) {
-    cacheRecoveryAttemptedFailures.add(failure)
-  }
-  throw failure
-}
 
 const isIntegrityFlag = (value: unknown): value is 0 | 1 => value === 0 || value === 1
 
@@ -1521,12 +1514,7 @@ const writeCacheSnapshot = (
     assertExistingCacheContentTransaction(root, openedDatabase)
   })
   const { acceptsEmptyContent, database, identity } = opened
-  const retryPrimary: CacheWriterPrimary = (() => {
-    if (acceptsEmptyContent) {
-      return { database: identity, kind: 'expected-new' }
-    }
-    return { database: identity, kind: 'expected-owned' }
-  })()
+  let writerIdentity = identity
   let rebuildResult: PrepareResult | undefined
   let writerFailure: unknown
   let writerFailed = false
@@ -1570,16 +1558,27 @@ const writeCacheSnapshot = (
         schemaVersion: SCHEMA_VERSION,
       })
       assertCacheSnapshotCurrent(snapshot)
+      writerIdentity = assertCacheDatabaseMetadata(location, writerIdentity)
       database.exec('COMMIT')
       rebuildResult = { hydrated: true, recordsIndexed: snapshot.records.length }
-    } catch (error) {
+    } catch (initialError) {
+      let error = initialError
+      let rollbackSafe = false
       try {
-        database.exec('ROLLBACK')
-      } catch (rollbackError) {
-        if (error instanceof CacheSnapshotAssertionChanged) {
-          throw rollbackError
+        writerIdentity = assertCacheDatabaseMetadata(location, writerIdentity)
+        rollbackSafe = true
+      } catch (authorityError) {
+        error = authorityError
+      }
+      if (rollbackSafe) {
+        try {
+          database.exec('ROLLBACK')
+        } catch (rollbackError) {
+          if (error instanceof CacheSnapshotAssertionChanged) {
+            throw rollbackError
+          }
+          // The original transaction failure is more useful than a secondary rollback failure.
         }
-        // The original transaction failure is more useful than a secondary rollback failure.
       }
       throw error
     }
@@ -1587,28 +1586,50 @@ const writeCacheSnapshot = (
     writerFailure = error
     writerFailed = true
   }
-  try {
-    database.close()
-  } catch (error) {
-    if (!writerFailed || writerFailure instanceof CacheSnapshotAssertionChanged) {
-      writerFailure = error
-      writerFailed = true
-    }
+  const closeResult = closeCacheDatabaseWithMetadataAuthority(
+    location,
+    writerIdentity,
+    database,
+    writerFailed ? [writerFailure] : [],
+  )
+  writerIdentity = closeResult.database
+  if (closeResult.validationFailure !== undefined) {
+    writerFailure = closeResult.validationFailure
+    writerFailed = true
+  } else if (
+    closeResult.closeFailure !== undefined &&
+    (!writerFailed || writerFailure instanceof CacheSnapshotAssertionChanged)
+  ) {
+    writerFailure = closeResult.closeFailure
+    writerFailed = true
+  } else if (closeResult.closeSuppressed && !writerFailed) {
+    writerFailure = new EncephalonError(
+      'REPOSITORY_CHANGED',
+      'The Encephalon cache layout changed during the operation.',
+      { entry: 'node_modules/.cache/encephalon/brain.sqlite', invariant: 'stable-identity' },
+    )
+    writerFailed = true
   }
   if (writerFailed) {
     if (writerFailure instanceof CacheSnapshotAssertionChanged) {
+      const retryPrimary: CacheWriterPrimary = acceptsEmptyContent
+        ? { database: writerIdentity, kind: 'expected-new' }
+        : { database: writerIdentity, kind: 'expected-owned' }
       return { cause: writerFailure.snapshotCause, kind: 'snapshot-changed', retryPrimary }
     }
     if (writerFailure instanceof EncephalonError || writerFailure instanceof CacheDatabaseFailure) {
       throw writerFailure
     }
     if (isRecoverableCacheFailure(writerFailure)) {
-      return failCacheDatabase(writerFailure, identity)
+      return failCacheDatabase(writerFailure, writerIdentity)
     }
     throw writerFailure
   }
   if (rebuildResult !== undefined) {
-    return { kind: 'committed', rebuild: { database: identity, result: rebuildResult, snapshot } }
+    return {
+      kind: 'committed',
+      rebuild: { database: writerIdentity, result: rebuildResult, snapshot },
+    }
   }
   return fail('INTERNAL_ERROR', 'The Encephalon cache writer ended unexpectedly.')
 }
@@ -1654,9 +1675,29 @@ type CacheSnapshotWriter = {
 }
 
 type CacheSnapshotPreparationSession = {
-  recovered: boolean
+  recovery: CacheRecoverySession
   writer: CacheSnapshotWriter
 }
+
+type CacheRecoverySession = {
+  attempted: boolean
+  notificationPending: boolean
+}
+
+const createCacheRecoverySession = (): CacheRecoverySession => ({
+  attempted: false,
+  notificationPending: false,
+})
+
+const createCacheSnapshotPreparationSession = (
+  root: string,
+  location: CacheLocation,
+  primary: CacheWriterPrimary = { kind: 'create-if-missing' },
+  recovery: CacheRecoverySession = createCacheRecoverySession(),
+): CacheSnapshotPreparationSession => ({
+  recovery,
+  writer: cacheSnapshotWriter(root, location, primary),
+})
 
 const cacheSnapshotWriter = (
   root: string,
@@ -1728,21 +1769,21 @@ const writeCacheSnapshotWithSession = (
     try {
       return write()
     } catch (error) {
+      if (session.recovery.attempted) {
+        throw error
+      }
       if (session.writer.recover(error)) {
-        session.recovered = true
-        try {
-          return write()
-        } catch (failure) {
-          return rethrowAfterCacheRecovery(failure)
-        }
+        session.recovery.attempted = true
+        session.recovery.notificationPending = true
+        return write()
       }
       throw error
     }
   })()
   if (written.kind === 'committed') {
     const rebuild = { ...written.rebuild, observeDatabase: session.writer.observe }
-    if (session.recovered) {
-      session.recovered = false
+    if (session.recovery.notificationPending) {
+      session.recovery.notificationPending = false
       cacheReadTestHooks.afterDisposableCacheRecoveryRebuild?.(rebuild.result)
     }
     return rebuild
@@ -1755,12 +1796,13 @@ type CacheRebuilder = <Result>(
   location: CacheLocation,
   completion: (rebuild: CompletedCacheRebuild) => Result,
   primary?: CacheWriterPrimary,
+  recovery?: CacheRecoverySession,
 ) => Result
 
 const cacheRebuilder =
   (runCanonicalSnapshot: CanonicalSnapshotRunner): CacheRebuilder =>
-  (root, location, completion, primary = { kind: 'create-if-missing' }) => {
-    const session = { recovered: false, writer: cacheSnapshotWriter(root, location, primary) }
+  (root, location, completion, primary = { kind: 'create-if-missing' }, recovery = createCacheRecoverySession()) => {
+    const session = createCacheSnapshotPreparationSession(root, location, primary, recovery)
     return runCanonicalSnapshot(root, location, snapshot =>
       completion(writeCacheSnapshotWithSession(snapshot, session)),
     )
@@ -1816,6 +1858,7 @@ type DisposableCacheRecoveryOptions<Result> = {
   lockMode: CacheRecoveryLockMode
   readState?: CacheReadRecoveryState | undefined
   rebuilder: CacheRebuilder
+  recovery: CacheRecoverySession
 }
 
 const recoverDisposableCacheUnderLock = <Result>(
@@ -1824,6 +1867,7 @@ const recoverDisposableCacheUnderLock = <Result>(
   failure: unknown,
   rebuilder: CacheRebuilder,
   completion: (rebuild: CompletedCacheRebuild) => Result,
+  recovery: CacheRecoverySession,
 ): DisposableCacheRecovery<Result> => {
   const complete = (rebuild: CompletedCacheRebuild) => {
     cacheReadTestHooks.afterDisposableCacheRecoveryRebuild?.(rebuild.result)
@@ -1831,13 +1875,13 @@ const recoverDisposableCacheUnderLock = <Result>(
   }
   if (failure instanceof CacheDatabaseFailure) {
     quarantineCacheDatabase(location, failure.database)
-    return rebuilder(root, location, complete, { kind: 'create-exclusive' })
+    return rebuilder(root, location, complete, { kind: 'create-exclusive' }, recovery)
   }
   if (failure instanceof CacheDatabaseObservedMissing) {
     if (inspectCacheDatabase(location, 'brain.sqlite') === undefined) {
       cacheReadTestHooks.afterMissingPrimaryRecoveryObservation?.()
       try {
-        return rebuilder(root, location, complete, { kind: 'create-exclusive' })
+        return rebuilder(root, location, complete, { kind: 'create-exclusive' }, recovery)
       } catch (error) {
         if (error instanceof CacheDatabaseCreationConflict) {
           return { kind: 'retry' }
@@ -1857,13 +1901,14 @@ const recoverDisposableCacheOnce = <Result>(
   lockMode: CacheRecoveryLockMode,
   rebuilder: CacheRebuilder,
   completion: (rebuild: CompletedCacheRebuild) => Result,
+  recovery: CacheRecoverySession,
 ): DisposableCacheRecovery<Result> => {
   if (isRecoverableCacheFailure(failure)) {
     return lockMode === 'acquire'
       ? withCacheOperationLock(root, location, captured =>
-          recoverDisposableCacheUnderLock(root, captured, failure, rebuilder, completion),
+          recoverDisposableCacheUnderLock(root, captured, failure, rebuilder, completion, recovery),
         )
-      : recoverDisposableCacheUnderLock(root, location, failure, rebuilder, completion)
+      : recoverDisposableCacheUnderLock(root, location, failure, rebuilder, completion, recovery)
   }
   throw failure
 }
@@ -1878,7 +1923,7 @@ const runWithDisposableCacheRecovery = <Result>(
     return operation()
   } catch (failure) {
     if (!(failure instanceof EncephalonError) && isRecoverableCacheFailure(failure)) {
-      if (failure instanceof Error && cacheRecoveryAttemptedFailures.has(failure)) {
+      if (options.recovery.attempted) {
         throw failure
       }
       if (options.readState?.rebuild !== undefined) {
@@ -1893,6 +1938,7 @@ const runWithDisposableCacheRecovery = <Result>(
         }
         return operation()
       }
+      options.recovery.attempted = true
       const recovery = recoverDisposableCacheOnce(
         root,
         location,
@@ -1900,6 +1946,7 @@ const runWithDisposableCacheRecovery = <Result>(
         options.lockMode,
         options.rebuilder,
         complete,
+        options.recovery,
       )
       if (recovery.kind === 'complete') {
         return recovery.result
@@ -2088,7 +2135,7 @@ function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
     return operation(location)
   }
   const completeSnapshot = (captured: CacheLocation) => {
-    const preparation = session ?? { recovered: false, writer: cacheSnapshotWriter(root, captured) }
+    const preparation = session ?? createCacheSnapshotPreparationSession(root, captured)
     const { writer } = preparation
     return runCanonicalSnapshot(root, captured, snapshot => {
       snapshot.assertCurrent()
@@ -2099,8 +2146,12 @@ function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
             return completed.result
           }
         } catch (error) {
+          if (preparation.recovery.attempted) {
+            throw error
+          }
           if (writer.recover(error)) {
-            preparation.recovered = true
+            preparation.recovery.attempted = true
+            preparation.recovery.notificationPending = true
           } else {
             throw error
           }
@@ -2153,13 +2204,15 @@ const prepareResolved = (
   runCanonicalSnapshot: CanonicalSnapshotRunner,
   session?: CacheSnapshotPreparationSession,
 ): PrepareResult => {
+  const preparation = session ?? createCacheSnapshotPreparationSession(root, capturedLocation)
   const rebuilder = cacheRebuilder(runCanonicalSnapshot)
   const operation = () =>
-    prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lockMode, runCanonicalSnapshot, session)
+    prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lockMode, runCanonicalSnapshot, preparation)
   return runWithDisposableCacheRecovery(root, capturedLocation, operation, {
     completion: { complete: rebuild => rebuild.result, kind: 'complete-from-rebuild' },
     lockMode,
     rebuilder,
+    recovery: preparation.recovery,
   })
 }
 
@@ -2175,18 +2228,6 @@ export const prepareResolvedRepository = (
 }
 
 /** @internal */
-export const prepareResolvedCanonicalSnapshot = (
-  root: string,
-  snapshot: ValidatedCanonicalSnapshot,
-  lockMode: CacheRecoveryLockMode = 'acquire',
-  location?: CacheLocation,
-): PrepareResult => {
-  const captured = location ?? inspectCacheLocation(root)
-  const runCanonicalSnapshot = sealedCanonicalSnapshotRunner(snapshot)
-  return prepareResolved(root, lockMode, captured, runCanonicalSnapshot)
-}
-
-/** @internal */
 export const createResolvedCanonicalSnapshotPreparer = (
   root: string,
   location: CacheLocation,
@@ -2194,7 +2235,7 @@ export const createResolvedCanonicalSnapshotPreparer = (
   hydrate: (snapshot: ValidatedCanonicalSnapshot) => PrepareResult
   prepare: (snapshot: ValidatedCanonicalSnapshot) => PrepareResult
 }> => {
-  const session = { recovered: false, writer: cacheSnapshotWriter(root, location) }
+  const session = createCacheSnapshotPreparationSession(root, location)
   return Object.freeze({
     hydrate: snapshot => writeCacheSnapshotWithSession(snapshot, session).result,
     prepare: snapshot => prepareResolved(root, 'held', location, sealedCanonicalSnapshotRunner(snapshot), session),
@@ -2290,6 +2331,7 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
     const location = inspectCacheLocation(root)
     return withRepositoryCanonicalSnapshotRunner(root, location, runCanonicalSnapshot => {
       const rebuilder = cacheRebuilder(runCanonicalSnapshot)
+      const preparation = createCacheSnapshotPreparationSession(root, location)
       return runWithDisposableCacheRecovery(
         root,
         location,
@@ -2300,8 +2342,15 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
             { kind: 'read', read, state: readState },
             'acquire',
             runCanonicalSnapshot,
+            preparation,
           ),
-        { completion: { kind: 'retry-operation' }, lockMode: 'acquire', readState, rebuilder },
+        {
+          completion: { kind: 'retry-operation' },
+          lockMode: 'acquire',
+          readState,
+          rebuilder,
+          recovery: preparation.recovery,
+        },
       )
     })
   } catch (error) {
@@ -2583,6 +2632,7 @@ const gatherRecordsFromDatabase = (input: GatherInput, searches: readonly Litera
     const location = inspectCacheLocation(root)
     return withRepositoryCanonicalSnapshotRunner(root, location, runCanonicalSnapshot => {
       const rebuilder = cacheRebuilder(runCanonicalSnapshot)
+      const recovery = createCacheRecoverySession()
       if (input.hydrate === true) {
         const readAfterHydration = (heldLocation: CacheLocation, rebuild: CompletedCacheRebuild) => {
           readState.rebuild = rebuild
@@ -2598,7 +2648,8 @@ const gatherRecordsFromDatabase = (input: GatherInput, searches: readonly Litera
           runWithDisposableCacheRecovery(
             root,
             heldLocation,
-            () => rebuilder(root, heldLocation, rebuild => readAfterHydration(heldLocation, rebuild)),
+            () =>
+              rebuilder(root, heldLocation, rebuild => readAfterHydration(heldLocation, rebuild), undefined, recovery),
             {
               completion: {
                 complete: hydration => readAfterHydration(heldLocation, hydration),
@@ -2607,10 +2658,12 @@ const gatherRecordsFromDatabase = (input: GatherInput, searches: readonly Litera
               lockMode: 'held',
               readState,
               rebuilder,
+              recovery,
             },
           ),
         )
       }
+      const preparation = createCacheSnapshotPreparationSession(root, location, undefined, recovery)
       return runWithDisposableCacheRecovery(
         root,
         location,
@@ -2625,8 +2678,15 @@ const gatherRecordsFromDatabase = (input: GatherInput, searches: readonly Litera
             },
             'acquire',
             runCanonicalSnapshot,
+            preparation,
           ),
-        { completion: { kind: 'retry-operation' }, lockMode: 'acquire', readState, rebuilder },
+        {
+          completion: { kind: 'retry-operation' },
+          lockMode: 'acquire',
+          readState,
+          rebuilder,
+          recovery,
+        },
       )
     })
   } catch (error) {

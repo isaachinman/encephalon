@@ -726,7 +726,8 @@ export const assertCacheDatabase = (location: CacheLocation, database: CacheData
   return changedLayout(databaseRelativePath(database.name), 'stable-identity')
 }
 
-const assertCacheDatabaseMetadata = (location: CacheLocation, database: CacheDatabase) => {
+/** @internal */
+export const assertCacheDatabaseMetadata = (location: CacheLocation, database: CacheDatabase) => {
   // Opening and closing any sibling file descriptor after BEGIN can release
   // process-scoped SQLite locks on POSIX, so this boundary observes metadata only.
   assertCacheLocation(location)
@@ -785,14 +786,47 @@ const suppressUnsafeDatabaseClose = (
   snapshot: CacheDatabase,
   database: { close: () => void },
   errors: readonly unknown[],
+  metadataAuthorityFailed = false,
 ) => {
   const closeProvenSafe = cacheDatabaseCloseIsProvenSafe(location, snapshot)
   const markedUnsafeSidecar = errors.some(error => error instanceof UnsafeCacheDatabaseSidecar)
-  const suppressClose = markedUnsafeSidecar || !closeProvenSafe
+  const suppressClose = metadataAuthorityFailed || markedUnsafeSidecar || !closeProvenSafe
   if (suppressClose) {
     cacheDatabaseCloseSafetyLatches.set(snapshot.path, database)
   }
   return suppressClose
+}
+
+/** @internal */
+export const closeCacheDatabaseWithMetadataAuthority = (
+  location: CacheLocation,
+  snapshot: CacheDatabase,
+  database: { close: () => void },
+  errors: readonly unknown[] = [],
+) => {
+  let current = snapshot
+  let validationFailure: unknown
+  try {
+    current = assertCacheDatabaseMetadata(location, current)
+  } catch (error) {
+    validationFailure = error
+  }
+  const closeSuppressed = suppressUnsafeDatabaseClose(
+    location,
+    current,
+    database,
+    [...errors, validationFailure],
+    validationFailure !== undefined,
+  )
+  let closeFailure: unknown
+  if (!closeSuppressed) {
+    try {
+      database.close()
+    } catch (error) {
+      closeFailure = error
+    }
+  }
+  return { closeFailure, closeSuppressed, database: current, validationFailure }
 }
 
 const initialCacheDatabase = <Database>(options: VerifiedCacheDatabaseOptions<Database>) => {
