@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-24 for code and behavioural-test snapshot `7666139ad3d1f4853cfee8710ddc841dc3978aec`.
+Last reviewed: 2026-08-24 for code and behavioural-test snapshot `d6b0075618da3d90314d0624014f8a896f2c4143`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -206,6 +206,8 @@ The rollout order is mandatory:
 5. Before removing any obsolete context, use a temporary non-`main` pull-request commit to verify that an intentionally failing current-Node check or release-equivalent check blocks an ordinary merge. Revert the temporary failure and rerun every required context at the exact clean head; never merge the deliberately failing revision.
 
 This contract describes a future maintainer-operated rollout. It does not claim that MAR-2574 has merged, MAR-2640 has been retargeted, or GitHub branch protection has been changed.
+
+The exact reviewed MAR-2640 code and behavioural-test snapshot for this boundary is `d6b0075618da3d90314d0624014f8a896f2c4143`. The generated-source authority accepts only its deterministic content with native LF or checkout-equivalent CRLF line endings. These release-gate changes do not alter the runtime API, package exports, canonical data, cache schema, generated declarations, or published dependency set.
 
 ## Contract Change Process
 

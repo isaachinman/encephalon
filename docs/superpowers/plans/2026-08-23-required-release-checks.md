@@ -86,11 +86,13 @@ export const renderPackageVersionSource = (version: string): string =>
   `// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = ${JSON.stringify(version)}\n`
 
 export const assertPackageVersionSource = (version: string, source: string): void => {
-  if (source !== renderPackageVersionSource(version)) {
+  if (source.replaceAll('\r\n', '\n') !== renderPackageVersionSource(version)) {
     throw new Error(staleGeneratedVersionMessage)
   }
 }
 ```
+
+CRLF normalisation is limited to checkout-equivalent line endings. Wrappers, extra content, lone carriage returns, stale versions, and every other byte-level content change remain rejected.
 
 Create `scripts/check-generated-version.ts` as the non-mutating adapter:
 
@@ -299,18 +301,23 @@ Do not update main branch protection from the stacked draft state. PR #66 curren
 
 ## Implementation Evidence
 
-- Task 1 was committed as `190ebc8b62e5226cf6e4e31ffcb587283cc2123a` (`[MAR-2640] Check generated package version before builds`).
-- Task 2 was committed as `894bb1f5d30c6c3c2e2b7ea7c0addf662f5f5480` (`[MAR-2640] Run release checks before merge`). Task 3 started on the exact required branch and this exact head.
-- Task 3 adds maintained assertions for the pre-build non-mutating generated-source check, release execution on pull requests and trusted `main` pushes, trusted-`main`-only bounded artifact upload, and the exact five required contexts. The README development sequence now runs `bun run check:generated` before any build. The maintained contract records the guarded post-MAR-2574 rollout, the read-only inspection command, the narrow `required_status_checks` mutation, preservation of `enforce_admins: false`, `allow_force_pushes: true`, and every unrelated setting, and explicitly makes no external-rollout claim.
+- Generated-version authority: `c3fbbbb32c06e104b3a348566afb927e68963e3e` (`[MAR-2640] Check generated package version before builds`).
+- Pull-request release gate: `1f3d217411c161ba4e2aefd172d948ecd9961084` (`[MAR-2640] Run release checks before merge`).
+- Maintained contract and rollout documentation: `899fc7181904b4edfd6e76a20ded3dec0b47bd54` and `bbae03d8bcd6fd6cf6de6567acd3f6884c455044`.
+- Regression hardening: `b8b3476725c80d67788fe3aef3d26b2783d9a9c3` and `d6b0075618da3d90314d0624014f8a896f2c4143`. The final semantic snapshot recognises every top-level workflow step marker, pins both generated-source adapters to the exact checker, accepts checkout-equivalent CRLF, and rejects wrappers or other content drift.
+- The exact MAR-2640 code and behavioural-test snapshot is `d6b0075618da3d90314d0624014f8a896f2c4143`. It is rebased on the final repository-controlled MAR-2574 snapshot `54e5ee87464475b2b37af1af537146a0f006b330`.
+- The README and maintained contract require the pre-build non-mutating generated-source check, release execution on pull requests and trusted `main` pushes, trusted-`main`-only bounded artifact upload, and the exact five required contexts. They record the guarded post-MAR-2574 rollout, the read-only inspection command, the narrow `required_status_checks` mutation, preservation of `enforce_admins: false`, `allow_force_pushes: true`, and every unrelated setting, without claiming external rollout completion.
 
 ### Red-green evidence
 
 - RED: `node --test --test-name-pattern "runs pull-request and current-Node package checks" test/package.test.ts` exited 1 with 0 passing and 1 failing test. It failed on the new README assertion because the old text said only trusted `main` pushes ran the release-equivalent gate.
 - GREEN: the same focused command exited 0 with 1 passing and 0 failing tests after the maintained documents were updated.
+- RED: the top-level workflow-marker regression returned `[]` for representative `if`, `shell`, and `id` steps while the new test expected all three markers. GREEN: the widened exact-indentation parser returned all markers and the complete package contract passed.
+- RED: the CRLF-equivalent generated source raised the stale-source error. GREEN: normalising only CRLF to LF accepted the platform-equivalent source while focused tests still rejected stale versions, wrappers, and misleading embedded versions.
 
 ### Local release gates
 
-Run on 2026-08-23 in the required order:
+Run on 2026-08-24 in the required order at semantic snapshot `d6b0075618da3d90314d0624014f8a896f2c4143`:
 
 | Command | Result |
 | --- | --- |
@@ -318,16 +325,16 @@ Run on 2026-08-23 in the required order:
 | `bun run check:generated` | Exit 0; no stale generated source. |
 | `bun run lint` | Exit 0; checked 120 files with no fixes. |
 | `bun run typecheck` | Exit 0 across the source, scripts, test, and runtime-guard TypeScript projects. |
-| `bun run test` | Exit 0; 566 tests, 564 passed, 2 skipped, 0 failed. |
+| `bun run test` | Exit 0; 567 tests, 565 passed, 2 skipped, 0 failed. |
 | `bun run benchmark:check` | Exit 0 for the schema-version 2 CI profile; all timing, memory, and cache-size budgets passed. |
 | `bun run build` | Exit 0 with no generated drift. |
-| `bun run check:package` | Exit 0. |
-| `bun run check:publish` | Exit 0 after recognising the expected refusal: `You cannot publish over the previously published versions: 0.2.0.` |
-| `bun run check:workflows` | Exit 0; 22 passed, 1 platform skip, 0 failed, and the repository policy check was silent. |
+| `bun run check:package` | The first invocation stopped before validation because the host's default npm cache contains root-owned entries. Re-running with an isolated temporary npm cache exited 0; the repository and user cache were unchanged. |
+| `bun run check:publish` | With the same isolated temporary npm cache, exited 0 after recognising the expected refusal: `You cannot publish over the previously published versions: 0.2.0.` |
+| `bun run check:workflows` | Exit 0; 63 passed, 1 platform skip, 0 failed, and the repository policy check was silent. |
 | `node dist/cli.mjs validate --root .` | Exit 0; `{"errors":[],"recordsChecked":38,"truncated":false,"valid":true}`. |
 | `git diff --check` | Exit 0 with no output. |
-| `git status --short --branch` | Exit 0; only `README.md`, `docs/contract.md`, `test/package.test.ts`, and this plan were changed. No generated file or package artifact drift was present. |
+| `git status --short --branch` | Exit 0 with a clean semantic worktree. No generated file or package artifact drift was present. |
 
-Read-only `gh api repos/isaachinman/encephalon/branches/main/protection` inspection exited 0 and confirmed that rollout has not occurred: strict protection currently requires only the three Node 24.15 OS contexts, while `enforce_admins.enabled` remains false and `allow_force_pushes.enabled` remains true. No GitHub settings were mutated.
+Read-only `gh api repos/isaachinman/encephalon/branches/main/protection` inspection on 2026-08-24 exited 0 and confirmed that rollout has not occurred: strict protection currently requires only the three Node 24.15 OS contexts, while `enforce_admins.enabled` remains false and `allow_force_pushes.enabled` remains true. No GitHub settings were mutated.
 
-Self-review found no runtime, public API, CLI, stored-data, dependency, secret, or unrelated-file change. The documentation uses British English, gives the exact five context names, keeps artifact upload main-only, and defers protection mutation until MAR-2574 has merged and the retargeted MAR-2640 exact head has emitted all five successful contexts.
+The semantic diff contains no runtime API, CLI, stored-data, cache-schema, published-dependency, secret, or unrelated-file change. The documentation uses British English, gives the exact five context names, keeps artifact upload main-only, and defers protection mutation until MAR-2574 has merged and the retargeted MAR-2640 exact head has emitted all five successful contexts.
