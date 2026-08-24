@@ -1670,6 +1670,47 @@ jobs:
   ])
 })
 
+// Mutation caught: secret-context values passed as ordinary inputs would bypass both external forwarding and local callee secret checks.
+test('rejects secret-context inputs forwarded to reusable workflows', () => {
+  const root = createFixture({
+    '.github/workflows/called.yml': `name: Called
+on: workflow_call
+permissions:
+  contents: read
+jobs: {}
+`,
+    '.github/workflows/caller.yml': `name: Caller
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  external:
+    uses: owner/repository/.github/workflows/called.yml@0123456789abcdef0123456789abcdef01234567
+    permissions: {}
+    with:
+      token: \${{ secrets.EXTERNAL_TOKEN }}
+  local:
+    uses: ./.github/workflows/called.yml
+    permissions: {}
+    with:
+      token: \${{ secrets.LOCAL_TOKEN }}
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/caller.yml',
+      location: 'jobs.external.with',
+      rule: 'credential-forwarding',
+    },
+    {
+      file: '.github/workflows/caller.yml',
+      location: 'jobs.local.with',
+      rule: 'credential-forwarding',
+    },
+  ])
+})
+
 // Mutation caught: reusing runner-job permission defaults would give an external reusable workflow configurable repository authority.
 test('accepts a pinned external reusable workflow only with exact empty job permissions', () => {
   const root = createFixture({
@@ -2542,6 +2583,11 @@ runs:
   image: Dockerfile
 `,
     '.github/actions/dockerfile/Dockerfile': 'FROM alpine:3.20\n',
+    '.github/actions/mutable-hub/action.yml': `name: Mutable Hub image
+runs:
+  using: docker
+  image: alpine:3.20
+`,
     '.github/actions/mutable/action.yml': `name: Mutable image
 runs:
   using: docker
@@ -2562,12 +2608,18 @@ jobs:
     steps:
       - uses: $/.github/actions/pinned
       - uses: $/.github/actions/mutable
+      - uses: $/.github/actions/mutable-hub
       - uses: $/.github/actions/dockerfile
       - uses: $/.github/actions/dockerfile-relative
 `,
   })
 
   assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/actions/mutable-hub/action.yml',
+      location: 'runs.image',
+      rule: 'external-image-digest',
+    },
     {
       file: '.github/actions/mutable/action.yml',
       location: 'runs.image',

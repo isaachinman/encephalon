@@ -40,6 +40,7 @@ export type ExternalReferenceObservation = Readonly<{
 type ParsedObject = Record<string, unknown>
 
 type ExecutableReference = Readonly<{
+  dockerImage?: true
   kind: 'action' | 'workflow'
   location: string
   path: readonly (number | string)[]
@@ -181,7 +182,8 @@ const sourceIntegrityFinding = {
 } as const satisfies WorkflowPolicyFinding
 const workflowPolicyGuidance: Record<Exclude<WorkflowPolicyRule, 'permission'>, string> = {
   'credential-environment': 'target the exact pullfrog-review environment',
-  'credential-forwarding': 'remove secrets from the external reusable-workflow call',
+  'credential-forwarding':
+    'pass local credentials through secrets rather than with; remove all credentials from external reusable-workflow calls',
   'external-image-digest': 'pin the external Docker image to a lowercase 64-character SHA-256 digest',
   'external-reference-sha': 'pin the external reference to a lowercase 40-character commit SHA',
   'local-reference': 'use an existing repository-contained target allowed for this local reference',
@@ -790,9 +792,18 @@ const executableReferences = (
     })
   } else if (kind === 'action' && isPlainObject(document.runs)) {
     const dockerImage = document.runs.image
+    const localDockerfileImage = dockerImage === 'Dockerfile' || dockerImage === './Dockerfile'
     const dockerImageReference =
-      document.runs.using === 'docker' && typeof dockerImage === 'string' && dockerImage.startsWith('docker://')
-        ? [{ kind: 'action' as const, location: 'runs.image', path: ['runs', 'image'], reference: dockerImage }]
+      document.runs.using === 'docker' && typeof dockerImage === 'string' && !localDockerfileImage
+        ? [
+            {
+              dockerImage: true as const,
+              kind: 'action' as const,
+              location: 'runs.image',
+              path: ['runs', 'image'],
+              reference: dockerImage,
+            },
+          ]
         : []
     const { accepted: stepsAccepted, references: stepActionReferences } = stepReferences(
       document.runs.steps,
@@ -1020,12 +1031,22 @@ const inspectWorkflowJobs = (
       if (accepted && isPlainObject(value)) {
         const reusableWorkflowReference = value.uses
         if (typeof reusableWorkflowReference === 'string') {
-          if (localReference.test(reusableWorkflowReference)) {
-            inspectJobPermissions(value, jobName, file, findings)
-          } else {
-            inspectExternalReusableWorkflowPermissions(value, jobName, file, findings)
-            if (value.secrets !== undefined) {
-              findings.push({ file, location: `jobs.${jobName}.secrets`, rule: 'credential-forwarding' })
+          const { accepted: inputsAccepted, containsSecret: inputContainsSecret } =
+            value.with === undefined
+              ? { accepted: true, containsSecret: false }
+              : containsSecretExpression(value.with, parsedTreeBudget)
+          accepted = inputsAccepted
+          if (accepted) {
+            if (inputContainsSecret) {
+              findings.push({ file, location: `jobs.${jobName}.with`, rule: 'credential-forwarding' })
+            }
+            if (localReference.test(reusableWorkflowReference)) {
+              inspectJobPermissions(value, jobName, file, findings)
+            } else {
+              inspectExternalReusableWorkflowPermissions(value, jobName, file, findings)
+              if (value.secrets !== undefined) {
+                findings.push({ file, location: `jobs.${jobName}.secrets`, rule: 'credential-forwarding' })
+              }
             }
           }
         } else {
@@ -1127,7 +1148,14 @@ export const inspectWorkflowPolicy = (
             traversalIntegrityAccepted = executable.accepted
             for (const reference of executable.references) {
               if (traversalIntegrityAccepted) {
-                if (localReference.test(reference.reference)) {
+                if (
+                  reference.kind === 'action' &&
+                  (reference.dockerImage === true || reference.reference.startsWith('docker://'))
+                ) {
+                  if (!fullDockerImageDigest.test(reference.reference)) {
+                    findings.push({ file, location: reference.location, rule: 'external-image-digest' })
+                  }
+                } else if (localReference.test(reference.reference)) {
                   const workspaceRelativeAction = reference.kind === 'action' && reference.reference.startsWith('./')
                   const target = workspaceRelativeAction
                     ? ({ kind: 'local-reference' } as const)
@@ -1149,10 +1177,6 @@ export const inspectWorkflowPolicy = (
                     if (traversalIntegrityAccepted) {
                       scheduleFile(target.path, reference.kind)
                     }
-                  }
-                } else if (reference.kind === 'action' && reference.reference.startsWith('docker://')) {
-                  if (!fullDockerImageDigest.test(reference.reference)) {
-                    findings.push({ file, location: reference.location, rule: 'external-image-digest' })
                   }
                 } else {
                   if (
