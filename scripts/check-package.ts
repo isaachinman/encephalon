@@ -246,7 +246,16 @@ try {
       'node',
       '--input-type=module',
       '--eval',
-      "const api = await import('encephalon'); if (typeof api.prepare !== 'function' || typeof api.initEncephalon !== 'function') process.exitCode = 1",
+      [
+        "const api = await import('encephalon')",
+        "if (typeof api.prepare !== 'function' || typeof api.initEncephalon !== 'function') process.exitCode = 1",
+        'let getterCalls = 0',
+        'const input = {}',
+        "Object.defineProperty(input, 'root', { get: () => { getterCalls += 1; throw new Error('hostile input secret') } })",
+        'let rejected = false',
+        "try { api.prepare(input) } catch (error) { rejected = error instanceof api.EncephalonError && error.code === 'INVALID_ARGUMENT' }",
+        'if (!rejected || getterCalls !== 0) process.exitCode = 1',
+      ].join('; '),
     ],
     consumer,
   )
