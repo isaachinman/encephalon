@@ -2415,7 +2415,7 @@ describe('cache filesystem containment', () => {
     assert.equal(readFileSync(join(outside, 'sentinel'), 'utf8'), 'outside recovery')
   })
 
-  test('rejects an operation lock candidate symlink without changing its target', () => {
+  test('ignores an unrelated operation lock candidate symlink without changing its target', () => {
     const root = createRoot()
     const outside = createOutsideDirectory()
     mkdirSync(cacheDirectoryPath(root), { recursive: true })
@@ -2426,8 +2426,18 @@ describe('cache filesystem containment', () => {
       process.platform === 'win32' ? 'junction' : 'dir',
     )
 
-    assertCacheLayoutRejected(() => withOperationLock(root, () => 'entered'))
+    const linkPath = join(cacheDirectoryPath(root), 'operation.lock.00000000-0000-4000-8000-000000000000')
+    const before = lstatSync(linkPath, { bigint: true })
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
     assert.equal(readFileSync(join(outside, 'sentinel'), 'utf8'), 'outside candidate')
+    const after = lstatSync(linkPath, { bigint: true })
+    assert.equal(after.isSymbolicLink(), true)
+    assert.equal(after.dev, before.dev)
+    assert.equal(after.ino, before.ino)
   })
 })
 
