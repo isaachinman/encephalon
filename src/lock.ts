@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import {
-  assertCacheLockCandidates,
   type CacheDatabase,
   CacheDatabaseCreationConflict,
   CacheDatabaseFailure,
@@ -17,16 +16,23 @@ import {
   observeCacheOwnedDirectory,
   observeCacheOwner,
   observeCacheRecoveryWitness,
+  observeExactCacheOwnedDirectoryChildren,
   openVerifiedCacheDatabase,
   promoteCacheOwnedDirectory,
   publishCacheOwnerRecovery,
   quarantineCacheDatabase,
   quarantineCacheOwnedDirectory,
   sameCacheEntryIdentity,
+  sameCacheOwnedFileObservation,
   writeCacheOwner,
 } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { sameStableEntryMetadata } from './filesystem-entry.ts'
+import {
+  type LockCandidateDirectoryReader,
+  type LockCandidateMaintenanceStats,
+  maintainLockCandidates,
+} from './lock-candidates.ts'
 import { classifySQLiteError, type SQLiteErrorCategory } from './sqlite-error.ts'
 
 const LOCK_WAIT_MILLISECONDS = 60_000
@@ -59,12 +65,17 @@ type ObservedOwner = {
 type RecoveryWitnessObservation = ReturnType<typeof observeCacheRecoveryWitness>
 
 type LockTestHooks = {
+  afterCandidateCreation?: ((path: string) => void) | undefined
+  afterCandidateMaintenance?: ((stats: LockCandidateMaintenanceStats) => void) | undefined
+  afterCandidateOwnerPublication?: ((path: string) => void) | undefined
   afterRecoveryCreation?: (() => void) | undefined
   afterRecoveryStaleObservation?: (() => void) | undefined
   afterStaleObservation?: (() => void) | undefined
   duringRecoveryObservation?: (() => void) | undefined
   gateClose?: ((database: DatabaseSync) => void) | undefined
   now?: (() => number) | undefined
+  beforeCandidateMaintenance?: (() => void) | undefined
+  openCandidateDirectory?: ((path: string) => LockCandidateDirectoryReader) | undefined
 }
 
 type RecoveryMarkerObservation =
@@ -199,36 +210,12 @@ const ownerFromObservation = (observation: CacheOwnedFileObservation): ObservedO
 const observeOwner = (location: CacheLocation, directory: CacheOwnedDirectory): ObservedOwner | undefined =>
   ownerFromObservation(observeCacheOwner(location, directory))
 
-const readOwner = (location: CacheLocation, directory: CacheOwnedDirectory) => {
-  const observed = observeOwner(location, directory)
-  return observed === undefined ? undefined : observed.owner
-}
-
 const sameObservedOwner = (first: ObservedOwner, second: ObservedOwner) =>
   first.contents === second.contents &&
   first.phased === second.phased &&
   sameLockOwner(first.owner, second.owner) &&
   sameCacheEntryIdentity(first.file, second.file) &&
   sameStableEntryMetadata(first.metadata, second.metadata)
-
-const sameCacheOwnedFileObservation = (first: RecoveryWitnessObservation, second: RecoveryWitnessObservation) => {
-  if (first.kind === 'missing' || second.kind === 'missing') {
-    return first.kind === second.kind
-  }
-  if (first.kind === 'oversized' || second.kind === 'oversized') {
-    return (
-      first.kind === 'oversized' &&
-      second.kind === 'oversized' &&
-      sameCacheEntryIdentity(first.file, second.file) &&
-      sameStableEntryMetadata(first.metadata, second.metadata)
-    )
-  }
-  return (
-    first.contents === second.contents &&
-    sameCacheEntryIdentity(first.file, second.file) &&
-    sameStableEntryMetadata(first.metadata, second.metadata)
-  )
-}
 
 const recoveredWitnessMatchesOwner = (owner: ObservedOwner, witness: RecoveryWitnessObservation) => {
   if (owner.phased && owner.owner.phase === 'recovering' && witness.kind === 'contents') {
@@ -274,42 +261,24 @@ const transientSharingViolation = (error: unknown) => {
 const releaseOwnedLock = (
   location: CacheLocation,
   directory: CacheOwnedDirectory,
-  token: string,
-  retrySharingViolations = false,
+  owner: CacheOwnedFileObservation,
+  recoveryWitness: CacheOwnedFileObservation,
 ) => {
-  const maximumAttempts = retrySharingViolations ? RECOVERY_RELEASE_ATTEMPTS : 1
-  let complete = false
-  for (const attempt of Array.from({ length: maximumAttempts }, (_, index) => index)) {
-    const owner = readOwner(location, directory)
-    if (owner !== undefined && owner.token === token) {
-      try {
-        quarantineCacheOwnedDirectory(location, directory, () => {
-          const currentOwner = readOwner(location, directory)
-          return currentOwner !== undefined && currentOwner.token === token
-        })
-        complete = true
-      } catch (error) {
-        const canRetry = retrySharingViolations && transientSharingViolation(error) && attempt < maximumAttempts - 1
-        if (canRetry) {
-          const currentOwner = cacheOwnedDirectoryIsCurrent(location, directory)
-            ? readOwner(location, directory)
-            : undefined
-          const stillOwned = currentOwner !== undefined && currentOwner.token === token
-          if (stillOwned) {
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RECOVERY_POLL_MILLISECONDS)
-          } else {
-            complete = true
-          }
-        } else {
-          throw error
-        }
-      }
-    } else {
-      complete = true
-    }
-    if (complete) {
-      break
-    }
+  const exactOwnership = () => {
+    const children = observeExactCacheOwnedDirectoryChildren(location, directory, 2)
+    return (
+      cacheOwnedDirectoryIsCurrent(location, directory) &&
+      sameCacheOwnedFileObservation(observeCacheOwner(location, directory), owner) &&
+      sameCacheOwnedFileObservation(observeCacheRecoveryWitness(location, directory), recoveryWitness) &&
+      children.length === 1 &&
+      children[0] === 'owner.json'
+    )
+  }
+  if (exactOwnership()) {
+    quarantineCacheOwnedDirectory(location, directory, exactOwnership, {
+      expectedChildren: ['owner.json'],
+      expectedFiles: { owner, recoveryWitness },
+    })
   }
 }
 
@@ -342,6 +311,7 @@ const releaseOwnedRecoveryMarker = (
         const expectedOwner: CacheOwnedFileObservation = marker.ownerFile
         const expectedWitness: CacheOwnedFileObservation = marker.recovered ?? { kind: 'missing' }
         quarantineCacheOwnedDirectory(location, marker.directory, markerRemainsCurrent, {
+          expectedChildren: marker.recovered === undefined ? ['owner.json'] : ['owner.json', 'owner.recovered.json'],
           expectedFiles: {
             owner: expectedOwner,
             recoveryWitness: expectedWitness,
@@ -405,7 +375,6 @@ export const withOperationLock = <Result>(
   capturedLocation?: CacheLocation,
 ): Result => {
   const location = capturedLocation ?? inspectCacheLocation(root)
-  assertCacheLockCandidates(location)
   const lockName = 'operation.lock'
   const recoveryName = 'operation-lock.recovery'
   const token = randomUUID()
@@ -414,6 +383,8 @@ export const withOperationLock = <Result>(
   const startedAt = now()
   let gate: HeldGate | undefined
   let candidateDirectory: CacheOwnedDirectory | undefined
+  let candidateOwnerFile: CacheOwnedFileObservation | undefined
+  let candidateRecoveryWitness: CacheOwnedFileObservation | undefined
   let ownedLockDirectory: CacheOwnedDirectory | undefined
 
   const remainingMilliseconds = () => Math.max(0, LOCK_WAIT_MILLISECONDS - (now() - startedAt))
@@ -507,6 +478,10 @@ export const withOperationLock = <Result>(
             observation.directory,
             () => recoveryMarkerRemainsStale(observation),
             {
+              expectedChildren: [
+                ...(observation.ownerFile.kind === 'missing' ? [] : ['owner.json']),
+                ...(observation.witness.kind === 'missing' ? [] : ['owner.recovered.json']),
+              ],
               expectedFiles: {
                 owner: observation.ownerFile,
                 recoveryWitness: observation.witness,
@@ -885,12 +860,22 @@ export const withOperationLock = <Result>(
   let operationOutcome: { value: Result } | undefined
   try {
     candidateDirectory = createCacheOwnedDirectory(location, candidateName)
+    candidateRecoveryWitness = observeCacheRecoveryWitness(location, candidateDirectory)
+    const missingCandidateOwner = observeCacheOwner(location, candidateDirectory)
+    testHooks.afterCandidateCreation?.(candidateDirectory.path)
+    if (missingCandidateOwner.kind !== 'missing' || candidateRecoveryWitness.kind !== 'missing') {
+      return fail('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
+        entry: 'node_modules/.cache/encephalon/operation.lock',
+        invariant: 'stable-owner-evidence',
+      })
+    }
     const candidateOwner: LockOwner = {
       acquiredAt: new Date().toISOString(),
       pid: process.pid,
       token,
     }
-    writeCacheOwner(location, candidateDirectory, `${JSON.stringify(candidateOwner)}\n`)
+    candidateOwnerFile = writeCacheOwner(location, candidateDirectory, `${JSON.stringify(candidateOwner)}\n`)
+    testHooks.afterCandidateOwnerPublication?.(candidateDirectory.path)
 
     const observedLock = observeCacheOwnedDirectory(location, lockName)
     if (observedLock.kind === 'stable') {
@@ -903,16 +888,58 @@ export const withOperationLock = <Result>(
     // must still hold that gate, so any directory metadata seen here is orphaned.
     const staleLock = inspectCacheOwnedDirectory(location, lockName)
     if (staleLock !== undefined) {
-      quarantineCacheOwnedDirectory(location, staleLock)
+      const staleOwner = observeCacheOwner(location, staleLock)
+      const staleWitness = observeCacheRecoveryWitness(location, staleLock)
+      const expectedChildren = staleOwner.kind === 'missing' ? [] : ['owner.json']
+      const actualChildren = observeExactCacheOwnedDirectoryChildren(location, staleLock, expectedChildren.length + 1)
+      const exactChildren =
+        staleWitness.kind === 'missing' &&
+        actualChildren.length === expectedChildren.length &&
+        actualChildren.every((name, index) => name === expectedChildren[index])
+      if (!exactChildren) {
+        return fail('VALIDATION_FAILED', 'The Encephalon cache layout is unsafe.', {
+          entry: 'node_modules/.cache/encephalon/operation.lock',
+          invariant: 'exact-child-set',
+        })
+      }
+      quarantineCacheOwnedDirectory(location, staleLock, undefined, {
+        expectedChildren,
+        expectedFiles: { owner: staleOwner, recoveryWitness: staleWitness },
+      })
     }
 
-    ownedLockDirectory = promoteCacheOwnedDirectory(location, candidateDirectory, lockName)
+    const expectedOwner = candidateOwnerFile
+    const expectedWitness = candidateRecoveryWitness
+    const candidateRemainsExact = () => {
+      if (candidateDirectory !== undefined) {
+        const children = observeExactCacheOwnedDirectoryChildren(location, candidateDirectory, 2)
+        return (
+          cacheOwnedDirectoryIsCurrent(location, candidateDirectory) &&
+          sameCacheOwnedFileObservation(observeCacheOwner(location, candidateDirectory), expectedOwner) &&
+          sameCacheOwnedFileObservation(observeCacheRecoveryWitness(location, candidateDirectory), expectedWitness) &&
+          children.length === 1 &&
+          children[0] === 'owner.json'
+        )
+      }
+      return false
+    }
+    ownedLockDirectory = promoteCacheOwnedDirectory(location, candidateDirectory, lockName, {
+      expectedChildren: ['owner.json'],
+      expectedFiles: { owner: expectedOwner, recoveryWitness: expectedWitness },
+      ownershipIsCurrent: candidateRemainsExact,
+    })
     candidateDirectory = undefined
+    testHooks.beforeCandidateMaintenance?.()
+    const maintenanceStats = maintainLockCandidates(location, {
+      now,
+      openDirectory: testHooks.openCandidateDirectory,
+    })
+    testHooks.afterCandidateMaintenance?.(maintenanceStats)
     try {
       operationOutcome = { value: operation(location) }
     } finally {
       try {
-        releaseOwnedLock(location, ownedLockDirectory, token)
+        releaseOwnedLock(location, ownedLockDirectory, expectedOwner, expectedWitness)
       } catch {
         // The SQLite gate is authoritative; stale metadata is removed by the next holder.
       }
@@ -935,9 +962,14 @@ export const withOperationLock = <Result>(
     gateCleanupError = error
   }
   try {
-    const remainingCandidate = candidateDirectory ?? inspectCacheOwnedDirectory(location, candidateName)
-    if (remainingCandidate !== undefined) {
-      quarantineCacheOwnedDirectory(location, remainingCandidate)
+    if (candidateDirectory !== undefined) {
+      const owner = candidateOwnerFile ?? { kind: 'missing' as const }
+      const witness = candidateRecoveryWitness ?? { kind: 'missing' as const }
+      const children = candidateOwnerFile === undefined ? [] : ['owner.json']
+      quarantineCacheOwnedDirectory(location, candidateDirectory, undefined, {
+        expectedChildren: children,
+        expectedFiles: { owner, recoveryWitness: witness },
+      })
     }
   } catch {
     // Candidate cleanup must not mask the operation outcome.

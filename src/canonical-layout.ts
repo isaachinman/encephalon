@@ -1,4 +1,5 @@
 import { type Dirent, opendirSync } from 'node:fs'
+import { type DirectoryReader, readBoundedDirectoryEntries } from './bounded-directory.ts'
 import {
   captureDirectoryWitness,
   type DirectoryWitness,
@@ -32,11 +33,6 @@ export const isCanonicalReservedDirectory = (name: string) => CANONICAL_RESERVED
 export const isCanonicalKindDirectoryEntry = (entry: Dirent) =>
   !entry.name.startsWith('_') && entry.isDirectory() && !entry.isSymbolicLink()
 
-type DirectoryReader<Entry> = {
-  closeSync: () => void
-  readSync: () => Entry | null
-}
-
 type OpenDirectory<Entry> = (path: string) => DirectoryReader<Entry>
 
 /** @internal */
@@ -50,20 +46,14 @@ export const collectBoundedDirectoryEntries = <Entry extends { name: string } = 
   let primaryError: unknown
   let result: { entries: Entry[]; overflow: false } | { entries: never[]; overflow: true } | undefined
   try {
-    const entries: Entry[] = []
-    while (entries.length <= maximum) {
-      const entry = reader.readSync()
-      if (entry === null) {
-        result = {
-          entries: entries.sort((first, second) => ordinalStringCompare(first.name, second.name)),
-          overflow: false as const,
-        }
-        break
-      }
-      onEntry?.()
-      entries.push(entry)
-    }
-    result ??= { entries: [], overflow: true as const }
+    const collected = readBoundedDirectoryEntries(reader, maximum + 1, () => onEntry?.())
+    result =
+      collected.entries.length > maximum
+        ? { entries: [], overflow: true as const }
+        : {
+            entries: collected.entries.sort((first, second) => ordinalStringCompare(first.name, second.name)),
+            overflow: false as const,
+          }
   } catch (error) {
     primaryError = error
   }
