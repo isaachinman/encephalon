@@ -512,6 +512,43 @@ jobs:
   ])
 })
 
+// Mutation caught: ignoring secret-tree exhaustion would retain provisional permission findings and inspect an over-budget job.
+test('fails closed when secret-tree scanning alone exceeds the parsed-tree limit', () => {
+  const root = createFixture({
+    '.github/workflows/secrets.yml': `name: Secrets
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    env:
+      TOKEN: \${{ secrets.TOKEN }}
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSecretTreeNodes: 5 } }), [
+    {
+      file: '.github/workflows/secrets.yml',
+      location: 'jobs.verify.environment',
+      rule: 'credential-environment',
+    },
+    {
+      file: '.github/workflows/secrets.yml',
+      location: 'jobs.verify.permissions',
+      rule: 'permission',
+    },
+  ])
+  assert.deepEqual(inspectWorkflowPolicy(root, { limits: { maximumSecretTreeNodes: 4 } }), [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
 // Mutation caught: allocating each discovered source a fresh executable budget would let aggregate parsed-tree work overflow.
 test('shares the combined parsed-tree work limit across discovered sources', () => {
   const root = createFixture({
