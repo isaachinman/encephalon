@@ -224,3 +224,52 @@ This addendum supersedes the directory-creation wording in finding E above. A po
 - `git diff --check` — passed.
 
 An independent final read-only review found no remaining implementation issue after the root-phase, committed-fstat, strict sidecar-presence, and secondary-carrier closures. Its only final finding was the stale phase/count wording corrected in this addendum.
+
+## Cache lifetime review addendum
+
+This addendum supersedes the earlier final statement that no maintained documentation change was required. The safe directory-publication phases are externally maintained performance semantics: publication-capable operations require one scan/graph pass only when the canonical root, every planned kind, and `_staging` already exist; two when only planned child directories must be created; and three when the canonical root is absent. `docs/contract.md`, `docs/performance.md`, and the package contract guard now state those exact qualifications.
+
+### Finding closures
+
+1. **Immediate post-`BEGIN` trust boundary:** operation-gate initialisation is split into explicit phases. `BEGIN IMMEDIATE` completes first, the existing MAR-2635 metadata-only authority captures the legitimate SQLite primary/sidecar state immediately, and only then may recovery-marker observation or publication run. The existing final post-initialisation assertion remains strict over exact primary and optional-sidecar presence/identity. Replacement, appearance, or disappearance at the recovery-publication hook is terminal: the protected callback is not entered, SQLite is neither closed nor reopened, no quarantine runs, the successor is preserved, and the close-safety latch blocks a second open.
+2. **Gate identity for the full session:** the exact opened gate identity is retained until release. Release uses the shared exact metadata authority before either `ROLLBACK` or close; the retained close action includes both operations so an authority mismatch latches the complete future release rather than partially releasing SQLite. Primary and sidecar appearance/disappearance/replacement inside a successful callback therefore fail closed with zero rollback/close/quarantine/reopen. If the callback also fails, its established public error remains primary while release is still suppressed. A release-authority failure during acquisition is folded into the acquisition error without skipping the recovery-marker release attempt, and a recovery-publication error retains precedence.
+3. **Writer final-close authority:** the former strict assertion followed by an identity-blind safety scan was replaced with one final expected-aware observation of the exact single-link primary and every optional sidecar. No pathname/metadata pass occurs between that authority and close. WAL replacement and a primary-plus-sidecars generation swap at the former inter-pass seam are terminal, preserve the successor exactly, perform zero writer closes/quarantines/retries, initialise the writer once, and latch a second API attempt. A stable ordinary writer initialisation failure still closes its exact generation and preserves the original failure through the established cache error envelope. The now-unused `requireStableObservation` option and identity-blind helper were removed.
+4. **Final-authority operational privacy:** a non-Encephalon filesystem failure from the exact final metadata authority is normalised once to a generic path-safe failure carrying only its established string code. Writer callers retain their existing cache envelope; gate release wraps the safe failure in the established `Unable to coordinate Encephalon cache access.` envelope. Private generation sentinels pass through unchanged, and a raw failure from the actual close hook retains its established cleanup behaviour.
+
+### TDD evidence
+
+- Owner-recovery replacement/appearance/disappearance regressions were RED because marker filesystem work ran before the post-`BEGIN` capture and could enter the callback or release a successor. All three are GREEN after the phase split.
+- Release-time replacement/appearance/disappearance regressions were RED because release unconditionally rolled back and closed without its opened identity. The sidecar matrix and a primary-swap/callback-precedence matrix are GREEN with zero rollback/close and latch-blocked second opens.
+- Final-close WAL and primary-plus-sidecars regressions were RED because the second identity-blind pass adopted the swapped generation. Both are GREEN with one authority check, one writer initialisation, zero writer closes, no quarantine, exact successor preservation, and terminal second opens.
+- The package documentation guard was RED against the previous unconditional one-scan statement and is GREEN against the exact one/two/three phase contract.
+- The acquisition cleanup regression proves a simultaneous publication failure and release-authority failure still attempts recovery-marker release while retaining publication-error precedence.
+- Final-authority `EIO` regressions were RED because both the writer cause and the gate release error retained the injected absolute database pathname, and the gate result escaped as a raw `Error`. They are GREEN with path-free cause chains, the established gate `IO_ERROR` envelope, one writer initialisation, zero rollback/close, a latched second open, and callback-failure precedence.
+
+### Compatibility and security review
+
+- No public API/export, cache schema/version, canonical JSON, runtime path, manifest/FTS row, instruction format, error code/message/details, lock acquisition category, recovery/quarantine rule, or persisted format changed.
+- The implementation extends the existing MAR-2635 metadata authority through the complete gate and writer lifetimes; it does not create a parallel authority.
+- Authority failures retain the private weak-state database carrier and surface only the established path-safe `EncephalonError`. Successor identities, absolute paths, device/inode values, SQLite handles, and sidecar evidence do not enter public details or JSON.
+- Operation errors remain primary over cleanup errors. Stable ordinary writer failures still close. Identity-uncertain generations suppress close and quarantine, preserving successor bytes and links.
+
+### Verification gates
+
+- Focused cache lifetime and authority-privacy regressions — 10 passed, 0 failed (immediate post-`BEGIN`, release sidecar/primary, writer final-close, stable writer failure, publication precedence, acquisition cleanup, and writer/gate final-authority privacy).
+- `node --test test/cache.test.ts` — 238 passed, 0 failed.
+- `node --test test/records.test.ts` — 160 passed, 0 failed.
+- `node --test test/init.test.ts` — 177 passed, 0 failed, 2 expected filesystem-platform skips.
+- `node --test test/lock-candidates.test.ts test/artifact-inspection.test.ts test/staging.test.ts test/errors.test.ts` — 57 passed, 0 failed.
+- `node --test test/package.test.ts` — 9 passed, 0 failed.
+- `bun run test` — 770 total, 768 passed, 0 failed, 2 expected skips; includes build.
+- `bun run lint` — 131 files checked, no diagnostics.
+- `bun run typecheck` — source, scripts, tests, and runtime-guard configurations passed.
+- `bun run benchmark:check` — schema-version 2 CI profile completed within maintained budgets.
+- `bun run build` — passed.
+- `bun run check:package` — passed.
+- `bun run check:generated` — passed.
+- `bun run check:workflows` — 63 passed, 0 failed, 1 expected Windows-only skip; policy command passed.
+- `bun run check:publish` — passed its expected already-published-version preflight classification for `0.2.0`.
+- `node dist/cli.mjs validate --root .` — valid, 38 records checked, no errors.
+- `git diff --check` — passed.
+
+The independent read-only review found the final-authority operational privacy gap after the lifetime changes and otherwise passed the immediate post-`BEGIN` boundary, full-session gate identity, cleanup precedence, strict optional-sidecar presence, and single-pass writer close. The operational failure normalisation and its RED/GREEN regressions close that final finding; the reviewer rechecked the resulting path-safe envelopes before commit.

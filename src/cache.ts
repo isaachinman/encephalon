@@ -295,7 +295,7 @@ type CacheReadTestHooks = {
   afterShowRead?: ((id: string) => void) | undefined
   beforeManifestEntryLstat?: ((path: string) => void) | undefined
   beforeIntegrityTextRead?: ((name: CacheIntegrityProbeName) => void) | undefined
-  duringDatabaseInitialisation?: ((mode: 'reader' | 'writer') => void) | undefined
+  duringDatabaseInitialisation?: ((mode: 'reader' | 'writer', database: DatabaseSync) => void) | undefined
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
   recordReadHooks?: RecordReadHooks | undefined
@@ -859,7 +859,7 @@ const openWriterDatabase = (
         database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;')
       }
       assertCacheSchemaTransaction(database)
-      cacheReadTestHooks.duringDatabaseInitialisation?.('writer')
+      cacheReadTestHooks.duringDatabaseInitialisation?.('writer', database)
     },
     DatabaseConstructor,
     location,
@@ -886,7 +886,7 @@ const readVerifiedCacheTransaction = <Result>(
       opened.exec('BEGIN')
       try {
         assertCacheSchema(opened)
-        cacheReadTestHooks.duringDatabaseInitialisation?.('reader')
+        cacheReadTestHooks.duringDatabaseInitialisation?.('reader', opened)
         result = read(opened)
         opened.exec('ROLLBACK')
       } catch (error) {

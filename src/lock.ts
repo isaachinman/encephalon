@@ -9,6 +9,7 @@ import {
   type CacheOwnedFileObservation,
   cacheOwnedDirectoryIsCurrent,
   cacheOwnedDirectoryMtimeMilliseconds,
+  closeCacheDatabaseWithMetadataAuthority,
   createCacheOwnedDirectory,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
@@ -68,6 +69,8 @@ type LockTestHooks = {
   afterCandidateCreation?: ((path: string) => void) | undefined
   afterCandidateMaintenance?: ((stats: LockCandidateMaintenanceStats) => void) | undefined
   afterCandidateOwnerPublication?: ((path: string) => void) | undefined
+  afterGateAcquisition?: (() => void) | undefined
+  afterRecoveryReleaseAttempt?: (() => void) | undefined
   afterRecoveryCreation?: (() => void) | undefined
   afterRecoveryStaleObservation?: (() => void) | undefined
   afterStaleObservation?: (() => void) | undefined
@@ -418,6 +421,7 @@ export const withOperationLock = <Result>(
   const now = testHooks.now ?? Date.now
   const startedAt = now()
   let gate: DatabaseSync | undefined
+  let gateIdentity: CacheDatabase | undefined
   let gateTransaction = false
   let candidateDirectory: CacheOwnedDirectory | undefined
   let candidateOwnerFile: CacheOwnedFileObservation | undefined
@@ -539,11 +543,13 @@ export const withOperationLock = <Result>(
   ) => {
     try {
       const opened = openVerifiedCacheDatabase({
-        afterVerifiedOpen: database => {
-          database.exec('BEGIN IMMEDIATE')
+        afterLockPreservingMetadataCapture: () => {
           if (recoveryMarkerIsOwned(ownedMarker)) {
             publicationState.result = publishRecoveredMarker(ownedMarker)
           }
+        },
+        afterVerifiedOpen: database => {
+          database.exec('BEGIN IMMEDIATE')
         },
         DatabaseConstructor: DatabaseSync,
         location,
@@ -553,6 +559,7 @@ export const withOperationLock = <Result>(
         primary,
       })
       gate = opened.database
+      gateIdentity = opened.identity
       gateTransaction = true
       return opened.identity
     } catch (error) {
@@ -564,19 +571,43 @@ export const withOperationLock = <Result>(
   }
 
   const releaseGate = () => {
-    if (gateTransaction) {
-      try {
-        gate?.exec('ROLLBACK')
-      } catch {
-        // Closing the connection below releases its operating-system lock.
-      }
-    }
-    gateTransaction = false
     const database = gate
+    const identity = gateIdentity
+    const transaction = gateTransaction
     gate = undefined
+    gateIdentity = undefined
+    gateTransaction = false
     if (database !== undefined) {
+      if (identity === undefined) {
+        return fail('INTERNAL_ERROR', 'The Encephalon operation gate identity was unavailable at release.')
+      }
       const close = testHooks.gateClose ?? ((current: DatabaseSync) => current.close())
-      close(database)
+      const closeResult = closeCacheDatabaseWithMetadataAuthority(
+        location,
+        identity,
+        {
+          close: () => {
+            if (transaction) {
+              try {
+                database.exec('ROLLBACK')
+              } catch {
+                // Closing the connection below releases its operating-system lock.
+              }
+            }
+            close(database)
+          },
+        },
+        [],
+      )
+      if (closeResult.validationFailure !== undefined) {
+        if (closeResult.validationFailure instanceof EncephalonError) {
+          throw closeResult.validationFailure
+        }
+        return wrapIo('Unable to coordinate Encephalon cache access.', closeResult.validationFailure)
+      }
+      if (closeResult.closeFailure !== undefined) {
+        throw closeResult.closeFailure
+      }
     }
   }
 
@@ -786,6 +817,7 @@ export const withOperationLock = <Result>(
         }
       }
       const publication = publicationState.result
+      testHooks.afterGateAcquisition?.()
       if (publication !== undefined) {
         ;({ cleanupMarker } = publication)
         if (publication.error !== undefined && acquisitionError === undefined) {
@@ -798,11 +830,18 @@ export const withOperationLock = <Result>(
           cacheOwnedDirectoryIsCurrent(location, publication.publishedMarker.directory)
         ) {
           acquired = false
-          releaseGate()
+          try {
+            releaseGate()
+          } catch (error) {
+            if (acquisitionError === undefined) {
+              acquisitionError = publication.error ?? error
+            }
+          }
         }
       }
       let cleanupError: unknown
       try {
+        testHooks.afterRecoveryReleaseAttempt?.()
         releaseOwnedRecoveryMarker(location, cleanupMarker, true)
       } catch (error) {
         cleanupError = error

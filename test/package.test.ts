@@ -150,6 +150,10 @@ describe('package contract', () => {
     assert.match(contract, /## Canonical Storage/)
     assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
+    const publicationPhaseCounts =
+      /Publication-capable operations use one scan and graph validation only when the canonical root, every planned kind, and `_staging` already exist; they use two when only planned child directories must be created and three when the canonical root is absent\./
+    assert.match(contract, publicationPhaseCounts)
+    assert.match(performance, publicationPhaseCounts)
     assert.match(
       contract,
       /When rebuilding, cache preparation, forced hydration, public reads, post-add hydration, record-producing and no-add initialisation, and disposable-corruption recovery consume the records-owned sealed snapshot/,
