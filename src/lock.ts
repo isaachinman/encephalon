@@ -10,6 +10,7 @@ import {
   type CacheOwnedDirectory,
   cacheOwnedDirectoryIsCurrent,
   cacheOwnedDirectoryMtimeMilliseconds,
+  closeCacheDatabaseWithMetadataAuthority,
   createCacheOwnedDirectory,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
@@ -64,6 +65,12 @@ type GatePrimary =
   | { kind: 'create-exclusive' }
   | { kind: 'create-if-missing' }
   | { database: CacheDatabase; kind: 'expected-owned' }
+
+type HeldGate = {
+  database: DatabaseSync
+  identity: CacheDatabase
+  transaction: boolean
+}
 
 const abandonedRecoveryMarkers = new Map<string, OwnedRecoveryMarker>()
 const MAX_ABANDONED_RECOVERY_MARKERS = 64
@@ -185,8 +192,7 @@ export const withOperationLock = <Result>(
   const candidateName = `operation.lock.${token}`
   const now = testHooks.now ?? Date.now
   const startedAt = now()
-  let gate: DatabaseSync | undefined
-  let gateTransaction = false
+  let gate: HeldGate | undefined
   let candidateDirectory: CacheOwnedDirectory | undefined
   let ownedLockDirectory: CacheOwnedDirectory | undefined
 
@@ -314,8 +320,7 @@ export const withOperationLock = <Result>(
         preserveDatabaseLocksAfterInitialisation: true,
         primary,
       })
-      gate = opened.database
-      gateTransaction = true
+      gate = { database: opened.database, identity: opened.identity, transaction: true }
       return opened.identity
     } catch (error) {
       if (error instanceof CacheDatabaseCreationConflict) {
@@ -326,19 +331,39 @@ export const withOperationLock = <Result>(
   }
 
   const releaseGate = () => {
-    if (gateTransaction) {
-      try {
-        gate?.exec('ROLLBACK')
-      } catch {
-        // Closing the connection below releases its operating-system lock.
-      }
-    }
-    gateTransaction = false
-    const database = gate
+    const heldGate = gate
     gate = undefined
-    if (database !== undefined) {
+    if (heldGate !== undefined) {
+      const { database, identity, transaction } = heldGate
       const close = testHooks.gateClose ?? ((current: DatabaseSync) => current.close())
-      close(database)
+      const { closeFailure, closeSuppressed, validationFailure } = closeCacheDatabaseWithMetadataAuthority(
+        location,
+        identity,
+        {
+          close: () => {
+            if (transaction) {
+              try {
+                database.exec('ROLLBACK')
+              } catch {
+                // Closing the connection below releases its operating-system lock.
+              }
+            }
+            close(database)
+          },
+        },
+      )
+      if (validationFailure !== undefined) {
+        if (validationFailure instanceof EncephalonError) {
+          throw validationFailure
+        }
+        return wrapIo('Unable to validate the Encephalon operation gate before cleanup.', validationFailure)
+      }
+      if (closeFailure !== undefined) {
+        throw closeFailure
+      }
+      if (closeSuppressed) {
+        return fail('INTERNAL_ERROR', 'The Encephalon operation gate could not be proven safe to close.')
+      }
     }
   }
 

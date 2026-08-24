@@ -757,14 +757,50 @@ const suppressUnsafeDatabaseClose = (
   snapshot: CacheDatabase,
   database: { close: () => void },
   errors: readonly unknown[],
+  metadataAuthorityFailed = false,
 ) => {
   const closeProvenSafe = cacheDatabaseCloseIsProvenSafe(location, snapshot)
   const markedUnsafeSidecar = errors.some(error => error instanceof UnsafeCacheDatabaseSidecar)
-  const suppressClose = markedUnsafeSidecar || !closeProvenSafe
+  const suppressClose = metadataAuthorityFailed || markedUnsafeSidecar || !closeProvenSafe
   if (suppressClose) {
     cacheDatabaseCloseSafetyLatches.set(snapshot.path, database)
   }
   return suppressClose
+}
+
+/** @internal */
+export const closeCacheDatabaseWithMetadataAuthority = <Database extends { close: () => void }>(
+  location: CacheLocation,
+  snapshot: CacheDatabase,
+  database: Database,
+  errors: readonly unknown[] = [],
+) => {
+  let currentDatabase = snapshot
+  let validationFailure: unknown
+  try {
+    currentDatabase = assertCacheDatabaseMetadata(location, snapshot)
+  } catch (error) {
+    validationFailure = error
+    if (error instanceof CacheDatabaseSidecarChanged) {
+      currentDatabase = error.database
+    }
+  }
+  const closeSuppressed = suppressUnsafeDatabaseClose(
+    location,
+    currentDatabase,
+    database,
+    [...errors, validationFailure],
+    validationFailure !== undefined,
+  )
+  let closeFailure: unknown
+  if (!closeSuppressed) {
+    try {
+      database.close()
+    } catch (error) {
+      closeFailure = error
+    }
+  }
+  return { closeFailure, closeSuppressed, database: currentDatabase, validationFailure }
 }
 
 const initialCacheDatabase = <Database>(options: VerifiedCacheDatabaseOptions<Database>) => {
@@ -858,7 +894,13 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
         }
         const closeSuppressed =
           lockPreservingInitialisationCompleted &&
-          suppressUnsafeDatabaseClose(options.location, snapshot, database, [error, validationError])
+          suppressUnsafeDatabaseClose(
+            options.location,
+            snapshot,
+            database,
+            [error, validationError],
+            validationError !== undefined,
+          )
         if (closeSuppressed) {
           if (validationError !== undefined) {
             throw validationError
