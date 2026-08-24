@@ -5,7 +5,7 @@ import {
   type CacheLocation,
   type CacheOwnedDirectory,
   type CacheOwnedFileObservation,
-  cacheOwnedDirectoryMtimeMilliseconds,
+  cacheOwnedDirectoryMtimeNanoseconds,
   observeCacheOwnedDirectoryForMaintenance,
   observeCacheOwner,
   observeCacheRecoveryWitness,
@@ -47,6 +47,7 @@ type CandidateOwner = Readonly<{
 type CandidateEvidence = Readonly<{
   children: readonly string[]
   directory: CacheOwnedDirectory
+  directoryMtimeNs: bigint
   owner: CacheOwnedFileObservation
   recoveryWitness: CacheOwnedFileObservation
 }>
@@ -156,10 +157,10 @@ const processIsDefinitelyDead = (pid: number) => {
   return dead
 }
 
-const candidateIsAbandoned = (location: CacheLocation, evidence: CandidateEvidence, token: string, now: number) => {
+const candidateIsAbandoned = (evidence: CandidateEvidence, token: string, now: number) => {
   let abandoned = false
   if (evidence.recoveryWitness.kind === 'missing') {
-    const directoryMtime = cacheOwnedDirectoryMtimeMilliseconds(location, evidence.directory)
+    const directoryMtime = Number(evidence.directoryMtimeNs) / 1_000_000
     if (evidence.owner.kind === 'missing') {
       abandoned = now - directoryMtime > CANDIDATE_GRACE_MILLISECONDS
     } else if (evidence.owner.kind === 'contents') {
@@ -169,10 +170,6 @@ const candidateIsAbandoned = (location: CacheLocation, evidence: CandidateEviden
           ? now - Math.max(directoryMtime, Number(evidence.owner.metadata.mtimeNs) / 1_000_000) >
             CANDIDATE_GRACE_MILLISECONDS
           : processIsDefinitelyDead(owner.pid)
-    } else {
-      abandoned =
-        now - Math.max(directoryMtime, Number(evidence.owner.metadata.mtimeNs) / 1_000_000) >
-        CANDIDATE_GRACE_MILLISECONDS
     }
   }
   return abandoned
@@ -188,6 +185,7 @@ const captureCandidateEvidence = (location: CacheLocation, name: string): Candid
       evidence = {
         children,
         directory: observation.directory,
+        directoryMtimeNs: cacheOwnedDirectoryMtimeNanoseconds(location, observation.directory),
         owner: observeCacheOwner(location, observation.directory),
         recoveryWitness: observeCacheRecoveryWitness(location, observation.directory),
       }
@@ -198,6 +196,7 @@ const captureCandidateEvidence = (location: CacheLocation, name: string): Candid
 
 const sameEvidence = (first: CandidateEvidence, second: CandidateEvidence) =>
   sameCacheEntryIdentity(first.directory, second.directory) &&
+  first.directoryMtimeNs === second.directoryMtimeNs &&
   first.children.length === second.children.length &&
   first.children.every((name, index) => name === second.children[index]) &&
   sameCacheOwnedFileObservation(first.owner, second.owner) &&
@@ -209,15 +208,25 @@ const reclaimCandidate = (
   token: string,
   evidence: CandidateEvidence,
   now: number,
-  assertCurrentLock: (() => void) | undefined,
+  assertCurrentLock: () => void,
 ) => {
   let moved = false
+  let authorityFailed = false
+  let authorityFailure: unknown
   const remainsAbandoned = () => {
     const current = captureCandidateEvidence(location, name)
-    return (
-      current !== undefined && sameEvidence(evidence, current) && candidateIsAbandoned(location, current, token, now)
-    )
+    const abandoned =
+      current !== undefined && sameEvidence(evidence, current) && candidateIsAbandoned(current, token, now)
+    try {
+      assertCurrentLock()
+    } catch (error) {
+      authorityFailed = true
+      authorityFailure = error
+      throw error
+    }
+    return abandoned
   }
+  let failed = false
   try {
     quarantineCacheOwnedDirectory(location, evidence.directory, remainsAbandoned, {
       expectedChildren: evidence.children,
@@ -227,14 +236,13 @@ const reclaimCandidate = (
       },
     })
   } catch {
-    assertCurrentLock?.()
-    assertCacheLocation(location)
+    failed = true
   }
-  return moved
+  return { authorityFailed, authorityFailure, failed, moved }
 }
 
 export type LockCandidateMaintenanceOptions = Readonly<{
-  assertCurrentLock?: (() => void) | undefined
+  assertCurrentLock: () => void
   now?: (() => number) | undefined
   openDirectory?: OpenLockCandidateDirectory | undefined
 }>
@@ -242,7 +250,7 @@ export type LockCandidateMaintenanceOptions = Readonly<{
 /** @internal */
 export const maintainLockCandidates = (
   location: CacheLocation,
-  options: LockCandidateMaintenanceOptions = {},
+  options: LockCandidateMaintenanceOptions,
 ): LockCandidateMaintenanceStats => {
   const stats = {
     candidatesInspected: 0,
@@ -252,55 +260,75 @@ export const maintainLockCandidates = (
     reclamationAttempts: 0,
   }
   const openDirectory = options.openDirectory ?? defaultOpenDirectory
+  const assertAuthority = () => {
+    options.assertCurrentLock()
+    assertCacheLocation(location)
+  }
+  options.assertCurrentLock()
+  assertCacheLocation(location)
   let cursor: CandidateCursor | undefined
   try {
-    assertCacheLocation(location)
     cursor = cursorFor(location, openDirectory)
-    while (
-      stats.directoryEntriesVisited < MAXIMUM_DIRECTORY_ENTRIES &&
-      stats.candidatesInspected < MAXIMUM_CANDIDATE_INSPECTIONS &&
-      stats.reclamationAttempts < MAXIMUM_RECLAMATION_ATTEMPTS
-    ) {
-      const entry = cursor.reader.readSync()
-      if (entry === null) {
-        stats.cursorExhausted = true
-        closeCursor(location.directory, cursor)
-        break
-      }
-      stats.directoryEntriesVisited += 1
-      const match = LOCK_CANDIDATE_PATTERN.exec(entry.name)
-      if (match !== null) {
-        stats.candidatesInspected += 1
-        try {
-          const evidence = captureCandidateEvidence(location, entry.name)
-          const token = match[1] as string
-          if (evidence !== undefined && candidateIsAbandoned(location, evidence, token, (options.now ?? Date.now)())) {
-            stats.reclamationAttempts += 1
-            if (
-              reclaimCandidate(
-                location,
-                entry.name,
-                token,
-                evidence,
-                (options.now ?? Date.now)(),
-                options.assertCurrentLock,
-              )
-            ) {
-              stats.candidatesReclaimed += 1
-            }
-          }
-        } catch {
-          options.assertCurrentLock?.()
-          assertCacheLocation(location)
+  } catch {
+    assertAuthority()
+    return Object.freeze({ ...stats })
+  }
+  while (
+    stats.directoryEntriesVisited < MAXIMUM_DIRECTORY_ENTRIES &&
+    stats.candidatesInspected < MAXIMUM_CANDIDATE_INSPECTIONS &&
+    stats.reclamationAttempts < MAXIMUM_RECLAMATION_ATTEMPTS
+  ) {
+    let entry: CandidateEntry | null
+    try {
+      entry = cursor.reader.readSync()
+    } catch {
+      closeCursor(location.directory, cursor)
+      assertAuthority()
+      break
+    }
+    if (entry === null) {
+      stats.cursorExhausted = true
+      closeCursor(location.directory, cursor)
+      break
+    }
+    stats.directoryEntriesVisited += 1
+    const match = LOCK_CANDIDATE_PATTERN.exec(entry.name)
+    if (match === null) {
+      continue
+    }
+    stats.candidatesInspected += 1
+    let candidateAuthorityFailed = false
+    let candidateAuthorityFailure: unknown
+    let candidateFailed = false
+    try {
+      const evidence = captureCandidateEvidence(location, entry.name)
+      const token = match[1] as string
+      if (evidence !== undefined && candidateIsAbandoned(evidence, token, (options.now ?? Date.now)())) {
+        stats.reclamationAttempts += 1
+        const reclaim = reclaimCandidate(
+          location,
+          entry.name,
+          token,
+          evidence,
+          (options.now ?? Date.now)(),
+          options.assertCurrentLock,
+        )
+        candidateAuthorityFailed = reclaim.authorityFailed
+        candidateAuthorityFailure = reclaim.authorityFailure
+        candidateFailed = reclaim.failed
+        if (reclaim.moved) {
+          stats.candidatesReclaimed += 1
         }
       }
+    } catch {
+      candidateFailed = true
     }
-  } catch {
-    if (cursor !== undefined) {
-      closeCursor(location.directory, cursor)
+    if (candidateAuthorityFailed) {
+      throw candidateAuthorityFailure
     }
-    options.assertCurrentLock?.()
-    assertCacheLocation(location)
+    if (candidateFailed) {
+      assertAuthority()
+    }
   }
   return Object.freeze({ ...stats })
 }

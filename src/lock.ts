@@ -55,6 +55,7 @@ type RecoveryOwner = LockOwner & {
 type CacheOwnedFileContents = Extract<CacheOwnedFileObservation, { kind: 'contents' }>
 
 type ObservedOwner = {
+  bytes: Uint8Array
   contents: string
   file: CacheOwnedFileContents['file']
   metadata: CacheOwnedFileContents['metadata']
@@ -74,7 +75,6 @@ type LockTestHooks = {
   duringRecoveryObservation?: (() => void) | undefined
   gateClose?: ((database: DatabaseSync) => void) | undefined
   now?: (() => number) | undefined
-  beforeCandidateMaintenance?: (() => void) | undefined
   openCandidateDirectory?: ((path: string) => LockCandidateDirectoryReader) | undefined
 }
 
@@ -198,6 +198,7 @@ const ownerFromObservation = (observation: CacheOwnedFileObservation): ObservedO
     const parsed = parseOwner(observation.contents)
     if (parsed !== undefined) {
       return {
+        bytes: observation.bytes,
         contents: observation.contents,
         file: observation.file,
         metadata: observation.metadata,
@@ -211,6 +212,7 @@ const observeOwner = (location: CacheLocation, directory: CacheOwnedDirectory): 
   ownerFromObservation(observeCacheOwner(location, directory))
 
 const sameObservedOwner = (first: ObservedOwner, second: ObservedOwner) =>
+  Buffer.compare(first.bytes, second.bytes) === 0 &&
   first.contents === second.contents &&
   first.phased === second.phased &&
   sameLockOwner(first.owner, second.owner) &&
@@ -723,6 +725,7 @@ export const withOperationLock = <Result>(
       const publishedMarker = {
         ...marker,
         recovered: {
+          bytes: publication.bytes,
           contents: recoveredContents,
           file: publication.file,
           kind: 'contents' as const,
@@ -923,7 +926,6 @@ export const withOperationLock = <Result>(
         invariant: 'stable-owner-evidence',
       })
     }
-    testHooks.beforeCandidateMaintenance?.()
     const maintenanceStats = maintainLockCandidates(location, {
       assertCurrentLock,
       now,

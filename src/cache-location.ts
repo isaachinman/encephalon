@@ -154,12 +154,14 @@ type CacheLocationTestHooks = {
   afterOwnerRecoveryCreation?: ((path: string) => void) | undefined
   beforeDatabaseOpen?: ((database: CacheDatabase) => void) | undefined
   beforeCacheOwnerOpen?: ((path: string) => void) | undefined
+  beforeCacheLocationAssertion?: (() => void) | undefined
   beforeLocationInspection?: (() => void) | undefined
   beforeOwnedDirectoryFinalIdentity?: ((path: string) => void) | undefined
   beforeOwnerRecoveryFsync?: ((path: string) => void) | undefined
   beforeQuarantineRename?: ((path: string) => void) | undefined
   beforeQuarantinedOwnerRemoval?: ((path: string) => void) | undefined
   beforeQuarantinedOwnerValidation?: ((path: string) => void) | undefined
+  beforeQuarantinedFileCleanup?: ((path: string) => void) | undefined
   duringOwnedDirectoryInspection?: ((path: string) => void) | undefined
   fsyncOwnedDirectory?: ((path: string) => void) | undefined
   regularFileRealpath?: ((path: string, actual: string) => string) | undefined
@@ -346,6 +348,7 @@ export const inspectCacheLocation = (root: string): CacheLocation => {
 }
 
 export const assertCacheLocation = (location: CacheLocation) => {
+  cacheLocationTestHooks.beforeCacheLocationAssertion?.()
   location.entries.forEach(assertDirectoryEntry)
   assertContained(location.repository, location.directory)
 }
@@ -1035,7 +1038,8 @@ export const quarantineCacheDatabase = (location: CacheLocation, database: Cache
 const safeOwnedDirectoryName = (name: string) =>
   name === 'operation.lock' || name === 'operation-lock.recovery' || /^operation\.lock\.[0-9a-f-]{36}$/u.test(name)
 
-const ownedDirectoryRelativePath = (name: string) => `node_modules/.cache/encephalon/${name}`
+const ownedDirectoryRelativePath = (name: string) =>
+  `node_modules/.cache/encephalon/${name.startsWith('operation.lock.') ? 'operation.lock' : name}`
 
 type CacheOwnedDirectoryObservation =
   | { kind: 'changed' }
@@ -1111,22 +1115,12 @@ export const observeCacheOwnedDirectory = (location: CacheLocation, name: string
   return observation
 }
 
-export type CacheOwnedDirectoryMaintenanceObservation = CacheOwnedDirectoryObservation | { kind: 'unsupported' }
-
 /** @internal */
-export const observeCacheOwnedDirectoryForMaintenance = (
-  location: CacheLocation,
-  name: string,
-): CacheOwnedDirectoryMaintenanceObservation => {
+export const observeCacheOwnedDirectoryForMaintenance = (location: CacheLocation, name: string) => {
   assertCacheLocation(location)
-  try {
-    const observation = observeOwnedDirectoryPath(location, name)
-    assertCacheLocation(location)
-    return observation
-  } catch {
-    assertCacheLocation(location)
-    return { kind: 'unsupported' }
-  }
+  const observation = observeOwnedDirectoryPath(location, name)
+  assertCacheLocation(location)
+  return observation
 }
 
 export const inspectCacheOwnedDirectory = (location: CacheLocation, name: string) => {
@@ -1169,6 +1163,16 @@ export const cacheOwnedDirectoryMtimeMilliseconds = (location: CacheLocation, di
     return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-metadata-identity')
   }
   return Number(metadata.mtimeMs)
+}
+
+/** @internal */
+export const cacheOwnedDirectoryMtimeNanoseconds = (location: CacheLocation, directory: CacheOwnedDirectory) => {
+  assertOwnedDirectory(location, directory)
+  const metadata = lstatSync(directory.path, { bigint: true })
+  if (!(metadata.isDirectory() && sameCacheEntryIdentity(directory, entryIdentityFrom(metadata)))) {
+    return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-metadata-identity')
+  }
+  return metadata.mtimeNs
 }
 
 const readDirectoryEntryNames = (path: string, maximum: number) => {
@@ -1221,9 +1225,6 @@ export const promoteCacheOwnedDirectory = (
     | undefined,
 ) => {
   assertOwnedDirectory(location, directory)
-  if (!(options?.ownershipIsCurrent?.() ?? true)) {
-    return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-owner-evidence')
-  }
   if (options?.expectedChildren !== undefined) {
     const children = observeExactCacheOwnedDirectoryChildren(location, directory, options.expectedChildren.length + 1)
     if (!sameChildSet(children, options.expectedChildren)) {
@@ -1236,6 +1237,9 @@ export const promoteCacheOwnedDirectory = (
   const targetObservation = observeCacheOwnedDirectory(location, targetName)
   if (targetObservation.kind !== 'missing') {
     return changedLayout(ownedDirectoryRelativePath(targetName), 'promotion-target-missing')
+  }
+  if (!(options?.ownershipIsCurrent?.() ?? true)) {
+    return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-owner-evidence')
   }
   const targetPath = resolve(location.directory, targetName)
   renameSync(directory.path, targetPath)
@@ -1301,7 +1305,13 @@ export const writeCacheOwner = (location: CacheLocation, directory: CacheOwnedDi
   ) {
     return changedLayout(relativePath, 'stable-identity')
   }
-  return { contents, file: owner, kind: 'contents' as const, metadata: createdMetadata }
+  return {
+    bytes: Buffer.from(contents) as Uint8Array,
+    contents,
+    file: owner,
+    kind: 'contents' as const,
+    metadata: createdMetadata,
+  }
 }
 
 const cacheOwnerSharingViolation = (error: unknown) => {
@@ -1344,15 +1354,14 @@ const readCacheOwnedFile = (
     }
     assertSingleLinkMutableFile(metadata, relativePath, () => changedLayout(relativePath, 'stable-identity'))
     const capturedMetadata = entryMetadataFrom(metadata)
-    let contents: string | undefined
+    let bytes: Uint8Array | undefined
     if (metadata.size <= BigInt(maximumBytes)) {
-      const bytes = Buffer.alloc(Number(metadata.size))
+      bytes = Buffer.alloc(Number(metadata.size))
       const read = readSync(descriptor, bytes, 0, bytes.length, 0)
       if (read !== bytes.length) {
         return changedLayout(relativePath, 'complete-owner-read')
       }
       cacheLocationTestHooks.afterCacheOwnerRead?.(path)
-      contents = bytes.toString('utf8')
     }
     const finalOpenedMetadata = fstatSync(descriptor, { bigint: true })
     assertOwnedDirectory(location, directory)
@@ -1371,8 +1380,14 @@ const readCacheOwnedFile = (
     ) {
       return changedLayout(relativePath, 'stable-identity')
     }
-    if (contents !== undefined) {
-      return { contents, file: captured, kind: 'contents' as const, metadata: capturedMetadata }
+    if (bytes !== undefined) {
+      return {
+        bytes,
+        contents: Buffer.from(bytes).toString('utf8'),
+        file: captured,
+        kind: 'contents' as const,
+        metadata: capturedMetadata,
+      }
     }
     return { file: captured, kind: 'oversized' as const, metadata: capturedMetadata }
   } finally {
@@ -1402,6 +1417,7 @@ export const sameCacheOwnedFileObservation = (first: CacheOwnedFileObservation, 
   return (
     first.kind === 'contents' &&
     second.kind === 'contents' &&
+    Buffer.compare(first.bytes, second.bytes) === 0 &&
     first.contents === second.contents &&
     sameCacheEntryIdentity(first.file, second.file) &&
     sameStableEntryMetadata(first.metadata, second.metadata)
@@ -1433,6 +1449,7 @@ type CacheOwnerRecoveryPublication =
       witness?: Extract<CacheOwnedFileObservation, { kind: 'contents' }>
     }
   | {
+      bytes: Uint8Array
       durabilityError?: unknown
       file: Extract<CacheOwnedFileObservation, { kind: 'contents' }>['file']
       kind: 'published'
@@ -1475,7 +1492,7 @@ const assertMovedCacheOwnedFile = (
       const descriptor = openSync(path, constants.O_RDONLY | NO_FOLLOW)
       try {
         const metadata = fstatSync(descriptor, { bigint: true })
-        const expectedBytes = Buffer.from(expected.contents)
+        const expectedBytes = expected.bytes
         if (
           !(metadata.isFile() && sameCacheEntryIdentity(expected.file, entryIdentityFrom(metadata))) ||
           metadata.size !== BigInt(expectedBytes.length) ||
@@ -1484,7 +1501,10 @@ const assertMovedCacheOwnedFile = (
           return changedLayout(relativePath, 'stable-quarantine-owner')
         }
         const bytes = Buffer.alloc(expectedBytes.length)
-        if (readSync(descriptor, bytes, 0, bytes.length, 0) !== bytes.length || !bytes.equals(expectedBytes)) {
+        if (
+          readSync(descriptor, bytes, 0, bytes.length, 0) !== bytes.length ||
+          Buffer.compare(bytes, expectedBytes) !== 0
+        ) {
           return changedLayout(relativePath, 'stable-quarantine-owner')
         }
         const finalOpenedMetadata = fstatSync(descriptor, { bigint: true })
@@ -1526,9 +1546,10 @@ const removeMovedCacheOwnedFile = (
 
 const sameObservedCacheOwner = (
   observation: ReturnType<typeof observeCacheOwner>,
-  expected: { contents: string; file: CacheEntryIdentity; metadata: EntryMetadata },
+  expected: { bytes: Uint8Array; contents: string; file: CacheEntryIdentity; metadata: EntryMetadata },
 ) =>
   observation.kind === 'contents' &&
+  Buffer.compare(observation.bytes, expected.bytes) === 0 &&
   observation.contents === expected.contents &&
   sameCacheEntryIdentity(observation.file, expected.file) &&
   sameStableEntryMetadata(observation.metadata, expected.metadata)
@@ -1536,7 +1557,7 @@ const sameObservedCacheOwner = (
 const observeExactCacheOwnerRecovery = (
   location: CacheLocation,
   directory: CacheOwnedDirectory,
-  expectedOwner: { contents: string; file: CacheEntryIdentity; metadata: EntryMetadata },
+  expectedOwner: { bytes: Uint8Array; contents: string; file: CacheEntryIdentity; metadata: EntryMetadata },
   expectedWitnessContents: string,
 ): Extract<CacheOwnedFileObservation, { kind: 'contents' }> | undefined => {
   const owner = observeCacheOwner(location, directory)
@@ -1555,7 +1576,7 @@ const observeExactCacheOwnerRecovery = (
 const observeCommittedCacheOwnerRecovery = (
   location: CacheLocation,
   directory: CacheOwnedDirectory,
-  expectedOwner: { contents: string; file: CacheEntryIdentity; metadata: EntryMetadata },
+  expectedOwner: { bytes: Uint8Array; contents: string; file: CacheEntryIdentity; metadata: EntryMetadata },
   expectedWitnessContents: string,
 ) => {
   let outcome:
@@ -1614,7 +1635,7 @@ const fsyncExactOwnedDirectory = (location: CacheLocation, directory: CacheOwned
 export const publishCacheOwnerRecovery = (
   location: CacheLocation,
   directory: CacheOwnedDirectory,
-  expectedOwner: { contents: string; file: CacheEntryIdentity; metadata: EntryMetadata },
+  expectedOwner: { bytes: Uint8Array; contents: string; file: CacheEntryIdentity; metadata: EntryMetadata },
   contents: string,
 ): CacheOwnerRecoveryPublication => {
   const bytes = Buffer.from(contents)
@@ -1654,6 +1675,7 @@ export const publishCacheOwnerRecovery = (
               sameCacheEntryIdentity(observedRecovery.witness.file, finalRecovery.witness.file)
             ) {
               return {
+                bytes: observedRecovery.witness.bytes,
                 durabilityError,
                 file: observedRecovery.witness.file,
                 kind: 'published' as const,
@@ -1725,6 +1747,7 @@ export const publishCacheOwnerRecovery = (
         sameCacheEntryIdentity(witness, exactRecovery.witness.file)
       ) {
         return {
+          bytes: Buffer.from(contents),
           durabilityError: publicationError,
           file: exactRecovery.witness.file,
           kind: 'published' as const,
@@ -1781,6 +1804,7 @@ export const publishCacheOwnerRecovery = (
   }
   if (finalRecovery.kind === 'exact' && sameCacheEntryIdentity(witness, finalRecovery.witness.file)) {
     return {
+      bytes: Buffer.from(contents),
       durabilityError,
       file: finalRecovery.witness.file,
       kind: 'published' as const,
@@ -1814,6 +1838,9 @@ export const quarantineCacheOwnedDirectory = (
     }
     if (options?.expectedFiles !== undefined) {
       assertExpectedOwnedFiles(location, directory, options.expectedFiles)
+    }
+    if (!(ownershipIsCurrent?.() ?? true)) {
+      return false
     }
     const quarantineName = `.${directory.name}.${randomUUID()}.quarantine`
     const quarantinePath = resolve(location.directory, quarantineName)
@@ -1850,6 +1877,7 @@ export const quarantineCacheOwnedDirectory = (
       )
     }
     cacheLocationTestHooks.beforeQuarantinedOwnerRemoval?.(quarantinePath)
+    cacheLocationTestHooks.beforeQuarantinedFileCleanup?.(quarantinePath)
     if (options?.expectedFiles === undefined) {
       const ownerPath = resolve(quarantinePath, 'owner.json')
       const recoveryWitnessPath = resolve(quarantinePath, 'owner.recovered.json')
