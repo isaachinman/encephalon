@@ -9,8 +9,11 @@ test('renders the complete generated package-version source deterministically', 
   )
 })
 
-test('rejects generated package-version source that is not an exact match', () => {
+test('accepts platform line endings and rejects generated package-version content drift', () => {
   assert.doesNotThrow(() => assertPackageVersionSource('0.2.0', renderPackageVersionSource('0.2.0')))
+  assert.doesNotThrow(() =>
+    assertPackageVersionSource('0.2.0', renderPackageVersionSource('0.2.0').replaceAll('\n', '\r\n')),
+  )
   assert.throws(
     () => assertPackageVersionSource('0.2.0', renderPackageVersionSource('0.2.1')),
     new Error('Generated runtime package version is stale. Run `bun run build` and commit src/generated/version.ts.'),
@@ -19,6 +22,10 @@ test('rejects generated package-version source that is not an exact match', () =
   assert.equal(misleadingStaleSource.includes('PACKAGE_VERSION = "0.2.0"'), true)
   assert.throws(
     () => assertPackageVersionSource('0.2.0', misleadingStaleSource),
+    new Error('Generated runtime package version is stale. Run `bun run build` and commit src/generated/version.ts.'),
+  )
+  assert.throws(
+    () => assertPackageVersionSource('0.2.0', `// Unreviewed wrapper\n${renderPackageVersionSource('0.2.0')}`),
     new Error('Generated runtime package version is stale. Run `bun run build` and commit src/generated/version.ts.'),
   )
 })

@@ -7,9 +7,21 @@ import { PACKAGE_VERSION } from '../src/generated/version.ts'
 const root = resolve(import.meta.dirname, '..')
 
 const topLevelStepSequence = (steps: string): string[] =>
-  [...steps.matchAll(/^ {6}- (?:name|run|uses): [^\n]+$/gm)].map(match =>
-    match[0].slice(8).replace(/^(uses: [^@]+)@.*$/, '$1'),
+  [...steps.matchAll(/^ {6}- [^\n]+$/gm)].map(match => match[0].slice(8).replace(/^(uses: [^@]+)@.*$/, '$1'))
+
+test('observes every top-level workflow step marker', () => {
+  assert.deepEqual(
+    topLevelStepSequence(`    steps:
+      - if: always()
+        run: ignored subordinate field
+      - shell: bash
+        run: ignored subordinate field
+      - id: package
+        uses: owner/action@0123456789abcdef0123456789abcdef01234567
+`),
+    ['if: always()', 'shell: bash', 'id: package'],
   )
+})
 
 describe('package contract', () => {
   test('declares a zero-runtime-dependency Node ESM package', () => {
@@ -259,10 +271,13 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'plans', '2026-08-23-required-release-checks.md'),
       'utf8',
     )
+    const generatedVersionCheck = readFileSync(resolve(root, 'scripts', 'check-generated-version.ts'), 'utf8')
+    const packageCheck = readFileSync(resolve(root, 'scripts', 'check-package.ts'), 'utf8')
     const publishCheck = readFileSync(resolve(root, 'scripts', 'check-publish.ts'), 'utf8')
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       scripts?: Record<string, unknown>
     }
+    const generatedVersionScript = String(packageJson.scripts?.['check:generated'])
     const publishScript = String(packageJson.scripts?.['check:publish'])
     const workflowCheckScript = String(packageJson.scripts?.['check:workflows'])
     const eventsStart = workflow.indexOf('\non:\n') + 1
@@ -353,7 +368,7 @@ jobs:
       'run: bun run build',
       'run: bun run check:package',
     ])
-    assert.match(verificationSteps, /- name: Check committed package version\n\s+run: bun run check:generated/)
+    assert.match(verificationSteps, /^ {6}- name: Check committed package version\n {8}run: bun run check:generated$/m)
     assert.doesNotMatch(verificationSteps, /^\s{8}(?:if|continue-on-error):/m)
 
     assert.equal(
@@ -380,7 +395,7 @@ jobs:
       'name: Check npm publish dry run',
       'name: Upload release-equivalent package artifact',
     ])
-    assert.match(releaseSteps, /- name: Check committed package version\n\s+run: bun run check:generated/)
+    assert.match(releaseSteps, /^ {6}- name: Check committed package version\n {8}run: bun run check:generated$/m)
     assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length, 1)
     assert.doesNotMatch(releaseSteps, /^\s{8}continue-on-error:/m)
     assert.match(
@@ -429,6 +444,13 @@ jobs:
       /A job skipped by a job-level `if` reports success and does not block a required check, but that skipped result does not prove the release-equivalent contract and requiring it would give false assurance\./
     assert.deepEqual(
       [contract, releaseChecksPlan].map(document => skippedReleaseContextRationale.test(document)),
+      [true, true],
+    )
+    const exactGeneratedSourceAssertion =
+      /const generatedVersionSource = readFileSync\(resolve\(root, 'src', 'generated', 'version\.ts'\), 'utf8'\)\n[ \t]*assertPackageVersionSource\(packageJson\.version, generatedVersionSource\)/
+    assert.equal(generatedVersionScript, 'bun run scripts/check-generated-version.ts')
+    assert.deepEqual(
+      [generatedVersionCheck, packageCheck].map(source => exactGeneratedSourceAssertion.test(source)),
       [true, true],
     )
     assert.equal(workflowCheckScript, 'bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts')
