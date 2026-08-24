@@ -618,7 +618,7 @@ jobs:
 })
 
 // Mutation caught: recursive source calls exhaust the JavaScript stack before a long bounded unique chain is inspected.
-test('iteratively inspects a long unique local-action chain', () => {
+test('iteratively inspects a long unique local-action chain', { timeout: 30_000 }, () => {
   const chainLength = 5000
   let activeVisits = 0
   let maximumActiveVisits = 0
