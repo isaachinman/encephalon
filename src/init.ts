@@ -294,10 +294,16 @@ const initResolved = (
               },
               { cursor: records, plans: [] },
             )
-            const authority = assertCanonicalLayoutAdditions(
-              plans.map(plan => plan.record.kind),
-              planning.authority(),
-            )
+            const authority = (() => {
+              try {
+                return assertCanonicalLayoutAdditions(
+                  plans.map(plan => plan.record.kind),
+                  planning.authority(),
+                )
+              } catch (error) {
+                return rethrowInvalidatedCandidateError(error, repositoryChanged)
+              }
+            })()
             const recordWriteOptions = {
               authority,
               ...(hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }),

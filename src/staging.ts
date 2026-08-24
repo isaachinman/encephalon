@@ -14,7 +14,7 @@ import {
   DirectoryWitnessError,
   revalidateDirectoryWitness,
 } from './directory-witness.ts'
-import { fail } from './errors.ts'
+import { EncephalonError, fail } from './errors.ts'
 import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.ts'
 
 /** @internal */
@@ -116,11 +116,15 @@ const stagingEntryLimit = (): never =>
     `${STAGING_RELATIVE_PATH} may contain at most ${MAX_STAGING_DIRECTORY_ENTRIES} entries. Remove excess or unrecognised entries from ${STAGING_RELATIVE_PATH} and retry.`,
   )
 
-const repositoryChanged = (): never =>
-  fail('REPOSITORY_CHANGED', 'Staging layout changed before publication.', {
+/** @internal */
+export class StagingLayoutChangedError extends EncephalonError {}
+
+const repositoryChanged = (): never => {
+  throw new StagingLayoutChangedError('REPOSITORY_CHANGED', 'Staging layout changed before publication.', {
     action: 'Inspect the staging directory and retry.',
     path: STAGING_RELATIVE_PATH,
   })
+}
 
 const isPermittedStagingType = (metadata: BigIntStats) => metadata.isFile() || metadata.isSymbolicLink()
 

@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
+import type { EncephalonError } from '../src/errors.ts'
 import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
@@ -622,6 +623,39 @@ describe('canonical records', () => {
     assert.equal(existsSync(candidatePath), false)
   })
 
+  test('add preserves repository change when a settled replanned layout cannot accept the candidate kind', () => {
+    const root = createRoot()
+    const candidatePath = join(root, 'encephalon', 'new-kind', 'candidate-after-kind-limit-race.json')
+    let changed = false
+    for (const index of Array.from({ length: 999 }, (_, value) => value)) {
+      mkdirSync(join(root, 'encephalon', `kind-${String(index).padStart(4, '0')}`), {
+        recursive: true,
+      })
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-scan-validation' && !changed) {
+        changed = true
+        mkdirSync(join(root, 'encephalon', 'concurrent-kind'))
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate-after-kind-limit-race',
+          kind: 'new-kind',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'generation.candidate-after-kind-limit-race',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+
+    assert.equal(changed, true)
+    assert.equal(existsSync(candidatePath), false)
+  })
+
   test('add replans canonical generation changed during graph validation', () => {
     const root = createRoot()
     const work = { canonicalScans: 0, graphValidations: 0, links: 0 }
@@ -924,6 +958,143 @@ describe('canonical records', () => {
     )
 
     assert.equal(changed, true)
+  })
+
+  test('preserves a public cache-location repository change after the canonical link', {
+    skip: renameParentWithOpenChildSkip,
+  }, () => {
+    const root = createRoot()
+    const id = 'public-cache-location-change-after-link'
+    const cacheDirectory = join(root, 'node_modules', '.cache', 'encephalon')
+    const displacedCache = join(root, 'displaced-cache-after-canonical-link')
+    let changed = false
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-canonical-link' && !changed) {
+        changed = true
+        renameSync(cacheDirectory, displacedCache)
+        mkdirSync(cacheDirectory)
+      }
+    }
+
+    assert.throws(
+      () =>
+        api.addRecord({
+          id,
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'cache.location-public-change-after-link',
+        }),
+      error => {
+        const actual = error as EncephalonError
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(actual.message, 'The Encephalon cache layout changed during the operation.')
+        assert.equal(actual.cause, undefined)
+        assert.deepEqual(actual.details, {
+          entry: 'node_modules/.cache/encephalon',
+          invariant: 'stable-identity',
+        })
+        return true
+      },
+    )
+
+    assert.equal(changed, true)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', `${id}.json`)), true)
+  })
+
+  test('replans a record whose size changes during a pre-link authority read', () => {
+    const root = createRoot()
+    const existingId = 'prelink-size-change-existing'
+    const existingPath = join(realpathSync(root), 'encephalon', 'decision', `${existingId}.json`)
+    const work = { canonicalScans: 0, graphValidations: 0, links: 0 }
+    let changed = false
+    let targetFstats = 0
+    writeCanonicalRecord(root, { id: existingId, subject: 'generation.prelink-size-change-existing' })
+    mkdirSync(join(root, 'encephalon', '_staging'))
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        work.canonicalScans += 1
+      },
+      fault: (point, path) => {
+        if (point === 'after-record-fstat' && path === existingPath) {
+          targetFstats += 1
+          if (targetFstats === 2 && !changed) {
+            changed = true
+            writeCanonicalRecord(root, {
+              id: existingId,
+              payload: { summary: 'x'.repeat(512) },
+              subject: 'generation.prelink-size-change-existing',
+            })
+          }
+        }
+      },
+      graphValidation: () => {
+        work.graphValidations += 1
+      },
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-canonical-link') {
+        work.links += 1
+      }
+    }
+
+    const added = api.addRecord({
+      id: 'candidate-after-prelink-size-change',
+      kind: 'decision',
+      payload: {},
+      root,
+      source: 'agent',
+      subject: 'generation.candidate-after-prelink-size-change',
+    })
+
+    assert.equal(changed, true, `expected the authority read hook to change the record after ${targetFstats} fstats`)
+    assert.equal(added.id, 'candidate-after-prelink-size-change')
+    assert.deepEqual(work, { canonicalScans: 2, graphValidations: 2, links: 1 })
+  })
+
+  test('classifies a record size change during post-link authority read as a committed canonical race', () => {
+    const root = createRoot()
+    const existingId = 'postlink-size-change-existing'
+    const existingPath = join(realpathSync(root), 'encephalon', 'decision', `${existingId}.json`)
+    const id = 'candidate-before-postlink-size-change'
+    let linked = false
+    let changed = false
+    writeCanonicalRecord(root, { id: existingId, subject: 'generation.postlink-size-change-existing' })
+    mutationRecordWriteTestHooks.readHooks = {
+      fault: (point, path) => {
+        if (point === 'after-record-fstat' && path === existingPath && linked && !changed) {
+          changed = true
+          writeCanonicalRecord(root, {
+            id: existingId,
+            payload: { summary: 'x'.repeat(512) },
+            subject: 'generation.postlink-size-change-existing',
+          })
+        }
+      },
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-canonical-link') {
+        linked = true
+      }
+    }
+
+    assertCommittedRepositoryChange(
+      () =>
+        api.addRecord({
+          id,
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'generation.candidate-before-postlink-size-change',
+        }),
+      `encephalon/decision/${id}.json`,
+      id,
+    )
+
+    assert.equal(changed, true)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', `${id}.json`)), true)
   })
 
   test('record publication outcome returns the canonical record with a post-link failure', () => {
@@ -2645,6 +2816,48 @@ describe('canonical records', () => {
     )
   })
 
+  test('reports cache hydration ahead of a competing staging cleanup failure', () => {
+    const root = createRoot()
+    const id = 'hydration-priority-over-cleanup'
+    const hydrationFailure = Object.assign(new Error('Injected cache hydration priority failure'), { code: 'EIO' })
+    const cleanupFailure = Object.assign(new Error('Injected staging cleanup priority failure'), { code: 'EIO' })
+
+    assert.throws(
+      () =>
+        addRecordResolved(
+          root,
+          {
+            id,
+            kind: 'decision',
+            payload: {},
+            source: 'agent',
+            subject: 'postcommit.hydration-priority-over-cleanup',
+          },
+          {
+            hooks: {
+              fault: point => {
+                if (point === 'during-cleanup') {
+                  throw cleanupFailure
+                }
+                if (point === 'during-hydration') {
+                  throw hydrationFailure
+                }
+              },
+            },
+          },
+        ),
+      error => {
+        const actual = error as EncephalonError
+        assert.equal(actual.code, 'IO_ERROR')
+        assert.equal(actual.details.postCommitPhase, 'cacheHydration')
+        assert.equal(actual.cause, hydrationFailure)
+        return true
+      },
+    )
+
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', `${id}.json`)), true)
+  })
+
   test('preserves operational artifact I/O during mutation-snapshot hydration', () => {
     const root = createRoot()
     const id = 'snapshot-artifact-io'
@@ -3273,6 +3486,74 @@ describe('canonical records', () => {
     assert.equal(added.id, 'candidate-kind-race')
     assert.deepEqual(readdirSync(join(root, 'encephalon', 'new-kind')), [`${added.id}.json`])
     assert.deepEqual(readdirSync(join(root, 'encephalon', '_staging')), [])
+  })
+
+  test('replans when a retained canonical root entry changes type before preparation capture', () => {
+    const root = createRoot()
+    const artifactsDirectory = join(root, 'encephalon', '_artifacts')
+    const displacedArtifacts = join(root, 'displaced-artifacts-before-preparation-capture')
+    const candidatePath = join(root, 'encephalon', 'decision', 'candidate-after-artifacts-type-change.json')
+    mkdirSync(artifactsDirectory, { recursive: true })
+    let changed = false
+    recordWriteTestHooks.fault = point => {
+      if ((point as string) === 'before-publication-directory-capture' && !changed) {
+        changed = true
+        renameSync(artifactsDirectory, displacedArtifacts)
+        writeFileSync(artifactsDirectory, 'replacement file')
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id: 'candidate-after-artifacts-type-change',
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'generation.artifacts-type-change-before-preparation',
+        }),
+      'REPOSITORY_CHANGED',
+    )
+
+    assert.equal(changed, true)
+    assert.equal(existsSync(candidatePath), false)
+  })
+
+  test('rejects an overfilled newly-created kind before its canonical link', () => {
+    const root = createRoot()
+    const kindDirectory = join(root, 'encephalon', 'new-kind')
+    const candidatePath = join(kindDirectory, 'candidate-after-new-kind-overflow.json')
+    let changed = false
+    recordWriteTestHooks.fault = point => {
+      if ((point as string) === 'before-publication-directory-capture' && !changed) {
+        changed = true
+        for (const index of Array.from({ length: 1001 }, (_, value) => value)) {
+          writeFileSync(join(kindDirectory, `concurrent-${String(index).padStart(4, '0')}`), '')
+        }
+      }
+    }
+
+    assert.throws(
+      () =>
+        api.addRecord({
+          id: 'candidate-after-new-kind-overflow',
+          kind: 'new-kind',
+          payload: {},
+          root,
+          source: 'test',
+          subject: 'generation.new-kind-overflow-before-preparation',
+        }),
+      error => {
+        const actual = error as EncephalonError
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(actual.details.canonicalCommitted, undefined)
+        return true
+      },
+    )
+
+    assert.equal(changed, true)
+    assert.equal(existsSync(candidatePath), false)
   })
 
   test('enforces supersedes count before item validation and repository access', () => {

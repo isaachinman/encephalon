@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import type { BigIntStats } from 'node:fs'
+import type { BigIntStats, Dirent } from 'node:fs'
 import {
   closeSync,
   constants,
@@ -73,6 +73,7 @@ import {
   cleanupStaleStagingEntries,
   createOwnedStagingName,
   inspectCurrentStagingFile,
+  StagingLayoutChangedError,
 } from './staging.ts'
 import type {
   AddRecordInput,
@@ -105,6 +106,8 @@ type ValidatedRecordScan = {
 }
 
 class CanonicalGenerationChanged extends Error {}
+
+class CanonicalRepositoryChangedError extends EncephalonError {}
 
 type CanonicalSnapshotRetryLedger = {
   readonly deadline: number
@@ -156,6 +159,7 @@ type RecordWriteFault =
   | 'after-staging-cleanup-preflight'
   | 'before-directory-preparation'
   | 'before-final-publication-revalidation'
+  | 'before-publication-directory-capture'
   | 'before-publication'
   | 'before-staging-cleanup-empty-probe'
   | 'before-staging-cleanup-entry-lstat'
@@ -331,12 +335,16 @@ const classifyPublicationVerificationError = (record: BrainRecord, error: unknow
     return publicationVerificationError(record)
   }
   if (
+    error instanceof CanonicalRepositoryChangedError ||
     error instanceof CanonicalPublicationIdentityError ||
     error instanceof DirectoryWitnessError ||
-    isCanonicalDirectoryReplacementError(error) ||
-    (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED')
+    error instanceof StagingLayoutChangedError ||
+    isCanonicalDirectoryReplacementError(error)
   ) {
     return publicationVerificationError(record)
+  }
+  if (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED') {
+    return error
   }
   return postCommitError(record, 'publicationVerification', error)
 }
@@ -1493,6 +1501,7 @@ const canonicalPublicationAuthority = (
   initialArtifactEvidence: readonly ArtifactInspectionResult[],
   cacheLocation?: CacheLocation,
   changed: () => never = repositoryChangedBeforePublication,
+  hooks: RecordReadHooks = {},
 ): CanonicalPublicationAuthority => {
   let layout = initialLayout
   let observations = [...initialObservations]
@@ -1522,7 +1531,8 @@ const canonicalPublicationAuthority = (
       if (!sameStableEntryMetadata(pathMetadata, descriptorMetadata)) {
         changed()
       }
-      const bytes = readBoundedDescriptor(descriptor, descriptorMetadata.size)
+      readFault(hooks, 'after-record-fstat', observation.path)
+      const bytes = readBoundedDescriptor(descriptor, descriptorMetadata.size, changed)
       const finalDescriptorMetadata = fstatSync(descriptor, { bigint: true })
       const finalPathMetadata = currentObservationMetadata(observation.path)
       if (
@@ -1577,20 +1587,35 @@ const canonicalPublicationAuthority = (
     sameEntryIdentity(expected.witness.canonicalMetadata, current.witness.canonicalMetadata)
   const sameEntryNames = (first: readonly { name: string }[], second: readonly { name: string }[]) =>
     first.length === second.length && first.every((entry, index) => entry.name === second[index]?.name)
+  const sameEntryType = (first: Dirent, second: Dirent) =>
+    first.isSymbolicLink() === second.isSymbolicLink() &&
+    first.isDirectory() === second.isDirectory() &&
+    first.isFile() === second.isFile()
+  const sameEntryNamesAndTypes = (first: readonly Dirent[], second: readonly Dirent[]) =>
+    first.length === second.length &&
+    first.every((entry, index) => {
+      const other = second[index]
+      return other !== undefined && entry.name === other.name && sameEntryType(entry, other)
+    })
   const authority: CanonicalPublicationAuthority = {
     acceptPreparation: (kind, rootSnapshot, kindSnapshot) => {
       const currentProjection = projection()
-      const expectedRootNames = new Set([...currentProjection.rootNames, STAGING_DIRECTORY_NAME, kind])
-      const actualRootNames = new Set(rootSnapshot.entries.map(entry => entry.name))
+      const plannedRootAdditions = new Set(
+        [STAGING_DIRECTORY_NAME, kind].filter(name => !currentProjection.rootNames.has(name)),
+      )
+      const retainedRootEntries = rootSnapshot.entries.filter(entry => !plannedRootAdditions.has(entry.name))
+      const plannedRootEntries = rootSnapshot.entries.filter(entry => plannedRootAdditions.has(entry.name))
       const rootGenerationAccepted =
         layout.root === null || (layout.root !== null && sameDirectoryGeneration(layout.root, rootSnapshot))
       const rootEntriesAccepted =
-        expectedRootNames.size === actualRootNames.size &&
-        [...expectedRootNames].every(name => actualRootNames.has(name))
+        !rootSnapshot.overflow &&
+        sameEntryNamesAndTypes(layout.root?.entries ?? [], retainedRootEntries) &&
+        plannedRootEntries.length === plannedRootAdditions.size &&
+        plannedRootEntries.every(entry => entry.isDirectory() && !entry.isSymbolicLink())
       const previousKind = layout.kinds.get(kind)
       const kindGenerationAccepted =
         previousKind === undefined
-          ? kindSnapshot.entries.length === 0
+          ? !kindSnapshot.overflow && kindSnapshot.entries.length === 0
           : sameCanonicalDirectoryGeneration(previousKind, kindSnapshot)
       if (!(rootGenerationAccepted && rootEntriesAccepted && kindGenerationAccepted)) {
         return changed()
@@ -1686,6 +1711,7 @@ const recordPlanningSnapshot = (
       artifactEvidence,
       cacheLocation,
       changed,
+      hooks,
     )
     return publicationAuthority
   }
@@ -1880,7 +1906,7 @@ export const assertRecordGraph = (
 }
 
 const repositoryChangedBeforePublicationError = () =>
-  new EncephalonError('REPOSITORY_CHANGED', 'Canonical layout changed before publication.')
+  new CanonicalRepositoryChangedError('REPOSITORY_CHANGED', 'Canonical layout changed before publication.')
 
 const repositoryChangedBeforePublication = (): never => {
   throw repositoryChangedBeforePublicationError()
@@ -1997,6 +2023,7 @@ const publishPlannedRecordInternal = (
     projection.rootNames.has(STAGING_DIRECTORY_NAME),
     options.authority.changed,
   )
+  fault(options.hooks, 'before-publication-directory-capture')
   const publicationRoot = capturePreparedPublicationDirectory(
     resolve(root, 'encephalon'),
     MAX_CANONICAL_BRAIN_ROOT_ENTRIES,
@@ -2296,7 +2323,13 @@ const addRecordFileResolved = (
       }
       const plan = planRecordAddition(root, createRecordFile(recordDraft, nextRecordCreatedAt(planning.records)))
       fault(options.hooks, 'after-scan-validation')
-      const authority = assertCanonicalLayoutAdditions([plan.record.kind], planning.authority())
+      const authority = (() => {
+        try {
+          return assertCanonicalLayoutAdditions([plan.record.kind], planning.authority())
+        } catch (error) {
+          return rethrowInvalidatedCandidateError(error, repositoryChanged)
+        }
+      })()
 
       const publishOptions = {
         authority,

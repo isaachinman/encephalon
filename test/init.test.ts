@@ -27,6 +27,7 @@ import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
+import { cacheLocationTestHooks } from '../src/cache-location.ts'
 import { DirectoryWitnessError } from '../src/directory-witness.ts'
 import { EncephalonError } from '../src/errors.ts'
 import * as api from '../src/index.ts'
@@ -225,6 +226,7 @@ afterEach(() => {
   artifactInspectionTestHooks.open = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.duringDatabaseInitialisation = undefined
+  cacheLocationTestHooks.beforeCacheLocationAssertion = undefined
   roots.splice(0).forEach(removeTestRepository)
 })
 
@@ -1300,6 +1302,103 @@ describe('initialisation', () => {
     }
     assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
     assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('init preserves repository change when a settled replanned layout cannot accept all baseline kinds', () => {
+    const root = createRoot()
+    let changed = false
+    for (const index of Array.from({ length: 997 }, (_, value) => value)) {
+      mkdirSync(join(root, 'encephalon', `kind-${String(index).padStart(4, '0')}`), {
+        recursive: true,
+      })
+    }
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            graphValidation: () => {
+              if (!changed) {
+                changed = true
+                mkdirSync(join(root, 'encephalon', 'concurrent-kind'))
+              }
+            },
+          },
+        ),
+      error => {
+        const actual = error as EncephalonError
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal((actual.details.initProgress as { canonicalCommitted?: unknown }).canonicalCommitted, false)
+        return true
+      },
+    )
+
+    assert.equal(changed, true)
+    for (const kind of ['architecture', 'context', 'workflow']) {
+      assert.equal(existsSync(join(root, 'encephalon', kind)), false)
+    }
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+  })
+
+  test('init preserves a public cache-location repository change after a baseline link', () => {
+    const root = createRoot()
+    const safeCause = new Error('Public init cache-location evidence')
+    const cacheLocationError = new EncephalonError(
+      'REPOSITORY_CHANGED',
+      'The Encephalon cache layout changed during the operation.',
+      {
+        entry: 'node_modules/.cache/encephalon',
+        invariant: 'stable-identity',
+      },
+      { cause: safeCause },
+    )
+    let linked = false
+    cacheLocationTestHooks.beforeCacheLocationAssertion = () => {
+      if (linked) {
+        throw cacheLocationError
+      }
+    }
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'after-canonical-link') {
+                  linked = true
+                }
+              },
+            },
+          },
+        ),
+      error => {
+        const actual = error as EncephalonError
+        assert.equal(actual.code, cacheLocationError.code)
+        assert.equal(actual.message, cacheLocationError.message)
+        assert.equal(actual.cause, safeCause)
+        const { initProgress, ...details } = actual.details
+        assert.deepEqual(details, cacheLocationError.details)
+        assert.deepEqual(initProgress, {
+          cacheState: 'disposable',
+          canonicalCommitted: true,
+          committedInstructionFiles: [],
+          committedRecordIds: committedBaselineIds(root),
+          phase: 'recordPublication',
+          recoveryAction:
+            'Inspect the reported canonical records, then repeat the same init operation with the same options.',
+          recoveryMode: 'inspectAndRerun',
+        })
+        return true
+      },
+    )
+
+    assert.equal(linked, true)
+    assert.equal(committedBaselineIds(root).length, 1)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
