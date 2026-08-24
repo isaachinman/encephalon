@@ -1,6 +1,6 @@
 import { parseInitInput } from './api-input.ts'
 import { canonicalPayload, scanBaseline } from './baseline.ts'
-import { hydrateResolvedCanonicalSnapshot, prepareResolvedCanonicalSnapshot } from './cache.ts'
+import { createResolvedCanonicalSnapshotPreparer } from './cache.ts'
 import { assertCacheLocation } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { applyInstructionChangesOutcome, planInstructionChanges } from './instructions.ts'
@@ -228,6 +228,7 @@ const initResolved = (
             subject: candidate.subject,
           }))
         : undefined
+      const canonicalSnapshotCache = createResolvedCanonicalSnapshotPreparer(root, location)
       const { actions, recordsCreated } = withRecordPlanningSnapshotRetryResolved(
         root,
         (planning, repositoryChanged) => {
@@ -324,7 +325,7 @@ const initResolved = (
                   mutationBytes <= MAX_CANONICAL_RECORD_BYTES
                     ? planning.sealCacheSnapshot([...records, ...attemptRecordsCreated], artifacts, location.repository)
                     : readValidatedCanonicalSnapshotAttemptResolved(root, location, authority.assertCurrent, hooks)
-                return hydrateResolvedCanonicalSnapshot(root, snapshot, 'held', location)
+                return canonicalSnapshotCache.hydrate(snapshot)
               } catch (error) {
                 return rethrowCanonicalGenerationChangeAfterCommit(error, attemptRecordsCreated)
               }
@@ -336,7 +337,7 @@ const initResolved = (
             const cacheSnapshot = planning.sealCacheSnapshot(records, artifacts, location.repository)
             progress.phase = 'cachePreparation'
             progress.cacheState = 'disposable'
-            const cacheResult = prepareResolvedCanonicalSnapshot(root, cacheSnapshot, 'held', location)
+            const cacheResult = canonicalSnapshotCache.prepare(cacheSnapshot)
             progress.cacheState = 'prepared'
             hooks.hydration?.(cacheResult)
           }

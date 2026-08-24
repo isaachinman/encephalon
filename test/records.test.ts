@@ -613,7 +613,7 @@ describe('canonical records', () => {
       }
     }
 
-    assertErrorCode(
+    assert.throws(
       () =>
         api.addRecord({
           id: 'candidate-after-malformed-successor',
@@ -623,7 +623,16 @@ describe('canonical records', () => {
           source: 'agent',
           subject: 'generation.candidate-after-malformed-successor',
         }),
-      'REPOSITORY_CHANGED',
+      (error: unknown) => {
+        const actual = error as Error & { cause?: unknown; code?: unknown; details?: unknown }
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(actual.message, 'Canonical layout changed before publication.')
+        assert.deepEqual(actual.details, {})
+        assert.equal(actual.cause, undefined)
+        assert.equal(JSON.stringify(actual).includes('CanonicalGenerationChanged'), false)
+        assert.equal(JSON.stringify(actual).includes(root), false)
+        return true
+      },
     )
 
     assert.equal(changed, true)
@@ -2957,6 +2966,56 @@ describe('canonical records', () => {
 
     assert.deepEqual(work, { cacheMutations: 0, canonicalScans: 2, graphValidations: 1 })
     assert.equal(existsSync(recordPath), true)
+    assert.equal(readdirSync(join(root, 'encephalon', '_staging')).length, 1)
+  })
+
+  test('committed add fallback retains the linked inode before its first bracket assertion', () => {
+    const root = createRoot()
+    const id = 'committed-fallback-byte-identical-successor'
+    const recordPath = join(root, 'encephalon', 'decision', `${id}.json`)
+    const displacedPath = join(root, 'committed-fallback-linked-inode.json')
+    const work = { cacheMutations: 0, canonicalScans: 0, graphValidations: 0 }
+    let successorBytes: Buffer | undefined
+    mutationRecordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        work.canonicalScans += 1
+      },
+      graphValidation: () => {
+        work.graphValidations += 1
+      },
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'during-cleanup') {
+        throw Object.assign(new Error('Injected staging cleanup failure'), { code: 'EIO' })
+      }
+      if (point === 'during-hydration') {
+        successorBytes = readFileSync(recordPath)
+        renameSync(recordPath, displacedPath)
+        writeFileSync(recordPath, successorBytes)
+      }
+    }
+    cacheReadTestHooks.afterCacheRecordInsert = () => {
+      work.cacheMutations += 1
+    }
+
+    assertCommittedRepositoryChange(
+      () =>
+        api.addRecord({
+          id,
+          kind: 'decision',
+          payload: {},
+          root,
+          source: 'agent',
+          subject: 'generation.committed-fallback-byte-identical-successor',
+        }),
+      `encephalon/decision/${id}.json`,
+      id,
+    )
+
+    assert.ok(successorBytes)
+    assert.deepEqual(work, { cacheMutations: 0, canonicalScans: 1, graphValidations: 1 })
+    assert.deepEqual(readFileSync(recordPath), successorBytes)
+    assert.equal(existsSync(displacedPath), true)
     assert.equal(readdirSync(join(root, 'encephalon', '_staging')).length, 1)
   })
 

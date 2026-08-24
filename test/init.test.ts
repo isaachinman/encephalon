@@ -8,6 +8,7 @@ import {
   fstatSync,
   ftruncateSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -28,7 +29,7 @@ import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
-import { cacheLocationTestHooks } from '../src/cache-location.ts'
+import { cacheLocationTestHooks, sameCacheEntryIdentity } from '../src/cache-location.ts'
 import { DirectoryWitnessError } from '../src/directory-witness.ts'
 import { EncephalonError } from '../src/errors.ts'
 import * as api from '../src/index.ts'
@@ -1968,6 +1969,230 @@ describe('initialisation', () => {
         ordinalStringCompare,
       ),
     )
+  })
+
+  test('idempotent init retains its claimed cache primary across all three canonical attempts', () => {
+    const root = createRoot()
+    const [record] = api.initEncephalon({ root }).recordsCreated
+    assert.ok(record)
+    const databasePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const claimedPath = join(root, 'idempotent-cache-retry-claim.sqlite')
+    const successorPath = join(root, 'idempotent-cache-retry-successor.sqlite')
+    const sourceDatabase = new DatabaseSync(databasePath, { readOnly: true })
+    sourceDatabase.prepare('VACUUM INTO ?').run(successorPath)
+    sourceDatabase.close()
+    const successorBytes = readFileSync(successorPath)
+    const successorIdentity = lstatSync(successorPath, { bigint: true })
+    rmSync(databasePath)
+    const recordPath = join(root, record.path)
+    const work = {
+      cacheMutations: 0,
+      canonicalScans: 0,
+      graphValidations: 0,
+      successorWriterInitialisations: 0,
+    }
+    let successorInstalled = false
+    cacheReadTestHooks.afterCacheRecordInsert = inserted => {
+      if (inserted.id === record.id && work.cacheMutations < 2) {
+        work.cacheMutations += 1
+        writeFileSync(recordPath, `${readFileSync(recordPath, 'utf8')} `)
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (
+        mode === 'writer' &&
+        successorInstalled &&
+        sameCacheEntryIdentity(successorIdentity, lstatSync(databasePath, { bigint: true }))
+      ) {
+        work.successorWriterInitialisations += 1
+      }
+    }
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            canonicalScan: () => {
+              work.canonicalScans += 1
+            },
+            graphValidation: () => {
+              work.graphValidations += 1
+              if (work.graphValidations === 3) {
+                for (const suffix of ['-wal', '-shm', '-journal']) {
+                  const sidecarPath = `${databasePath}${suffix}`
+                  if (existsSync(sidecarPath)) {
+                    renameSync(sidecarPath, `${claimedPath}${suffix}`)
+                  }
+                }
+                renameSync(databasePath, claimedPath)
+                renameSync(successorPath, databasePath)
+                successorInstalled = true
+              }
+            },
+          },
+        ),
+      (error: unknown) => {
+        const actual = error as Error & {
+          cause?: unknown
+          code?: unknown
+          details?: Record<string, unknown>
+        }
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(actual.message, 'The Encephalon cache layout changed during the operation.')
+        assert.deepEqual(actual.details, {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          initProgress: {
+            cacheState: 'disposable',
+            canonicalCommitted: false,
+            committedInstructionFiles: [],
+            committedRecordIds: [],
+            phase: 'cachePreparation',
+            recoveryAction:
+              'Inspect canonical state, run prepare, run validate, then repeat the same init operation with the same options.',
+            recoveryMode: 'inspectAndRerun',
+          },
+          invariant: 'stable-identity',
+        })
+        assert.equal(actual.cause, undefined)
+        assert.equal(JSON.stringify(actual).includes('CanonicalGenerationChanged'), false)
+        assert.equal(JSON.stringify(actual).includes(root), false)
+        return true
+      },
+    )
+
+    assert.deepEqual(work, {
+      cacheMutations: 2,
+      canonicalScans: 3,
+      graphValidations: 3,
+      successorWriterInitialisations: 0,
+    })
+    assert.equal(successorInstalled, true)
+    assert.equal(existsSync(claimedPath), true)
+    assert.equal(sameCacheEntryIdentity(successorIdentity, lstatSync(databasePath, { bigint: true })), true)
+    assert.deepEqual(readFileSync(databasePath), successorBytes)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), true)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), true)
+  })
+
+  test('init retains its claimed cache primary when a retry becomes record-producing', () => {
+    const root = createRoot()
+    const [record] = api.initEncephalon({ root }).recordsCreated
+    assert.ok(record)
+    const agentsBytes = readFileSync(join(root, 'AGENTS.md'))
+    const claudeBytes = readFileSync(join(root, 'CLAUDE.md'))
+    const databasePath = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const claimedPath = join(root, 'record-producing-cache-retry-claim.sqlite')
+    const successorPath = join(root, 'record-producing-cache-retry-successor.sqlite')
+    const sourceDatabase = new DatabaseSync(databasePath, { readOnly: true })
+    sourceDatabase.prepare('VACUUM INTO ?').run(successorPath)
+    sourceDatabase.close()
+    const successorBytes = readFileSync(successorPath)
+    const successorIdentity = lstatSync(successorPath, { bigint: true })
+    rmSync(databasePath)
+    const recordPath = join(root, record.path)
+    const work = {
+      cacheMutations: 0,
+      canonicalScans: 0,
+      graphValidations: 0,
+      links: 0,
+      successorWriterInitialisations: 0,
+    }
+    let publishedRecordId: string | undefined
+    let successorInstalled = false
+    cacheReadTestHooks.afterCacheRecordInsert = inserted => {
+      if (inserted.id === record.id && work.cacheMutations === 0) {
+        work.cacheMutations += 1
+        unlinkSync(recordPath)
+      }
+    }
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (
+        mode === 'writer' &&
+        successorInstalled &&
+        sameCacheEntryIdentity(successorIdentity, lstatSync(databasePath, { bigint: true }))
+      ) {
+        work.successorWriterInitialisations += 1
+      }
+    }
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            canonicalScan: () => {
+              work.canonicalScans += 1
+            },
+            graphValidation: () => {
+              work.graphValidations += 1
+            },
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'after-canonical-link') {
+                  work.links += 1
+                  const [publishedRecord] = rawRecordFilesForSubject(root, record.kind, record.subject)
+                  assert.ok(publishedRecord)
+                  publishedRecordId = publishedRecord.id
+                  for (const suffix of ['-wal', '-shm', '-journal']) {
+                    const sidecarPath = `${databasePath}${suffix}`
+                    if (existsSync(sidecarPath)) {
+                      renameSync(sidecarPath, `${claimedPath}${suffix}`)
+                    }
+                  }
+                  renameSync(databasePath, claimedPath)
+                  renameSync(successorPath, databasePath)
+                  successorInstalled = true
+                }
+              },
+            },
+          },
+        ),
+      (error: unknown) => {
+        const actual = error as Error & {
+          cause?: unknown
+          code?: unknown
+          details?: Record<string, unknown>
+        }
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(actual.message, 'The Encephalon cache layout changed during the operation.')
+        assert.ok(publishedRecordId)
+        assert.deepEqual(actual.details, {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          initProgress: {
+            cacheState: 'disposable',
+            canonicalCommitted: true,
+            committedInstructionFiles: [],
+            committedRecordIds: [publishedRecordId],
+            phase: 'cachePreparation',
+            recoveryAction:
+              'Inspect canonical state, run prepare, run validate, then repeat the same init operation with the same options.',
+            recoveryMode: 'inspectAndRerun',
+          },
+          invariant: 'stable-identity',
+        })
+        assert.equal(actual.cause, undefined)
+        assert.equal(JSON.stringify(actual).includes('CanonicalGenerationChanged'), false)
+        assert.equal(JSON.stringify(actual).includes(root), false)
+        return true
+      },
+    )
+
+    assert.deepEqual(work, {
+      cacheMutations: 1,
+      canonicalScans: 2,
+      graphValidations: 2,
+      links: 1,
+      successorWriterInitialisations: 0,
+    })
+    assert.equal(successorInstalled, true)
+    assert.equal(existsSync(claimedPath), true)
+    assert.equal(sameCacheEntryIdentity(successorIdentity, lstatSync(databasePath, { bigint: true })), true)
+    assert.deepEqual(readFileSync(databasePath), successorBytes)
+    assert.ok(publishedRecordId)
+    assert.equal(existsSync(join(root, 'encephalon', record.kind, `${publishedRecordId}.json`)), true)
+    assert.deepEqual(readFileSync(join(root, 'AGENTS.md')), agentsBytes)
+    assert.deepEqual(readFileSync(join(root, 'CLAUDE.md')), claudeBytes)
   })
 
   test('idempotent init returns ordinary validation for a settled malformed cache successor', () => {

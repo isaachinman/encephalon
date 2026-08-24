@@ -155,6 +155,7 @@ type CanonicalPublicationAuthority = {
     rootSnapshot: CanonicalDirectorySnapshot,
     kindSnapshot: CanonicalDirectorySnapshot,
     digest: string,
+    metadata: BigIntStats,
   ) => void
   changed: () => never
   projection: () => {
@@ -1758,7 +1759,7 @@ const canonicalPublicationAuthority = (
       }
       authority.assertCurrent()
     },
-    acceptPublication: (kind, recordName, rootSnapshot, kindSnapshot, digest) => {
+    acceptPublication: (kind, recordName, rootSnapshot, kindSnapshot, digest, metadata) => {
       try {
         if (layout.root !== rootSnapshot || layout.kinds.get(kind) !== kindSnapshot) {
           return changed()
@@ -1772,11 +1773,15 @@ const canonicalPublicationAuthority = (
           return changed()
         }
         const recordPath = resolve(root, 'encephalon', kind, recordName)
+        const pathMetadata = lstatSync(recordPath, { bigint: true })
+        if (!sameStableEntryMetadata(metadata, pathMetadata)) {
+          return changed()
+        }
         observations = [
           ...observations,
           {
             digest,
-            metadata: lstatSync(recordPath, { bigint: true }),
+            metadata: pathMetadata,
             path: recordPath,
           },
         ]
@@ -2254,6 +2259,7 @@ const publishPlannedRecordInternal = (
   let finalStagingRevalidationSucceeded = false
   let postCleanupStagingWitness: DirectoryWitness | undefined
   let publicationAccepted = false
+  let publicationAcceptanceAttempted = false
   let stagingWitness: DirectoryWitness | undefined
   const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
     if (committedErrorPhase === undefined || postCommitPriority[phase] > postCommitPriority[committedErrorPhase]) {
@@ -2269,6 +2275,20 @@ const publishPlannedRecordInternal = (
       committedError = classifyPublicationVerificationError(record, error)
       committedErrorPhase = 'publicationVerification'
     }
+  }
+  const acceptCurrentPublication = (currentDescriptor: number) => {
+    assertCanonicalPublicationIdentity(path, currentDescriptor)
+    options.authority.acceptPublication(
+      recordFile.kind,
+      `${recordFile.id}.json`,
+      publicationRoot,
+      publicationKind,
+      recordDigest(formatted),
+      fstatSync(currentDescriptor, { bigint: true }),
+    )
+    publicationAccepted = true
+    fault(options.hooks, 'after-publication-accept')
+    assertCanonicalPublicationIdentity(path, currentDescriptor)
   }
   try {
     assertPreparedPublicationDirectory(root, stagingDirectory, options.authority.changed)
@@ -2344,6 +2364,14 @@ const publishPlannedRecordInternal = (
       descriptor = undefined
     }
     let stagingCleanupFault: unknown
+    if (published && committedErrorPhase !== 'publicationVerification' && descriptor !== undefined) {
+      publicationAcceptanceAttempted = true
+      try {
+        acceptCurrentPublication(descriptor)
+      } catch (error) {
+        capturePublicationVerificationError(error)
+      }
+    }
     try {
       fault(options.hooks, 'during-cleanup')
     } catch (error) {
@@ -2359,18 +2387,14 @@ const publishPlannedRecordInternal = (
         if (stagingWitness !== undefined) {
           revalidatePublicationDirectories([stagingWitness], options.authority.changed)
         }
-        if (published && committedErrorPhase === 'publicationVerification' && descriptor !== undefined) {
-          assertCanonicalPublicationIdentity(path, descriptor)
-          options.authority.acceptPublication(
-            recordFile.kind,
-            `${recordFile.id}.json`,
-            publicationRoot,
-            publicationKind,
-            recordDigest(formatted),
-          )
-          publicationAccepted = true
-          fault(options.hooks, 'after-publication-accept')
-          assertCanonicalPublicationIdentity(path, descriptor)
+        if (
+          published &&
+          committedErrorPhase === 'publicationVerification' &&
+          descriptor !== undefined &&
+          !publicationAcceptanceAttempted
+        ) {
+          publicationAcceptanceAttempted = true
+          acceptCurrentPublication(descriptor)
           if (stagingWitness !== undefined) {
             revalidatePublicationDirectories([stagingWitness], options.authority.changed)
           }
@@ -2434,18 +2458,9 @@ const publishPlannedRecordInternal = (
     postCleanupStagingWitness !== undefined
   ) {
     try {
-      assertCanonicalPublicationIdentity(path, descriptor)
       assertStagingEmpty(postCleanupStagingWitness)
-      options.authority.acceptPublication(
-        recordFile.kind,
-        `${recordFile.id}.json`,
-        publicationRoot,
-        publicationKind,
-        recordDigest(formatted),
-      )
-      publicationAccepted = true
-      fault(options.hooks, 'after-publication-accept')
-      assertCanonicalPublicationIdentity(path, descriptor)
+      publicationAcceptanceAttempted = true
+      acceptCurrentPublication(descriptor)
       assertStagingEmpty(postCleanupStagingWitness)
     } catch (error) {
       capturePublicationVerificationError(error)
@@ -2470,16 +2485,6 @@ const publishPlannedRecordInternal = (
     }
   }
   const assertCommittedCurrent = () => {
-    if (!publicationAccepted) {
-      options.authority.acceptPublication(
-        recordFile.kind,
-        `${recordFile.id}.json`,
-        publicationRoot,
-        publicationKind,
-        recordDigest(formatted),
-      )
-      publicationAccepted = true
-    }
     options.authority.assertCurrent()
   }
   return {

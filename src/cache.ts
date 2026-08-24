@@ -1653,6 +1653,11 @@ type CacheSnapshotWriter = {
   write: (snapshot: ValidatedCanonicalSnapshot) => CacheSnapshotWrite
 }
 
+type CacheSnapshotPreparationSession = {
+  recovered: boolean
+  writer: CacheSnapshotWriter
+}
+
 const cacheSnapshotWriter = (
   root: string,
   location: CacheLocation,
@@ -1714,6 +1719,37 @@ const cacheSnapshotWriter = (
   return { mayObserveCurrent, observe, recover, write }
 }
 
+const writeCacheSnapshotWithSession = (
+  snapshot: ValidatedCanonicalSnapshot,
+  session: CacheSnapshotPreparationSession,
+): CompletedCacheRebuild => {
+  const write = () => session.writer.write(snapshot)
+  const written = (() => {
+    try {
+      return write()
+    } catch (error) {
+      if (session.writer.recover(error)) {
+        session.recovered = true
+        try {
+          return write()
+        } catch (failure) {
+          return rethrowAfterCacheRecovery(failure)
+        }
+      }
+      throw error
+    }
+  })()
+  if (written.kind === 'committed') {
+    const rebuild = { ...written.rebuild, observeDatabase: session.writer.observe }
+    if (session.recovered) {
+      session.recovered = false
+      cacheReadTestHooks.afterDisposableCacheRecoveryRebuild?.(rebuild.result)
+    }
+    return rebuild
+  }
+  throw written.cause
+}
+
 type CacheRebuilder = <Result>(
   root: string,
   location: CacheLocation,
@@ -1724,35 +1760,10 @@ type CacheRebuilder = <Result>(
 const cacheRebuilder =
   (runCanonicalSnapshot: CanonicalSnapshotRunner): CacheRebuilder =>
   (root, location, completion, primary = { kind: 'create-if-missing' }) => {
-    const writer = cacheSnapshotWriter(root, location, primary)
-    let recovered = false
-    return runCanonicalSnapshot(root, location, snapshot => {
-      const write = () => writer.write(snapshot)
-      const written = (() => {
-        try {
-          return write()
-        } catch (error) {
-          if (writer.recover(error)) {
-            recovered = true
-            try {
-              return write()
-            } catch (failure) {
-              return rethrowAfterCacheRecovery(failure)
-            }
-          }
-          throw error
-        }
-      })()
-      if (written.kind === 'committed') {
-        const rebuild = { ...written.rebuild, observeDatabase: writer.observe }
-        if (recovered) {
-          recovered = false
-          cacheReadTestHooks.afterDisposableCacheRecoveryRebuild?.(rebuild.result)
-        }
-        return completion(rebuild)
-      }
-      throw written.cause
-    })
+    const session = { recovered: false, writer: cacheSnapshotWriter(root, location, primary) }
+    return runCanonicalSnapshot(root, location, snapshot =>
+      completion(writeCacheSnapshotWithSession(snapshot, session)),
+    )
   }
 
 const canonicalSnapshotCacheRebuilder = (snapshot: ValidatedCanonicalSnapshot): CacheRebuilder =>
@@ -2049,6 +2060,7 @@ function resolvePreparedCacheWithoutCorruptionRecovery(
   completion: { kind: 'prepare' },
   lockMode: CacheRecoveryLockMode,
   runCanonicalSnapshot: CanonicalSnapshotRunner,
+  session?: CacheSnapshotPreparationSession,
 ): PrepareResult
 function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
   root: string,
@@ -2056,6 +2068,7 @@ function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
   completion: { kind: 'read'; read: (database: DatabaseSync) => Result; state: CacheReadRecoveryState },
   lockMode: CacheRecoveryLockMode,
   runCanonicalSnapshot: CanonicalSnapshotRunner,
+  session?: CacheSnapshotPreparationSession,
 ): Result
 function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
   root: string,
@@ -2063,6 +2076,7 @@ function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
   completion: CachePreparationCompletion<Result>,
   lockMode: CacheRecoveryLockMode,
   runCanonicalSnapshot: CanonicalSnapshotRunner,
+  session?: CacheSnapshotPreparationSession,
 ): PrepareResult | Result {
   if (completion.kind === 'read' && completion.state.rebuild !== undefined) {
     return requireSnapshotCacheResult(root, location, completion, completion.state.rebuild)
@@ -2074,8 +2088,8 @@ function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
     return operation(location)
   }
   const completeSnapshot = (captured: CacheLocation) => {
-    const writer = cacheSnapshotWriter(root, captured)
-    let recovered = false
+    const preparation = session ?? { recovered: false, writer: cacheSnapshotWriter(root, captured) }
+    const { writer } = preparation
     return runCanonicalSnapshot(root, captured, snapshot => {
       snapshot.assertCurrent()
       if (writer.mayObserveCurrent() && inspectCacheDatabase(captured, 'brain.sqlite') !== undefined) {
@@ -2086,41 +2100,18 @@ function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
           }
         } catch (error) {
           if (writer.recover(error)) {
-            recovered = true
+            preparation.recovered = true
           } else {
             throw error
           }
         }
       }
-      const write = () => writer.write(snapshot)
-      const written = (() => {
-        try {
-          return write()
-        } catch (error) {
-          if (writer.recover(error)) {
-            recovered = true
-            try {
-              return write()
-            } catch (failure) {
-              return rethrowAfterCacheRecovery(failure)
-            }
-          }
-          throw error
-        }
-      })()
-      if (written.kind === 'committed') {
-        const rebuild = { ...written.rebuild, observeDatabase: writer.observe }
-        if (recovered) {
-          recovered = false
-          cacheReadTestHooks.afterDisposableCacheRecoveryRebuild?.(rebuild.result)
-        }
-        if (completion.kind === 'read') {
-          completion.state.rebuild = rebuild
-          return requireSnapshotCacheResult(root, captured, completion, rebuild)
-        }
-        return rebuild.result
+      const rebuild = writeCacheSnapshotWithSession(snapshot, preparation)
+      if (completion.kind === 'read') {
+        completion.state.rebuild = rebuild
+        return requireSnapshotCacheResult(root, captured, completion, rebuild)
       }
-      throw written.cause
+      return rebuild.result
     })
   }
   const completeFresh = (captured: CacheLocation) => readFreshCacheResult(root, captured, completion)
@@ -2144,18 +2135,27 @@ const prepareResolvedWithoutCorruptionRecovery = (
   location: CacheLocation,
   lockMode: CacheRecoveryLockMode,
   runCanonicalSnapshot: CanonicalSnapshotRunner,
+  session?: CacheSnapshotPreparationSession,
 ): PrepareResult =>
-  resolvePreparedCacheWithoutCorruptionRecovery(root, location, { kind: 'prepare' }, lockMode, runCanonicalSnapshot)
+  resolvePreparedCacheWithoutCorruptionRecovery(
+    root,
+    location,
+    { kind: 'prepare' },
+    lockMode,
+    runCanonicalSnapshot,
+    session,
+  )
 
 const prepareResolved = (
   root: string,
   lockMode: CacheRecoveryLockMode,
   capturedLocation: CacheLocation,
   runCanonicalSnapshot: CanonicalSnapshotRunner,
+  session?: CacheSnapshotPreparationSession,
 ): PrepareResult => {
   const rebuilder = cacheRebuilder(runCanonicalSnapshot)
   const operation = () =>
-    prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lockMode, runCanonicalSnapshot)
+    prepareResolvedWithoutCorruptionRecovery(root, capturedLocation, lockMode, runCanonicalSnapshot, session)
   return runWithDisposableCacheRecovery(root, capturedLocation, operation, {
     completion: { complete: rebuild => rebuild.result, kind: 'complete-from-rebuild' },
     lockMode,
@@ -2184,6 +2184,21 @@ export const prepareResolvedCanonicalSnapshot = (
   const captured = location ?? inspectCacheLocation(root)
   const runCanonicalSnapshot = sealedCanonicalSnapshotRunner(snapshot)
   return prepareResolved(root, lockMode, captured, runCanonicalSnapshot)
+}
+
+/** @internal */
+export const createResolvedCanonicalSnapshotPreparer = (
+  root: string,
+  location: CacheLocation,
+): Readonly<{
+  hydrate: (snapshot: ValidatedCanonicalSnapshot) => PrepareResult
+  prepare: (snapshot: ValidatedCanonicalSnapshot) => PrepareResult
+}> => {
+  const session = { recovered: false, writer: cacheSnapshotWriter(root, location) }
+  return Object.freeze({
+    hydrate: snapshot => writeCacheSnapshotWithSession(snapshot, session).result,
+    prepare: snapshot => prepareResolved(root, 'held', location, sealedCanonicalSnapshotRunner(snapshot), session),
+  })
 }
 
 const hydrateResolvedWithRebuilder = (
