@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-24 for code and behavioural-test snapshot `68cfcb9210c984e864505c37bfef1973164bbf40`.
+Last reviewed: 2026-08-24 for code and behavioural-test snapshot `7666139ad3d1f4853cfee8710ddc841dc3978aec`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -183,7 +183,7 @@ MAR-2565 validated mutation cache construction, deterministic disk fallback, and
 - MAR-2574 cannot satisfy its least-authority acceptance criteria until a reviewed upstream Pullfrog release removes the internal MCP contents-write authority and makes the agent-runtime production dependency closure lock-verifiable, followed by the protected-environment rollout and an approved exact-head dispatch. This contract does not claim acceptance, rollout, or GitHub settings completion.
 - Workflow tooling uses exact development-only `@types/bun@1.3.1` and `yaml@2.9.0`; YAML was already present in the development lock graph, so the direct pin adds no resolved package. Bun types and `skipLibCheck` remain limited to `tsconfig.scripts.json`, the historical handwritten `scripts/bun-runtime.d.ts` declaration remains removed, scripts remain excluded from the package, and the Node consumer/runtime remains unchanged with zero published runtime dependencies.
 
-The exact reviewed repository-controlled code and behavioural-test snapshot for this boundary is `68cfcb9210c984e864505c37bfef1973164bbf40`. Detailed remediation lineage and gate evidence are recorded once in the [MAR-2574 implementation plan](./superpowers/plans/2026-08-23-workflow-supply-chain-hardening.md#implementation-evidence). These repository-policy changes do not alter the runtime API, package exports, canonical data, cache schema, or generated declarations.
+The exact reviewed repository-controlled code and behavioural-test snapshot for this boundary is `7666139ad3d1f4853cfee8710ddc841dc3978aec`. Detailed remediation lineage and gate evidence are recorded once in the [MAR-2574 implementation plan](./superpowers/plans/2026-08-23-workflow-supply-chain-hardening.md#implementation-evidence). These repository-policy changes do not alter the runtime API, package exports, canonical data, cache schema, or generated declarations.
 
 ## Package and Release Gates
 
