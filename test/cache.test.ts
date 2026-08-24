@@ -6,6 +6,7 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -26,6 +27,7 @@ import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
 import {
+  CacheDatabaseCreationConflict,
   CacheDatabaseFailure,
   cacheLocationTestHooks,
   inspectCacheDatabase,
@@ -65,6 +67,34 @@ const createOutsideDirectory = () => {
   return directory
 }
 
+const createHardLinkIfSupported = (target: string, path: string) => {
+  let supported = true
+  try {
+    linkSync(target, path)
+  } catch (error) {
+    const { code } = error as NodeJS.ErrnoException
+    if (code === 'EACCES' || code === 'ENOSYS' || code === 'ENOTSUP' || code === 'EPERM' || code === 'EXDEV') {
+      supported = false
+    } else {
+      throw error
+    }
+  }
+  return supported
+}
+
+const detectHardLinkSupport = () => {
+  const directory = mkdtempSync(join(tmpdir(), 'encephalon-hard-link-probe-'))
+  const target = join(directory, 'target')
+  const alias = join(directory, 'alias')
+  writeFileSync(target, 'hard-link probe')
+  const supported = createHardLinkIfSupported(target, alias)
+  rmSync(directory, { force: true, recursive: true })
+  return supported
+}
+
+const hardLinksSupported = detectHardLinkSupport()
+const hardLinkSkip = hardLinksSupported ? false : 'The test filesystem does not support user-created hard links.'
+
 afterEach(() => {
   artifactInspectionTestHooks.close = undefined
   artifactInspectionTestHooks.fault = undefined
@@ -72,7 +102,9 @@ afterEach(() => {
   cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
   cacheLocationTestHooks.afterDatabaseOpen = undefined
   cacheLocationTestHooks.afterPrimaryBootstrapClose = undefined
+  cacheLocationTestHooks.afterPrimaryBootstrapOpen = undefined
   cacheLocationTestHooks.afterQuarantineRename = undefined
+  cacheLocationTestHooks.afterRegularFileOpen = undefined
   cacheLocationTestHooks.beforeDatabaseOpen = undefined
   cacheLocationTestHooks.beforeLocationInspection = undefined
   cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = undefined
@@ -95,6 +127,7 @@ afterEach(() => {
   recordWriteTestHooks.fault = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
   roots.splice(0).forEach(removeTestRepository)
+  cacheLocationTestHooks.releaseCloseSafetyLatchesForTests?.()
 })
 
 const functionFromApi = <T>(name: string) => (api as unknown as Record<string, T>)[name] as T
@@ -721,7 +754,7 @@ describe('cache filesystem containment', () => {
             entry: entry.entry,
             invariant: 'real-directory',
           })
-          assert.equal(JSON.stringify(error).includes(outside), false)
+          assert.equal(causeChainText(error).includes(outside), false)
           return true
         },
       )
@@ -746,12 +779,486 @@ describe('cache filesystem containment', () => {
           entry: 'node_modules/.cache/encephalon/brain.sqlite',
           invariant: 'regular-non-symlink-file',
         })
-        assert.equal(JSON.stringify(error).includes(outside), false)
+        assert.equal(causeChainText(error).includes(outside), false)
         return true
       },
     )
     assert.equal(readFileSync(target, 'utf8'), 'outside database bytes')
     assert.equal(readFileSync(cacheDatabasePath(root), 'utf8'), 'outside database bytes')
+  })
+
+  test('rejects hard-linked primary databases before SQLite opens them', { skip: hardLinkSkip }, () => {
+    const cases = [
+      {
+        databaseName: 'brain.sqlite',
+        name: 'primary cache',
+        operation: (root: string, _entered: () => void) =>
+          functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        prepareTarget: (path: string) => writeFileSync(path, ''),
+      },
+      {
+        databaseName: 'operation-lock.sqlite',
+        name: 'operation gate',
+        operation: (root: string, entered: () => void) => withOperationLock(root, entered),
+        prepareTarget: (path: string) => {
+          const database = new DatabaseSync(path)
+          database.close()
+        },
+      },
+    ] as const
+
+    for (const entry of cases) {
+      const root = createRoot()
+      const outside = createOutsideDirectory()
+      const target = join(outside, `${entry.databaseName}-target`)
+      const databasePath = join(cacheDirectoryPath(root), entry.databaseName)
+      mkdirSync(cacheDirectoryPath(root), { recursive: true })
+      entry.prepareTarget(target)
+      const before = readFileSync(target)
+      linkSync(target, databasePath)
+      let databaseOpens = 0
+      let operationEntered = false
+      cacheLocationTestHooks.beforeDatabaseOpen = database => {
+        if (database.name === entry.databaseName) {
+          databaseOpens += 1
+        }
+      }
+
+      assert.throws(
+        () =>
+          entry.operation(root, () => {
+            operationEntered = true
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED', entry.name)
+          assert.deepEqual((error as { details?: unknown }).details, {
+            entry: `node_modules/.cache/encephalon/${entry.databaseName}`,
+            invariant: 'single-link-file',
+          })
+          assert.equal(causeChainText(error).includes(outside), false)
+          return true
+        },
+      )
+      assert.equal(databaseOpens, 0, entry.name)
+      assert.equal(operationEntered, false, entry.name)
+      assert.deepEqual(readFileSync(target), before, entry.name)
+      assert.deepEqual(readFileSync(databasePath), before, entry.name)
+      cacheLocationTestHooks.beforeDatabaseOpen = undefined
+    }
+  })
+
+  test('rejects hard-linked SQLite sidecars without changing either alias', { skip: hardLinkSkip }, () => {
+    const databases = [
+      {
+        databaseName: 'brain.sqlite',
+        operation: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')({ root }),
+        prepare: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      },
+      {
+        databaseName: 'operation-lock.sqlite',
+        operation: (root: string) => withOperationLock(root, () => 'entered'),
+        prepare: (root: string) => withOperationLock(root, () => 'prepared'),
+      },
+    ] as const
+    const suffixes = ['-wal', '-shm', '-journal'] as const
+
+    for (const database of databases) {
+      for (const suffix of suffixes) {
+        const root = createRoot()
+        const outside = createOutsideDirectory()
+        database.prepare(root)
+        const sidecarPath = join(cacheDirectoryPath(root), `${database.databaseName}${suffix}`)
+        const target = join(outside, `${database.databaseName}${suffix}-target`)
+        rmSync(sidecarPath, { force: true })
+        writeFileSync(target, `outside ${database.databaseName}${suffix} bytes`)
+        const before = readFileSync(target)
+        linkSync(target, sidecarPath)
+        let databaseOpens = 0
+        cacheLocationTestHooks.beforeDatabaseOpen = candidate => {
+          if (candidate.name === database.databaseName) {
+            databaseOpens += 1
+          }
+        }
+
+        assert.throws(
+          () => database.operation(root),
+          (error: unknown) => {
+            assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+            assert.deepEqual((error as { details?: unknown }).details, {
+              entry: `node_modules/.cache/encephalon/${database.databaseName}${suffix}`,
+              invariant: 'single-link-file',
+            })
+            assert.equal(causeChainText(error).includes(outside), false)
+            return true
+          },
+        )
+        assert.equal(databaseOpens, 0, `${database.databaseName}${suffix}`)
+        assert.deepEqual(readFileSync(target), before)
+        assert.deepEqual(readFileSync(sidecarPath), before)
+        cacheLocationTestHooks.beforeDatabaseOpen = undefined
+      }
+    }
+  })
+
+  test('rejects hard-linked aliases introduced at database open validation boundaries', { skip: hardLinkSkip }, () => {
+    const databases = [
+      {
+        databaseName: 'brain.sqlite',
+        operation: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        prepare: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      },
+      {
+        databaseName: 'operation-lock.sqlite',
+        operation: (root: string) => withOperationLock(root, () => 'entered'),
+        prepare: (root: string) => withOperationLock(root, () => 'prepared'),
+      },
+    ] as const
+    const boundaries = ['before-open', 'after-open'] as const
+
+    for (const database of databases) {
+      for (const boundary of boundaries) {
+        const root = createRoot()
+        const outside = createOutsideDirectory()
+        database.prepare(root)
+        const databasePath = join(cacheDirectoryPath(root), database.databaseName)
+        const alias = join(outside, `${database.databaseName}-${boundary}`)
+        const before = readFileSync(databasePath)
+        let initialisationReached = false
+        let postOpenReached = false
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = candidate => {
+          if (candidate.name === database.databaseName) {
+            initialisationReached = true
+          }
+        }
+        cacheReadTestHooks.duringDatabaseInitialisation = () => {
+          initialisationReached = true
+        }
+        if (boundary === 'before-open') {
+          cacheLocationTestHooks.beforeDatabaseOpen = candidate => {
+            if (candidate.name === database.databaseName) {
+              cacheLocationTestHooks.beforeDatabaseOpen = undefined
+              linkSync(databasePath, alias)
+            }
+          }
+          cacheLocationTestHooks.afterDatabaseOpen = candidate => {
+            if (candidate.name === database.databaseName) {
+              postOpenReached = true
+            }
+          }
+        } else {
+          cacheLocationTestHooks.afterDatabaseOpen = candidate => {
+            if (candidate.name === database.databaseName) {
+              cacheLocationTestHooks.afterDatabaseOpen = undefined
+              postOpenReached = true
+              linkSync(databasePath, alias)
+            }
+          }
+        }
+
+        assert.throws(
+          () => database.operation(root),
+          (error: unknown) => {
+            assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+            assert.deepEqual((error as { details?: unknown }).details, {
+              entry: `node_modules/.cache/encephalon/${database.databaseName}`,
+              invariant: 'single-link-file',
+            })
+            assert.equal(causeChainText(error).includes(outside), false)
+            return true
+          },
+        )
+        assert.equal(existsSync(databasePath), true)
+        assert.equal(existsSync(alias), true)
+        assert.equal(postOpenReached, boundary === 'after-open')
+        assert.equal(initialisationReached, false)
+        assert.deepEqual(readFileSync(databasePath), before)
+        assert.deepEqual(readFileSync(alias), before)
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        cacheLocationTestHooks.beforeDatabaseOpen = undefined
+        cacheLocationTestHooks.afterDatabaseOpen = undefined
+        cacheReadTestHooks.duringDatabaseInitialisation = undefined
+      }
+    }
+  })
+
+  test('preserves repository-change precedence for hard-linked primary replacements', { skip: hardLinkSkip }, () => {
+    const databases = [
+      {
+        databaseName: 'brain.sqlite',
+        operation: (root: string, _entered: () => void) =>
+          functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        prepare: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      },
+      {
+        databaseName: 'operation-lock.sqlite',
+        operation: (root: string, entered: () => void) => withOperationLock(root, entered),
+        prepare: (root: string) => withOperationLock(root, () => 'prepared'),
+      },
+    ] as const
+
+    for (const database of databases) {
+      const root = createRoot()
+      const outside = createOutsideDirectory()
+      database.prepare(root)
+      const databasePath = join(cacheDirectoryPath(root), database.databaseName)
+      const displacedPath = join(root, `displaced-${database.databaseName}`)
+      const successorPath = join(root, `successor-${database.databaseName}`)
+      const alias = join(outside, `${database.databaseName}-replacement-alias`)
+      copyFileSync(databasePath, successorPath)
+      linkSync(successorPath, alias)
+      const before = readFileSync(successorPath)
+      let operationEntered = false
+      cacheLocationTestHooks.beforeDatabaseOpen = candidate => {
+        if (candidate.name === database.databaseName) {
+          cacheLocationTestHooks.beforeDatabaseOpen = undefined
+          renameSync(databasePath, displacedPath)
+          renameSync(successorPath, databasePath)
+        }
+      }
+
+      assert.throws(
+        () =>
+          database.operation(root, () => {
+            operationEntered = true
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          assert.deepEqual((error as { details?: unknown }).details, {
+            entry: `node_modules/.cache/encephalon/${database.databaseName}`,
+            invariant: 'stable-identity',
+          })
+          assert.equal(causeChainText(error).includes(outside), false)
+          return true
+        },
+      )
+      assert.equal(operationEntered, false)
+      assert.deepEqual(readFileSync(databasePath), before)
+      assert.deepEqual(readFileSync(alias), before)
+      assert.equal(existsSync(displacedPath), true)
+    }
+  })
+
+  test('preserves creation-conflict precedence for a hard-linked successor', { skip: hardLinkSkip }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    const databasePath = cacheDatabasePath(root)
+    const displacedPath = join(root, 'displaced-created-primary.sqlite')
+    const successorPath = join(root, 'hard-linked-bootstrap-successor.sqlite')
+    const alias = join(outside, 'bootstrap-successor-alias.sqlite')
+    const successor = new DatabaseSync(successorPath)
+    successor.exec('CREATE TABLE successor_sentinel(value TEXT);')
+    successor.close()
+    linkSync(successorPath, alias)
+    const before = readFileSync(successorPath)
+    cacheLocationTestHooks.afterPrimaryBootstrapClose = path => {
+      if (basename(path) === 'brain.sqlite') {
+        cacheLocationTestHooks.afterPrimaryBootstrapClose = undefined
+        renameSync(path, displacedPath)
+        renameSync(successorPath, path)
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          invariant: 'stable-identity',
+        })
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.deepEqual(readFileSync(databasePath), before)
+    assert.deepEqual(readFileSync(alias), before)
+    assert.equal(existsSync(displacedPath), true)
+  })
+
+  test('preserves repository-change precedence for hard-linked sidecar replacements', { skip: hardLinkSkip }, () => {
+    const databases = [
+      {
+        databaseName: 'brain.sqlite',
+        operation: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+        prepare: (root: string) => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      },
+      {
+        databaseName: 'operation-lock.sqlite',
+        operation: (root: string) => withOperationLock(root, () => 'entered'),
+        prepare: (root: string) => withOperationLock(root, () => 'prepared'),
+      },
+    ] as const
+
+    for (const database of databases) {
+      const root = createRoot()
+      const outside = createOutsideDirectory()
+      database.prepare(root)
+      const sidecarPath = join(cacheDirectoryPath(root), `${database.databaseName}-journal`)
+      const displacedPath = join(root, `displaced-${database.databaseName}-journal`)
+      const target = join(outside, `${database.databaseName}-journal-replacement`)
+      writeFileSync(sidecarPath, 'captured sidecar bytes')
+      writeFileSync(target, 'hard-linked replacement sidecar bytes')
+      const before = readFileSync(target)
+      cacheLocationTestHooks.beforeDatabaseOpen = candidate => {
+        if (candidate.name === database.databaseName) {
+          cacheLocationTestHooks.beforeDatabaseOpen = undefined
+          renameSync(sidecarPath, displacedPath)
+          linkSync(target, sidecarPath)
+        }
+      }
+
+      assert.throws(
+        () => database.operation(root),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          assert.deepEqual((error as { details?: unknown }).details, {
+            entry: `node_modules/.cache/encephalon/${database.databaseName}-journal`,
+            invariant: 'stable-identity',
+          })
+          assert.equal(causeChainText(error).includes(outside), false)
+          return true
+        },
+      )
+      assert.deepEqual(readFileSync(sidecarPath), before)
+      assert.deepEqual(readFileSync(target), before)
+      assert.equal(existsSync(displacedPath), true)
+    }
+  })
+
+  test('rejects a hard link introduced after the gate transaction begins', { skip: hardLinkSkip }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    withOperationLock(root, () => 'prepared')
+    const databasePath = join(cacheDirectoryPath(root), 'operation-lock.sqlite')
+    const alias = join(outside, 'post-begin-operation-lock.sqlite')
+    const before = readFileSync(databasePath)
+    let operationEntered = false
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = candidate => {
+      if (candidate.name === 'operation-lock.sqlite') {
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        linkSync(databasePath, alias)
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+          invariant: 'single-link-file',
+        })
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.deepEqual(readFileSync(databasePath), before)
+    assert.deepEqual(readFileSync(alias), before)
+  })
+
+  test('does not quarantine a primary hard-linked at the final source boundary', { skip: hardLinkSkip }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    const databasePath = cacheDatabasePath(root)
+    const alias = join(outside, 'quarantine-brain.sqlite')
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    writeFileSync(databasePath, 'corrupt cache bytes')
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        cacheLocationTestHooks.beforeQuarantineRename = undefined
+        linkSync(path, alias)
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          invariant: 'single-link-file',
+        })
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.equal(readFileSync(databasePath, 'utf8'), 'corrupt cache bytes')
+    assert.equal(readFileSync(alias, 'utf8'), 'corrupt cache bytes')
+  })
+
+  test('preserves repository-change precedence for a hard-linked quarantine replacement', {
+    skip: hardLinkSkip,
+  }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    const databasePath = cacheDatabasePath(root)
+    const displacedPath = join(root, 'displaced-corrupt-hard-linked-brain.sqlite')
+    const target = join(outside, 'quarantine-replacement-brain.sqlite')
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    writeFileSync(databasePath, 'corrupt cache bytes')
+    writeFileSync(target, 'hard-linked quarantine replacement bytes')
+    const before = readFileSync(target)
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        cacheLocationTestHooks.beforeQuarantineRename = undefined
+        renameSync(path, displacedPath)
+        linkSync(target, path)
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          invariant: 'stable-quarantine-source',
+        })
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.deepEqual(readFileSync(databasePath), before)
+    assert.deepEqual(readFileSync(target), before)
+    assert.equal(readFileSync(displacedPath, 'utf8'), 'corrupt cache bytes')
+  })
+
+  test('does not unlink a quarantine file hard-linked after its rename', { skip: hardLinkSkip }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    const databasePath = cacheDatabasePath(root)
+    const alias = join(outside, 'renamed-quarantine-brain.sqlite')
+    let quarantinePath: string | undefined
+    functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root })
+    writeFileSync(databasePath, 'corrupt cache bytes')
+    cacheLocationTestHooks.afterQuarantineRename = path => {
+      if (basename(path).startsWith('.brain.sqlite.')) {
+        cacheLocationTestHooks.afterQuarantineRename = undefined
+        quarantinePath = path
+        linkSync(path, alias)
+      }
+    }
+
+    assert.throws(
+      () => functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/brain.sqlite',
+          invariant: 'stable-quarantine-identity',
+        })
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.ok(quarantinePath !== undefined)
+    assert.equal(existsSync(databasePath), false)
+    assert.equal(readFileSync(quarantinePath, 'utf8'), 'corrupt cache bytes')
+    assert.equal(readFileSync(alias, 'utf8'), 'corrupt cache bytes')
   })
 
   test('rejects an unexpected cache sidecar type', () => {
@@ -972,6 +1479,35 @@ describe('cache filesystem containment', () => {
     assert.equal(existsSync(databasePath), true)
   })
 
+  test('reports an exclusive primary unlinked while its creation descriptor is open as a creation conflict', {
+    skip: process.platform === 'win32' ? 'Windows does not permit unlinking an open cache primary.' : false,
+  }, () => {
+    const root = createRoot()
+    const location = inspectCacheLocation(root)
+    const databasePath = cacheDatabasePath(root)
+    let disappearances = 0
+    cacheLocationTestHooks.afterPrimaryBootstrapOpen = path => {
+      if (basename(path) === 'brain.sqlite') {
+        cacheLocationTestHooks.afterPrimaryBootstrapOpen = undefined
+        rmSync(path)
+        disappearances += 1
+      }
+    }
+
+    assert.throws(
+      () =>
+        openVerifiedCacheDatabase({
+          DatabaseConstructor: DatabaseSync,
+          location,
+          name: 'brain.sqlite',
+          primary: { kind: 'create-exclusive' },
+        }),
+      (error: unknown) => error instanceof CacheDatabaseCreationConflict,
+    )
+    assert.equal(disappearances, 1)
+    assert.equal(existsSync(databasePath), false)
+  })
+
   test('rejects primary replacements immediately after SQLite opens where open-file rename is supported', {
     skip: process.platform === 'win32',
   }, () => {
@@ -1058,6 +1594,34 @@ describe('cache filesystem containment', () => {
         entry.name,
       )
     }
+  })
+
+  test('accepts optional sidecar teardown after its verification descriptor opens', {
+    skip: process.platform === 'win32' ? 'Windows does not permit unlinking an open SQLite sidecar.' : false,
+  }, () => {
+    const root = createRoot()
+    withOperationLock(root, () => 'prepared')
+    const journalPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
+    writeFileSync(journalPath, 'disappearing journal')
+    let teardowns = 0
+    let operationEntered = false
+    cacheLocationTestHooks.afterRegularFileOpen = path => {
+      if (basename(path) === 'operation-lock.sqlite-journal') {
+        cacheLocationTestHooks.afterRegularFileOpen = undefined
+        rmSync(path)
+        teardowns += 1
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => {
+        operationEntered = true
+        return 'entered'
+      }),
+      'entered',
+    )
+    assert.equal(teardowns, 1)
+    assert.equal(operationEntered, true)
   })
 
   test('retries one post-open sidecar replacement across every database path', () => {
@@ -1263,6 +1827,420 @@ describe('cache filesystem containment', () => {
     )
     assert.equal(sameCacheEntryIdentity(replacementIdentity, statSync(gatePath, { bigint: true })), true)
     assert.equal(statSync(displacedPath).isFile(), true)
+  })
+
+  test('preserves post-BEGIN repository-change precedence for a hard-linked gate replacement', {
+    skip: process.platform === 'win32' ? 'Windows does not permit renaming an open SQLite database.' : hardLinkSkip,
+  }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    withOperationLock(root, () => 'prepared')
+    const gatePath = join(cacheDirectoryPath(root), 'operation-lock.sqlite')
+    const displacedPath = join(root, 'post-begin-displaced-operation-lock.sqlite')
+    const successorPath = join(root, 'post-begin-successor-operation-lock.sqlite')
+    const alias = join(outside, 'post-begin-operation-lock-alias.sqlite')
+    copyFileSync(gatePath, successorPath)
+    linkSync(successorPath, alias)
+    const before = readFileSync(successorPath)
+    let operationEntered = false
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        renameSync(gatePath, displacedPath)
+        renameSync(successorPath, gatePath)
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+          invariant: 'stable-identity',
+        })
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.deepEqual(readFileSync(gatePath), before)
+    assert.deepEqual(readFileSync(alias), before)
+    assert.equal(existsSync(displacedPath), true)
+  })
+
+  test('preserves post-BEGIN repository-change precedence for a hard-linked gate journal successor', {
+    skip:
+      process.platform === 'win32' ? 'Windows does not permit renaming an open SQLite rollback journal.' : hardLinkSkip,
+  }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    withOperationLock(root, () => 'prepared')
+    const sidecarPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
+    const displacedPath = join(root, 'post-begin-displaced-operation-lock.sqlite-journal')
+    const successorPath = join(root, 'post-begin-successor-operation-lock.sqlite-journal')
+    const alias = join(outside, 'post-begin-operation-lock-journal-alias')
+    writeFileSync(sidecarPath, '')
+    writeFileSync(successorPath, 'hard-linked gate journal successor')
+    linkSync(successorPath, alias)
+    const before = readFileSync(successorPath)
+    let operationEntered = false
+    cacheLocationTestHooks.afterDatabaseOpen = database => {
+      if (database.name === 'operation-lock.sqlite' && !existsSync(sidecarPath)) {
+        writeFileSync(sidecarPath, '')
+      }
+    }
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        renameSync(sidecarPath, displacedPath)
+        renameSync(successorPath, sidecarPath)
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite-journal',
+          invariant: 'stable-identity',
+        })
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.deepEqual(readFileSync(sidecarPath), before)
+    assert.deepEqual(readFileSync(alias), before)
+    assert.equal(existsSync(displacedPath), true)
+  })
+
+  test('preserves a same-generation hard-linked gate journal after the transaction begins', {
+    skip:
+      process.platform === 'win32' ? 'Windows does not permit linking an open SQLite rollback journal.' : hardLinkSkip,
+  }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    withOperationLock(root, () => 'prepared')
+    const sidecarPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
+    const alias = join(outside, 'post-begin-same-generation-journal-alias')
+    writeFileSync(sidecarPath, '')
+    let aliasedBytes: Buffer | undefined
+    let databaseOpens = 0
+    let operationEntered = false
+    cacheLocationTestHooks.afterDatabaseOpen = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        databaseOpens += 1
+        if (!existsSync(sidecarPath)) {
+          writeFileSync(sidecarPath, '')
+        }
+      }
+    }
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        aliasedBytes = readFileSync(sidecarPath)
+        linkSync(sidecarPath, alias)
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite-journal',
+          invariant: 'single-link-file',
+        })
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.notEqual(aliasedBytes, undefined)
+    assert.deepEqual(readFileSync(sidecarPath), aliasedBytes)
+    assert.deepEqual(readFileSync(alias), aliasedBytes)
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+          invariant: 'stable-identity',
+        })
+        return true
+      },
+    )
+    assert.equal(databaseOpens, 1)
+    assert.equal(operationEntered, false)
+  })
+
+  test('preserves a hard-linked gate journal successor when the gate primary is also hard linked', {
+    skip:
+      process.platform === 'win32' ? 'Windows does not permit renaming an open SQLite rollback journal.' : hardLinkSkip,
+  }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    withOperationLock(root, () => 'prepared')
+    const gatePath = join(cacheDirectoryPath(root), 'operation-lock.sqlite')
+    const primaryAlias = join(outside, 'post-begin-combined-gate-alias.sqlite')
+    const sidecarPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
+    const displacedPath = join(root, 'post-begin-combined-displaced-journal')
+    const successorPath = join(root, 'post-begin-combined-successor-journal')
+    const sidecarAlias = join(outside, 'post-begin-combined-journal-alias')
+    writeFileSync(sidecarPath, '')
+    writeFileSync(successorPath, 'hard-linked combined gate journal successor')
+    linkSync(successorPath, sidecarAlias)
+    const primaryBefore = readFileSync(gatePath)
+    const sidecarBefore = readFileSync(successorPath)
+    let operationEntered = false
+    cacheLocationTestHooks.afterDatabaseOpen = database => {
+      if (database.name === 'operation-lock.sqlite' && !existsSync(sidecarPath)) {
+        writeFileSync(sidecarPath, '')
+      }
+    }
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        linkSync(gatePath, primaryAlias)
+        renameSync(sidecarPath, displacedPath)
+        renameSync(successorPath, sidecarPath)
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+          invariant: 'single-link-file',
+        })
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.deepEqual(readFileSync(gatePath), primaryBefore)
+    assert.deepEqual(readFileSync(primaryAlias), primaryBefore)
+    assert.deepEqual(readFileSync(sidecarPath), sidecarBefore)
+    assert.deepEqual(readFileSync(sidecarAlias), sidecarBefore)
+    assert.equal(existsSync(displacedPath), true)
+  })
+
+  test('preserves a redirected hard-linked gate journal after the transaction begins', {
+    skip:
+      process.platform === 'win32'
+        ? 'Windows does not permit replacing a cache directory containing an open SQLite database.'
+        : hardLinkSkip ||
+          (renameParentWithOpenChildSupported ? false : 'The filesystem cannot rename an open cache directory.'),
+  }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    withOperationLock(root, () => 'prepared')
+    const cachePath = cacheDirectoryPath(root)
+    const displacedCachePath = join(root, 'post-begin-redirected-cache')
+    const sidecarPath = join(outside, 'operation-lock.sqlite-journal')
+    const alias = join(outside, 'redirected-operation-lock-journal-alias')
+    writeFileSync(sidecarPath, 'redirected hard-linked gate journal')
+    linkSync(sidecarPath, alias)
+    const before = readFileSync(sidecarPath)
+    let databaseOpens = 0
+    let operationEntered = false
+    cacheLocationTestHooks.afterDatabaseOpen = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        databaseOpens += 1
+      }
+    }
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        renameSync(cachePath, displacedCachePath)
+        symlinkSync(outside, cachePath, 'dir')
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon',
+          invariant: 'real-directory',
+        })
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.deepEqual(readFileSync(sidecarPath), before)
+    assert.deepEqual(readFileSync(alias), before)
+
+    rmSync(cachePath)
+    renameSync(displacedCachePath, cachePath)
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+          invariant: 'stable-identity',
+        })
+        return true
+      },
+    )
+    assert.equal(databaseOpens, 1)
+    assert.equal(operationEntered, false)
+    assert.deepEqual(readFileSync(sidecarPath), before)
+    assert.deepEqual(readFileSync(alias), before)
+  })
+
+  test('preserves a hard-linked gate journal when close-safety inspection throws', {
+    skip:
+      process.platform === 'win32' ? 'Windows does not permit linking an open SQLite rollback journal.' : hardLinkSkip,
+  }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    withOperationLock(root, () => 'prepared')
+    const location = inspectCacheLocation(root)
+    const snapshot = inspectCacheDatabase(location, 'operation-lock.sqlite')
+    assert.ok(snapshot)
+    const sidecarPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
+    const alias = join(outside, 'inspection-failure-journal-alias')
+    writeFileSync(sidecarPath, '')
+    let aliasedBytes: Buffer | undefined
+    cacheLocationTestHooks.afterDatabaseOpen = database => {
+      if (database.name === 'operation-lock.sqlite' && !existsSync(sidecarPath)) {
+        writeFileSync(sidecarPath, '')
+      }
+    }
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        aliasedBytes = readFileSync(sidecarPath)
+        linkSync(sidecarPath, alias)
+        cacheLocationTestHooks.regularFileRealpath = (path, actual) => {
+          if (basename(path) === 'operation-lock.sqlite-journal') {
+            throw Object.assign(new Error('Injected close-safety inspection failure.'), { code: 'EACCES' })
+          }
+          return actual
+        }
+      }
+    }
+
+    assert.throws(
+      () =>
+        openVerifiedCacheDatabase({
+          afterVerifiedOpen: database => {
+            database.exec('BEGIN IMMEDIATE')
+          },
+          DatabaseConstructor: DatabaseSync,
+          location,
+          name: 'operation-lock.sqlite',
+          openOptions: {},
+          preserveDatabaseLocksAfterInitialisation: true,
+          primary: { database: snapshot, kind: 'expected-owned' },
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'EACCES')
+        assert.equal(causeChainText(error).includes('Injected close-safety inspection failure.'), true)
+        assert.equal(causeChainText(error).includes(outside), false)
+        return true
+      },
+    )
+    assert.notEqual(aliasedBytes, undefined)
+    assert.deepEqual(readFileSync(sidecarPath), aliasedBytes)
+    assert.deepEqual(readFileSync(alias), aliasedBytes)
+  })
+
+  test('bounds retained database opens after repeated post-BEGIN hard-linked journal observations', {
+    skip:
+      process.platform === 'win32' ? 'Windows does not permit linking an open SQLite rollback journal.' : hardLinkSkip,
+  }, () => {
+    const entries = Array.from({ length: 5 }, (_, index) => {
+      const root = createRoot()
+      const outside = createOutsideDirectory()
+      withOperationLock(root, () => 'prepared')
+      const sidecarPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
+      writeFileSync(sidecarPath, '')
+      return {
+        alias: join(outside, `bounded-journal-alias-${index}`),
+        root,
+        sidecarPath,
+      }
+    })
+    const repeatedAlias = join(createOutsideDirectory(), 'bounded-journal-repeated-alias')
+    let databaseOpens = 0
+    let linkTriggers = 0
+    let operationEntries = 0
+    const trigger = (entry: (typeof entries)[number], alias: string) => {
+      cacheLocationTestHooks.afterDatabaseOpen = database => {
+        if (database.name === 'operation-lock.sqlite') {
+          databaseOpens += 1
+          if (!existsSync(entry.sidecarPath)) {
+            writeFileSync(entry.sidecarPath, '')
+          }
+        }
+      }
+      cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+        if (database.name === 'operation-lock.sqlite') {
+          linkTriggers += 1
+          linkSync(entry.sidecarPath, alias)
+        }
+      }
+      assert.throws(
+        () =>
+          withOperationLock(entry.root, () => {
+            operationEntries += 1
+          }),
+        (error: unknown) => {
+          assert.equal(
+            ['REPOSITORY_CHANGED', 'VALIDATION_FAILED'].includes(String((error as { code?: unknown }).code)),
+            true,
+          )
+          return true
+        },
+      )
+    }
+
+    const [firstEntry] = entries
+    assert.ok(firstEntry)
+    trigger(firstEntry, firstEntry.alias)
+    trigger(firstEntry, repeatedAlias)
+    for (const entry of entries.slice(1)) {
+      trigger(entry, entry.alias)
+    }
+
+    assert.equal(databaseOpens, 4)
+    assert.equal(linkTriggers, 4)
+    assert.equal(operationEntries, 0)
+    assert.equal(existsSync(repeatedAlias), false)
+    for (const entry of entries.slice(0, 4)) {
+      assert.deepEqual(readFileSync(entry.sidecarPath), readFileSync(entry.alias))
+    }
   })
 
   test('rejects an uncoordinated gate successor after exact corrupt quarantine', () => {
