@@ -85,16 +85,6 @@ const generatedPayload = (records: readonly { payload: unknown; subject: string 
   return payload as Record<string, unknown>
 }
 
-const assertPackageMetadataErrorReasons = (value: unknown) => {
-  assert.ok(Array.isArray(value))
-  assert.deepEqual(
-    value,
-    value.includes('unreadable-directory')
-      ? ['package-metadata-error', 'unreadable-directory']
-      : ['package-metadata-error'],
-  )
-}
-
 type InitCounts = {
   baselineScans: number
   canonicalScans: number
@@ -2585,23 +2575,170 @@ describe('initialisation', () => {
     assert.deepEqual(workflow.workflowFiles, ['.github/workflows/accepted.yml'])
   })
 
-  test('omits top-level facts rejected at final directory revalidation', () => {
+  test('retries a package rewrite after source collection and returns only successor package facts', () => {
+    const root = createRoot()
+    const packagePath = join(root, 'package.json')
+    writeFileSync(
+      packagePath,
+      JSON.stringify({
+        name: 'old-private-project',
+        packageManager: 'npm@11.0.0',
+        scripts: { 'old-command': 'private' },
+      }),
+    )
+    let attempts = 0
+
+    const baseline = scanBaselineWithHooks(root, {
+      afterBaselineSources: () => {
+        attempts += 1
+        if (attempts === 1) {
+          writeFileSync(
+            packagePath,
+            JSON.stringify({
+              name: 'new-public-project',
+              packageManager: 'npm@11.0.0',
+              scripts: { 'new-command': 'public' },
+            }),
+          )
+        }
+      },
+    })
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
+    const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
+
+    assert.equal(attempts, 2)
+    assert.equal(overview.scanTruncated, false)
+    assert.deepEqual(overview.scanTruncationReasons, [])
+    assert.equal(tooling.packageName, 'new-public-project')
+    assert.deepEqual(workflow.scriptKeys, ['new-command'])
+    assert.doesNotMatch(JSON.stringify(baseline), /old-private-project|old-command/)
+  })
+
+  test('retries a nested source addition after collection and returns only successor language facts', () => {
+    const root = createRoot()
+    const addedSource = join(root, 'src', 'added.py')
+    ensureParent(join(root, 'src', 'existing.ts'))
+    writeFileSync(join(root, 'src', 'existing.ts'), 'export {}\n')
+    let attempts = 0
+
+    const baseline = scanBaselineWithHooks(root, {
+      afterBaselineSources: () => {
+        attempts += 1
+        if (attempts === 1) {
+          writeFileSync(addedSource, 'pass\n')
+        }
+      },
+    })
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+
+    assert.equal(attempts, 2)
+    assert.deepEqual(overview.languageCounts, [
+      { files: 1, language: 'Python' },
+      { files: 1, language: 'TypeScript' },
+    ])
+    assert.equal(overview.scannedRegularFiles, 2)
+    assert.equal(overview.scanTruncated, false)
+    assert.deepEqual(overview.scanTruncationReasons, [])
+  })
+
+  test('retries a workflow rename after source collection and returns only the successor filename', () => {
+    const root = createRoot()
+    const oldWorkflow = join(root, '.github', 'workflows', 'old-private.yml')
+    const newWorkflow = join(root, '.github', 'workflows', 'new-public.yml')
+    ensureParent(oldWorkflow)
+    writeFileSync(oldWorkflow, 'name: workflow\n')
+    let attempts = 0
+
+    const baseline = scanBaselineWithHooks(root, {
+      afterBaselineSources: () => {
+        attempts += 1
+        if (attempts === 1) {
+          renameSync(oldWorkflow, newWorkflow)
+        }
+      },
+    })
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
+
+    assert.equal(attempts, 2)
+    assert.equal(overview.scanTruncated, false)
+    assert.deepEqual(overview.scanTruncationReasons, [])
+    assert.deepEqual(workflow.workflowFiles, ['.github/workflows/new-public.yml'])
+    assert.doesNotMatch(JSON.stringify(baseline), /old-private\.yml/)
+  })
+
+  for (const sourceFailure of [
+    {
+      createError: () => new TypeError('unexpected package hook failure'),
+      hooks: (error: Error) => ({
+        beforePackageMetadataRead: () => {
+          throw error
+        },
+      }),
+      source: 'package',
+    },
+    {
+      createError: () => Object.assign(new Error('unknown top-level filesystem failure'), { code: 'EPRIVATE' }),
+      hooks: (error: Error) => ({
+        beforeTopLevelRevalidation: () => {
+          throw error
+        },
+      }),
+      source: 'top-level',
+    },
+    {
+      createError: () => new Error('unexpected language hook failure'),
+      hooks: (error: Error) => ({
+        afterLanguageDirectoryCapture: () => {
+          throw error
+        },
+      }),
+      source: 'language',
+    },
+    {
+      createError: () => new Error('unexpected workflow hook failure'),
+      hooks: (error: Error) => ({
+        beforeWorkflowDirectoryCapture: () => {
+          throw error
+        },
+      }),
+      source: 'workflow',
+    },
+  ] as const) {
+    test(`propagates unexpected ${sourceFailure.source} source failures by object identity`, () => {
+      const root = createRoot()
+      const unexpected = sourceFailure.createError()
+
+      assert.throws(
+        () => scanBaselineWithHooks(root, sourceFailure.hooks(unexpected)),
+        error => error === unexpected,
+      )
+    })
+  }
+
+  test('retries top-level facts rejected at final directory revalidation', () => {
     const root = createRoot()
     writeFileSync(join(root, 'package-lock.json'), '{}')
+    let attempts = 0
 
     const baseline = scanBaselineWithHooks(root, {
       beforeTopLevelRevalidation: () => {
-        throw new DirectoryWitnessError()
+        attempts += 1
+        if (attempts === 1) {
+          throw new DirectoryWitnessError()
+        }
       },
     })
     const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
     const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
 
-    assert.deepEqual(overview.recognisedTopLevelFiles, [])
-    assert.deepEqual(overview.sources, [])
-    assert.deepEqual(tooling.recognisedFiles, [])
-    assert.deepEqual(tooling.sources, [])
-    assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory'])
+    assert.equal(attempts, 2)
+    assert.deepEqual(overview.recognisedTopLevelFiles, ['package-lock.json'])
+    assert.deepEqual(overview.sources, ['package-lock.json'])
+    assert.deepEqual(tooling.recognisedFiles, ['package-lock.json'])
+    assert.deepEqual(tooling.sources, ['package-lock.json'])
+    assert.deepEqual(overview.scanTruncationReasons, [])
   })
 
   test('reserves the global language-directory budget before scheduling children', () => {
@@ -2635,10 +2772,12 @@ describe('initialisation', () => {
     ensureParent(join(replacement, 'new.py'))
     writeFileSync(join(child, 'old.ts'), 'export {}\n')
     writeFileSync(join(replacement, 'new.py'), 'pass\n')
+    let replaced = false
 
     const baseline = scanBaselineWithHooks(root, {
       beforeLanguageDirectoryCapture: path => {
-        if (path === child) {
+        if (path === child && !replaced) {
+          replaced = true
           renameSync(child, moved)
           renameSync(replacement, child)
         }
@@ -2646,9 +2785,12 @@ describe('initialisation', () => {
     })
     const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
 
-    assert.deepEqual(overview.languageCounts, [])
-    assert.equal(overview.scannedRegularFiles, 0)
-    assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory'])
+    assert.deepEqual(overview.languageCounts, [
+      { files: 1, language: 'Python' },
+      { files: 1, language: 'TypeScript' },
+    ])
+    assert.equal(overview.scannedRegularFiles, 2)
+    assert.deepEqual(overview.scanTruncationReasons, [])
   })
 
   test('rejects a queued parent replaced after its child directory is captured', () => {
@@ -2661,10 +2803,12 @@ describe('initialisation', () => {
     ensureParent(join(replacement, 'new.py'))
     writeFileSync(join(child, 'old.ts'), 'export {}\n')
     writeFileSync(join(replacement, 'new.py'), 'pass\n')
+    let replaced = false
 
     const baseline = scanBaselineWithHooks(root, {
       afterLanguageDirectoryCapture: path => {
-        if (path === child) {
+        if (path === child && !replaced) {
+          replaced = true
           renameSync(child, moved)
           renameSync(replacement, child)
         }
@@ -2672,9 +2816,12 @@ describe('initialisation', () => {
     })
     const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
 
-    assert.deepEqual(overview.languageCounts, [])
-    assert.equal(overview.scannedRegularFiles, 0)
-    assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory'])
+    assert.deepEqual(overview.languageCounts, [
+      { files: 1, language: 'Python' },
+      { files: 1, language: 'TypeScript' },
+    ])
+    assert.equal(overview.scannedRegularFiles, 2)
+    assert.deepEqual(overview.scanTruncationReasons, [])
   })
 
   test('stops before reading one regular file beyond the global limit', () => {
@@ -2695,7 +2842,7 @@ describe('initialisation', () => {
     assert.deepEqual(overview.scanTruncationReasons, ['regular-file-limit'])
   })
 
-  test('omits all sources when the repository generation changes across baseline passes', () => {
+  test('retries all sources when the repository generation changes across baseline passes', () => {
     const root = createRoot()
     const moved = `${root}-moved`
     roots.push(moved)
@@ -2703,11 +2850,15 @@ describe('initialisation', () => {
     writeFileSync(join(root, 'index.ts'), 'export {}\n')
     ensureParent(join(root, '.github', 'workflows', 'private.yml'))
     writeFileSync(join(root, '.github', 'workflows', 'private.yml'), 'name: private\n')
+    let attempts = 0
 
     const baseline = scanBaselineWithHooks(root, {
       afterBaselineSources: () => {
-        renameSync(root, moved)
-        mkdirSync(root)
+        attempts += 1
+        if (attempts === 1) {
+          renameSync(root, moved)
+          mkdirSync(root)
+        }
       },
     })
     const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
@@ -2717,7 +2868,8 @@ describe('initialisation', () => {
     assert.deepEqual(overview.languageCounts, [])
     assert.deepEqual(overview.recognisedTopLevelFiles, [])
     assert.deepEqual(overview.sources, [])
-    assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory'])
+    assert.equal(attempts, 2)
+    assert.deepEqual(overview.scanTruncationReasons, [])
     assert.deepEqual(tooling.sources, [])
     assert.deepEqual(workflow.sources, [])
     assert.doesNotMatch(JSON.stringify(baseline), /private-project|index\.ts|private\.yml/)
@@ -2797,48 +2949,80 @@ describe('initialisation', () => {
     assert.doesNotMatch(JSON.stringify(baseline), /private-project/)
   })
 
-  test('reports replaced package metadata without retaining the old or new facts', () => {
+  test('reports valid non-object package metadata without retaining package facts', () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'package.json'), '["private-project"]')
+
+    const baseline = scanBaseline(root)
+    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
+    const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
+    const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
+
+    assert.equal(overview.scanTruncated, true)
+    assert.deepEqual(overview.scanTruncationReasons, ['package-metadata-error'])
+    assert.equal('packageName' in tooling, false)
+    assert.deepEqual(tooling.workspacePatterns, [])
+    assert.deepEqual(workflow.scriptKeys, [])
+    assert.deepEqual(overview.sources, [])
+    assert.doesNotMatch(JSON.stringify(baseline), /private-project/)
+  })
+
+  test('retries replaced package metadata and returns only successor facts', () => {
     const root = createRoot()
     const packagePath = join(root, 'package.json')
     const movedPath = join(root, 'moved-package.json')
     const replacementPath = join(root, 'replacement.json')
     writeFileSync(packagePath, JSON.stringify({ name: 'old-private-project' }))
-    writeFileSync(replacementPath, JSON.stringify({ name: 'new-private-project' }))
+    writeFileSync(replacementPath, JSON.stringify({ name: 'new-public-project' }))
+    let replaced = false
+    let attempts = 0
 
     const baseline = scanBaselineWithHooks(root, {
+      afterBaselineSources: () => {
+        attempts += 1
+      },
       afterPackageMetadataLstat: () => {
-        renameSync(packagePath, movedPath)
-        renameSync(replacementPath, packagePath)
+        if (!replaced) {
+          replaced = true
+          renameSync(packagePath, movedPath)
+          renameSync(replacementPath, packagePath)
+        }
       },
     })
     const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
     const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
     const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
 
-    assertPackageMetadataErrorReasons(overview.scanTruncationReasons)
-    assert.equal('packageName' in tooling, false)
-    assert.deepEqual(overview.sources, [])
-    assert.deepEqual(tooling.sources, [])
-    assert.deepEqual(workflow.sources, [])
-    assert.doesNotMatch(JSON.stringify(baseline), /old-private-project|new-private-project/)
+    assert.equal(attempts, 2)
+    assert.deepEqual(overview.scanTruncationReasons, [])
+    assert.equal(tooling.packageName, 'new-public-project')
+    assert.deepEqual(overview.sources, ['package.json'])
+    assert.deepEqual(tooling.sources, ['package.json'])
+    assert.deepEqual(workflow.sources, ['package.json'])
+    assert.doesNotMatch(JSON.stringify(baseline), /old-private-project/)
   })
 
-  test('reports package metadata that disappears after validated top-level enumeration', () => {
+  test('retries package metadata that disappears after validated top-level enumeration', () => {
     const root = createRoot()
     const packagePath = join(root, 'package.json')
     const movedPath = join(root, 'moved-package.json')
     writeFileSync(packagePath, JSON.stringify({ name: 'private-project' }))
+    let attempts = 0
 
     const baseline = scanBaselineWithHooks(root, {
       beforePackageMetadataRead: () => {
-        renameSync(packagePath, movedPath)
+        attempts += 1
+        if (attempts === 1) {
+          renameSync(packagePath, movedPath)
+        }
       },
     })
     const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
     const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
     const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
 
-    assertPackageMetadataErrorReasons(overview.scanTruncationReasons)
+    assert.equal(attempts, 2)
+    assert.deepEqual(overview.scanTruncationReasons, [])
     assert.equal('packageName' in tooling, false)
     assert.deepEqual(overview.sources, [])
     assert.deepEqual(tooling.sources, [])
@@ -2925,41 +3109,49 @@ describe('initialisation', () => {
     assert.doesNotMatch(JSON.stringify(baseline), /alias-project|"alias"/)
   })
 
-  test('reports replaced workflow ancestry without retaining workflow facts', () => {
+  test('retries replaced workflow ancestry and returns only successor workflow facts', () => {
     const root = createRoot()
     const githubPath = join(root, '.github')
-    const movedPath = join(root, 'moved-github')
+    const movedPath = `${root}-moved-github`
     const replacementPath = join(root, 'replacement-github')
+    roots.push(movedPath)
     ensureParent(join(githubPath, 'workflows', 'old-private.yml'))
-    ensureParent(join(replacementPath, 'workflows', 'new-private.yml'))
+    ensureParent(join(replacementPath, 'workflows', 'new-public.yml'))
     writeFileSync(join(githubPath, 'workflows', 'old-private.yml'), 'name: old\n')
-    writeFileSync(join(replacementPath, 'workflows', 'new-private.yml'), 'name: new\n')
+    writeFileSync(join(replacementPath, 'workflows', 'new-public.yml'), 'name: new\n')
+    let replaced = false
 
     const baseline = scanBaselineWithHooks(root, {
       afterWorkflowEnumeration: () => {
-        renameSync(githubPath, movedPath)
-        renameSync(replacementPath, githubPath)
+        if (!replaced) {
+          replaced = true
+          renameSync(githubPath, movedPath)
+          renameSync(replacementPath, githubPath)
+        }
       },
     })
     const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
     const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
 
-    assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory', 'workflow-enumeration-error'])
-    assert.deepEqual(workflow.workflowFiles, [])
-    assert.deepEqual(workflow.sources, [])
-    assert.doesNotMatch(JSON.stringify(workflow), /old-private|new-private|moved-github|replacement-github/)
+    assert.deepEqual(overview.scanTruncationReasons, [])
+    assert.deepEqual(workflow.workflowFiles, ['.github/workflows/new-public.yml'])
+    assert.deepEqual(workflow.sources, ['.github/workflows/new-public.yml'])
+    assert.doesNotMatch(JSON.stringify(workflow), /old-private|moved-github|replacement-github/)
   })
 
-  test('reports workflow ancestry that disappears after its initial observation', () => {
+  test('retries workflow ancestry that disappears after its initial observation', () => {
     const root = createRoot()
     const githubPath = join(root, '.github')
-    const movedPath = join(root, 'moved-github')
+    const movedPath = `${root}-moved-github`
+    roots.push(movedPath)
     ensureParent(join(githubPath, 'workflows', 'private.yml'))
     writeFileSync(join(githubPath, 'workflows', 'private.yml'), 'name: private\n')
+    let removed = false
 
     const baseline = scanBaselineWithHooks(root, {
       afterOptionalDirectoryLstat: path => {
-        if (path === githubPath) {
+        if (path === githubPath && !removed) {
+          removed = true
           renameSync(githubPath, movedPath)
         }
       },
@@ -2967,28 +3159,33 @@ describe('initialisation', () => {
     const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
     const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
 
-    assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory', 'workflow-enumeration-error'])
+    assert.deepEqual(overview.scanTruncationReasons, [])
     assert.deepEqual(workflow.workflowFiles, [])
     assert.deepEqual(workflow.sources, [])
     assert.doesNotMatch(JSON.stringify(baseline), /private\.yml|moved-github/)
   })
 
-  test('reports workflow ancestry that disappears before its preliminary metadata check', () => {
+  test('retries workflow ancestry that disappears before its preliminary metadata check', () => {
     const root = createRoot()
     const githubPath = join(root, '.github')
-    const movedPath = join(root, 'moved-github')
+    const movedPath = `${root}-moved-github`
+    roots.push(movedPath)
     ensureParent(join(githubPath, 'workflows', 'private.yml'))
     writeFileSync(join(githubPath, 'workflows', 'private.yml'), 'name: private\n')
+    let removed = false
 
     const baseline = scanBaselineWithHooks(root, {
       beforeWorkflowDirectoryCapture: () => {
-        renameSync(githubPath, movedPath)
+        if (!removed) {
+          removed = true
+          renameSync(githubPath, movedPath)
+        }
       },
     })
     const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
     const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
 
-    assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory', 'workflow-enumeration-error'])
+    assert.deepEqual(overview.scanTruncationReasons, [])
     assert.deepEqual(workflow.workflowFiles, [])
     assert.deepEqual(workflow.sources, [])
     assert.doesNotMatch(JSON.stringify(baseline), /private\.yml|moved-github/)
