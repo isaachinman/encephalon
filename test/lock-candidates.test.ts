@@ -50,6 +50,7 @@ const age = (path: string) => utimesSync(path, new Date(0), new Date(0))
 afterEach(() => {
   cacheLocationTestHooks.beforeCacheLocationAssertion = undefined
   cacheLocationTestHooks.beforeCacheOwnerOpen = undefined
+  cacheLocationTestHooks.beforeOwnedDirectoryPromotionRename = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
   cacheLocationTestHooks.beforeQuarantinedFileCleanup = undefined
   roots.splice(0).forEach(removeTestRepository)
@@ -738,6 +739,40 @@ describe('lock candidate maintenance', () => {
         const candidate = error as { details?: { entry?: unknown } }
         assert.equal(candidate.details?.entry, 'node_modules/.cache/encephalon/operation.lock')
         assert.equal(String(candidate.details?.entry).includes('operation.lock.'), false)
+        return true
+      },
+    )
+  })
+
+  test('redacts the private candidate token from a promotion filesystem cause chain', () => {
+    const root = createRoot()
+    let privateToken: string | undefined
+    cacheLocationTestHooks.beforeOwnedDirectoryPromotionRename = path => {
+      privateToken = basename(path)
+      renameSync(path, `${path}.displaced`)
+    }
+
+    assert.throws(
+      () => withOperationLock(root, () => 'entered'),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        assert.ok(privateToken !== undefined)
+        const publicError = error as Error & { details?: unknown }
+        const publicCauses = Array.from({ length: 8 }).reduce<unknown[]>(
+          (chain, _) => {
+            const current = chain.at(-1) as (Error & { code?: unknown; path?: unknown }) | undefined
+            return current?.cause === undefined ? chain : [...chain, current.cause]
+          },
+          [publicError],
+        )
+        const projected = JSON.stringify(
+          publicCauses.map(cause => {
+            const current = cause as Error & { code?: unknown; path?: unknown }
+            return { code: current.code, message: current.message, path: current.path, stack: current.stack }
+          }),
+        )
+        assert.equal(projected.includes(privateToken), false)
+        assert.equal(JSON.stringify(publicError.details).includes(privateToken), false)
         return true
       },
     )

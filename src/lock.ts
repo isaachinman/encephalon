@@ -122,6 +122,46 @@ const MAX_OWNER_PID = 2_147_483_647
 const MAX_OWNER_TIMESTAMP_LENGTH = 64
 const MAX_OWNER_TOKEN_LENGTH = 128
 
+const causeContainsPrivateCandidate = (cause: unknown, candidateName: string, remainingDepth = 8): boolean => {
+  const candidate =
+    typeof cause === 'object' && cause !== null
+      ? (cause as { cause?: unknown; message?: unknown; path?: unknown })
+      : undefined
+  return (
+    (typeof candidate?.message === 'string' && candidate.message.includes(candidateName)) ||
+    (typeof candidate?.path === 'string' && candidate.path.includes(candidateName)) ||
+    (remainingDepth > 0 &&
+      candidate?.cause !== undefined &&
+      causeContainsPrivateCandidate(candidate.cause, candidateName, remainingDepth - 1))
+  )
+}
+
+const causeCode = (cause: unknown, remainingDepth = 8): string | undefined => {
+  const candidate =
+    typeof cause === 'object' && cause !== null ? (cause as { cause?: unknown; code?: unknown }) : undefined
+  const { code: candidateCode } = candidate ?? {}
+  let code: string | undefined
+  if (typeof candidateCode === 'string') {
+    code = candidateCode
+  } else if (remainingDepth > 0 && candidate?.cause !== undefined) {
+    code = causeCode(candidate.cause, remainingDepth - 1)
+  }
+  return code
+}
+
+const redactPrivateCandidateCause = (cause: unknown, candidateName: string) => {
+  let safeCause = cause
+  if (causeContainsPrivateCandidate(cause, candidateName)) {
+    const replacement = new Error('A private operation-lock candidate filesystem operation failed.')
+    const code = causeCode(cause)
+    if (code !== undefined) {
+      Object.assign(replacement, { code })
+    }
+    safeCause = replacement
+  }
+  return safeCause
+}
+
 const sameLockOwner = (first: RecoveryOwner, second: RecoveryOwner) =>
   first.acquiredAt === second.acquiredAt &&
   first.phase === second.phase &&
@@ -869,7 +909,7 @@ export const withOperationLock = <Result>(
       operationError = error
     } else {
       try {
-        wrapIo('Unable to coordinate Encephalon cache access.', error)
+        wrapIo('Unable to coordinate Encephalon cache access.', redactPrivateCandidateCause(error, candidateName))
       } catch (wrappedError) {
         operationError = wrappedError
       }

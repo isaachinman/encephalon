@@ -116,6 +116,7 @@ afterEach(() => {
   cacheLocationTestHooks.beforeCacheOwnerOpen = undefined
   cacheLocationTestHooks.beforeCacheLocationAssertion = undefined
   cacheLocationTestHooks.beforeLocationInspection = undefined
+  cacheLocationTestHooks.beforeOwnedDirectoryPromotionRename = undefined
   cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = undefined
   cacheLocationTestHooks.beforeOwnerRecoveryFsync = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
