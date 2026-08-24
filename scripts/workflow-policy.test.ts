@@ -33,6 +33,17 @@ const repositoryRoot = fileURLToPath(new URL('..', import.meta.url))
 const directorySymlinkType = process.platform === 'win32' ? 'junction' : 'dir'
 const windowsOnlyTest = process.platform === 'win32' ? test : test.skip
 const posixOnlyTest = process.platform === 'win32' ? test.skip : test
+const posixFifoTest = (() => {
+  if (process.platform === 'win32') {
+    return test.skip
+  }
+  const root = mkdtempSync(join(tmpdir(), 'encephalon-workflow-fifo-capability-test-'))
+  try {
+    return spawnSync('mkfifo', [join(root, 'fifo')]).status === 0 ? test : test.skip
+  } finally {
+    rmSync(root, { force: true, recursive: true })
+  }
+})()
 
 type PullfrogStep = Record<string, unknown> & {
   env?: unknown
@@ -283,6 +294,53 @@ jobs: {}
     { allocatedBytes: sourceBytes, kind: 'allocation' },
     { bytesRead: sourceBytes, kind: 'read', requestedBytes: sourceBytes },
   ])
+})
+
+// Mutation caught: a blocking descriptor open would hang before rejecting a FIFO substituted after source realpath.
+posixFifoTest('does not block when a workflow source is replaced by a FIFO before descriptor open', () => {
+  const root = createFixture({
+    '.github/workflows/fifo.yml': `name: FIFO replacement
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+  })
+  const script = `
+    import { spawnSync } from 'node:child_process'
+    import { realpathSync, renameSync } from 'node:fs'
+    import { join } from 'node:path'
+    import { inspectWorkflowPolicy } from ${JSON.stringify(new URL('./workflow-policy.ts', import.meta.url).href)}
+    const root = process.argv[1]
+    const sourcePath = join(realpathSync.native(root), '.github/workflows/fifo.yml')
+    let fifoCreated = false
+    let replaced = false
+    const findings = inspectWorkflowPolicy(root, {
+      afterSourceInitialRealpath: path => {
+        if (path === sourcePath && !replaced) {
+          replaced = true
+          renameSync(path, \`\${path}.original\`)
+          const result = spawnSync('mkfifo', [path])
+          fifoCreated = result.status === 0
+          if (!fifoCreated) throw result.error ?? new Error('mkfifo failed')
+        }
+      },
+    })
+    process.stdout.write(JSON.stringify({ fifoCreated, findings, replaced }))
+  `
+
+  const child = spawnSync(process.execPath, ['--input-type=module', '--eval', script, root], {
+    encoding: 'utf8',
+    timeout: 2000,
+  })
+
+  assert.equal(child.error, undefined)
+  assert.equal(child.status, 0, child.stderr)
+  assert.deepEqual(JSON.parse(child.stdout), {
+    fifoCreated: true,
+    findings: [{ file: '.github/workflows', location: '$', rule: 'source-integrity' }],
+    replaced: true,
+  })
 })
 
 // Mutation caught: applying the aggregate limit after reading would transfer the second source's overflowing byte.
@@ -1288,6 +1346,31 @@ jobs:
   ])
 })
 
+// Mutation caught: accepting an active executable object would let a composite action's self-aliased steps evade fail-closed traversal.
+test('rejects self-aliased composite action steps in the executable walker', () => {
+  const root = createFixture({
+    '.github/actions/cyclic/action.yml': `name: Cyclic composite
+runs:
+  using: composite
+  steps: &steps
+    - *steps
+`,
+    '.github/workflows/cyclic-action.yml': `name: Cyclic action caller
+on: workflow_dispatch
+permissions: { contents: read }
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/cyclic
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    { file: '.github/workflows', location: '$', rule: 'source-integrity' },
+  ])
+})
+
 test('inspects only executable uses positions', () => {
   const root = createFixture({
     '.github/actions/checked/action.yml': `name: Checked
@@ -1401,6 +1484,39 @@ jobs:
       file: '.github/workflows/credentials.yml',
       location: 'jobs.oidc.permissions.id-token',
       rule: 'permission',
+    },
+  ])
+})
+
+// Mutation caught: scanning only runner steps would miss secret expressions in job-level environment values.
+test('requires protection for job-level secret environments only on unprotected runners', () => {
+  const root = createFixture({
+    '.github/workflows/job-environment.yml': `name: Job environment
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  protected:
+    runs-on: ubuntu-latest
+    environment: pullfrog-review
+    env:
+      TOKEN: \${{ secrets.TOKEN }}
+    steps:
+      - run: echo protected
+  unprotected:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: \${{ secrets.TOKEN }}
+    steps:
+      - run: echo unprotected
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/job-environment.yml',
+      location: 'jobs.unprotected.environment',
+      rule: 'credential-environment',
     },
   ])
 })

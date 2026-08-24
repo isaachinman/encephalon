@@ -75,6 +75,7 @@ type WorkflowPolicyOptions = Readonly<{
   afterFinalDirectoryRealpath?: (path: string) => void
   afterFinalFileRealpath?: (path: string) => void
   afterFirstFinalRevalidation?: () => void
+  afterSourceInitialRealpath?: (path: string) => void
   beforeFinalRevalidation?: () => void
   limits?: Partial<WorkflowPolicyLimits>
   onExternalReference?: (observation: ExternalReferenceObservation) => void
@@ -84,6 +85,7 @@ type WorkflowPolicyOptions = Readonly<{
 
 type ValidatedNativeFileOptions = Readonly<{
   afterFinalRealpath?: (path: string) => void
+  afterInitialRealpath?: (path: string) => void
   maximumBytes?: number
   onDescriptorIo?: (observation: DescriptorIoObservation) => void
 }>
@@ -307,6 +309,10 @@ const readRealPath = (path: string) => {
 }
 
 const isSingleLinkRegularFile = (stats: BigIntStats) => stats.isFile() && stats.nlink === 1n
+const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
+const nonBlockFlag = typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0
+const noControllingTerminalFlag = typeof constants.O_NOCTTY === 'number' ? constants.O_NOCTTY : 0
+const sourceOpenFlags = constants.O_RDONLY | noFollowFlag | nonBlockFlag | noControllingTerminalFlag
 
 const observeNativeFile = (
   root: string,
@@ -432,14 +438,14 @@ export const readValidatedNativeFile = (
   try {
     const initialStats = lstatSync(path, { bigint: true })
     const initialNativePath = realpathSync.native(path)
+    options.afterInitialRealpath?.(path)
     if (
       isSingleLinkRegularFile(initialStats) &&
       !initialStats.isSymbolicLink() &&
       samePath(initialNativePath, path) &&
       isContainedPath(root, initialNativePath)
     ) {
-      const noFollow = constants.O_NOFOLLOW ?? 0
-      descriptor = openSync(path, constants.O_RDONLY | noFollow)
+      descriptor = openSync(path, sourceOpenFlags)
       const beforeReadStats = fstatSync(descriptor, { bigint: true })
       if (isSingleLinkRegularFile(beforeReadStats) && sameStableEntryMetadata(initialStats, beforeReadStats)) {
         if (beforeReadStats.size <= BigInt(maximumBytes)) {
@@ -1080,6 +1086,9 @@ export const inspectWorkflowPolicy = (
       const remainingAggregateSourceBytes = Math.max(0, limits.maximumAggregateSourceBytes - aggregateSourceBytes)
       const sourceAllowance = Math.max(0, Math.min(limits.maximumSourceBytes, remainingAggregateSourceBytes))
       const readResult = readValidatedNativeFile(nativeRoot, source.path, {
+        afterInitialRealpath: path => {
+          options.afterSourceInitialRealpath?.(path)
+        },
         maximumBytes: sourceAllowance,
         onDescriptorIo: observation => {
           options.onSourceDescriptorIo?.(source.path, observation)
