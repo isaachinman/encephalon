@@ -122,18 +122,19 @@ export class CacheDatabaseCreationConflict extends Error {
   }
 }
 
-class CacheDatabaseSidecarChanged extends EncephalonError {
-  readonly database: CacheDatabase
+const cacheDatabaseSidecarChanges = new WeakMap<EncephalonError, CacheDatabase>()
 
-  constructor(database: CacheDatabase, relativePath: string) {
-    super('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
-      entry: relativePath,
-      invariant: 'stable-identity',
-    })
-    this.name = 'CacheDatabaseSidecarChanged'
-    this.database = database
-  }
+const cacheDatabaseSidecarChanged = (database: CacheDatabase, relativePath: string) => {
+  const error = new EncephalonError('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {
+    entry: relativePath,
+    invariant: 'stable-identity',
+  })
+  cacheDatabaseSidecarChanges.set(error, database)
+  return error
 }
+
+const cacheDatabaseSidecarChangedDatabase = (error: unknown) =>
+  error instanceof EncephalonError ? cacheDatabaseSidecarChanges.get(error) : undefined
 
 class UnsafeCacheDatabaseSidecar extends EncephalonError {}
 
@@ -593,12 +594,16 @@ const inspectSidecarMetadata = (
 const reconcileSidecarSnapshots = (
   database: CacheDatabase,
   observed: Partial<Record<CacheDatabaseSidecarSuffix, CacheFile>>,
+  requireSamePresence = false,
 ) => {
   for (const suffix of DATABASE_SIDECAR_SUFFIXES) {
     const expected = database.sidecars[suffix]
     const current = observed[suffix]
-    if (expected !== undefined && current !== undefined && !sameCacheEntryIdentity(expected, current)) {
-      throw new CacheDatabaseSidecarChanged(
+    if (
+      (requireSamePresence && (expected === undefined) !== (current === undefined)) ||
+      (expected !== undefined && current !== undefined && !sameCacheEntryIdentity(expected, current))
+    ) {
+      throw cacheDatabaseSidecarChanged(
         { ...database, sidecars: observed },
         `${databaseRelativePath(database.name)}${suffix}`,
       )
@@ -611,7 +616,7 @@ const reconcileSidecars = (location: CacheLocation, database: CacheDatabase) =>
   reconcileSidecarSnapshots(database, inspectSidecars(location, database.name, database.sidecars))
 
 const reconcileSidecarMetadata = (location: CacheLocation, database: CacheDatabase) =>
-  reconcileSidecarSnapshots(database, inspectSidecarMetadata(location, database.name, database.sidecars))
+  reconcileSidecarSnapshots(database, inspectSidecarMetadata(location, database.name, database.sidecars), true)
 
 const cacheDatabaseCloseIsProvenSafe = (location: CacheLocation, database: CacheDatabase) => {
   try {
@@ -744,6 +749,21 @@ export const assertCacheDatabaseMetadata = (location: CacheLocation, database: C
   return { ...database, sidecars }
 }
 
+const captureCacheDatabaseMetadata = (location: CacheLocation, database: CacheDatabase) => {
+  assertCacheLocation(location)
+  const identity = inspectRegularFileMetadata(database.path, databaseRelativePath(database.name), {
+    expected: database,
+    requireSingleLink: true,
+  })
+  if (identity === undefined || !sameCacheEntryIdentity(database, identity)) {
+    return changedLayout(databaseRelativePath(database.name), 'stable-identity')
+  }
+  assertCacheLocation(location)
+  const sidecars = inspectSidecarMetadata(location, database.name, {})
+  assertCacheLocation(location)
+  return { ...database, sidecars }
+}
+
 const assertOwnedCacheDatabase = (location: CacheLocation, database: CacheDatabase) => {
   assertCacheLocation(location)
   const identity = inspectRegularFile(database.path, databaseRelativePath(database.name), {
@@ -789,7 +809,9 @@ const suppressUnsafeDatabaseClose = (
   metadataAuthorityFailed = false,
 ) => {
   const closeProvenSafe = cacheDatabaseCloseIsProvenSafe(location, snapshot)
-  const markedUnsafeSidecar = errors.some(error => error instanceof UnsafeCacheDatabaseSidecar)
+  const markedUnsafeSidecar = errors.some(
+    error => error instanceof UnsafeCacheDatabaseSidecar || cacheDatabaseSidecarChangedDatabase(error) !== undefined,
+  )
   const suppressClose = metadataAuthorityFailed || markedUnsafeSidecar || !closeProvenSafe
   if (suppressClose) {
     cacheDatabaseCloseSafetyLatches.set(snapshot.path, database)
@@ -865,8 +887,9 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
       cacheLocationTestHooks.beforeDatabaseOpen?.(snapshot)
       snapshot = assertPrimary(snapshot)
     } catch (error) {
-      if (error instanceof CacheDatabaseSidecarChanged) {
-        snapshot = error.database
+      const changedDatabase = cacheDatabaseSidecarChangedDatabase(error)
+      if (changedDatabase !== undefined) {
+        snapshot = changedDatabase
         if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
           throw error
         }
@@ -890,6 +913,7 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
       options.afterVerifiedOpen?.(database, context)
       lockPreservingInitialisationCompleted = options.preserveDatabaseLocksAfterInitialisation === true
       if (options.preserveDatabaseLocksAfterInitialisation) {
+        snapshot = captureCacheDatabaseMetadata(options.location, snapshot)
         cacheLocationTestHooks.afterDatabaseLockInitialisation?.(snapshot)
       }
       snapshot = options.preserveDatabaseLocksAfterInitialisation
@@ -897,19 +921,8 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
         : assertPrimary(snapshot)
       return { database, identity: snapshot }
     } catch (error) {
-      if (error instanceof CacheDatabaseSidecarChanged) {
-        const closeSuppressed =
-          lockPreservingInitialisationCompleted &&
-          suppressUnsafeDatabaseClose(options.location, snapshot, database, [error])
-        if (closeSuppressed) {
-          throw error
-        }
-        closeDatabaseAfterFailure(database)
-        snapshot = error.database
-        if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
-          throw error
-        }
-      } else {
+      const changedDatabase = cacheDatabaseSidecarChangedDatabase(error)
+      if (changedDatabase === undefined) {
         let validationError: unknown
         try {
           snapshot = options.preserveDatabaseLocksAfterInitialisation
@@ -935,6 +948,17 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
           throw error
         }
         return failCacheDatabase(error, snapshot)
+      }
+      const closeSuppressed =
+        lockPreservingInitialisationCompleted &&
+        suppressUnsafeDatabaseClose(options.location, snapshot, database, [error], true)
+      if (closeSuppressed) {
+        throw error
+      }
+      closeDatabaseAfterFailure(database)
+      snapshot = changedDatabase
+      if (attempt === MAX_CACHE_DATABASE_OPEN_ATTEMPTS - 1) {
+        throw error
       }
     }
   }

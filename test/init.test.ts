@@ -243,6 +243,13 @@ describe('initialisation', () => {
     ['workflow', 'encephalon:init/commands-ci'],
   ] as const
 
+  const prepareEmptyBaselineDirectories = (root: string) => {
+    mkdirSync(join(root, 'encephalon', '_staging'), { recursive: true })
+    for (const [kind] of baselinePublicationOrder) {
+      mkdirSync(join(root, 'encephalon', kind), { recursive: true })
+    }
+  }
+
   const scannedBaselineEntries = (root: string) =>
     scanBaseline(root).map(record => [record.kind, record.subject] as const)
 
@@ -1466,7 +1473,7 @@ describe('initialisation', () => {
 
   test('replans a replacement canonical generation before publishing the baseline', () => {
     const root = createRoot()
-    mkdirSync(join(root, 'encephalon', 'decision'), { recursive: true })
+    prepareEmptyBaselineDirectories(root)
     const brainDirectory = join(root, 'encephalon')
     const displaced = join(root, 'displaced-encephalon-before-init')
     let replaced = false
@@ -1479,7 +1486,7 @@ describe('initialisation', () => {
             if (point === 'before-directory-preparation' && !replaced) {
               replaced = true
               renameSync(brainDirectory, displaced)
-              mkdirSync(join(brainDirectory, 'decision'), { recursive: true })
+              prepareEmptyBaselineDirectories(root)
             }
           },
         },
@@ -1493,8 +1500,36 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'CLAUDE.md')), true)
   })
 
+  test('creates the canonical root and every planned baseline child across two safe replans', () => {
+    const root = createRoot()
+    const linkScans: number[] = []
+    let canonicalScans = 0
+
+    const result = initEncephalonWithHooks(
+      { root },
+      {
+        canonicalScan: () => {
+          canonicalScans += 1
+        },
+        recordWriteHooks: {
+          fault: point => {
+            if (point === 'after-canonical-link') {
+              linkScans.push(canonicalScans)
+            }
+          },
+        },
+      },
+    )
+
+    assert.equal(result.recordsCreated.length, baselinePublicationOrder.length)
+    assert.equal(canonicalScans, 3)
+    assert.deepEqual(linkScans, [3, 3, 3])
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
   test('init replans changed canonical generation before the first baseline link', () => {
     const root = createRoot()
+    prepareEmptyBaselineDirectories(root)
     const concurrentId = 'concurrent-repository-overview'
     const concurrentCreatedAt = new Date(Date.now() + 86_400_000).toISOString()
     const work = { baselineScans: 0, canonicalScans: 0, graphValidations: 0, links: 0 }
@@ -1554,6 +1589,7 @@ describe('initialisation', () => {
 
   test('init preserves repository change when the replanned canonical generation settles malformed', () => {
     const root = createRoot()
+    prepareEmptyBaselineDirectories(root)
     const malformedPath = join(root, 'encephalon', 'decision', 'malformed-successor.json')
     let changed = false
 
@@ -1590,7 +1626,7 @@ describe('initialisation', () => {
 
     assert.equal(changed, true)
     assert.equal(existsSync(malformedPath), true)
-    assert.equal(existsSync(join(root, 'encephalon', '_staging')), false)
+    assert.equal(existsSync(join(root, 'encephalon', '_staging')), true)
     assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
@@ -1951,7 +1987,7 @@ describe('initialisation', () => {
     assert.deepEqual(workflow.scriptInvocations, [{ arguments: ['run', 'test'], executable: 'npm', scriptKey: 'test' }])
   })
 
-  test('plans first and idempotent baseline additions against one canonical snapshot', () => {
+  test('plans first and idempotent baseline additions against one snapshot per stable attempt', () => {
     const root = createRoot()
     writeFileSync(
       join(root, 'package.json'),
@@ -1965,9 +2001,9 @@ describe('initialisation', () => {
     assert.equal(first.result.recordsCreated.length, 3)
     assert.deepEqual(first.counts, {
       baselineScans: 1,
-      canonicalScans: 1,
+      canonicalScans: 3,
       diskCacheValidations: 0,
-      graphValidations: 1,
+      graphValidations: 3,
       hydrations: 1,
     })
 
@@ -2560,6 +2596,7 @@ describe('initialisation', () => {
     })
     assert.equal(bytesPerRecord * recordFiles.length, MAX_CANONICAL_RECORD_BYTES - 608)
     assert.equal(api.validateRecords({ root }).valid, true)
+    prepareEmptyBaselineDirectories(root)
     const work = { canonicalScans: 0, graphValidations: 0, instructionWrites: 0 }
     const countCanonicalScan = () => {
       work.canonicalScans += 1
@@ -2725,6 +2762,7 @@ describe('initialisation', () => {
 
   test('stops a baseline batch after a post-link canonical generation replacement', () => {
     const root = createRoot()
+    prepareEmptyBaselineDirectories(root)
     const kindDirectory = join(root, 'encephalon', 'context')
     const displaced = join(root, 'displaced-context-after-publication')
     let publicationAttempts = 0
@@ -2754,8 +2792,8 @@ describe('initialisation', () => {
     assert.equal(publicationAttempts, 1)
     assert.equal(readdirSync(displaced).filter(name => name.endsWith('.json')).length, 1)
     assert.deepEqual(readdirSync(kindDirectory), [])
-    assert.equal(existsSync(join(root, 'encephalon', 'architecture')), false)
-    assert.equal(existsSync(join(root, 'encephalon', 'workflow')), false)
+    assert.deepEqual(readdirSync(join(root, 'encephalon', 'architecture')), [])
+    assert.deepEqual(readdirSync(join(root, 'encephalon', 'workflow')), [])
     assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
@@ -2763,6 +2801,7 @@ describe('initialisation', () => {
 
   test('stops a mid-batch canonical generation race at the exact committed prefix', () => {
     const root = createRoot()
+    prepareEmptyBaselineDirectories(root)
     const safeCauseMessage = 'Canonical layout changed before publication.'
     let cacheHooks = 0
     let instructionHooks = 0
@@ -2849,12 +2888,13 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
-    assert.equal(existsSync(join(root, 'encephalon', 'architecture')), false)
-    assert.equal(existsSync(join(root, 'encephalon', 'workflow')), false)
+    assert.deepEqual(readdirSync(join(root, 'encephalon', 'architecture')), [])
+    assert.deepEqual(readdirSync(join(root, 'encephalon', 'workflow')), [])
   })
 
   test('reports the full committed prefix when canonical generation changes during cache snapshot sealing', () => {
     const root = createRoot()
+    prepareEmptyBaselineDirectories(root)
     let canonicalScans = 0
     let graphValidations = 0
     let sealRaceInjected = false
@@ -2914,6 +2954,7 @@ describe('initialisation', () => {
 
   test('reports the full committed prefix when canonical generation changes during cache insertion', () => {
     const root = createRoot()
+    prepareEmptyBaselineDirectories(root)
     const work = {
       cacheMutations: 0,
       canonicalScans: 0,
@@ -3013,6 +3054,7 @@ describe('initialisation', () => {
 
   test('reports the full mid-batch canonical generation prefix after a later hard link', () => {
     const root = createRoot()
+    prepareEmptyBaselineDirectories(root)
     let cacheHooks = 0
     let instructionHooks = 0
     let publicationLinks = 0
@@ -3078,7 +3120,7 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
-    assert.equal(existsSync(join(root, 'encephalon', 'workflow')), false)
+    assert.deepEqual(readdirSync(join(root, 'encephalon', 'workflow')), [])
   })
 
   test('records package scripts as structured argv data instead of shell strings', () => {

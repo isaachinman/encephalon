@@ -174,3 +174,53 @@ All commands ran on the exact ticket branch from base `aef71241f59ff6a792c3bc50d
 - `bun run check:publish` — passed its expected already-published-version preflight classification.
 - `node dist/cli.mjs validate --root .` — valid, 38 records checked, no errors.
 - `git diff --check` — passed.
+
+## Final generation review addendum
+
+This addendum supersedes the directory-creation wording in finding E above. A portable Node filesystem call cannot return an identity handle for the exact directory instance created by `mkdirSync`, so a pathname witness captured after that call cannot prove operation ownership if a same-name successor is installed before the call returns. The final closure does not use such a witness as ownership proof.
+
+### Final finding closures
+
+1. **Created root, kind, and staging identity:** an attempt that creates the canonical root aborts through the private preparation change immediately when `mkdirSync` returns, before any kind or staging syscall. It therefore cannot follow a root symlink successor, create children outside the repository, leak a raw `ENOTDIR` for a file successor, or reach a canonical hard link. The next complete attempt binds the exact successor root, creates every required baseline kind plus `_staging` in one preparation pass, and aborts again before publication if it created any child. A third complete scan treats that post-creation layout as its baseline, binds the exact root/kind/staging identities, and is the first attempt allowed to link. Existing roots that only require child creation still use one preparation replan. All phases consume the same maximum-three/non-resetting-60-second ledger without a nested retry path; stable invalid successors retain ordinary validation.
+2. **Parent revalidation errors:** `assertParentIdentity` now receives the canonical changed callback and the read hooks. `ENOENT`, `ENOTDIR`, and `ELOOP` at this exact secondary boundary enter the private generation sentinel; a stable operational failure is normalised without retaining the absolute pathname and preserves its established public classification.
+3. **Record-open privacy:** the shared `openObservedRecordDescriptor` boundary now preserves existing sentinel/`EncephalonError` authority, re-observes a failed pathname to distinguish replacement, and normalises a stable operational failure before it can reach either pre-commit or committed cause chains. Closing and publication reinspection use the same helper and hooks. The committed publication authority also normalises later fstat/fault and descriptor-close failures, so a post-link operational cause cannot retain the canonical absolute path.
+4. **Unreadable closing evidence:** after exact path and parent revalidation, only a later `EACCES` or `EPERM` confirms the original stable `INVALID_RECORD` result. Other failures, including `EIO`, are rethrown through the path-safe record operational error.
+5. **Descriptor helper cleanup:** the unreachable `invalidRecordReadChange` fallback was removed. Every `readBoundedDescriptor` caller must now provide its exact generation-changed authority.
+6. **Cache sidecar privacy and close safety:** the sidecar-changed database snapshot is retained in a module-private `WeakMap` keyed by a plain `EncephalonError`. Terminal public errors expose only the established code, message, and details; they have no enumerable database carrier or private subclass name and remain JSON serialisable. After trusted lock initialisation, the existing MAR-2635 metadata-only authority captures one fresh sidecar baseline so a contender may accept its own journal transition after `BEGIN IMMEDIATE`; the following authority check requires exact presence and identity. A post-capture replacement, appearance, or disappearance is terminal, suppresses SQLite close, latches the database against reopening, and cannot retry or quarantine. The same close-safety decision recognises a private sidecar-change carrier discovered during secondary validation after another initialisation failure. DML-time WAL and post-BEGIN gate-journal successors are preserved exactly.
+
+### Final TDD evidence
+
+- The five records privacy/error regressions were introduced together and initially failed 5/5: the parent disappearance did not retry, stable parent/open failures retained injected absolute paths, committed reinspection retained the raw open cause, and a closing `EIO` was swallowed as `INVALID_RECORD`. The focused batch passed 5/5 after the shared-boundary changes.
+- The DML-time single-link WAL successor regression initially failed because the public error name was `CacheDatabaseSidecarChanged`. It passed after the carrier moved to private weak state and also proved no `database` property, no absolute path/device/inode/private name, successful JSON serialisation, zero quarantine, and exact successor preservation.
+- The wrapped-`mkdirSync` root/kind/staging regression initially linked into a successor from the same attempt. A dedicated root file/symlink RED additionally returned raw `ENOTDIR` or could create descendants through the successor. Root creation now aborts before any descendant syscall; missing-root first use proves exactly three complete scans/graph validations, two preparation replans, no earlier link, and publication only from scan three. Persistent replacement proves exactly three scans/graphs, three replacements, and zero links. Stable invalid successors retain ordinary `VALIDATION_FAILED`, and multi-kind initialisation proves every planned kind plus staging is created together on scan two before all baseline links occur on scan three.
+- The initial post-BEGIN sidecar fix was RED because a single-link journal successor was closed and retried. It now proves one open, zero callback entries, closes, retries, or quarantines, a terminal session latch, and exact successor preservation. Fresh post-BEGIN appearance/disappearance regressions then exposed optional-presence adoption; exact metadata reconciliation closes both. A secondary-validation regression initially threw the private carrier but failed to latch, allowing the next open; close suppression now recognises that carrier wherever it appears. The existing cross-process timestamp regression caught an over-strict pre-BEGIN witness and now proves that only the trusted operation-owned `BEGIN` transition is freshly captured before strict comparison.
+- An armed post-link `after-record-fstat` regression initially retained the injected absolute record path in `publicationVerification.cause`. It now has the same path-safe `EIO` cause as the existing committed open regression.
+- Existing later-boundary tests precreate their canonical directories so their scan/link assertions continue to measure the intended graph, final-link, post-link, cache-sealing, and committed-prefix races rather than the new safe first-use preparation phase. First-use add and init coverage explicitly records the additional preparation attempt.
+
+### Final compatibility and security review
+
+- No public API, package export, canonical JSON, runtime path, validation result, cache schema/version, manifest, FTS row, instruction, or persisted format changed.
+- Established public codes, messages, details, `RECORD_EXISTS`, committed-prefix fields, and no-post-link-retry behaviour are preserved.
+- A first mutation into a missing canonical layout now performs two bounded preparation replans before linking: one after root creation and one after all planned child creation. This is an internal phase-count change within the existing three-attempt/60-second contract. The maintained contract already states that a pre-link generation change discards and recomputes the complete attempt, so no contract documentation change was required.
+- Private directory identities, record paths, filesystem metadata, cache database handles, digests, payloads, ancestor evidence, and sentinel class names are absent from public details and cause chains.
+- The cache change reuses the MAR-2635 authority and does not add a second identity authority or recovery/quarantine path.
+
+### Final verification gates
+
+- `node --test test/records.test.ts` — 160 passed, 0 failed.
+- `node --test --test-reporter=dot test/cache.test.ts` — 229 passed, 0 failed.
+- `node --test test/init.test.ts` — 177 passed, 0 failed, 2 expected filesystem-platform skips.
+- `node --test test/artifact-inspection.test.ts test/staging.test.ts test/errors.test.ts test/cli.test.ts test/package.test.ts` — 53 passed, 0 failed.
+- `bun run test` — 761 total, 759 passed, 0 failed, 2 expected skips; includes build.
+- `bun run lint` — 131 files checked, no diagnostics.
+- `bun run typecheck` — source, scripts, tests, and runtime-guard configurations passed.
+- `bun run benchmark:check` — CI profile completed within the maintained budgets.
+- `bun run build` — passed.
+- `bun run check:package` — passed serially. An earlier parallel invocation raced a simultaneous build and transiently packaged the output between declaration-file replacement steps; the required isolated rerun passed.
+- `bun run check:generated` — passed.
+- `bun run check:workflows` — 63 passed, 0 failed, 1 expected Windows-only skip; policy command passed.
+- `bun run check:publish` — passed its expected already-published-version preflight classification for `0.2.0`.
+- `node dist/cli.mjs validate --root .` — valid, 38 records checked, no errors.
+- `git diff --check` — passed.
+
+An independent final read-only review found no remaining implementation issue after the root-phase, committed-fstat, strict sidecar-presence, and secondary-carrier closures. Its only final finding was the stale phase/count wording corrected in this addendum.

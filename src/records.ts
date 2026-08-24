@@ -122,6 +122,8 @@ type ValidatedRecordScan = {
 
 class CanonicalGenerationChanged extends Error {}
 
+class CanonicalPreparationChanged extends CanonicalGenerationChanged {}
+
 class CanonicalRepositoryChangedError extends EncephalonError {}
 
 type CanonicalSnapshotRetryLedger = {
@@ -230,7 +232,9 @@ type RecordReadFault =
   | 'after-record-lstat'
   | 'after-record-open'
   | 'after-record-read'
+  | 'before-parent-lstat'
   | 'before-rejected-record-read'
+  | 'before-record-open'
   | 'before-kind-lstat'
 
 type RecordWork =
@@ -590,26 +594,60 @@ const assertPreparedPublicationDirectory = (root: string, path: string, changed:
   }
 }
 
-const ensurePublicationDirectory = (root: string, path: string, existed: boolean, changed: () => never) => {
+type PublicationDirectoryPreparation = 'conflict' | 'created' | 'existing'
+
+const ensurePublicationDirectory = (
+  root: string,
+  path: string,
+  existed: boolean,
+  changed: () => never,
+): PublicationDirectoryPreparation => {
   if (existed) {
     assertPreparedPublicationDirectory(root, path, changed)
-    return
+    return 'existing'
   }
   try {
     mkdirSync(path)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      return changed()
+      return 'conflict'
     }
     throw error
   }
-  try {
-    return captureDirectoryWitness(path, { allowLink: false })
-  } catch (error) {
-    if (error instanceof DirectoryWitnessError || isCanonicalDirectoryReplacementError(error)) {
-      return changed()
-    }
-    throw error
+  return 'created'
+}
+
+/** @internal */
+export const prepareCanonicalPublicationDirectories = (
+  root: string,
+  kinds: readonly string[],
+  authority: CanonicalPublicationAuthority,
+) => {
+  authority.assertCurrent()
+  const brainDirectory = resolve(root, 'encephalon')
+  const projection = authority.projection()
+  const preparedRoot = ensurePublicationDirectory(root, brainDirectory, projection.rootExists, authority.changed)
+  if (preparedRoot === 'conflict') {
+    return authority.changed()
+  }
+  if (preparedRoot === 'created') {
+    throw new CanonicalPreparationChanged()
+  }
+  const preparedKinds = [...new Set(kinds)].map(kind =>
+    ensurePublicationDirectory(root, resolve(brainDirectory, kind), projection.rootNames.has(kind), authority.changed),
+  )
+  const preparedStaging = ensurePublicationDirectory(
+    root,
+    resolve(brainDirectory, STAGING_DIRECTORY_NAME),
+    projection.rootNames.has(STAGING_DIRECTORY_NAME),
+    authority.changed,
+  )
+  const conflictObserved = preparedKinds.includes('conflict') || preparedStaging === 'conflict'
+  if (conflictObserved) {
+    return authority.changed()
+  }
+  if (preparedKinds.some(prepared => prepared === 'created') || preparedStaging === 'created') {
+    throw new CanonicalPreparationChanged()
   }
 }
 
@@ -641,16 +679,6 @@ const samePublicationDirectoryIdentity = (first: DirectoryWitness, second: Direc
   sameEntryIdentity(first.pathMetadata, second.pathMetadata) &&
   sameEntryIdentity(first.canonicalMetadata, second.canonicalMetadata)
 
-const assertCreatedPublicationDirectory = (
-  created: DirectoryWitness | undefined,
-  prepared: DirectoryWitness,
-  changed: () => never,
-) => {
-  if (created !== undefined && !samePublicationDirectoryIdentity(created, prepared)) {
-    return changed()
-  }
-}
-
 const fsyncDirectory = (path: string) => {
   if (process.platform !== 'win32') {
     let descriptor: number | undefined
@@ -670,16 +698,7 @@ const fsyncDirectory = (path: string) => {
   }
 }
 
-const assertParentIdentity = (path: string, expected: EntryIdentity) => {
-  const metadata = lstatSync(path, { bigint: true })
-  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameEntryIdentity(metadata, expected)) {
-    canonicalGenerationChanged()
-  }
-}
-
-const invalidRecordReadChange = (): never => fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
-
-const readBoundedDescriptor = (descriptor: number, size: bigint, changed: () => never = invalidRecordReadChange) => {
+const readBoundedDescriptor = (descriptor: number, size: bigint, changed: () => never) => {
   const boundedSize = Number(size)
   const buffer = Buffer.alloc(boundedSize)
   let offset = 0
@@ -704,7 +723,7 @@ const currentRecordPathMetadata = (path: string, changed: () => never) => {
     if (isCanonicalDirectoryReplacementError(error)) {
       return changed()
     }
-    throw error
+    throw preserveRecordAuthorityError(error)
   }
 }
 
@@ -718,16 +737,46 @@ const pathSafeRecordOperationalError = (error: unknown) => {
   return typeof code === 'string' ? Object.assign(new Error('A record filesystem operation failed.'), { code }) : error
 }
 
-const openObservedRecordDescriptor = (path: string, expected: BigIntStats, changed: () => never) => {
+const preserveRecordAuthorityError = (error: unknown) =>
+  error instanceof CanonicalGenerationChanged || error instanceof EncephalonError
+    ? error
+    : pathSafeRecordOperationalError(error)
+
+const assertParentIdentity = (path: string, expected: EntryIdentity, changed: () => never, hooks?: RecordReadHooks) => {
+  let metadata: BigIntStats
+  try {
+    readFault(hooks, 'before-parent-lstat', path)
+    metadata = lstatSync(path, { bigint: true })
+  } catch (error) {
+    if (isCanonicalDirectoryReplacementError(error)) {
+      return changed()
+    }
+    throw preserveRecordAuthorityError(error)
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameEntryIdentity(metadata, expected)) {
+    return changed()
+  }
+}
+
+const openObservedRecordDescriptor = (
+  path: string,
+  expected: BigIntStats,
+  changed: () => never,
+  hooks?: RecordReadHooks,
+) => {
   let descriptor: number
   try {
+    readFault(hooks, 'before-record-open', path)
     descriptor = openSync(path, recordOpenFlags)
   } catch (error) {
+    if (error instanceof CanonicalGenerationChanged || error instanceof EncephalonError) {
+      throw error
+    }
     const current = currentRecordPathMetadata(path, changed)
     if (!sameStableEntryMetadata(expected, current)) {
       return changed()
     }
-    throw error
+    throw pathSafeRecordOperationalError(error)
   }
   let metadata: BigIntStats
   try {
@@ -736,7 +785,7 @@ const openObservedRecordDescriptor = (path: string, expected: BigIntStats, chang
     try {
       closeSync(descriptor)
     } catch {}
-    throw error
+    throw preserveRecordAuthorityError(error)
   }
   if (!(metadata.isFile() && sameStableEntryMetadata(expected, metadata))) {
     try {
@@ -791,11 +840,12 @@ const readRecord = (
       path,
       pathMetadata,
       canonicalGenerationChanged,
+      hooks,
     )
     descriptor = openedDescriptor
     descriptorMetadata = openedMetadata
     readFault(hooks, 'after-record-open', path)
-    assertParentIdentity(kindPath, kindIdentity)
+    assertParentIdentity(kindPath, kindIdentity, canonicalGenerationChanged, hooks)
     if (descriptorMetadata.size > BigInt(MAX_RECORD_BYTES)) {
       return {
         evidence: {
@@ -835,7 +885,7 @@ const readRecord = (
       return canonicalGenerationChanged()
     }
     const current = currentRecordPathMetadata(path, canonicalGenerationChanged)
-    assertParentIdentity(kindPath, kindIdentity)
+    assertParentIdentity(kindPath, kindIdentity, canonicalGenerationChanged, hooks)
     if (!sameStableEntryMetadata(pathMetadata, current)) {
       return canonicalGenerationChanged()
     }
@@ -1498,7 +1548,11 @@ const sameCanonicalLayoutGeneration = (root: string, layout: CanonicalLayoutWitn
   return current
 }
 
-const reinspectRecordObservation = (observation: RecordObservation, changed: () => never): RecordObservation => {
+const reinspectRecordObservation = (
+  observation: RecordObservation,
+  changed: () => never,
+  hooks: RecordReadHooks,
+): RecordObservation => {
   let descriptor: number | undefined
   let primaryError: unknown
   let result: RecordObservation | undefined
@@ -1511,7 +1565,12 @@ const reinspectRecordObservation = (observation: RecordObservation, changed: () 
     ) {
       changed()
     }
-    const { descriptor: openedDescriptor } = openObservedRecordDescriptor(observation.path, pathMetadata, changed)
+    const { descriptor: openedDescriptor } = openObservedRecordDescriptor(
+      observation.path,
+      pathMetadata,
+      changed,
+      hooks,
+    )
     descriptor = openedDescriptor
     const bytes = readBoundedDescriptor(descriptor, observation.metadata.size, changed)
     const finalDescriptorMetadata = fstatSync(descriptor, { bigint: true })
@@ -1566,7 +1625,7 @@ const assertRejectedRecordEvidenceCurrent = (
   hooks: RecordReadHooks,
 ) => {
   assertPathObservationCurrent(evidence, changed)
-  assertParentIdentity(evidence.kindPath, evidence.kindIdentity)
+  assertParentIdentity(evidence.kindPath, evidence.kindIdentity, changed, hooks)
   if (evidence.reason === 'metadata') {
     return
   }
@@ -1578,6 +1637,7 @@ const assertRejectedRecordEvidenceCurrent = (
       evidence.path,
       evidence.metadata,
       changed,
+      hooks,
     )
     descriptor = openedDescriptor
     if (metadata.size > BigInt(MAX_RECORD_BYTES)) {
@@ -1602,8 +1662,11 @@ const assertRejectedRecordEvidenceCurrent = (
   }
   if (primaryError !== undefined) {
     assertPathObservationCurrent(evidence, changed)
-    assertParentIdentity(evidence.kindPath, evidence.kindIdentity)
-    return
+    assertParentIdentity(evidence.kindPath, evidence.kindIdentity, changed, hooks)
+    if (isRecordReadabilityError(primaryError)) {
+      return
+    }
+    throw preserveRecordAuthorityError(primaryError)
   }
   if (closeError !== undefined) {
     throw closeError
@@ -1656,7 +1719,7 @@ const assertCanonicalSnapshotCurrent = (
       changed()
     }
     scan.observations.reduce<undefined>((verified, observation) => {
-      reinspectRecordObservation(observation, changed)
+      reinspectRecordObservation(observation, changed, hooks)
       return verified
     }, undefined)
     scan.rejections.reduce<undefined>((verified, evidence) => {
@@ -1682,7 +1745,9 @@ const withCanonicalSnapshotRetry = <Result>(
     return operation()
   } catch (error) {
     if (error instanceof CanonicalGenerationChanged) {
-      ledger.repositoryChanged = true
+      if (!(error instanceof CanonicalPreparationChanged)) {
+        ledger.repositoryChanged = true
+      }
       if (ledger.attempt < ledger.maximumAttempts) {
         return withCanonicalSnapshotRetry(operation, ledger)
       }
@@ -1833,6 +1898,7 @@ const canonicalPublicationAuthority = (
         observation.path,
         pathMetadata,
         changed,
+        hooks,
       )
       descriptor = openedDescriptor
       readFault(hooks, 'after-record-fstat', observation.path)
@@ -1865,10 +1931,10 @@ const canonicalPublicationAuthority = (
       if (code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR') {
         return changed()
       }
-      throw primaryError
+      throw preserveRecordAuthorityError(primaryError)
     }
     if (closeError !== undefined) {
-      throw closeError
+      throw preserveRecordAuthorityError(closeError)
     }
     if (result === undefined) {
       return changed()
@@ -2426,21 +2492,10 @@ const publishPlannedRecordInternal = (
     options.authority.assertCurrent()
   }
   options.authority.assertCurrent()
-  const createdRoot = ensurePublicationDirectory(root, brainDirectory, projection.rootExists, options.authority.changed)
   const kindDirectory = resolve(brainDirectory, recordFile.kind)
-  const createdKind = ensurePublicationDirectory(
-    root,
-    kindDirectory,
-    projection.rootNames.has(recordFile.kind),
-    options.authority.changed,
-  )
   const stagingDirectory = resolve(brainDirectory, STAGING_DIRECTORY_NAME)
-  const createdStaging = ensurePublicationDirectory(
-    root,
-    stagingDirectory,
-    projection.rootNames.has(STAGING_DIRECTORY_NAME),
-    options.authority.changed,
-  )
+  prepareCanonicalPublicationDirectories(root, [recordFile.kind], options.authority)
+  const preparedStaging = capturePreparedPublicationDirectoryWitness(stagingDirectory, options.authority.changed)
   fault(options.hooks, 'before-publication-directory-capture')
   const publicationRoot = capturePreparedPublicationDirectory(
     resolve(root, 'encephalon'),
@@ -2453,9 +2508,9 @@ const publishPlannedRecordInternal = (
     options.authority.changed,
   )
   const publicationStaging = capturePreparedPublicationDirectoryWitness(stagingDirectory, options.authority.changed)
-  assertCreatedPublicationDirectory(createdRoot, publicationRoot.witness, options.authority.changed)
-  assertCreatedPublicationDirectory(createdKind, publicationKind.witness, options.authority.changed)
-  assertCreatedPublicationDirectory(createdStaging, publicationStaging, options.authority.changed)
+  if (!samePublicationDirectoryIdentity(preparedStaging, publicationStaging)) {
+    return options.authority.changed()
+  }
   options.authority.acceptPreparation(recordFile.kind, publicationRoot, publicationKind)
   const stagingName = createOwnedStagingName(process.pid, randomUUID())
   const stagingPath = resolve(stagingDirectory, stagingName)

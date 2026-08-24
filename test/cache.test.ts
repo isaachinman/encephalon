@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import {
+  type BigIntStats,
   chmodSync,
   copyFileSync,
   existsSync,
@@ -612,6 +613,70 @@ test('cache writer rejects primary and sidecar hard links introduced during DML'
   }
 })
 
+test('cache writer keeps a DML-time single-link WAL successor private and preserved', {
+  skip: process.platform === 'win32' ? 'Windows cannot replace an open SQLite WAL deterministically.' : false,
+}, () => {
+  const root = createRoot()
+  writeCanonicalCacheRecord(root, 'writer-wal-successor-seed', 0)
+  assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 1 })
+  writeCanonicalCacheRecord(root, 'writer-wal-successor-addition', 1)
+  const databasePath = cacheDatabasePath(root)
+  const walPath = `${databasePath}-wal`
+  const displacedPath = join(root, 'writer-wal-predecessor')
+  const successorPath = join(root, 'writer-wal-successor')
+  const successorBytes = Buffer.from('single-link WAL successor\n')
+  writeFileSync(successorPath, successorBytes)
+  let quarantines = 0
+  let replaced = false
+  let successorIdentity: BigIntStats | undefined
+  canonicalCacheTestHooks.afterCacheRecordInsert = record => {
+    if (record.id === 'writer-wal-successor-addition' && !replaced) {
+      replaced = true
+      assert.equal(existsSync(walPath), true)
+      renameSync(walPath, displacedPath)
+      renameSync(successorPath, walPath)
+      successorIdentity = lstatSync(walPath, { bigint: true })
+    }
+  }
+  cacheLocationTestHooks.beforeQuarantineRename = path => {
+    if (basename(path) === 'brain.sqlite') {
+      quarantines += 1
+    }
+  }
+
+  assert.throws(
+    () => api.hydrate({ root }),
+    (error: unknown) => {
+      const actual = error as Error & {
+        code?: unknown
+        database?: unknown
+        details?: unknown
+      }
+      assert.equal(actual.name, 'EncephalonError')
+      assert.equal(actual.code, 'REPOSITORY_CHANGED')
+      assert.equal(actual.message, 'The Encephalon cache layout changed during the operation.')
+      assert.deepEqual(actual.details, {
+        entry: 'node_modules/.cache/encephalon/brain.sqlite-wal',
+        invariant: 'stable-identity',
+      })
+      assert.equal('database' in actual, false)
+      assert.doesNotThrow(() => JSON.stringify(actual))
+      assert.equal(JSON.stringify(actual).includes(root), false)
+      assert.equal(JSON.stringify(actual).includes('CacheDatabaseSidecarChanged'), false)
+      assert.equal(JSON.stringify(actual).includes('dev'), false)
+      assert.equal(JSON.stringify(actual).includes('ino'), false)
+      return true
+    },
+  )
+
+  assert.equal(replaced, true)
+  assert.equal(quarantines, 0)
+  assert.ok(successorIdentity !== undefined)
+  assert.equal(existsSync(walPath), true)
+  assert.equal(sameCacheEntryIdentity(successorIdentity, lstatSync(walPath, { bigint: true })), true)
+  assert.deepEqual(readFileSync(walPath), successorBytes)
+})
+
 test('cache writer rejects a same-path primary successor after COMMIT and before close', {
   skip: process.platform === 'win32' ? 'Windows cannot replace an open SQLite primary deterministically.' : false,
 }, () => {
@@ -673,7 +738,7 @@ test('cache writer rejects a same-path primary successor after COMMIT and before
   assert.deepEqual(readFileSync(databasePath), successorBytes)
 })
 
-test('canonical snapshot cache manifest uses one records pass for every rebuilding consumer', () => {
+test('canonical snapshot cache manifest uses one records pass per stable rebuilding attempt', () => {
   const id = 'single-pass-cache-consumer'
   const cases = [
     {
@@ -766,8 +831,8 @@ test('canonical snapshot cache manifest uses one records pass for every rebuildi
   assert.equal(initialised.recordsCreated.length > 0, true)
   assert.deepEqual(initWork, {
     cacheOwnedCanonicalStats: 0,
-    canonicalScans: 1,
-    graphValidations: 1,
+    canonicalScans: 3,
+    graphValidations: 3,
   })
 })
 
@@ -2289,48 +2354,270 @@ describe('cache filesystem containment', () => {
     }
   })
 
-  test('retries sidecar replacement immediately after the gate transaction begins', {
+  test('preserves a single-link gate journal successor without retry after the transaction begins', {
     skip: process.platform === 'win32' ? 'Windows does not permit renaming an open SQLite rollback journal.' : false,
   }, () => {
-    for (const persistent of [false, true]) {
+    const root = createRoot()
+    withOperationLock(root, () => 'prepared')
+    const sidecarPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
+    const displacedPath = join(root, 'gate-journal-predecessor')
+    const successorPath = join(root, 'gate-journal-successor')
+    const successorBytes = Buffer.from('single-link gate journal successor\n')
+    writeFileSync(sidecarPath, '')
+    writeFileSync(successorPath, successorBytes)
+    let attempts = 0
+    let callbackEntries = 0
+    let closes = 0
+    let quarantines = 0
+    let successorIdentity: BigIntStats | undefined
+    const originalClose = DatabaseSync.prototype.close
+    cacheLocationTestHooks.afterDatabaseOpen = database => {
+      if (database.name === 'operation-lock.sqlite' && !existsSync(sidecarPath)) {
+        writeFileSync(sidecarPath, '')
+      }
+    }
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        attempts += 1
+        if (attempts === 1) {
+          renameSync(sidecarPath, displacedPath)
+          renameSync(successorPath, sidecarPath)
+          successorIdentity = lstatSync(sidecarPath, { bigint: true })
+        }
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'operation-lock.sqlite') {
+        quarantines += 1
+      }
+    }
+    DatabaseSync.prototype.close = function () {
+      closes += 1
+      return originalClose.call(this)
+    }
+
+    try {
+      assert.throws(
+        () =>
+          withOperationLock(root, () => {
+            callbackEntries += 1
+            return 'entered'
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+      assert.throws(
+        () => withOperationLock(root, () => 'unexpected'),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+    } finally {
+      DatabaseSync.prototype.close = originalClose
+    }
+
+    assert.equal(attempts, 1)
+    assert.equal(callbackEntries, 0)
+    assert.equal(closes, 0)
+    assert.equal(quarantines, 0)
+    assert.ok(successorIdentity !== undefined)
+    assert.equal(sameCacheEntryIdentity(successorIdentity, lstatSync(sidecarPath, { bigint: true })), true)
+    assert.deepEqual(readFileSync(sidecarPath), successorBytes)
+  })
+
+  test('rejects post-BEGIN gate journal appearance and disappearance without close or retry', {
+    skip: process.platform === 'win32' ? 'Windows does not permit renaming an open SQLite rollback journal.' : false,
+  }, () => {
+    for (const transition of ['appearance', 'disappearance'] as const) {
       const root = createRoot()
       withOperationLock(root, () => 'prepared')
-      const sidecarPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
-      writeFileSync(sidecarPath, '')
+      const sidecarSuffix = transition === 'appearance' ? '-wal' : '-journal'
+      const sidecarPath = join(cacheDirectoryPath(root), `operation-lock.sqlite${sidecarSuffix}`)
+      const displacedPath = join(root, `${transition}-gate-journal`)
+      const successorBytes = Buffer.from('post-BEGIN gate journal successor\n')
       let attempts = 0
+      let callbackEntries = 0
+      let closes = 0
+      let opens = 0
+      let quarantines = 0
+      let retainedBytes: Buffer | undefined
+      let retainedIdentity: BigIntStats | undefined
+      const originalClose = DatabaseSync.prototype.close
       cacheLocationTestHooks.afterDatabaseOpen = database => {
-        if (database.name === 'operation-lock.sqlite' && !existsSync(sidecarPath)) {
-          writeFileSync(sidecarPath, '')
+        if (database.name === 'operation-lock.sqlite') {
+          opens += 1
+          if (transition === 'disappearance' && !existsSync(sidecarPath)) {
+            writeFileSync(sidecarPath, '')
+          }
         }
       }
       cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
         if (database.name === 'operation-lock.sqlite') {
           attempts += 1
-          if (persistent || attempts === 1) {
-            renameSync(sidecarPath, join(root, `gate-sidecar-generation-${attempts}`))
-            writeFileSync(sidecarPath, '')
+          if (attempts === 1) {
+            if (transition === 'appearance') {
+              assert.equal(existsSync(sidecarPath), false)
+              writeFileSync(sidecarPath, successorBytes)
+              retainedBytes = successorBytes
+              retainedIdentity = lstatSync(sidecarPath, { bigint: true })
+            } else {
+              assert.equal(existsSync(sidecarPath), true)
+              retainedBytes = readFileSync(sidecarPath)
+              retainedIdentity = lstatSync(sidecarPath, { bigint: true })
+              renameSync(sidecarPath, displacedPath)
+            }
           }
         }
       }
+      cacheLocationTestHooks.beforeQuarantineRename = path => {
+        if (basename(path) === 'operation-lock.sqlite') {
+          quarantines += 1
+        }
+      }
+      DatabaseSync.prototype.close = function () {
+        closes += 1
+        return originalClose.call(this)
+      }
 
-      if (persistent) {
+      try {
         assert.throws(
-          () => withOperationLock(root, () => 'entered'),
+          () =>
+            withOperationLock(root, () => {
+              callbackEntries += 1
+              return 'entered'
+            }),
+          (error: unknown) => {
+            const actual = error as Error & { code?: unknown; database?: unknown; details?: unknown }
+            assert.equal(actual.name, 'EncephalonError')
+            assert.equal(actual.code, 'REPOSITORY_CHANGED', `${transition}: ${actual.message}`)
+            assert.deepEqual(actual.details, {
+              entry: `node_modules/.cache/encephalon/operation-lock.sqlite${sidecarSuffix}`,
+              invariant: 'stable-identity',
+            })
+            assert.equal('database' in actual, false)
+            assert.doesNotThrow(() => JSON.stringify(actual))
+            assert.equal(JSON.stringify(actual).includes(root), false)
+            return true
+          },
+        )
+        assert.throws(
+          () => withOperationLock(root, () => 'unexpected'),
           (error: unknown) => {
             assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
             return true
           },
         )
-      } else {
-        assert.equal(
-          withOperationLock(root, () => 'entered'),
-          'entered',
-        )
+      } finally {
+        DatabaseSync.prototype.close = originalClose
+        cacheLocationTestHooks.afterDatabaseOpen = undefined
+        cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
+        cacheLocationTestHooks.beforeQuarantineRename = undefined
       }
-      assert.equal(attempts, persistent ? 3 : 2)
-      cacheLocationTestHooks.afterDatabaseLockInitialisation = undefined
-      cacheLocationTestHooks.afterDatabaseOpen = undefined
+
+      assert.equal(attempts, 1, transition)
+      assert.equal(callbackEntries, 0, transition)
+      assert.equal(closes, 0, transition)
+      assert.equal(opens, 1, transition)
+      assert.equal(quarantines, 0, transition)
+      assert.ok(retainedBytes !== undefined)
+      assert.ok(retainedIdentity !== undefined)
+      const retainedPath = transition === 'appearance' ? sidecarPath : displacedPath
+      assert.equal(sameCacheEntryIdentity(retainedIdentity, lstatSync(retainedPath, { bigint: true })), true)
+      assert.deepEqual(readFileSync(retainedPath), retainedBytes)
+      if (transition === 'disappearance') {
+        assert.equal(existsSync(sidecarPath), false)
+      }
     }
+  })
+
+  test('suppresses close when secondary metadata validation observes a gate journal successor', {
+    skip: process.platform === 'win32' ? 'Windows does not permit renaming an open SQLite rollback journal.' : false,
+  }, () => {
+    const root = createRoot()
+    withOperationLock(root, () => 'prepared')
+    const sidecarPath = join(cacheDirectoryPath(root), 'operation-lock.sqlite-journal')
+    const displacedPath = join(root, 'secondary-validation-gate-journal-predecessor')
+    const successorPath = join(root, 'secondary-validation-gate-journal-successor')
+    const successorBytes = Buffer.from('secondary validation journal successor\n')
+    writeFileSync(successorPath, successorBytes)
+    let attempts = 0
+    let callbackEntries = 0
+    let closes = 0
+    let opens = 0
+    let quarantines = 0
+    let successorIdentity: BigIntStats | undefined
+    const originalClose = DatabaseSync.prototype.close
+    cacheLocationTestHooks.afterDatabaseOpen = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        opens += 1
+        if (!existsSync(sidecarPath)) {
+          writeFileSync(sidecarPath, '')
+        }
+      }
+    }
+    cacheLocationTestHooks.afterDatabaseLockInitialisation = database => {
+      if (database.name === 'operation-lock.sqlite') {
+        attempts += 1
+        if (attempts === 1) {
+          renameSync(sidecarPath, displacedPath)
+          renameSync(successorPath, sidecarPath)
+          successorIdentity = lstatSync(sidecarPath, { bigint: true })
+          throw Object.assign(new Error(`primary operation failure at ${sidecarPath}`), { code: 'EIO' })
+        }
+      }
+    }
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'operation-lock.sqlite') {
+        quarantines += 1
+      }
+    }
+    DatabaseSync.prototype.close = function () {
+      closes += 1
+      return originalClose.call(this)
+    }
+
+    try {
+      assert.throws(
+        () =>
+          withOperationLock(root, () => {
+            callbackEntries += 1
+            return 'entered'
+          }),
+        (error: unknown) => {
+          const actual = error as Error & { code?: unknown; database?: unknown; details?: unknown }
+          assert.equal(actual.name, 'EncephalonError')
+          assert.equal(actual.code, 'REPOSITORY_CHANGED')
+          assert.deepEqual(actual.details, {
+            entry: 'node_modules/.cache/encephalon/operation-lock.sqlite-journal',
+            invariant: 'stable-identity',
+          })
+          assert.equal('database' in actual, false)
+          assert.equal(causeChainText(actual).includes(root), false)
+          return true
+        },
+      )
+      assert.throws(
+        () => withOperationLock(root, () => 'unexpected'),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+          return true
+        },
+      )
+    } finally {
+      DatabaseSync.prototype.close = originalClose
+    }
+
+    assert.equal(attempts, 1)
+    assert.equal(callbackEntries, 0)
+    assert.equal(closes, 0)
+    assert.equal(opens, 1)
+    assert.equal(quarantines, 0)
+    assert.ok(successorIdentity !== undefined)
+    assert.equal(sameCacheEntryIdentity(successorIdentity, lstatSync(sidecarPath, { bigint: true })), true)
+    assert.deepEqual(readFileSync(sidecarPath), successorBytes)
   })
 
   test('rejects an unsafe sidecar introduced after the gate transaction begins', {

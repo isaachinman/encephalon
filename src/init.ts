@@ -12,6 +12,7 @@ import {
   MAX_CANONICAL_RECORD_BYTES,
   nextRecordCreatedAt,
   planRecordAddition,
+  prepareCanonicalPublicationDirectories,
   publishPlannedRecordOutcome,
   type RecordReadHooks,
   type RecordWriteHooks,
@@ -296,6 +297,11 @@ const initResolved = (
                 return rethrowInvalidatedCandidateError(error, repositoryChanged)
               }
             })()
+            prepareCanonicalPublicationDirectories(
+              root,
+              plans.map(plan => plan.record.kind),
+              authority,
+            )
             const recordWriteOptions = {
               authority,
               ...(hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }),
