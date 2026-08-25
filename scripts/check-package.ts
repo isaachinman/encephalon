@@ -45,7 +45,27 @@ const parseRetainedTarballDirectory = (arguments_: string[]) => {
   throw retainedTarballUsage()
 }
 
+const preflightRetainedTarballDirectory = (retainedDirectory: string) => {
+  relative(root, retainedDirectory)
+    .split(sep)
+    .reduce(
+      (state, segment, index, segments) => {
+        const directory = resolve(state.parent, segment)
+        const entry = state.ancestorMissing ? undefined : lstatSync(directory, { throwIfNoEntry: false })
+        const isDestination = index === segments.length - 1
+        if (entry !== undefined && (isDestination || !(entry.isDirectory() && !entry.isSymbolicLink()))) {
+          throw retainedTarballUsage()
+        }
+        return { ancestorMissing: state.ancestorMissing || entry === undefined, parent: directory }
+      },
+      { ancestorMissing: false, parent: root },
+    )
+}
+
 const retainedTarballDirectory = parseRetainedTarballDirectory(process.argv.slice(2))
+if (retainedTarballDirectory !== undefined) {
+  preflightRetainedTarballDirectory(retainedTarballDirectory)
+}
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-check-'))
 
 const execute = (command: readonly string[], cwd = root) => {

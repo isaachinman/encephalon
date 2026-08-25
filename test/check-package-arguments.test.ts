@@ -25,7 +25,7 @@ test('rejects absolute and out-of-repository retained-tarball directories', () =
   }
 })
 
-test('rejects retained-tarball directories beneath a symlinked parent', { timeout: 30_000 }, () => {
+test('rejects retained-tarball directories beneath a symlinked parent before invoking npm', { timeout: 30_000 }, () => {
   const outsideDirectory = mkdtempSync(join(tmpdir(), 'encephalon-retained-package-'))
   const symlink = resolve(root, 'test', `.retained-package-link-${randomUUID()}`)
   const retainedDirectory = join(symlink, 'nested')
@@ -34,7 +34,11 @@ test('rejects retained-tarball directories beneath a symlinked parent', { timeou
     const result = spawnSync(
       process.execPath,
       ['./scripts/check-package.ts', '--retain-tarball', relative(root, retainedDirectory)],
-      { cwd: root, encoding: 'utf8' },
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: process.platform === 'win32' ? process.env : { ...process.env, PATH: '' },
+      },
     )
     assert.notEqual(result.status, 0)
     assert.equal(result.stdout, '')
