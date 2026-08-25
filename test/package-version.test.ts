@@ -4,11 +4,36 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
+import { parse } from 'yaml'
 import { assertPackageVersionSource, renderPackageVersionSource } from '../scripts/package-version.ts'
 
 const root = resolve(import.meta.dirname, '..')
 const staleGeneratedVersionMessage =
   'Generated runtime package version is stale. Run `bun run build` and commit src/generated/version.ts.'
+
+const assertGeneratedVersionWorkflowCommands = () => {
+  const workflow = parse(readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')) as {
+    jobs?: Record<string, { steps?: Array<{ run?: unknown }> }>
+  }
+  const commands = ['verify', 'release'].map(job => {
+    const command = workflow.jobs?.[job]?.steps?.find(
+      step => typeof step.run === 'string' && step.run.endsWith('check-generated-version.ts'),
+    )?.run
+    if (typeof command === 'string') {
+      return command
+    }
+    throw new Error(`Missing generated-version check in the ${job} workflow job.`)
+  })
+  assert.deepEqual(commands, ['node ./scripts/check-generated-version.ts', 'node ./scripts/check-generated-version.ts'])
+}
+
+const runWorkflowGeneratedVersionCheck = (temporaryRoot: string) => {
+  assertGeneratedVersionWorkflowCommands()
+  return spawnSync(process.execPath, ['./scripts/check-generated-version.ts'], {
+    cwd: temporaryRoot,
+    encoding: 'utf8',
+  })
+}
 
 const createCheckFixture = () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), 'encephalon-package-version-check-'))
@@ -114,10 +139,7 @@ test('direct generated-version check bypasses package lifecycle hooks', () => {
       'utf8',
     )
 
-    const directResult = spawnSync('bun', ['run', './scripts/check-generated-version.ts'], {
-      cwd: temporaryRoot,
-      encoding: 'utf8',
-    })
+    const directResult = runWorkflowGeneratedVersionCheck(temporaryRoot)
     assert.notEqual(directResult.status, 0)
     assert.equal(directResult.stderr.includes(staleGeneratedVersionMessage), true)
     assert.equal(readFileSync(generatedVersionPath, 'utf8'), staleSource)
@@ -125,6 +147,39 @@ test('direct generated-version check bypasses package lifecycle hooks', () => {
 
     const aliasResult = spawnSync('bun', ['run', 'check:generated'], { cwd: temporaryRoot, encoding: 'utf8' })
     assert.equal(aliasResult.status, 0, `${aliasResult.stdout}${aliasResult.stderr}`)
+    assert.equal(readFileSync(generatedVersionPath, 'utf8'), currentSource)
+    assert.equal(readFileSync(repairMarkerPath, 'utf8'), 'true\n')
+  } finally {
+    rmSync(temporaryRoot, { force: true, recursive: true })
+  }
+})
+
+test('authoritative workflow check bypasses Bun preloads', () => {
+  const temporaryRoot = createCheckFixture()
+  const generatedVersionPath = resolve(temporaryRoot, 'src', 'generated', 'version.ts')
+  const repairMarkerPath = resolve(temporaryRoot, 'preload-ran')
+  const staleSource = '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.1"\n'
+  const currentSource = '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.0"\n'
+  try {
+    writeFileSync(generatedVersionPath, staleSource, 'utf8')
+    writeFileSync(resolve(temporaryRoot, 'bunfig.toml'), 'preload = ["./repair-generated.ts"]\n', 'utf8')
+    writeFileSync(
+      resolve(temporaryRoot, 'repair-generated.ts'),
+      `import { writeFileSync } from 'node:fs'\nwriteFileSync(new URL('./src/generated/version.ts', import.meta.url), ${JSON.stringify(currentSource)})\nwriteFileSync(new URL('./preload-ran', import.meta.url), ${JSON.stringify('true\n')})\n`,
+      'utf8',
+    )
+
+    const result = runWorkflowGeneratedVersionCheck(temporaryRoot)
+    assert.notEqual(result.status, 0)
+    assert.equal(result.stderr.includes(staleGeneratedVersionMessage), true)
+    assert.equal(readFileSync(generatedVersionPath, 'utf8'), staleSource)
+    assert.equal(existsSync(repairMarkerPath), false)
+
+    const bunResult = spawnSync('bun', ['run', './scripts/check-generated-version.ts'], {
+      cwd: temporaryRoot,
+      encoding: 'utf8',
+    })
+    assert.equal(bunResult.status, 0, `${bunResult.stdout}${bunResult.stderr}`)
     assert.equal(readFileSync(generatedVersionPath, 'utf8'), currentSource)
     assert.equal(readFileSync(repairMarkerPath, 'utf8'), 'true\n')
   } finally {

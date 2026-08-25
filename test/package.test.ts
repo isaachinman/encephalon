@@ -2,11 +2,51 @@ import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, test } from 'node:test'
+import { parseDocument, visit } from 'yaml'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
+const githubExpression = (source: string) => `\${{ ${source} }}`
+
+const workflowContainsSecretsContext = (workflow: string) => {
+  const document = parseDocument(workflow, { uniqueKeys: true })
+  assert.deepEqual(document.errors, [])
+  let found = false
+  visit(document, {
+    Scalar: (_key, node) => {
+      if (typeof node.value === 'string' && /\bsecrets\s*(?:\.|\[)/iu.test(node.value)) {
+        found = true
+        return visit.BREAK
+      }
+    },
+  })
+  return found
+}
 
 describe('package contract', () => {
+  test('detects GitHub Actions secrets contexts without rejecting ordinary text', () => {
+    for (const workflow of [
+      `env:\n  TOKEN: ${githubExpression('secrets.NPM_TOKEN')}\n`,
+      `env:\n  TOKEN: ${githubExpression("secrets['NPM_TOKEN']")}\n`,
+      `env:\n  TOKEN: ${githubExpression('secrets["NPM_TOKEN"]')}\n`,
+      `env:\n  TOKEN: ${githubExpression("format('{1}', '}}', secrets['NPM_TOKEN'])")}\n`,
+      `env:\n  TOKEN: ${githubExpression("format('{{0}}', secrets.NPM_TOKEN)")}\n`,
+      `env:\n  TOKEN: prefix ${githubExpression('github.ref')} middle ${githubExpression('secrets.NPM_TOKEN')} suffix\n`,
+      "jobs:\n  verify:\n    if: secrets.RUN_VERIFY == 'true'\n",
+      `env:\n  "${githubExpression('secrets.DYNAMIC_NAME')}": value\n`,
+    ]) {
+      assert.equal(workflowContainsSecretsContext(workflow), true, workflow)
+    }
+
+    for (const workflow of [
+      `env:\n  REF: ${githubExpression('github.ref')}\n`,
+      'env:\n  NOTE: repository secrets are unavailable to pull requests\n',
+      '# secrets.NPM_TOKEN must never be used here\nenv:\n  SAFE: true\n',
+    ]) {
+      assert.equal(workflowContainsSecretsContext(workflow), false, workflow)
+    }
+  })
+
   test('declares a zero-runtime-dependency Node ESM package', () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as Record<string, unknown>
 
@@ -266,7 +306,7 @@ describe('package contract', () => {
   contents: read
 `,
     )
-    assert.doesNotMatch(workflow, /\$\{\{(?:[^}]|}(?!}))*\bsecrets\b/)
+    assert.equal(workflowContainsSecretsContext(workflow), false)
     assert.match(
       workflowConfiguration,
       /concurrency:\n\s+group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}\n\s+cancel-in-progress: true/,
@@ -307,18 +347,14 @@ jobs:
       verificationSteps,
       /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}/,
     )
-    assert.equal(
-      verificationSteps.includes(`      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.1
-      - run: bun run ./scripts/check-generated-version.ts
-      - run: bun install --frozen-lockfile`),
-      true,
+    assert.match(
+      verificationSteps,
+      /- uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0\n\s+- run: node \.\/scripts\/check-generated-version\.ts\n\s+- if: matrix\.context == 'ubuntu-current'\n\s+uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}\n\s+- uses: oven-sh\/setup-bun@v2\n\s+with:\n\s+bun-version: 1\.3\.1\n\s+- run: bun install --frozen-lockfile/,
     )
     assert.deepEqual(
       [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
       [
-        'bun run ./scripts/check-generated-version.ts',
+        'node ./scripts/check-generated-version.ts',
         'bun install --frozen-lockfile',
         'bun run typecheck',
         'bun run test',
@@ -329,7 +365,8 @@ jobs:
       ],
     )
     assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 8)
-    assert.doesNotMatch(verificationSteps, /^\s{8}(?:if|continue-on-error):/m)
+    assert.equal(verificationSteps.match(/^\s{6}- if:/gm)?.length, 1)
+    assert.doesNotMatch(verificationSteps, /^\s{8}continue-on-error:/m)
 
     assert.equal(
       releaseHeader,
@@ -343,18 +380,14 @@ jobs:
     assert.doesNotMatch(releaseJob, /^ {4}permissions:/m)
     assert.match(releaseSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
     assert.match(releaseSteps, /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0/)
-    assert.equal(
-      releaseSteps.includes(`      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.1
-      - run: bun run ./scripts/check-generated-version.ts
-      - run: bun install --frozen-lockfile`),
-      true,
+    assert.match(
+      releaseSteps,
+      /- uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0\n\s+- run: node \.\/scripts\/check-generated-version\.ts\n\s+- uses: oven-sh\/setup-bun@v2\n\s+with:\n\s+bun-version: 1\.3\.1\n\s+- run: bun install --frozen-lockfile/,
     )
     assert.deepEqual(
       [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
       [
-        'bun run ./scripts/check-generated-version.ts',
+        'node ./scripts/check-generated-version.ts',
         'bun install --frozen-lockfile',
         'bun run build',
         'bun run check:package',
@@ -387,7 +420,7 @@ jobs:
     )
     assert.equal(
       [
-        'bun run ./scripts/check-generated-version.ts',
+        'node ./scripts/check-generated-version.ts',
         'bun run build',
         'bun run check:package',
         'npm pack',
@@ -401,7 +434,8 @@ jobs:
         ),
       true,
     )
-    assert.equal(workflow.match(/bun run \.\/scripts\/check-generated-version\.ts/g)?.length, 2)
+    assert.equal(workflow.match(/node \.\/scripts\/check-generated-version\.ts/g)?.length, 2)
+    assert.doesNotMatch(workflow, /^\s+- run: bun run \.\/scripts\/check-generated-version\.ts$/m)
     assert.doesNotMatch(workflow, /^\s+- run: bun run check:generated$/m)
     assert.match(readme, /four verification lanes/)
     assert.match(readme, /trusted pushes to `main`/)

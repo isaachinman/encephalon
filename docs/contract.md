@@ -166,7 +166,7 @@ MAR-2565 validated mutation cache construction, deterministic disk fallback, and
 
 - Runtime consumers require Node.js 24.15.0 or newer and do not require Bun.
 - The npm package has no runtime dependencies and no install, preinstall, postinstall, or prepare lifecycle scripts.
-- `bun run check:generated` is the contributor-facing alias for the non-mutating generated-version check. Both CI jobs must instead run the exact direct command `bun run ./scripts/check-generated-version.ts` before installation so package lifecycle hooks cannot run first. The check compares the complete committed package-version source; stale or missing source receives deterministic build-and-commit guidance, while unrelated I/O failures remain unchanged.
+- `bun run check:generated` is the contributor-facing alias for the non-mutating generated-version check. Both CI jobs must instead run the exact direct command `node ./scripts/check-generated-version.ts` immediately after Node setup and before Bun setup or installation so package lifecycle hooks and Bun preloads cannot run first. The check compares the complete committed package-version source; stale or missing source receives deterministic build-and-commit guidance, while unrelated I/O failures remain unchanged.
 - The tarball whitelist is intentionally small and checked by `bun run check:package`.
 - `bun run check:package` must build, pack, install the actual tarball into a temporary Git repository with scripts disabled, import the API, typecheck consumer declarations, and execute the packed CLI through Node.
 - `bun run check:publish` is a dry-run release gate only. Publishing is manual maintainer work and must not be performed by agents.
