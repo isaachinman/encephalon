@@ -13,7 +13,7 @@ import {
 } from '../src/api-input.ts'
 import { EncephalonError, failBudget } from '../src/errors.ts'
 import { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
-import { parseRecordFile } from '../src/schema.ts'
+import { createRecordFile, formatRecordFile, parseRecordFile } from '../src/schema.ts'
 
 type BudgetName = keyof typeof OPERATION_BUDGETS
 
@@ -52,15 +52,28 @@ const validRecordFile = () => ({
 })
 
 const parserCases = [
-  { field: 'root', name: 'root', parse: parseRootInput, value: {} },
-  { field: 'root', name: 'list', parse: parseListRecordsInput, value: {} },
-  { field: 'id', name: 'show', parse: parseShowRecordInput, value: { id: 'record-1' } },
-  { field: 'query', name: 'full search', parse: parseFullSearchRecordsInput, value: { query: 'x' } },
-  { field: 'query', name: 'compact search', parse: parseCompactSearchRecordsInput, value: { query: 'x' } },
-  { field: 'searches', name: 'gather', parse: parseGatherInput, value: {} },
-  { field: 'root', name: 'init', parse: parseInitInput, value: {} },
-  { field: 'payload', name: 'add', parse: parseAddRecordInput, value: validAddInput() },
+  { envelope: 'root', field: 'root', name: 'root', parse: parseRootInput, value: {} },
+  { envelope: 'listRecords', field: 'root', name: 'list', parse: parseListRecordsInput, value: {} },
+  { envelope: 'showRecord', field: 'id', name: 'show', parse: parseShowRecordInput, value: { id: 'record-1' } },
+  {
+    envelope: 'searchRecords',
+    field: 'query',
+    name: 'full search',
+    parse: parseFullSearchRecordsInput,
+    value: { query: 'x' },
+  },
+  {
+    envelope: 'searchRecords',
+    field: 'query',
+    name: 'compact search',
+    parse: parseCompactSearchRecordsInput,
+    value: { query: 'x' },
+  },
+  { envelope: 'gatherRecords', field: 'searches', name: 'gather', parse: parseGatherInput, value: {} },
+  { envelope: 'initEncephalon', field: 'root', name: 'init', parse: parseInitInput, value: {} },
+  { envelope: 'addRecord', field: 'payload', name: 'add', parse: parseAddRecordInput, value: validAddInput() },
 ] as const satisfies ReadonlyArray<{
+  envelope: string
   field: string
   name: string
   parse: (value: unknown) => unknown
@@ -80,25 +93,32 @@ describe('API input envelopes', () => {
             throw new Error('hostile input secret')
           },
         })
-        assertInvalidInput(() => parserCase.parse(input), parserCase.name === 'root' ? 'root' : undefined)
+        assertInvalidInput(() => parserCase.parse(input), parserCase.envelope)
         assert.equal(getterCalls, 0, `${parserCase.name}.${field}`)
       }
+
+      let setterCalls = 0
+      const setterInput = { ...parserCase.value }
+      Object.defineProperty(setterInput, parserCase.field, {
+        enumerable: true,
+        set: () => {
+          setterCalls += 1
+        },
+      })
+      assertInvalidInput(() => parserCase.parse(setterInput), parserCase.envelope)
+      assert.equal(setterCalls, 0, `${parserCase.name}.${parserCase.field} setter`)
     }
   })
 
-  test('accepts compatible data properties but rejects symbols and exotic prototypes', () => {
+  test('accepts ordinary data objects but rejects unknown, non-enumerable, symbol, and class fields', () => {
     const nullPrototype = Object.assign(Object.create(null) as Record<string, unknown>, {
       root: '/repository',
-      unknownData: 'ignored',
-    })
-    Object.defineProperty(nullPrototype, 'anotherUnknownData', {
-      value: true,
     })
     assert.deepEqual(parseRootInput(nullPrototype), { root: '/repository' })
 
     const nonEnumerable = {}
     Object.defineProperty(nonEnumerable, 'root', { value: '/repository' })
-    assert.deepEqual(parseRootInput(nonEnumerable), { root: '/repository' })
+    assertInvalidInput(() => parseRootInput(nonEnumerable), 'root')
     assert.deepEqual(parseRootInput(runInNewContext('({ root: "/repository" })')), { root: '/repository' })
     assertInvalidInput(
       () =>
@@ -117,30 +137,43 @@ describe('API input envelopes', () => {
 
     for (const parserCase of parserCases) {
       const symbolInput = { ...parserCase.value, [Symbol('hostile input secret')]: true }
-      assertInvalidInput(() => parserCase.parse(symbolInput))
+      assertInvalidInput(() => parserCase.parse(symbolInput), parserCase.envelope)
 
-      const exoticInput = Object.assign(Object.create({ inherited: true }) as Record<string, unknown>, parserCase.value)
-      assertInvalidInput(() => parserCase.parse(exoticInput))
+      const unknownInput = { ...parserCase.value, unknownData: true }
+      assertInvalidInput(() => parserCase.parse(unknownInput), parserCase.envelope)
+
+      const nonEnumerableUnknownInput = { ...parserCase.value }
+      Object.defineProperty(nonEnumerableUnknownInput, 'unknownData', { value: true })
+      assertInvalidInput(() => parserCase.parse(nonEnumerableUnknownInput), parserCase.envelope)
+
+      class InputEnvelope {}
+      const classInput = Object.assign(new InputEnvelope(), parserCase.value)
+      assertInvalidInput(() => parserCase.parse(classInput), parserCase.envelope)
+
+      const nullPrototypeInput = Object.assign(Object.create(null) as Record<string, unknown>, parserCase.value)
+      assert.doesNotThrow(() => parserCase.parse(nullPrototypeInput), parserCase.name)
     }
   })
 
-  test('normalises reflection failures and never performs ordinary property gets', () => {
-    for (const trap of ['getPrototypeOf', 'ownKeys', 'getOwnPropertyDescriptor'] as const) {
-      let getCalls = 0
-      const input = new Proxy(
-        { root: '/repository' },
-        {
-          get: () => {
-            getCalls += 1
-            throw new Error('hostile input secret')
+  test('normalises reflection failures across every parser and never performs ordinary property gets', () => {
+    for (const parserCase of parserCases) {
+      for (const trap of ['getPrototypeOf', 'ownKeys', 'getOwnPropertyDescriptor'] as const) {
+        let getCalls = 0
+        const input = new Proxy(
+          { root: '/repository', ...parserCase.value },
+          {
+            get: () => {
+              getCalls += 1
+              throw new Error('hostile input secret')
+            },
+            [trap]: () => {
+              throw new Error('hostile input secret')
+            },
           },
-          [trap]: () => {
-            throw new Error('hostile input secret')
-          },
-        },
-      )
-      assertInvalidInput(() => parseRootInput(input), 'root')
-      assert.equal(getCalls, 0, trap)
+        )
+        assertInvalidInput(() => parserCase.parse(input), parserCase.envelope)
+        assert.equal(getCalls, 0, `${parserCase.name}.${trap}`)
+      }
     }
 
     let getCalls = 0
@@ -157,46 +190,23 @@ describe('API input envelopes', () => {
     assert.equal(getCalls, 0)
   })
 
-  test('returns a recognised-field-only add snapshot', () => {
+  test('keeps accepted add-record memory and canonical JSON structurally identical', () => {
+    const artifact = '_artifacts/context/record-1/file.txt'
     const input = {
       ...validAddInput(),
-      recordDraft: 'hostile',
-      start: '/outside',
-      unknownData: true,
+      artifacts: [artifact],
+      confidence: -0,
+      searchText: 'canonical search text',
+      supersedes: ['record-0'],
     }
-    Object.defineProperty(input, '__proto__', {
-      enumerable: true,
-      value: '/outside',
-    })
-    const parsed = parseAddRecordInput(input) as Record<string, unknown>
-    assert.equal(Object.hasOwn(parsed, '__proto__'), false)
-    assert.equal('start' in parsed, false)
-    assert.equal('unknownData' in parsed, false)
-    assert.notEqual(parsed.recordDraft, 'hostile')
-  })
-
-  test('bounds ignored envelope data properties before descriptor inspection', () => {
-    const boundary = Object.fromEntries([
-      ['root', '/repository'],
-      ...Array.from({ length: 64 }, (_, index) => [`unknown-${index}`, index]),
-    ])
-    assert.deepEqual(parseRootInput(boundary), { root: '/repository' })
-
-    let descriptorCalls = 0
-    const overBudget = new Proxy(
-      Object.fromEntries([
-        ['root', '/repository'],
-        ...Array.from({ length: 65 }, (_, index) => [`unknown-${index}`, index]),
-      ]),
-      {
-        getOwnPropertyDescriptor: (target, key) => {
-          descriptorCalls += 1
-          return Reflect.getOwnPropertyDescriptor(target, key)
-        },
-      },
-    )
-    assertInvalidInput(() => parseRootInput(overBudget), 'root')
-    assert.equal(descriptorCalls, 0)
+    const parsed = parseAddRecordInput(input)
+    const { recordDraft, ...normalizedInput } = parsed
+    assert.deepEqual(normalizedInput, recordDraft)
+    const createdAt = '2026-08-24T00:00:00.000Z'
+    const canonical = JSON.parse(formatRecordFile(createRecordFile(recordDraft, createdAt))) as Record<string, unknown>
+    assert.deepEqual(canonical, createRecordFile(recordDraft, createdAt))
+    assert.deepEqual(canonical.artifacts, parsed.artifacts)
+    assert.deepEqual(canonical.supersedes, parsed.supersedes)
   })
 })
 
@@ -207,6 +217,8 @@ describe('dense data arrays', () => {
     assertInvalidInput(() => parseGatherInput({ searches: sparse }), 'searches')
     assertInvalidInput(() => parseGatherInput({ shows: sparse }), 'shows')
     assertInvalidInput(() => parseAddRecordInput({ ...validAddInput(), supersedes: sparse }), 'supersedes')
+    assertInvalidInput(() => parseAddRecordInput({ ...validAddInput(), artifacts: sparse }), 'artifacts')
+    assertInvalidInput(() => parseRecordFile({ ...validRecordFile(), supersedes: sparse }), 'supersedes')
     assertInvalidInput(
       () =>
         parseRecordFile({
@@ -238,10 +250,10 @@ describe('dense data arrays', () => {
     }
   })
 
-  test('rejects symbols and accessor extras while ignoring ordinary string data extras', () => {
+  test('rejects symbol, named, accessor, and non-enumerable array properties', () => {
     const dataExtra = ['x']
-    Object.defineProperty(dataExtra, 'metadata', { value: 'ignored' })
-    assert.deepEqual(parseGatherInput({ searches: dataExtra }).searches, ['x'])
+    Object.defineProperty(dataExtra, 'metadata', { value: 'rejected' })
+    assertInvalidInput(() => parseGatherInput({ searches: dataExtra }), 'searches')
 
     const symbolArray = ['x']
     Object.defineProperty(symbolArray, Symbol('hostile input secret'), { value: true })
@@ -251,8 +263,8 @@ describe('dense data arrays', () => {
     assert.deepEqual(parseGatherInput({ searches: crossRealmArray }).searches, ['x'])
 
     const nonEnumerableIndex = ['x']
-    Object.defineProperty(nonEnumerableIndex, 0, { value: 'x' })
-    assert.deepEqual(parseGatherInput({ searches: nonEnumerableIndex }).searches, ['x'])
+    Object.defineProperty(nonEnumerableIndex, 0, { enumerable: false, value: 'x' })
+    assertInvalidInput(() => parseGatherInput({ searches: nonEnumerableIndex }), 'searches')
 
     let getterCalls = 0
     const accessorExtra = ['x']
@@ -266,26 +278,19 @@ describe('dense data arrays', () => {
     assert.equal(getterCalls, 0)
   })
 
-  test('bounds ignored array data properties before descriptor inspection', () => {
-    const boundary = ['x']
-    for (const index of Array.from({ length: 64 }, (_, value) => value)) {
-      Object.defineProperty(boundary, `unknown-${index}`, { value: index })
-    }
-    assert.deepEqual(parseGatherInput({ searches: boundary }).searches, ['x'])
-
+  test('rejects an array whose length changes during its descriptor snapshot', () => {
+    let ownKeyCalls = 0
     const target = ['x']
-    for (const index of Array.from({ length: 65 }, (_, value) => value)) {
-      Object.defineProperty(target, `unknown-${index}`, { value: index })
-    }
-    let descriptorCalls = 0
-    const overBudget = new Proxy(target, {
-      getOwnPropertyDescriptor: (array, key) => {
-        descriptorCalls += 1
-        return Reflect.getOwnPropertyDescriptor(array, key)
+    const unstable = new Proxy(target, {
+      ownKeys: array => {
+        ownKeyCalls += 1
+        const keys = Reflect.ownKeys(array)
+        array.push('y')
+        return keys
       },
     })
-    assertInvalidInput(() => parseGatherInput({ searches: overBudget }), 'searches')
-    assert.equal(descriptorCalls, 1)
+    assertInvalidInput(() => parseGatherInput({ searches: unstable }), 'searches')
+    assert.equal(ownKeyCalls, 1)
   })
 
   test('normalises array inspection failures and checks count budgets before own keys', () => {

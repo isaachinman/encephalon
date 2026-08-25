@@ -1,5 +1,4 @@
 import { fail } from './errors.ts'
-import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { guardedGetOwnPropertyDescriptor, guardedOwnKeys, PROPERTY_INSPECTION_FAILED } from './property-inspection.ts'
 
 declare const denseDataArrayInspectionBrand: unique symbol
@@ -57,32 +56,48 @@ const canonicalArrayIndex = (key: string) => {
 /** @internal */
 export const readDenseDataArray = (inspection: DenseDataArrayInspection): unknown[] => {
   const keys = guardedOwnKeys(inspection.value)
-  if (keys !== PROPERTY_INSPECTION_FAILED) {
-    const maximumKeys = inspection.length + OPERATION_BUDGETS.denseArrayExtraProperties.maximum + 1
-    if (keys.length <= maximumKeys) {
-      const values = new Array<unknown>(inspection.length)
-      let indexedProperties = 0
-      for (const key of keys) {
-        if (typeof key === 'string') {
-          if (key !== 'length') {
-            const descriptor = guardedGetOwnPropertyDescriptor(inspection.value, key)
-            if (descriptor !== PROPERTY_INSPECTION_FAILED && descriptor !== undefined && 'value' in descriptor) {
-              const index = canonicalArrayIndex(key)
-              if (index !== undefined && index < inspection.length) {
-                values[index] = descriptor.value
-                indexedProperties += 1
-              }
-            } else {
-              return failStructure(inspection.field)
-            }
-          }
-        } else {
-          return failStructure(inspection.field)
+  if (
+    keys !== PROPERTY_INSPECTION_FAILED &&
+    keys.length === inspection.length + 1 &&
+    keys.every(key => {
+      if (key === 'length') {
+        return true
+      }
+      if (typeof key === 'string') {
+        const index = canonicalArrayIndex(key)
+        return index !== undefined && index < inspection.length
+      }
+      return false
+    })
+  ) {
+    const values = keys.reduce<unknown[]>((snapshot, key) => {
+      if (key === 'length') {
+        return snapshot
+      }
+      if (typeof key === 'string') {
+        const descriptor = guardedGetOwnPropertyDescriptor(inspection.value, key)
+        const index = canonicalArrayIndex(key)
+        if (
+          descriptor !== PROPERTY_INSPECTION_FAILED &&
+          descriptor !== undefined &&
+          'value' in descriptor &&
+          descriptor.enumerable === true &&
+          index !== undefined
+        ) {
+          snapshot[index] = descriptor.value
+          return snapshot
         }
       }
-      if (indexedProperties === inspection.length) {
-        return values
-      }
+      return failStructure(inspection.field)
+    }, new Array<unknown>(inspection.length))
+    const lengthDescriptor = guardedGetOwnPropertyDescriptor(inspection.value, 'length')
+    if (
+      lengthDescriptor !== PROPERTY_INSPECTION_FAILED &&
+      lengthDescriptor !== undefined &&
+      'value' in lengthDescriptor &&
+      lengthDescriptor.value === inspection.length
+    ) {
+      return values
     }
   }
   return failStructure(inspection.field)

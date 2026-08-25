@@ -4,6 +4,7 @@ import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import {
   guardedGetOwnPropertyDescriptor,
   guardedGetPrototypeOf,
+  guardedIsArray,
   guardedOwnKeys,
   PROPERTY_INSPECTION_FAILED,
 } from './property-inspection.ts'
@@ -55,14 +56,6 @@ const isObjectConstructorForPrototype = (value: unknown, prototype: object) => {
   return false
 }
 
-const guardedIsArray = (value: object) => {
-  try {
-    return Array.isArray(value)
-  } catch {
-    return PROPERTY_INSPECTION_FAILED
-  }
-}
-
 const hasPlainObjectPrototype = (value: object) => {
   const prototype = guardedGetPrototypeOf(value)
   if (prototype === null) {
@@ -93,30 +86,28 @@ const objectInput = (value: unknown, name: string, recognizedKeys: ReadonlySet<s
     }
     if (array === false && hasPlainObjectPrototype(object)) {
       const keys = guardedOwnKeys(object)
-      if (keys !== PROPERTY_INSPECTION_FAILED) {
-        const maximumKeys = recognizedKeys.size + OPERATION_BUDGETS.inputEnvelopeExtraProperties.maximum
-        if (keys.length <= maximumKeys) {
-          const snapshot: Record<string, unknown> = {}
-          for (const key of keys) {
-            if (typeof key === 'string') {
-              const descriptor = guardedGetOwnPropertyDescriptor(object, key)
-              if (descriptor !== PROPERTY_INSPECTION_FAILED && descriptor !== undefined && 'value' in descriptor) {
-                if (recognizedKeys.has(key)) {
-                  Object.defineProperty(snapshot, key, {
-                    enumerable: true,
-                    value: descriptor.value,
-                    writable: true,
-                  })
-                }
-              } else {
-                return failObjectStructure(name)
-              }
-            } else {
-              return failObjectStructure(name)
-            }
+      if (
+        keys !== PROPERTY_INSPECTION_FAILED &&
+        keys.length <= recognizedKeys.size &&
+        keys.every((key): key is string => typeof key === 'string' && recognizedKeys.has(key))
+      ) {
+        return keys.reduce<Record<string, unknown>>((snapshot, key) => {
+          const descriptor = guardedGetOwnPropertyDescriptor(object, key)
+          if (
+            descriptor !== PROPERTY_INSPECTION_FAILED &&
+            descriptor !== undefined &&
+            'value' in descriptor &&
+            descriptor.enumerable === true
+          ) {
+            Object.defineProperty(snapshot, key, {
+              enumerable: true,
+              value: descriptor.value,
+              writable: true,
+            })
+            return snapshot
           }
-          return snapshot
-        }
+          return failObjectStructure(name)
+        }, {})
       }
     }
     return failObjectStructure(name)

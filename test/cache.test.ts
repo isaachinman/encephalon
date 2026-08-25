@@ -1462,6 +1462,12 @@ describe('SQLite cache and reads', () => {
         },
       ],
       [
+        'prepare unknown envelope field',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root, unknownData: true })
+        },
+      ],
+      [
         'hydrate accessor envelope',
         root => {
           functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')(accessorEnvelope(root))
@@ -1537,6 +1543,14 @@ describe('SQLite cache and reads', () => {
         },
       ],
       [
+        'gather sparse shows',
+        root => {
+          const shows = new Array<string>(2)
+          shows[1] = 'record-2'
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ root, shows })
+        },
+      ],
+      [
         'add sparse supersedes',
         root => {
           const supersedes = new Array<string>(2)
@@ -1548,6 +1562,22 @@ describe('SQLite cache and reads', () => {
             source: 'agent',
             subject: 'cache.validation',
             supersedes,
+          })
+        },
+      ],
+      [
+        'add sparse artifacts',
+        root => {
+          const artifacts = new Array<string>(2)
+          artifacts[1] = '_artifacts/context/record-1/file.txt'
+          functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')({
+            artifacts,
+            id: 'record-1',
+            kind: 'context',
+            payload: null,
+            root,
+            source: 'agent',
+            subject: 'cache.validation',
           })
         },
       ],
@@ -1671,6 +1701,7 @@ describe('SQLite cache and reads', () => {
         },
       )
       assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon')), false, name)
+      assert.equal(existsSync(join(root, 'encephalon')), false, name)
       assert.equal(existsSync(join(root, 'AGENTS.md')), false, name)
       assert.equal(existsSync(join(root, 'CLAUDE.md')), false, name)
     }
