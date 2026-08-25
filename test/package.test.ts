@@ -222,7 +222,9 @@ describe('package contract', () => {
   })
 
   test('retains the exact package tarball exercised by the package checker', { timeout: 30_000 }, () => {
-    const artifactDirectoryName = join('test', `.package-artifacts-test-${randomUUID()}`)
+    const artifactParentName = join('test', `.package-artifacts-test-${randomUUID()}`)
+    const artifactDirectoryName = join(artifactParentName, 'nested')
+    const artifactParent = resolve(root, artifactParentName)
     const artifactDirectory = resolve(root, artifactDirectoryName)
     const referenceDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-reference-'))
     try {
@@ -260,7 +262,7 @@ describe('package contract', () => {
         readFileSync(resolve(referenceDirectory, retainedFilename)),
       )
     } finally {
-      rmSync(artifactDirectory, { force: true, recursive: true })
+      rmSync(artifactParent, { force: true, recursive: true })
       rmSync(referenceDirectory, { force: true, recursive: true })
     }
   })

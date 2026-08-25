@@ -85,6 +85,7 @@ const runExpectedFailure = (command: string[], cwd = root) => {
 
 const retainTarball = (tarball: string, filename: string) => {
   if (retainedTarballDirectory !== undefined) {
+    mkdirSync(dirname(retainedTarballDirectory), { mode: 0o700, recursive: true })
     mkdirSync(retainedTarballDirectory, { mode: 0o700 })
     const retainedTarball = resolve(retainedTarballDirectory, filename)
     copyFileSync(tarball, retainedTarball, constants.COPYFILE_EXCL)

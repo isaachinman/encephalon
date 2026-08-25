@@ -3,9 +3,22 @@ import { win32 } from 'node:path'
 
 type NpmCommandOptions = {
   nodeExecutable?: string
-  pathEnvironment?: string
+  npmExecPath?: string
   pathExists?: (path: string) => boolean
   platform?: NodeJS.Platform
+}
+
+const isCanonicalNpmCliPath = (path: string) => {
+  const binDirectory = win32.dirname(path)
+  const npmDirectory = win32.dirname(binDirectory)
+  const nodeModulesDirectory = win32.dirname(npmDirectory)
+  return (
+    win32.isAbsolute(path) &&
+    win32.basename(path).toLowerCase() === 'npm-cli.js' &&
+    win32.basename(binDirectory).toLowerCase() === 'bin' &&
+    win32.basename(npmDirectory).toLowerCase() === 'npm' &&
+    win32.basename(nodeModulesDirectory).toLowerCase() === 'node_modules'
+  )
 }
 
 export const npmCommand = (arguments_: readonly string[], options: NpmCommandOptions = {}): string[] => {
@@ -18,27 +31,18 @@ export const npmCommand = (arguments_: readonly string[], options: NpmCommandOpt
       return [nodeExecutable, bundledNpmCli, ...arguments_]
     }
 
-    const pathCommand = (options.pathEnvironment ?? process.env.PATH ?? process.env.Path ?? '')
-      .split(win32.delimiter)
-      .map(entry => entry.trim())
-      .map(entry => (entry.startsWith('"') && entry.endsWith('"') ? entry.slice(1, -1) : entry))
-      .filter(entry => entry.length > 0)
-      .flatMap(entry => {
-        const npmCli = win32.resolve(entry, 'node_modules', 'npm', 'bin', 'npm-cli.js')
-        const npmExecutable = win32.resolve(entry, 'npm.exe')
-        if (pathExists(npmCli)) {
-          return [[nodeExecutable, npmCli, ...arguments_]]
-        }
-        if (pathExists(npmExecutable)) {
-          return [[npmExecutable, ...arguments_]]
-        }
-        return []
-      })
-      .at(0)
-    if (pathCommand !== undefined) {
-      return pathCommand
+    const npmExecPath = options.npmExecPath ?? process.env.npm_execpath
+    if (npmExecPath !== undefined && isCanonicalNpmCliPath(npmExecPath) && pathExists(npmExecPath)) {
+      return [nodeExecutable, npmExecPath, ...arguments_]
     }
-    throw new Error('Unable to resolve npm for the active Windows Node runtime.')
+
+    const siblingNpmExecutable = win32.resolve(win32.dirname(nodeExecutable), 'npm.exe')
+    if (pathExists(siblingNpmExecutable)) {
+      return [siblingNpmExecutable, ...arguments_]
+    }
+    throw new Error(
+      'Unable to resolve npm for the active Windows Node runtime. Install npm beside node.exe or run this check through npm.',
+    )
   }
   return ['npm', ...arguments_]
 }

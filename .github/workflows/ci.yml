@@ -59,6 +59,7 @@ jobs:
       - run: bun run build
       - run: git diff --exit-code
       - run: node ./scripts/check-package.ts
+      - run: git diff --exit-code
 
   release:
     name: Release-equivalent package gate
