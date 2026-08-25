@@ -103,11 +103,81 @@ const stripYamlScalarQuotes = (source: string) => {
     : trimmed
 }
 
-const workflowContainsSecretsContext = (workflow: string) =>
-  extractGithubExpressions(workflow).some(expressionContainsSecretsContext) ||
-  [...workflow.matchAll(/^\s+(?:-\s+)?if:\s*(.+)$/gmu)]
-    .map(match => stripYamlScalarQuotes(match[1] ?? ''))
-    .some(expressionContainsSecretsContext)
+const stripYamlComment = (line: string) => {
+  let commentStart = line.length
+  let cursor = 0
+  let quote: "'" | '"' | undefined
+
+  while (cursor < line.length && commentStart === line.length) {
+    const character = line[cursor]
+    const nextCharacter = line[cursor + 1]
+    if (quote === '"' && character === '\\') {
+      cursor += 2
+    } else if (quote === "'" && character === "'" && nextCharacter === "'") {
+      cursor += 2
+    } else if (quote !== undefined) {
+      if (character === quote) {
+        quote = undefined
+      }
+      cursor += 1
+    } else if (character === "'" || character === '"') {
+      quote = character
+      cursor += 1
+    } else if (character === '#' && (cursor === 0 || /\s/u.test(line[cursor - 1] ?? ''))) {
+      commentStart = cursor
+    } else {
+      cursor += 1
+    }
+  }
+
+  return line.slice(0, commentStart).trimEnd()
+}
+
+const partitionWorkflowSource = (source: string) => {
+  const state = source.split('\n').reduce(
+    (result, line) => {
+      const trimmedLine = line.trimStart()
+      const indentation = line.length - trimmedLine.length
+      const continuesBlockScalar =
+        result.blockScalarIndent !== undefined && (trimmedLine.length === 0 || indentation > result.blockScalarIndent)
+      if (result.blockScalarIndent !== undefined && !continuesBlockScalar) {
+        result.blockScalarIndent = undefined
+      }
+
+      const evaluableLine = continuesBlockScalar ? line : stripYamlComment(line)
+      result.evaluableLines.push(evaluableLine)
+      result.structuralLines.push(continuesBlockScalar ? '' : evaluableLine)
+      if (result.blockScalarIndent === undefined && /:\s*[>|][+-]?[1-9]?[+-]?\s*$/u.test(evaluableLine)) {
+        result.blockScalarIndent = indentation
+      }
+      return result
+    },
+    {
+      blockScalarIndent: undefined as number | undefined,
+      evaluableLines: [] as string[],
+      structuralLines: [] as string[],
+    },
+  )
+  return {
+    evaluableSource: state.evaluableLines.join('\n'),
+    structuralSource: state.structuralLines.join('\n'),
+  }
+}
+
+const workflowContainsSecretsContext = (workflow: string) => {
+  const { evaluableSource, structuralSource } = partitionWorkflowSource(workflow)
+  const encodedYamlScalar = /\\(?:U[\dA-Fa-f]{8}|u[\dA-Fa-f]{4}|x[\dA-Fa-f]{2})|\\\s*$/mu
+  const flowStyleCondition = /[,{]\s*["']?if["']?\s*:/u
+  const implicitConditions = [...structuralSource.matchAll(/^\s+(?:-\s+)?if:\s*(.+)$/gmu)].map(match =>
+    stripYamlScalarQuotes(match[1] ?? ''),
+  )
+  return (
+    encodedYamlScalar.test(structuralSource) ||
+    flowStyleCondition.test(structuralSource) ||
+    extractGithubExpressions(evaluableSource).some(expressionContainsSecretsContext) ||
+    implicitConditions.some(expression => /^[>|]/u.test(expression) || expressionContainsSecretsContext(expression))
+  )
+}
 
 describe('package contract', () => {
   test('detects GitHub Actions secrets contexts in expressions and implicit conditions', () => {
@@ -120,7 +190,11 @@ describe('package contract', () => {
       `env:\n  TOKEN: prefix ${githubExpression('github.ref')} middle ${githubExpression('secrets.NPM_TOKEN')} suffix\n`,
       `env:\n  TOKEN: ${githubExpression('toJson(secrets)')}\n`,
       `env:\n  TOKEN: ${githubExpression('secrets != null')}\n`,
+      'env:\n  TOKEN: "\\u0024{{ secrets.NPM_TOKEN }}"\n',
       "jobs:\n  verify:\n    if: secrets.RUN_VERIFY == 'true'\n",
+      'jobs:\n  verify:\n    if: >-\n      secrets.RUN_VERIFY\n',
+      'jobs: { verify: { if: secrets.RUN_VERIFY, runs-on: ubuntu-latest } }\n',
+      `steps:\n  - run: |\n      # ${githubExpression('secrets.NPM_TOKEN')}\n`,
       `env:\n  "${githubExpression('secrets.DYNAMIC_NAME')}": value\n`,
     ]) {
       assert.equal(workflowContainsSecretsContext(workflow), true, workflow)
@@ -134,6 +208,7 @@ describe('package contract', () => {
       `env:\n  NOTE: ${githubExpression('github.secrets')}\n`,
       'env:\n  NOTE: repository secrets are unavailable to pull requests\n',
       '# secrets.NPM_TOKEN must never be used here\nenv:\n  SAFE: true\n',
+      `# ${githubExpression('secrets.NPM_TOKEN')} is documentation only\nenv:\n  SAFE: true\n`,
       'steps:\n  - run: echo "do not use secrets.NPM_TOKEN here"\n',
       `steps:\n  - run: echo 'do not use secrets["NPM_TOKEN"] here'\n`,
     ]) {
@@ -362,6 +437,7 @@ describe('package contract', () => {
     const publishScript = String(packageJson.scripts?.['check:publish'])
     const eventsStart = workflow.indexOf('\non:\n') + 1
     const permissionsStart = workflow.indexOf('\npermissions:\n', eventsStart)
+    const concurrencyStart = workflow.indexOf('\nconcurrency:\n', permissionsStart)
     const jobsStart = workflow.indexOf('\njobs:\n')
     const releaseStart = workflow.indexOf('\n  release:\n', jobsStart)
     const workflowConfiguration = workflow.slice(0, jobsStart)
@@ -393,8 +469,12 @@ describe('package contract', () => {
 `,
     )
     assert.doesNotMatch(workflow.slice(eventsStart, permissionsStart), /paths|ignore|workflow_dispatch|schedule/)
-    assert.match(workflowConfiguration, /^permissions:\n\s+contents: read$/mu)
-    assert.doesNotMatch(workflowConfiguration, /^\s+[\w-]+:\s+write$/gmu)
+    assert.equal(
+      workflow.slice(permissionsStart + 1, concurrencyStart),
+      `permissions:
+  contents: read
+`,
+    )
     assert.doesNotMatch(workflowConfiguration, /^(?:defaults|env):/gmu)
     assert.equal(workflowContainsSecretsContext(workflow), false)
     assert.match(
@@ -464,7 +544,6 @@ jobs:
       `
   release:
     name: Release-equivalent package gate
-    needs: verify
     runs-on: ubuntu-latest
 `,
     )

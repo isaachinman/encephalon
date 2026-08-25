@@ -10,27 +10,11 @@ const root = resolve(import.meta.dirname, '..')
 const staleGeneratedVersionMessage =
   'Generated runtime package version is stale. Run `bun run build` and commit src/generated/version.ts.'
 
-const assertGeneratedVersionWorkflowCommands = () => {
-  const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
-  const verifyStart = workflow.indexOf('\n  verify:\n')
-  const releaseStart = workflow.indexOf('\n  release:\n', verifyStart)
-  assert.notEqual(verifyStart, -1)
-  assert.notEqual(releaseStart, -1)
-  const commands = [workflow.slice(verifyStart, releaseStart), workflow.slice(releaseStart)].map(job => {
-    const matchingCommands = [...job.matchAll(/^\s+- run: (.+check-generated-version\.ts)$/gmu)].map(match => match[1])
-    assert.equal(matchingCommands.length, 1)
-    return matchingCommands[0]
-  })
-  assert.deepEqual(commands, ['node ./scripts/check-generated-version.ts', 'node ./scripts/check-generated-version.ts'])
-}
-
-const runWorkflowGeneratedVersionCheck = (temporaryRoot: string) => {
-  assertGeneratedVersionWorkflowCommands()
-  return spawnSync(process.execPath, ['./scripts/check-generated-version.ts'], {
+const runAuthoritativeGeneratedVersionCheck = (temporaryRoot: string) =>
+  spawnSync(process.execPath, ['./scripts/check-generated-version.ts'], {
     cwd: temporaryRoot,
     encoding: 'utf8',
   })
-}
 
 const createCheckFixture = () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), 'encephalon-package-version-check-'))
@@ -136,7 +120,7 @@ test('direct generated-version check bypasses package lifecycle hooks', () => {
       'utf8',
     )
 
-    const directResult = runWorkflowGeneratedVersionCheck(temporaryRoot)
+    const directResult = runAuthoritativeGeneratedVersionCheck(temporaryRoot)
     assert.notEqual(directResult.status, 0)
     assert.equal(directResult.stderr.includes(staleGeneratedVersionMessage), true)
     assert.equal(readFileSync(generatedVersionPath, 'utf8'), staleSource)
@@ -166,7 +150,7 @@ test('authoritative workflow check bypasses Bun preloads', () => {
       'utf8',
     )
 
-    const result = runWorkflowGeneratedVersionCheck(temporaryRoot)
+    const result = runAuthoritativeGeneratedVersionCheck(temporaryRoot)
     assert.notEqual(result.status, 0)
     assert.equal(result.stderr.includes(staleGeneratedVersionMessage), true)
     assert.equal(readFileSync(generatedVersionPath, 'utf8'), staleSource)

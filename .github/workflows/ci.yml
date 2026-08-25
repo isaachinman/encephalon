@@ -61,7 +61,6 @@ jobs:
 
   release:
     name: Release-equivalent package gate
-    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
