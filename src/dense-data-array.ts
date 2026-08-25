@@ -93,8 +93,6 @@ export const readDenseDataArray = (inspection: DenseDataArrayInspection): unknow
       }
       return failStructure(inspection.field)
     }, new Array<unknown>(inspection.length))
-    const keysMatch = guardedOwnKeysMatch(inspection.value, keys)
-    const lengthDescriptor = guardedGetOwnPropertyDescriptor(inspection.value, 'length')
     const descriptorsMatch = keys.every(key => {
       if (key === 'length') {
         return true
@@ -105,13 +103,15 @@ export const readDenseDataArray = (inspection: DenseDataArrayInspection): unknow
       }
       return false
     })
+    const keysMatch = guardedOwnKeysMatch(inspection.value, keys)
+    const lengthDescriptor = guardedGetOwnPropertyDescriptor(inspection.value, 'length')
     if (
+      descriptorsMatch &&
       keysMatch &&
       lengthDescriptor !== PROPERTY_INSPECTION_FAILED &&
       lengthDescriptor !== undefined &&
       'value' in lengthDescriptor &&
-      lengthDescriptor.value === inspection.length &&
-      descriptorsMatch
+      lengthDescriptor.value === inspection.length
     ) {
       return values
     }

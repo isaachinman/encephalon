@@ -112,9 +112,10 @@ const objectInput = (value: unknown, name: string, recognizedKeys: ReadonlySet<s
           }
           return failObjectStructure(name)
         }, {})
-        const finalPrototype = guardedGetPrototypeOf(object)
         const descriptorsMatch = keys.every(key => guardedEnumerableDataPropertyMatches(object, key, snapshot[key]))
-        if (finalPrototype === prototype && guardedOwnKeysMatch(object, keys) && descriptorsMatch) {
+        const keysMatch = guardedOwnKeysMatch(object, keys)
+        const finalPrototype = guardedGetPrototypeOf(object)
+        if (descriptorsMatch && keysMatch && finalPrototype === prototype) {
           return snapshot
         }
       }
