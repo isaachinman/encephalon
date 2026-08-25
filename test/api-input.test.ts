@@ -190,6 +190,28 @@ describe('API input envelopes', () => {
     assert.equal(getCalls, 0)
   })
 
+  test('rejects envelope metadata changes during descriptor capture', () => {
+    const keyTarget = { root: '/repository' }
+    const changingKeys = new Proxy(keyTarget, {
+      getOwnPropertyDescriptor: (target, key) => {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key)
+        Object.defineProperty(target, 'unknownData', { configurable: true, value: true })
+        return descriptor
+      },
+    })
+    assertInvalidInput(() => parseRootInput(changingKeys), 'root')
+
+    const prototypeTarget = { root: '/repository' }
+    const changingPrototype = new Proxy(prototypeTarget, {
+      getOwnPropertyDescriptor: (target, key) => {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key)
+        Object.setPrototypeOf(target, { inherited: true })
+        return descriptor
+      },
+    })
+    assertInvalidInput(() => parseRootInput(changingPrototype), 'root')
+  })
+
   test('keeps accepted add-record memory and canonical JSON structurally identical', () => {
     const artifact = '_artifacts/context/record-1/file.txt'
     const input = {
@@ -290,7 +312,21 @@ describe('dense data arrays', () => {
       },
     })
     assertInvalidInput(() => parseGatherInput({ searches: unstable }), 'searches')
-    assert.equal(ownKeyCalls, 1)
+    assert.equal(ownKeyCalls, 2)
+  })
+
+  test('rejects array extras added during indexed descriptor capture', () => {
+    const target = ['x']
+    const unstable = new Proxy(target, {
+      getOwnPropertyDescriptor: (array, key) => {
+        const descriptor = Reflect.getOwnPropertyDescriptor(array, key)
+        if (key === '0') {
+          Object.defineProperty(array, 'metadata', { configurable: true, value: 'added' })
+        }
+        return descriptor
+      },
+    })
+    assertInvalidInput(() => parseGatherInput({ searches: unstable }), 'searches')
   })
 
   test('normalises array inspection failures and checks count budgets before own keys', () => {

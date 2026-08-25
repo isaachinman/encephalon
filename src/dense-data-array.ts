@@ -1,5 +1,11 @@
 import { fail } from './errors.ts'
-import { guardedGetOwnPropertyDescriptor, guardedOwnKeys, PROPERTY_INSPECTION_FAILED } from './property-inspection.ts'
+import {
+  guardedGetOwnPropertyDescriptor,
+  guardedIsArray,
+  guardedOwnKeys,
+  guardedOwnKeysMatch,
+  PROPERTY_INSPECTION_FAILED,
+} from './property-inspection.ts'
 
 declare const denseDataArrayInspectionBrand: unique symbol
 
@@ -14,21 +20,14 @@ export type DenseDataArrayInspection = {
 const failStructure = (field: string): never =>
   fail('INVALID_ARGUMENT', `${field} must be a dense array of data properties.`, { field })
 
-const isArray = (value: unknown) => {
-  try {
-    return Array.isArray(value)
-  } catch {
-    return false
-  }
-}
-
 /** @internal */
 export const inspectDenseDataArray = (
   value: unknown,
   field: string,
   invalidTypeMessage: string,
 ): DenseDataArrayInspection => {
-  if (isArray(value)) {
+  const isArray = guardedIsArray(value)
+  if (isArray === true) {
     const array = value as unknown[]
     const descriptor = guardedGetOwnPropertyDescriptor(array, 'length')
     if (
@@ -41,6 +40,9 @@ export const inspectDenseDataArray = (
     ) {
       return { field, length: descriptor.value, value: array } as DenseDataArrayInspection
     }
+    return failStructure(field)
+  }
+  if (isArray === PROPERTY_INSPECTION_FAILED) {
     return failStructure(field)
   }
   return fail('INVALID_ARGUMENT', invalidTypeMessage, { field })
@@ -90,8 +92,10 @@ export const readDenseDataArray = (inspection: DenseDataArrayInspection): unknow
       }
       return failStructure(inspection.field)
     }, new Array<unknown>(inspection.length))
+    const keysMatch = guardedOwnKeysMatch(inspection.value, keys)
     const lengthDescriptor = guardedGetOwnPropertyDescriptor(inspection.value, 'length')
     if (
+      keysMatch &&
       lengthDescriptor !== PROPERTY_INSPECTION_FAILED &&
       lengthDescriptor !== undefined &&
       'value' in lengthDescriptor &&

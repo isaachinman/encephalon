@@ -29,6 +29,16 @@ export const guardedOwnKeys = (value: object) => {
 }
 
 /** @internal */
+export const guardedOwnKeysMatch = (value: object, expected: readonly PropertyKey[]) => {
+  const actual = guardedOwnKeys(value)
+  if (actual !== PROPERTY_INSPECTION_FAILED && actual.length === expected.length) {
+    const expectedKeys = new Set(expected)
+    return actual.every(key => expectedKeys.has(key))
+  }
+  return false
+}
+
+/** @internal */
 export const guardedGetOwnPropertyDescriptor = (value: object, key: PropertyKey) => {
   try {
     return Object.getOwnPropertyDescriptor(value, key)

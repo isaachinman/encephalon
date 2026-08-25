@@ -6,6 +6,7 @@ import {
   guardedGetPrototypeOf,
   guardedIsArray,
   guardedOwnKeys,
+  guardedOwnKeysMatch,
   PROPERTY_INSPECTION_FAILED,
 } from './property-inspection.ts'
 import type { ValidatedAddRecordInput } from './schema.ts'
@@ -56,22 +57,23 @@ const isObjectConstructorForPrototype = (value: unknown, prototype: object) => {
   return false
 }
 
-const hasPlainObjectPrototype = (value: object) => {
+const plainObjectPrototype = (value: object) => {
   const prototype = guardedGetPrototypeOf(value)
   if (prototype === null) {
-    return true
+    return prototype
   }
   if (prototype !== PROPERTY_INSPECTION_FAILED && guardedGetPrototypeOf(prototype) === null) {
     const constructorDescriptor = guardedGetOwnPropertyDescriptor(prototype, 'constructor')
     if (
       constructorDescriptor !== PROPERTY_INSPECTION_FAILED &&
       constructorDescriptor !== undefined &&
-      'value' in constructorDescriptor
+      'value' in constructorDescriptor &&
+      isObjectConstructorForPrototype(constructorDescriptor.value, prototype)
     ) {
-      return isObjectConstructorForPrototype(constructorDescriptor.value, prototype)
+      return prototype
     }
   }
-  return false
+  return PROPERTY_INSPECTION_FAILED
 }
 
 const objectInput = (value: unknown, name: string, recognizedKeys: ReadonlySet<string>): Record<string, unknown> => {
@@ -84,14 +86,15 @@ const objectInput = (value: unknown, name: string, recognizedKeys: ReadonlySet<s
     if (array === true) {
       return failObjectType(name)
     }
-    if (array === false && hasPlainObjectPrototype(object)) {
+    const prototype = array === false ? plainObjectPrototype(object) : PROPERTY_INSPECTION_FAILED
+    if (prototype !== PROPERTY_INSPECTION_FAILED) {
       const keys = guardedOwnKeys(object)
       if (
         keys !== PROPERTY_INSPECTION_FAILED &&
         keys.length <= recognizedKeys.size &&
         keys.every((key): key is string => typeof key === 'string' && recognizedKeys.has(key))
       ) {
-        return keys.reduce<Record<string, unknown>>((snapshot, key) => {
+        const snapshot = keys.reduce<Record<string, unknown>>((result, key) => {
           const descriptor = guardedGetOwnPropertyDescriptor(object, key)
           if (
             descriptor !== PROPERTY_INSPECTION_FAILED &&
@@ -99,15 +102,19 @@ const objectInput = (value: unknown, name: string, recognizedKeys: ReadonlySet<s
             'value' in descriptor &&
             descriptor.enumerable === true
           ) {
-            Object.defineProperty(snapshot, key, {
+            Object.defineProperty(result, key, {
               enumerable: true,
               value: descriptor.value,
               writable: true,
             })
-            return snapshot
+            return result
           }
           return failObjectStructure(name)
         }, {})
+        const finalPrototype = guardedGetPrototypeOf(object)
+        if (finalPrototype === prototype && guardedOwnKeysMatch(object, keys)) {
+          return snapshot
+        }
       }
     }
     return failObjectStructure(name)
