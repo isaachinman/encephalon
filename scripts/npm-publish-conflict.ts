@@ -30,7 +30,16 @@ export const isPublishedVersionConflictOutput = (stdout: string, stderr: string)
     .map(readNpmJsonError)
     .filter((error): error is NpmJsonError => error !== undefined)
   const combined = `${stdout}\n${stderr}`
-  const hasTextConflictCode = /(?:^|\r?\n)npm error code (EPUBLISHCONFLICT|E403)(?:\r?\n|$)/.test(combined)
+  const textErrorCodes = [...combined.matchAll(/(?:^|\r?\n)npm error code (\S+)(?=\r?\n|$)/g)]
+    .map(match => match[1])
+    .filter((code): code is string => code !== undefined)
+  const hasTextConflictCode = textErrorCodes.some(code => conflictCodes.has(code))
+  const hasTextNonConflictCode = textErrorCodes.some(code => !conflictCodes.has(code))
   const hasTextConflictMessage = /You cannot publish over the previously published versions/.test(combined)
-  return jsonErrors.some(isPublishConflictError) || (hasTextConflictCode && hasTextConflictMessage)
+  const jsonErrorsAreConflicts = jsonErrors.every(isPublishConflictError)
+  return (
+    !hasTextNonConflictCode &&
+    jsonErrorsAreConflicts &&
+    (jsonErrors.length > 0 || (hasTextConflictCode && hasTextConflictMessage))
+  )
 }

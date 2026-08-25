@@ -37,11 +37,10 @@ const runPublishCheckFixture = (temporaryRoot: string, result: object) =>
   })
 
 test('accepts only npm diagnostics for an already-published package version', () => {
+  const conflictJson =
+    '{"error":{"code":"EPUBLISHCONFLICT","summary":"You cannot publish over the previously published versions: 0.2.0."}}'
   const accepted = [
-    [
-      '{"error":{"code":"EPUBLISHCONFLICT","summary":"You cannot publish over the previously published versions: 0.2.0."}}',
-      '',
-    ],
+    [conflictJson, ''],
     ['', '{"error":{"code":"E403","summary":"You cannot publish over the previously published versions: 0.2.0."}}'],
     ['{"error":{"summary":"You cannot publish over the previously published versions: 0.2.0."}}', ''],
     ['You cannot publish over the previously published versions: 0.2.0.\n', 'npm error code EPUBLISHCONFLICT\n'],
@@ -58,10 +57,16 @@ test('accepts only npm diagnostics for an already-published package version', ()
     ['{"id":"encephalon@0.2.0"}', ''],
     ['You cannot publish over the previously published versions: 0.2.0.\n', 'npm error code E401\n'],
     ['not json', 'npm error code EPUBLISHCONFLICT\n'],
+    [conflictJson, 'npm error code E401\nAuthentication failed.\n'],
+    [
+      'You cannot publish over the previously published versions: 0.2.0.\n',
+      'npm error code EPUBLISHCONFLICT\nnpm error code E401\n',
+    ],
+    [conflictJson, '{"error":{"code":"E401","summary":"Authentication failed."}}'],
   ] as const
   assert.deepEqual(
     rejected.map(([stdout, stderr]) => isPublishedVersionConflictOutput(stdout, stderr)),
-    [false, false, false, false, false],
+    [false, false, false, false, false, false, false, false],
   )
 })
 
@@ -87,10 +92,10 @@ test('publish checker forwards npm output and rejects unrelated publish failures
     const failure = runPublishCheckFixture(temporaryRoot, {
       status: 1,
       stderr: 'npm error code E401\nAuthentication failed.\n',
-      stdout: '',
+      stdout: conflictOutput,
     })
     assert.notEqual(failure.status, 0)
-    assert.equal(failure.stdout, '')
+    assert.equal(failure.stdout, conflictOutput)
     assert.match(failure.stderr, /^npm error code E401\nAuthentication failed\.\n/u)
     assert.match(failure.stderr, /npm publish dry-run failed with exit code 1\./u)
   } finally {
