@@ -69,7 +69,6 @@ type GatePrimary =
 type HeldGate = {
   database: DatabaseSync
   identity: CacheDatabase
-  transaction: boolean
 }
 
 const abandonedRecoveryMarkers = new Map<string, OwnedRecoveryMarker>()
@@ -320,7 +319,7 @@ export const withOperationLock = <Result>(
         preserveDatabaseLocksAfterInitialisation: true,
         primary,
       })
-      gate = { database: opened.database, identity: opened.identity, transaction: true }
+      gate = { database: opened.database, identity: opened.identity }
       return opened.identity
     } catch (error) {
       if (error instanceof CacheDatabaseCreationConflict) {
@@ -334,29 +333,25 @@ export const withOperationLock = <Result>(
     const heldGate = gate
     gate = undefined
     if (heldGate !== undefined) {
-      const { database, identity, transaction } = heldGate
+      const { database, identity } = heldGate
       const close = testHooks.gateClose ?? ((current: DatabaseSync) => current.close())
-      const { closeFailure, closeSuppressed, validationFailure } = closeCacheDatabaseWithMetadataAuthority(
-        location,
-        identity,
-        {
+      const { closeFailure, closeProofFailure, closeSuppressed, validationFailure } =
+        closeCacheDatabaseWithMetadataAuthority(location, identity, {
           close: () => {
-            if (transaction) {
-              try {
-                database.exec('ROLLBACK')
-              } catch {
-                // Closing the connection below releases its operating-system lock.
-              }
+            try {
+              database.exec('ROLLBACK')
+            } catch {
+              // Closing the connection below releases its operating-system lock.
             }
             close(database)
           },
-        },
-      )
-      if (validationFailure !== undefined) {
-        if (validationFailure instanceof EncephalonError) {
-          throw validationFailure
+        })
+      const metadataAuthorityFailure = validationFailure ?? closeProofFailure
+      if (metadataAuthorityFailure !== undefined) {
+        if (metadataAuthorityFailure instanceof EncephalonError) {
+          throw metadataAuthorityFailure
         }
-        return wrapIo('Unable to validate the Encephalon operation gate before cleanup.', validationFailure)
+        return wrapIo('Unable to validate the Encephalon operation gate before cleanup.', metadataAuthorityFailure)
       }
       if (closeFailure !== undefined) {
         throw closeFailure

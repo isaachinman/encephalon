@@ -1558,6 +1558,48 @@ describe('cache filesystem containment', () => {
     assert.equal(existsSync(databasePath), false)
   })
 
+  test('rejects a hard link added while a fresh primary creation descriptor is open', { skip: hardLinkSkip }, () => {
+    const databaseNames = ['brain.sqlite', 'operation-lock.sqlite'] as const
+
+    for (const databaseName of databaseNames) {
+      const root = createRoot()
+      const outside = createOutsideDirectory()
+      const location = inspectCacheLocation(root)
+      const databasePath = join(cacheDirectoryPath(root), databaseName)
+      const alias = join(outside, `${databaseName}-bootstrap-alias`)
+      let initialisationEntries = 0
+      cacheLocationTestHooks.afterPrimaryBootstrapOpen = path => {
+        if (basename(path) === databaseName) {
+          cacheLocationTestHooks.afterPrimaryBootstrapOpen = undefined
+          linkSync(path, alias)
+        }
+      }
+
+      assert.throws(
+        () =>
+          openVerifiedCacheDatabase({
+            afterVerifiedOpen: () => {
+              initialisationEntries += 1
+            },
+            DatabaseConstructor: DatabaseSync,
+            location,
+            name: databaseName,
+            primary: { kind: 'create-exclusive' },
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+          assert.deepEqual((error as { details?: unknown }).details, {
+            entry: `node_modules/.cache/encephalon/${databaseName}`,
+            invariant: 'single-link-file',
+          })
+          return true
+        },
+      )
+      assert.equal(initialisationEntries, 0)
+      assert.deepEqual(readFileSync(databasePath), readFileSync(alias))
+    }
+  })
+
   test('rejects primary replacements immediately after SQLite opens where open-file rename is supported', {
     skip: process.platform === 'win32',
   }, () => {
@@ -2100,6 +2142,84 @@ describe('cache filesystem containment', () => {
       assert.deepEqual(cleanup.attempts, { close: 0, rollback: 0 })
       assert.deepEqual(readFileSync(sidecarPath), journalBytes)
       assert.deepEqual(readFileSync(alias), journalBytes)
+    } finally {
+      cleanup.restore()
+    }
+  })
+
+  test('rechecks the gate primary after observing sidecars for close safety', { skip: hardLinkSkip }, () => {
+    const root = createRoot()
+    const outside = createOutsideDirectory()
+    withOperationLock(root, () => 'prepared')
+    const databasePath = join(cacheDirectoryPath(root), 'operation-lock.sqlite')
+    const alias = join(outside, 'close-proof-operation-lock-alias')
+    const before = readFileSync(databasePath)
+    let aliasIntroduced = false
+    const cleanup = observeDatabaseCleanupAttempts(() => aliasIntroduced)
+
+    try {
+      assert.throws(
+        () =>
+          withOperationLock(root, () => {
+            cacheLocationTestHooks.regularFileRealpath = (path, actual) => {
+              if (!aliasIntroduced && basename(path) === 'operation-lock.sqlite-journal') {
+                linkSync(databasePath, alias)
+                aliasIntroduced = true
+              }
+              return actual
+            }
+            return 'entered'
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+          assert.deepEqual((error as { details?: unknown }).details, {
+            entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+            invariant: 'single-link-file',
+          })
+          assert.equal(causeChainText(error).includes(outside), false)
+          return true
+        },
+      )
+      assert.equal(aliasIntroduced, true)
+      assert.deepEqual(cleanup.attempts, { close: 0, rollback: 0 })
+      assert.deepEqual(readFileSync(databasePath), before)
+      assert.deepEqual(readFileSync(alias), before)
+    } finally {
+      cleanup.restore()
+    }
+  })
+
+  test('preserves a proof-only gate close inspection failure', () => {
+    const root = createRoot()
+    withOperationLock(root, () => 'prepared')
+    let primaryObservations = 0
+    const cleanup = observeDatabaseCleanupAttempts(() => primaryObservations >= 2)
+
+    try {
+      assert.throws(
+        () =>
+          withOperationLock(root, () => {
+            cacheLocationTestHooks.regularFileRealpath = (path, actual) => {
+              if (basename(path) === 'operation-lock.sqlite') {
+                primaryObservations += 1
+                if (primaryObservations === 2) {
+                  throw Object.assign(new Error('Injected final close-proof inspection failure.'), {
+                    code: 'EACCES',
+                  })
+                }
+              }
+              return actual
+            }
+            return 'entered'
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+          assert.equal(causeChainText(error).includes('Injected final close-proof inspection failure.'), true)
+          return true
+        },
+      )
+      assert.equal(primaryObservations, 2)
+      assert.deepEqual(cleanup.attempts, { close: 0, rollback: 0 })
     } finally {
       cleanup.restore()
     }

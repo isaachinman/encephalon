@@ -585,12 +585,21 @@ const reconcileSidecars = (location: CacheLocation, database: CacheDatabase) =>
 const reconcileSidecarMetadata = (location: CacheLocation, database: CacheDatabase) =>
   reconcileSidecarSnapshots(database, inspectSidecarMetadata(location, database.name, database.sidecars))
 
-const cacheDatabaseCloseIsProvenSafe = (location: CacheLocation, database: CacheDatabase) => {
+const proveCacheDatabaseCloseSafety = (location: CacheLocation, database: CacheDatabase) => {
   try {
     assertCacheLocation(location)
+    const relativePath = databaseRelativePath(database.name)
+    const primary = inspectRegularFileMetadata(database.path, relativePath, {
+      expected: database,
+      requireSingleLink: true,
+      requireStableObservation: true,
+    })
+    if (primary === undefined || !sameCacheEntryIdentity(database, primary)) {
+      changedLayout(relativePath, 'stable-identity')
+    }
     DATABASE_SIDECAR_SUFFIXES.reduce((safe, suffix) => {
-      const relativePath = `${databaseRelativePath(database.name)}${suffix}`
-      inspectRegularFileMetadata(resolve(location.directory, `${database.name}${suffix}`), relativePath, {
+      const sidecarRelativePath = `${relativePath}${suffix}`
+      inspectRegularFileMetadata(resolve(location.directory, `${database.name}${suffix}`), sidecarRelativePath, {
         optional: true,
         requireSingleLink: true,
         requireStableObservation: true,
@@ -598,11 +607,9 @@ const cacheDatabaseCloseIsProvenSafe = (location: CacheLocation, database: Cache
       return safe
     }, true)
     assertCacheLocation(location)
-    return true
-  } catch {
-    // The authoritative validation path reports this observation failure. SQLite
-    // close is allowed only after containment and every sidecar is proven safe.
-    return false
+    return { provenSafe: true } as const
+  } catch (error) {
+    return { error, provenSafe: false } as const
   }
 }
 
@@ -759,13 +766,16 @@ const suppressUnsafeDatabaseClose = (
   errors: readonly unknown[],
   metadataAuthorityFailed = false,
 ) => {
-  const closeProvenSafe = cacheDatabaseCloseIsProvenSafe(location, snapshot)
+  const closeProof = proveCacheDatabaseCloseSafety(location, snapshot)
   const markedUnsafeSidecar = errors.some(error => error instanceof UnsafeCacheDatabaseSidecar)
-  const suppressClose = metadataAuthorityFailed || markedUnsafeSidecar || !closeProvenSafe
+  const suppressClose = metadataAuthorityFailed || markedUnsafeSidecar || !closeProof.provenSafe
   if (suppressClose) {
     cacheDatabaseCloseSafetyLatches.set(snapshot.path, database)
   }
-  return suppressClose
+  return {
+    closeProofFailure: closeProof.provenSafe ? undefined : closeProof.error,
+    closeSuppressed: suppressClose,
+  }
 }
 
 /** @internal */
@@ -785,7 +795,7 @@ export const closeCacheDatabaseWithMetadataAuthority = <Database extends { close
       currentDatabase = error.database
     }
   }
-  const closeSuppressed = suppressUnsafeDatabaseClose(
+  const { closeProofFailure, closeSuppressed } = suppressUnsafeDatabaseClose(
     location,
     currentDatabase,
     database,
@@ -800,7 +810,13 @@ export const closeCacheDatabaseWithMetadataAuthority = <Database extends { close
       closeFailure = error
     }
   }
-  return { closeFailure, closeSuppressed, database: currentDatabase, validationFailure }
+  return {
+    closeFailure,
+    closeProofFailure,
+    closeSuppressed,
+    database: currentDatabase,
+    validationFailure,
+  }
 }
 
 const initialCacheDatabase = <Database>(options: VerifiedCacheDatabaseOptions<Database>) => {
@@ -874,7 +890,7 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
       if (error instanceof CacheDatabaseSidecarChanged) {
         const closeSuppressed =
           lockPreservingInitialisationCompleted &&
-          suppressUnsafeDatabaseClose(options.location, snapshot, database, [error])
+          suppressUnsafeDatabaseClose(options.location, snapshot, database, [error]).closeSuppressed
         if (closeSuppressed) {
           throw error
         }
@@ -900,7 +916,7 @@ export const openVerifiedCacheDatabase = <Database extends { close: () => void }
             database,
             [error, validationError],
             validationError !== undefined,
-          )
+          ).closeSuppressed
         if (closeSuppressed) {
           if (validationError !== undefined) {
             throw validationError
