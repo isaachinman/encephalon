@@ -39,16 +39,22 @@ const runPublishCheckFixture = (temporaryRoot: string, result: object) =>
 test('accepts only npm diagnostics for an already-published package version', () => {
   const conflictJson =
     '{"error":{"code":"EPUBLISHCONFLICT","summary":"You cannot publish over the previously published versions: 0.2.0."}}'
+  const prettyConflictJson = `{
+  "error": {
+    "summary": "You cannot publish over the previously published versions: 0.2.0."
+  }
+}`
   const accepted = [
     [conflictJson, ''],
     ['', '{"error":{"code":"E403","summary":"You cannot publish over the previously published versions: 0.2.0."}}'],
     ['{"error":{"summary":"You cannot publish over the previously published versions: 0.2.0."}}', ''],
+    [`${prettyConflictJson.replaceAll('\n', '\r\n')}\r\nnpm warn using --force\r\n`, ''],
     ['You cannot publish over the previously published versions: 0.2.0.\n', 'npm error code EPUBLISHCONFLICT\n'],
     ['You cannot publish over the previously published versions: 0.2.0.\r\n', 'npm error code E403\r\n'],
   ] as const
   assert.deepEqual(
     accepted.map(([stdout, stderr]) => isPublishedVersionConflictOutput(stdout, stderr)),
-    [true, true, true, true, true],
+    [true, true, true, true, true, true],
   )
 
   const rejected = [
@@ -63,10 +69,24 @@ test('accepts only npm diagnostics for an already-published package version', ()
       'npm error code EPUBLISHCONFLICT\nnpm error code E401\n',
     ],
     [conflictJson, '{"error":{"code":"E401","summary":"Authentication failed."}}'],
+    [
+      '{"error":{"code":"E401","summary":"Authentication failed."}}\nnpm warn retrying\n',
+      'npm error code EPUBLISHCONFLICT\nYou cannot publish over the previously published versions: 0.2.0.\n',
+    ],
+    [conflictJson, 'npm error Authentication failed\n'],
+    [conflictJson, 'npm ERR! network timeout\n'],
+    [
+      '{"id":"encephalon@0.2.0"}\n',
+      'npm error code EPUBLISHCONFLICT\nYou cannot publish over the previously published versions: 0.2.0.\n',
+    ],
+    [
+      `${conflictJson}\n{"error":{"code":"E401","summary":"Authentication failed."}}\n`,
+      'npm error code EPUBLISHCONFLICT\nYou cannot publish over the previously published versions: 0.2.0.\n',
+    ],
   ] as const
   assert.deepEqual(
     rejected.map(([stdout, stderr]) => isPublishedVersionConflictOutput(stdout, stderr)),
-    [false, false, false, false, false, false, false, false],
+    [false, false, false, false, false, false, false, false, false, false, false, false, false],
   )
 })
 
@@ -80,23 +100,24 @@ test('publish checker forwards npm output and rejects unrelated publish failures
 
     const conflictOutput =
       '{"error":{"code":"EPUBLISHCONFLICT","summary":"You cannot publish over the previously published versions: 0.2.0."}}\n'
+    const conflictOutputWithWarning = `${conflictOutput}npm warn using --force\n`
     const conflict = runPublishCheckFixture(temporaryRoot, {
       status: 1,
-      stderr: 'npm warning\n',
-      stdout: conflictOutput,
+      stderr: '',
+      stdout: conflictOutputWithWarning,
     })
     assert.equal(conflict.status, 0, conflict.stderr)
-    assert.equal(conflict.stdout, conflictOutput)
-    assert.equal(conflict.stderr, 'npm warning\n')
+    assert.equal(conflict.stdout, conflictOutputWithWarning)
+    assert.equal(conflict.stderr, '')
 
     const failure = runPublishCheckFixture(temporaryRoot, {
       status: 1,
-      stderr: 'npm error code E401\nAuthentication failed.\n',
+      stderr: 'npm error Authentication failed\n',
       stdout: conflictOutput,
     })
     assert.notEqual(failure.status, 0)
     assert.equal(failure.stdout, conflictOutput)
-    assert.match(failure.stderr, /^npm error code E401\nAuthentication failed\.\n/u)
+    assert.match(failure.stderr, /^npm error Authentication failed\n/u)
     assert.match(failure.stderr, /npm publish dry-run failed with exit code 1\./u)
   } finally {
     rmSync(temporaryRoot, { force: true, recursive: true })
