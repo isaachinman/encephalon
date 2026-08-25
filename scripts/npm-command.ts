@@ -70,33 +70,35 @@ export const npmCommand = (arguments_: readonly string[], options: NpmCommandOpt
       return { arguments: [bundledNpmCli, ...arguments_], executable: nodeExecutable }
     }
 
-    const npmExecPath = options.npmExecPath ?? process.env.npm_execpath
-    if (npmExecPath !== undefined && isCanonicalNpmCliPath(npmExecPath) && pathExists(npmExecPath)) {
-      return { arguments: [npmExecPath, ...arguments_], executable: nodeExecutable }
-    }
-
     const siblingNpmExecutable = win32.resolve(win32.dirname(nodeExecutable), 'npm.exe')
     if (pathExists(siblingNpmExecutable)) {
       return { arguments: [...arguments_], executable: siblingNpmExecutable }
     }
 
     const siblingNpmBatch = win32.resolve(win32.dirname(nodeExecutable), 'npm.cmd')
-    if (pathExists(siblingNpmBatch)) {
-      const environment = options.environment ?? process.env
-      const commandInterpreter = options.commandInterpreter ?? environmentValue(environment, 'ComSpec')
-      if (
-        commandInterpreter !== undefined &&
-        win32.isAbsolute(commandInterpreter) &&
-        win32.basename(commandInterpreter).toLowerCase() === 'cmd.exe' &&
-        pathExists(commandInterpreter)
-      ) {
-        return {
-          arguments: ['/d', '/s', '/v:off', '/c', batchCommandLine(arguments_.length)],
-          environment: batchEnvironment([siblingNpmBatch, ...arguments_], environment),
-          executable: commandInterpreter,
-          windowsVerbatimArguments: true,
-        }
+    const hasSiblingNpmBatch = pathExists(siblingNpmBatch)
+    const environment = options.environment ?? process.env
+    const commandInterpreter = options.commandInterpreter ?? environmentValue(environment, 'ComSpec')
+    const hasSafeCommandInterpreter =
+      commandInterpreter !== undefined &&
+      win32.isAbsolute(commandInterpreter) &&
+      win32.basename(commandInterpreter).toLowerCase() === 'cmd.exe' &&
+      pathExists(commandInterpreter)
+    if (hasSiblingNpmBatch && hasSafeCommandInterpreter) {
+      return {
+        arguments: ['/d', '/s', '/v:off', '/c', batchCommandLine(arguments_.length)],
+        environment: batchEnvironment([siblingNpmBatch, ...arguments_], environment),
+        executable: commandInterpreter,
+        windowsVerbatimArguments: true,
       }
+    }
+
+    const npmExecPath = options.npmExecPath ?? process.env.npm_execpath
+    if (npmExecPath !== undefined && isCanonicalNpmCliPath(npmExecPath) && pathExists(npmExecPath)) {
+      return { arguments: [npmExecPath, ...arguments_], executable: nodeExecutable }
+    }
+
+    if (hasSiblingNpmBatch) {
       throw new Error('Unable to resolve an absolute Windows cmd.exe through ComSpec for the active Node runtime.')
     }
     throw new Error(

@@ -16,11 +16,15 @@ const stderr = result.stderr ?? ''
 process.stdout.write(stdout)
 process.stderr.write(stderr)
 
+if (result.signal !== null) {
+  throw new Error(`npm publish dry-run terminated with signal ${result.signal}.`)
+}
+
 if (exitCode === 0) {
   process.exit(0)
 }
 
-if (isPublishedVersionConflictOutput(stdout, stderr)) {
+if (exitCode === 1 && isPublishedVersionConflictOutput(stdout, stderr)) {
   process.exit(0)
 }
 

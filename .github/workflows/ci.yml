@@ -59,6 +59,9 @@ jobs:
       - run: bun run build
       - run: git diff --exit-code HEAD
       - run: node ./scripts/check-package.ts
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
       - run: git diff --exit-code HEAD
 
   release:
@@ -80,10 +83,16 @@ jobs:
       - run: bun run build
       - run: git diff --exit-code HEAD
       - name: Check npm publish dry run
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
         run: node ./scripts/check-publish.ts
       - name: Check and retain release-equivalent package artifact
         id: package
         shell: bash
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
         run: |
           retained_tarball=$(node ./scripts/check-package.ts --retain-tarball package-artifacts)
           echo "tarball=$retained_tarball" >> "$GITHUB_OUTPUT"

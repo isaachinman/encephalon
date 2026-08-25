@@ -165,6 +165,10 @@ jobs:
   assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 10)
   assert.equal(verificationSteps.match(/^\s{6}- if:/gm)?.length, 1)
   assert.doesNotMatch(verificationSteps, /^\s{8}continue-on-error:/m)
+  assert.match(
+    verificationJob,
+    /- run: node \.\/scripts\/check-package\.ts\n {8}env:\n {10}NODE_OPTIONS: ''\n {10}NODE_PATH: ''/u,
+  )
 
   assert.equal(
     releaseHeader,
@@ -197,10 +201,13 @@ jobs:
   assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length, 1)
   assert.doesNotMatch(releaseSteps, /^\s{8}continue-on-error:/m)
   assert.equal(releaseJob.match(/npm pack --dry-run=false/g)?.length ?? 0, 0)
-  assert.match(releaseJob, /- name: Check npm publish dry run\n\s+run: node \.\/scripts\/check-publish\.ts/)
   assert.match(
     releaseJob,
-    /- name: Check and retain release-equivalent package artifact\n\s+id: package\n\s+shell: bash\n\s+run: \|\n\s+retained_tarball=\$\(node \.\/scripts\/check-package\.ts --retain-tarball package-artifacts\)\n\s+echo "tarball=\$retained_tarball" >> "\$GITHUB_OUTPUT"/,
+    /- name: Check npm publish dry run\n\s+env:\n\s+NODE_OPTIONS: ''\n\s+NODE_PATH: ''\n\s+run: node \.\/scripts\/check-publish\.ts/,
+  )
+  assert.match(
+    releaseJob,
+    /- name: Check and retain release-equivalent package artifact\n\s+id: package\n\s+shell: bash\n\s+env:\n\s+NODE_OPTIONS: ''\n\s+NODE_PATH: ''\n\s+run: \|\n\s+retained_tarball=\$\(node \.\/scripts\/check-package\.ts --retain-tarball package-artifacts\)\n\s+echo "tarball=\$retained_tarball" >> "\$GITHUB_OUTPUT"/,
   )
   assert.equal(releaseJob.match(/node \.\/scripts\/check-publish\.ts/g)?.length, 1)
   assert.equal(releaseJob.match(/node \.\/scripts\/check-package\.ts --retain-tarball/g)?.length, 1)
@@ -250,6 +257,8 @@ jobs:
   assert.doesNotMatch(workflow, /^\s+- run: bun run \.\/scripts\/check-generated-version\.ts$/m)
   assert.doesNotMatch(workflow, /^\s+- run: bun run check:generated$/m)
   assert.equal(workflow.match(/^\s+- run: git diff --exit-code HEAD$/gmu)?.length, 4)
+  assert.equal(workflow.match(/NODE_OPTIONS: ''/g)?.length, 3)
+  assert.equal(workflow.match(/NODE_PATH: ''/g)?.length, 3)
   assert.match(readme, /four verification lanes/)
   assert.match(readme, /trusted pushes to `main`/)
   assert.match(readme, /release-equivalent package gate/)

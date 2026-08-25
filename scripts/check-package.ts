@@ -205,7 +205,12 @@ try {
     bin?: unknown
     exports?: unknown
     files?: unknown
+    bundleDependencies?: unknown
+    bundledDependencies?: unknown
     dependencies?: unknown
+    optionalDependencies?: unknown
+    peerDependencies?: unknown
+    peerDependenciesMeta?: unknown
     scripts?: Record<string, unknown>
   }
   if (typeof packageJson.version !== 'string') {
@@ -234,7 +239,12 @@ try {
         'README.md',
         'LICENSE',
       ]) ||
-    packageJson.dependencies !== undefined
+    packageJson.bundleDependencies !== undefined ||
+    packageJson.bundledDependencies !== undefined ||
+    packageJson.dependencies !== undefined ||
+    packageJson.optionalDependencies !== undefined ||
+    packageJson.peerDependencies !== undefined ||
+    packageJson.peerDependenciesMeta !== undefined
   ) {
     throw new Error('Package identity, exports, engine, files, or zero-runtime-dependency contract is invalid.')
   }

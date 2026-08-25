@@ -41,7 +41,8 @@ test('resolves only runtime-bound Windows npm fallbacks', () => {
   assert.deepEqual(
     npmCommand(['pack'], {
       nodeExecutable,
-      pathExists: path => path === npmExecutable,
+      npmExecPath,
+      pathExists: path => path === npmExecutable || path === npmExecPath,
       platform: 'win32',
     }),
     { arguments: ['pack'], executable: npmExecutable },
@@ -54,7 +55,8 @@ test('resolves only runtime-bound Windows npm fallbacks', () => {
       commandInterpreter,
       environment: { Path: String.raw`D:\Windows\System32` },
       nodeExecutable,
-      pathExists: path => path === npmBatch || path === commandInterpreter,
+      npmExecPath,
+      pathExists: path => path === npmBatch || path === commandInterpreter || path === npmExecPath,
       platform: 'win32',
     }),
     {
@@ -67,6 +69,17 @@ test('resolves only runtime-bound Windows npm fallbacks', () => {
       executable: commandInterpreter,
       windowsVerbatimArguments: true,
     },
+  )
+
+  assert.deepEqual(
+    npmCommand(['publish'], {
+      commandInterpreter: 'cmd.exe',
+      nodeExecutable,
+      npmExecPath,
+      pathExists: path => path === npmBatch || path === npmExecPath,
+      platform: 'win32',
+    }),
+    { arguments: [npmExecPath, 'publish'], executable: nodeExecutable },
   )
 
   assert.throws(

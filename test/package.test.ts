@@ -20,6 +20,14 @@ import { spawnNpmCommand } from '../scripts/npm-command.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
+const forbiddenRuntimeDependencyValues = {
+  bundleDependencies: ['runtime-package'],
+  bundledDependencies: ['runtime-package'],
+  dependencies: { 'runtime-package': '1.0.0' },
+  optionalDependencies: { 'runtime-package': '1.0.0' },
+  peerDependencies: { 'runtime-package': '1.0.0' },
+  peerDependenciesMeta: { 'runtime-package': { optional: true } },
+} as const
 
 const packageFixturePaths = [
   'package.json',
@@ -66,13 +74,44 @@ describe('package contract', () => {
     assert.equal(packageJson.type, 'module')
     assert.deepEqual(packageJson.engines, { node: '>=24.15.0' })
     assert.deepEqual(packageJson.bin, { encephalon: 'dist/cli.mjs' })
-    assert.equal(packageJson.dependencies, undefined)
+    for (const field of Object.keys(forbiddenRuntimeDependencyValues)) {
+      assert.equal(packageJson[field], undefined, field)
+    }
 
     const scripts = packageJson.scripts as Record<string, unknown> | undefined
     assert.equal(scripts?.install, undefined)
     assert.equal(scripts?.preinstall, undefined)
     assert.equal(scripts?.postinstall, undefined)
     assert.equal(scripts?.prepare, undefined)
+  })
+
+  test('rejects every runtime dependency manifest field', () => {
+    const failures = Object.entries(forbiddenRuntimeDependencyValues).map(([field, value]) => {
+      const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-dependency-')
+      try {
+        const packageJson = JSON.parse(readFileSync(resolve(fixtureRoot, 'package.json'), 'utf8')) as Record<
+          string,
+          unknown
+        >
+        writeFileSync(resolve(fixtureRoot, 'package.json'), `${JSON.stringify({ ...packageJson, [field]: value })}\n`)
+        return {
+          field,
+          result: spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+            cwd: fixtureRoot,
+            encoding: 'utf8',
+            timeout: 30_000,
+          }),
+        }
+      } finally {
+        rmSync(temporaryRoot, { force: true, recursive: true })
+      }
+    })
+
+    for (const { field, result } of failures) {
+      assert.notEqual(result.status, 0, field)
+      assert.equal(result.stdout, '', field)
+      assert.match(result.stderr, /zero-runtime-dependency contract is invalid/u, field)
+    }
   })
 
   test('has a side-effect-free TypeScript API entrypoint', () => {

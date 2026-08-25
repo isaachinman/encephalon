@@ -30,58 +30,65 @@ const scanNpmDiagnostics = (rawText: string): NpmDiagnosticScan => {
     if (start === -1) {
       searchIndex = text.length
     } else {
-      candidateCount += 1
-      let cursor = start
-      let depth = 0
-      let end: number | undefined
-      let escaped = false
-      let inString = false
+      const lineStart = text.lastIndexOf('\n', start - 1) + 1
+      const startsJsonLine = /^[\t ]*$/.test(text.slice(lineStart, start))
+      const followsJsonCandidate = candidateCount > 0 && /^[\t ]*$/.test(text.slice(searchIndex, start))
+      if (startsJsonLine || followsJsonCandidate) {
+        candidateCount += 1
+        let cursor = start
+        let depth = 0
+        let end: number | undefined
+        let escaped = false
+        let inString = false
 
-      while (cursor < text.length && cursor - start < jsonCandidateLengthLimit && end === undefined) {
-        const character = text[cursor]
-        if (inString) {
-          if (escaped) {
-            escaped = false
-          } else if (character === '\\') {
-            escaped = true
+        while (cursor < text.length && cursor - start < jsonCandidateLengthLimit && end === undefined) {
+          const character = text[cursor]
+          if (inString) {
+            if (escaped) {
+              escaped = false
+            } else if (character === '\\') {
+              escaped = true
+            } else if (character === '"') {
+              inString = false
+            }
           } else if (character === '"') {
-            inString = false
-          }
-        } else if (character === '"') {
-          inString = true
-        } else if (character === '{') {
-          depth += 1
-        } else if (character === '}') {
-          depth -= 1
-          if (depth === 0) {
-            end = cursor + 1
-          }
-        }
-        cursor += 1
-      }
-
-      if (candidateCount > jsonCandidateLimit || end === undefined) {
-        hasInvalidJson = true
-      } else {
-        try {
-          const payload = JSON.parse(text.slice(start, end)) as unknown
-          if (isObject(payload) && isObject(payload.error)) {
-            errors.push(payload.error)
-          } else {
-            hasInvalidJson = true
-          }
-        } catch {
-          hasInvalidJson = true
-        }
-
-        if (!hasInvalidJson) {
-          for (let index = start; index < end; index += 1) {
-            if (maskedText[index] !== '\n') {
-              maskedText[index] = ' '
+            inString = true
+          } else if (character === '{') {
+            depth += 1
+          } else if (character === '}') {
+            depth -= 1
+            if (depth === 0) {
+              end = cursor + 1
             }
           }
-          searchIndex = end
+          cursor += 1
         }
+
+        if (candidateCount > jsonCandidateLimit || end === undefined) {
+          hasInvalidJson = true
+        } else {
+          try {
+            const payload = JSON.parse(text.slice(start, end)) as unknown
+            if (isObject(payload) && isObject(payload.error)) {
+              errors.push(payload.error)
+            } else {
+              hasInvalidJson = true
+            }
+          } catch {
+            hasInvalidJson = true
+          }
+
+          if (!hasInvalidJson) {
+            for (let index = start; index < end; index += 1) {
+              if (maskedText[index] !== '\n') {
+                maskedText[index] = ' '
+              }
+            }
+            searchIndex = end
+          }
+        }
+      } else {
+        hasInvalidJson = true
       }
     }
   }
@@ -115,7 +122,7 @@ export const isPublishedVersionConflictOutput = (stdout: string, stderr: string)
     .map(line => npmErrorCodeLine.exec(line)?.[1])
     .filter((code): code is string => code !== undefined)
   const hasTextConflictCode = textErrorCodes.some(code => conflictCodes.has(code))
-  const hasTextConflictMessage = /You cannot publish over the previously published versions/.test(text)
+  const hasTextConflictMessage = lines.some(line => conflictSummary.test(line) || npmConflictLine.test(line))
   const hasUnexpectedError = lines.some(line => {
     const code = npmErrorCodeLine.exec(line)?.[1]
     const isConflictCodeLine = code !== undefined && conflictCodes.has(code)
