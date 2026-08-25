@@ -166,9 +166,18 @@ MAR-2565 validated mutation cache construction, deterministic disk fallback, and
 
 - Runtime consumers require Node.js 24.15.0 or newer and do not require Bun.
 - The npm package has no runtime dependencies and no install, preinstall, postinstall, or prepare lifecycle scripts.
+- `bun run check:generated` compares the complete committed package-version source non-mutatively before either CI job can run a build-capable command. Stale or missing source receives deterministic build-and-commit guidance; unrelated I/O failures remain unchanged.
 - The tarball whitelist is intentionally small and checked by `bun run check:package`.
 - `bun run check:package` must build, pack, install the actual tarball into a temporary Git repository with scripts disabled, import the API, typecheck consumer declarations, and execute the packed CLI through Node.
 - `bun run check:publish` is a dry-run release gate only. Publishing is manual maintainer work and must not be performed by agents.
+- The release-equivalent package gate runs with read-only workflow permissions and without repository, provider, or npm secrets on pull requests and trusted pushes to `main`. It builds, checks, packs, inspects, and exercises the publish contract in both cases. Only a trusted push to `main` uploads the bounded tarball; pull requests retain it in runner-local storage.
+
+After rollout, branch protection must require exactly `verify (ubuntu-latest)`, `verify (macos-latest)`, `verify (windows-latest)`, `verify (ubuntu-current)`, and `Release-equivalent package gate`. Rollout is maintainer-operated only after an exact pull-request head has emitted all five successful contexts; this repository change does not claim that the external setting has been updated. Re-query the read-only status-check configuration with:
+
+```bash
+gh api repos/isaachinman/encephalon/branches/main/protection/required_status_checks \
+  --jq '{strict, contexts: (.contexts | sort)}'
+```
 
 ## Contract Change Process
 

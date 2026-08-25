@@ -224,6 +224,7 @@ describe('package contract', () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       scripts?: Record<string, unknown>
     }
+    const generatedVersionScript = String(packageJson.scripts?.['check:generated'])
     const publishScript = String(packageJson.scripts?.['check:publish'])
     const eventsStart = workflow.indexOf('\non:\n') + 1
     const permissionsStart = workflow.indexOf('\npermissions:\n', eventsStart)
@@ -303,6 +304,7 @@ jobs:
       [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
       [
         'bun install --frozen-lockfile',
+        'bun run check:generated',
         'bun run typecheck',
         'bun run test',
         'bun run lint',
@@ -311,7 +313,7 @@ jobs:
         'bun run check:package',
       ],
     )
-    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
+    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 8)
     assert.doesNotMatch(verificationSteps, /^\s{8}(?:if|continue-on-error):/m)
 
     assert.equal(
@@ -319,7 +321,6 @@ jobs:
       `
   release:
     name: Release-equivalent package gate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: verify
     runs-on: ubuntu-latest
 `,
@@ -328,10 +329,11 @@ jobs:
     assert.match(releaseSteps, /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0/)
     assert.deepEqual(
       [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
-      ['bun install --frozen-lockfile', 'bun run build', 'bun run check:package'],
+      ['bun install --frozen-lockfile', 'bun run check:generated', 'bun run build', 'bun run check:package'],
     )
-    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 5)
-    assert.doesNotMatch(releaseSteps, /^\s{8}(?:if|continue-on-error):/m)
+    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 6)
+    assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length, 1)
+    assert.doesNotMatch(releaseSteps, /^\s{8}continue-on-error:/m)
     assert.match(
       releaseJob,
       /- name: Create release-equivalent package artifact\n\s+shell: bash\n\s+run: \|\n\s+mkdir -p package-artifacts\n\s+npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts > package-artifacts\/npm-pack\.json/,
@@ -346,7 +348,8 @@ jobs:
         .filter(line => !line.includes('uses: actions/upload-artifact@'))
         .slice(1)
         .join('\n'),
-      `        with:
+      `        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
           name: encephalon-npm-package
           path: package-artifacts/*
           if-no-files-found: error
@@ -354,7 +357,14 @@ jobs:
 `,
     )
     assert.equal(
-      ['bun run build', 'bun run check:package', 'npm pack', 'bun run check:publish', 'actions/upload-artifact']
+      [
+        'bun run check:generated',
+        'bun run build',
+        'bun run check:package',
+        'npm pack',
+        'bun run check:publish',
+        'actions/upload-artifact',
+      ]
         .map(step => releaseJob.indexOf(step))
         .every(
           (position, index, positions) =>
@@ -365,6 +375,7 @@ jobs:
     assert.match(readme, /four verification lanes/)
     assert.match(readme, /trusted pushes to `main`/)
     assert.match(readme, /release-equivalent package gate/)
+    assert.equal(generatedVersionScript, 'bun run scripts/check-generated-version.ts')
     assert.equal(publishScript, 'bun run scripts/check-publish.ts')
     assert.equal(publishCheck.includes("'--dry-run'"), true)
     assert.equal(publishCheck.includes("'--ignore-scripts'"), true)

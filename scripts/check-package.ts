@@ -13,6 +13,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import { gunzipSync } from 'node:zlib'
+import { assertPackageVersionSource } from './package-version.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-check-'))
@@ -113,9 +114,7 @@ try {
     throw new Error('Package version must be a string.')
   }
   const generatedVersionSource = readFileSync(resolve(root, 'src', 'generated', 'version.ts'), 'utf8')
-  if (!generatedVersionSource.includes(`PACKAGE_VERSION = ${JSON.stringify(packageJson.version)}`)) {
-    throw new Error('Generated runtime package version is stale.')
-  }
+  assertPackageVersionSource(packageJson.version, generatedVersionSource)
   if (
     packageJson.name !== 'encephalon' ||
     packageJson.license !== 'MIT' ||
