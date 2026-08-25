@@ -4,7 +4,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
-import { parse } from 'yaml'
 import { assertPackageVersionSource, renderPackageVersionSource } from '../scripts/package-version.ts'
 
 const root = resolve(import.meta.dirname, '..')
@@ -12,17 +11,15 @@ const staleGeneratedVersionMessage =
   'Generated runtime package version is stale. Run `bun run build` and commit src/generated/version.ts.'
 
 const assertGeneratedVersionWorkflowCommands = () => {
-  const workflow = parse(readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')) as {
-    jobs?: Record<string, { steps?: Array<{ run?: unknown }> }>
-  }
-  const commands = ['verify', 'release'].map(job => {
-    const command = workflow.jobs?.[job]?.steps?.find(
-      step => typeof step.run === 'string' && step.run.endsWith('check-generated-version.ts'),
-    )?.run
-    if (typeof command === 'string') {
-      return command
-    }
-    throw new Error(`Missing generated-version check in the ${job} workflow job.`)
+  const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
+  const verifyStart = workflow.indexOf('\n  verify:\n')
+  const releaseStart = workflow.indexOf('\n  release:\n', verifyStart)
+  assert.notEqual(verifyStart, -1)
+  assert.notEqual(releaseStart, -1)
+  const commands = [workflow.slice(verifyStart, releaseStart), workflow.slice(releaseStart)].map(job => {
+    const matchingCommands = [...job.matchAll(/^\s+- run: (.+check-generated-version\.ts)$/gmu)].map(match => match[1])
+    assert.equal(matchingCommands.length, 1)
+    return matchingCommands[0]
   })
   assert.deepEqual(commands, ['node ./scripts/check-generated-version.ts', 'node ./scripts/check-generated-version.ts'])
 }

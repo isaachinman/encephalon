@@ -2,29 +2,115 @@ import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, test } from 'node:test'
-import { parseDocument, visit } from 'yaml'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
 const githubExpression = (source: string) => `\${{ ${source} }}`
+const githubIdentifierCharacter = /[A-Za-z0-9_-]/u
 
-const workflowContainsSecretsContext = (workflow: string) => {
-  const document = parseDocument(workflow, { uniqueKeys: true })
-  assert.deepEqual(document.errors, [])
+const expressionContainsSecretsContext = (expression: string) => {
+  let cursor = 0
+  let quote: "'" | '"' | undefined
   let found = false
-  visit(document, {
-    Scalar: (_key, node) => {
-      if (typeof node.value === 'string' && /\bsecrets\s*(?:\.|\[)/iu.test(node.value)) {
-        found = true
-        return visit.BREAK
+
+  while (cursor < expression.length && !found) {
+    const character = expression[cursor]
+    const nextCharacter = expression[cursor + 1]
+    if (quote !== undefined) {
+      if (character === '\\') {
+        cursor += 2
+      } else if (character === quote && nextCharacter === quote) {
+        cursor += 2
+      } else {
+        if (character === quote) {
+          quote = undefined
+        }
+        cursor += 1
       }
-    },
-  })
+    } else if (character === "'" || character === '"') {
+      quote = character
+      cursor += 1
+    } else {
+      const previousCharacter = expression[cursor - 1]
+      const afterToken = expression[cursor + 'secrets'.length]
+      const isSecretsToken = expression.slice(cursor, cursor + 'secrets'.length).toLowerCase() === 'secrets'
+      if (
+        isSecretsToken &&
+        previousCharacter !== '.' &&
+        !githubIdentifierCharacter.test(previousCharacter ?? '') &&
+        !githubIdentifierCharacter.test(afterToken ?? '')
+      ) {
+        found = true
+      }
+      cursor += 1
+    }
+  }
+
   return found
 }
 
+const extractGithubExpressions = (source: string) => {
+  const expressions: string[] = []
+  let searchStart = 0
+
+  while (searchStart < source.length) {
+    const expressionStart = source.indexOf('${{', searchStart)
+    if (expressionStart < 0) {
+      searchStart = source.length
+    } else {
+      let cursor = expressionStart + 3
+      let expressionEnd = -1
+      let quote: "'" | '"' | undefined
+      while (cursor < source.length && expressionEnd < 0) {
+        const character = source[cursor]
+        const nextCharacter = source[cursor + 1]
+        if (quote !== undefined) {
+          if (character === '\\') {
+            cursor += 2
+          } else if (character === quote && nextCharacter === quote) {
+            cursor += 2
+          } else {
+            if (character === quote) {
+              quote = undefined
+            }
+            cursor += 1
+          }
+        } else if (character === "'" || character === '"') {
+          quote = character
+          cursor += 1
+        } else if (character === '}' && nextCharacter === '}') {
+          expressionEnd = cursor
+        } else {
+          cursor += 1
+        }
+      }
+
+      assert.notEqual(expressionEnd, -1, 'Unterminated GitHub Actions expression.')
+      expressions.push(source.slice(expressionStart + 3, expressionEnd))
+      searchStart = expressionEnd + 2
+    }
+  }
+
+  return expressions
+}
+
+const stripYamlScalarQuotes = (source: string) => {
+  const trimmed = source.trim()
+  const [firstCharacter] = trimmed
+  const lastCharacter = trimmed.at(-1)
+  return (firstCharacter === "'" && lastCharacter === "'") || (firstCharacter === '"' && lastCharacter === '"')
+    ? trimmed.slice(1, -1)
+    : trimmed
+}
+
+const workflowContainsSecretsContext = (workflow: string) =>
+  extractGithubExpressions(workflow).some(expressionContainsSecretsContext) ||
+  [...workflow.matchAll(/^\s+(?:-\s+)?if:\s*(.+)$/gmu)]
+    .map(match => stripYamlScalarQuotes(match[1] ?? ''))
+    .some(expressionContainsSecretsContext)
+
 describe('package contract', () => {
-  test('detects GitHub Actions secrets contexts without rejecting ordinary text', () => {
+  test('detects GitHub Actions secrets contexts in expressions and implicit conditions', () => {
     for (const workflow of [
       `env:\n  TOKEN: ${githubExpression('secrets.NPM_TOKEN')}\n`,
       `env:\n  TOKEN: ${githubExpression("secrets['NPM_TOKEN']")}\n`,
@@ -32,16 +118,24 @@ describe('package contract', () => {
       `env:\n  TOKEN: ${githubExpression("format('{1}', '}}', secrets['NPM_TOKEN'])")}\n`,
       `env:\n  TOKEN: ${githubExpression("format('{{0}}', secrets.NPM_TOKEN)")}\n`,
       `env:\n  TOKEN: prefix ${githubExpression('github.ref')} middle ${githubExpression('secrets.NPM_TOKEN')} suffix\n`,
+      `env:\n  TOKEN: ${githubExpression('toJson(secrets)')}\n`,
+      `env:\n  TOKEN: ${githubExpression('secrets != null')}\n`,
       "jobs:\n  verify:\n    if: secrets.RUN_VERIFY == 'true'\n",
       `env:\n  "${githubExpression('secrets.DYNAMIC_NAME')}": value\n`,
     ]) {
       assert.equal(workflowContainsSecretsContext(workflow), true, workflow)
     }
+  })
 
+  test('ignores secrets-shaped ordinary text outside GitHub Actions expressions', () => {
     for (const workflow of [
       `env:\n  REF: ${githubExpression('github.ref')}\n`,
+      `env:\n  NOTE: ${githubExpression("'secrets.NPM_TOKEN'")}\n`,
+      `env:\n  NOTE: ${githubExpression('github.secrets')}\n`,
       'env:\n  NOTE: repository secrets are unavailable to pull requests\n',
       '# secrets.NPM_TOKEN must never be used here\nenv:\n  SAFE: true\n',
+      'steps:\n  - run: echo "do not use secrets.NPM_TOKEN here"\n',
+      `steps:\n  - run: echo 'do not use secrets["NPM_TOKEN"] here'\n`,
     ]) {
       assert.equal(workflowContainsSecretsContext(workflow), false, workflow)
     }
@@ -268,7 +362,6 @@ describe('package contract', () => {
     const publishScript = String(packageJson.scripts?.['check:publish'])
     const eventsStart = workflow.indexOf('\non:\n') + 1
     const permissionsStart = workflow.indexOf('\npermissions:\n', eventsStart)
-    const concurrencyStart = workflow.indexOf('\nconcurrency:\n', permissionsStart)
     const jobsStart = workflow.indexOf('\njobs:\n')
     const releaseStart = workflow.indexOf('\n  release:\n', jobsStart)
     const workflowConfiguration = workflow.slice(0, jobsStart)
@@ -300,12 +393,9 @@ describe('package contract', () => {
 `,
     )
     assert.doesNotMatch(workflow.slice(eventsStart, permissionsStart), /paths|ignore|workflow_dispatch|schedule/)
-    assert.equal(
-      workflow.slice(permissionsStart + 1, concurrencyStart),
-      `permissions:
-  contents: read
-`,
-    )
+    assert.match(workflowConfiguration, /^permissions:\n\s+contents: read$/mu)
+    assert.doesNotMatch(workflowConfiguration, /^\s+[\w-]+:\s+write$/gmu)
+    assert.doesNotMatch(workflowConfiguration, /^(?:defaults|env):/gmu)
     assert.equal(workflowContainsSecretsContext(workflow), false)
     assert.match(
       workflowConfiguration,
@@ -342,14 +432,15 @@ jobs:
     )
     assert.match(verificationRunner, /^ {4}runs-on: \$\{\{ matrix\.os \}\}\n$/)
     assert.doesNotMatch(verificationJob, /^ {4}(?:if|continue-on-error|permissions):/m)
-    assert.match(verificationSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
-    assert.match(
-      verificationSteps,
-      /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}/,
-    )
-    assert.match(
-      verificationSteps,
-      /- uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0\n\s+- run: node \.\/scripts\/check-generated-version\.ts\n\s+- if: matrix\.context == 'ubuntu-current'\n\s+uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}\n\s+- uses: oven-sh\/setup-bun@v2\n\s+with:\n\s+bun-version: 1\.3\.1\n\s+- run: bun install --frozen-lockfile/,
+    const trustedVerificationPrefix =
+      /^ {4}steps:\n {6}- uses: actions\/checkout@\S+\n {8}with:\n {10}persist-credentials: false\n {6}- uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- if: matrix\.context == 'ubuntu-current'\n {8}uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: \$\{\{ matrix\.node \}\}\n {6}- uses: oven-sh\/setup-bun@v2\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile\n/u
+    assert.match(verificationSteps, trustedVerificationPrefix)
+    assert.doesNotMatch(
+      verificationSteps.replace(
+        '    steps:\n',
+        '    steps:\n      - uses: ./.github/actions/repair-generated-source\n',
+      ),
+      trustedVerificationPrefix,
     )
     assert.deepEqual(
       [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
@@ -378,11 +469,12 @@ jobs:
 `,
     )
     assert.doesNotMatch(releaseJob, /^ {4}permissions:/m)
-    assert.match(releaseSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
-    assert.match(releaseSteps, /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0/)
-    assert.match(
-      releaseSteps,
-      /- uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0\n\s+- run: node \.\/scripts\/check-generated-version\.ts\n\s+- uses: oven-sh\/setup-bun@v2\n\s+with:\n\s+bun-version: 1\.3\.1\n\s+- run: bun install --frozen-lockfile/,
+    const trustedReleasePrefix =
+      /^ {4}steps:\n {6}- uses: actions\/checkout@\S+\n {8}with:\n {10}persist-credentials: false\n {6}- uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- uses: oven-sh\/setup-bun@v2\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile\n/u
+    assert.match(releaseSteps, trustedReleasePrefix)
+    assert.doesNotMatch(
+      releaseSteps.replace('    steps:\n', '    steps:\n      - run: bun run repair-generated-source\n'),
+      trustedReleasePrefix,
     )
     assert.deepEqual(
       [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
