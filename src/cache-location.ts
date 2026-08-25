@@ -597,15 +597,14 @@ const proveCacheDatabaseCloseSafety = (location: CacheLocation, database: CacheD
     if (primary === undefined || !sameCacheEntryIdentity(database, primary)) {
       changedLayout(relativePath, 'stable-identity')
     }
-    DATABASE_SIDECAR_SUFFIXES.reduce((safe, suffix) => {
+    for (const suffix of DATABASE_SIDECAR_SUFFIXES) {
       const sidecarRelativePath = `${relativePath}${suffix}`
       inspectRegularFileMetadata(resolve(location.directory, `${database.name}${suffix}`), sidecarRelativePath, {
         optional: true,
         requireSingleLink: true,
         requireStableObservation: true,
       })
-      return safe
-    }, true)
+    }
     assertCacheLocation(location)
     return { provenSafe: true } as const
   } catch (error) {
@@ -783,7 +782,6 @@ export const closeCacheDatabaseWithMetadataAuthority = <Database extends { close
   location: CacheLocation,
   snapshot: CacheDatabase,
   database: Database,
-  errors: readonly unknown[] = [],
 ) => {
   let currentDatabase = snapshot
   let validationFailure: unknown
@@ -799,7 +797,7 @@ export const closeCacheDatabaseWithMetadataAuthority = <Database extends { close
     location,
     currentDatabase,
     database,
-    [...errors, validationFailure],
+    [validationFailure],
     validationFailure !== undefined,
   )
   let closeFailure: unknown
@@ -814,7 +812,6 @@ export const closeCacheDatabaseWithMetadataAuthority = <Database extends { close
     closeFailure,
     closeProofFailure,
     closeSuppressed,
-    database: currentDatabase,
     validationFailure,
   }
 }

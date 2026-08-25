@@ -2193,7 +2193,7 @@ describe('cache filesystem containment', () => {
     const root = createRoot()
     withOperationLock(root, () => 'prepared')
     let primaryObservations = 0
-    const cleanup = observeDatabaseCleanupAttempts(() => primaryObservations >= 2)
+    const cleanup = observeDatabaseCleanupAttempts(() => true)
 
     try {
       assert.throws(
