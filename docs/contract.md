@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-25 for code and behavioural-test snapshot `070a43a234cf4aa1baf29bfec2bafbdb77e66c5e`.
+Last reviewed: 2026-08-25 for code and behavioural-test snapshot `e48ee6d842b8274f5ee1eb30a6705a151519332a`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
