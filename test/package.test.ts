@@ -207,7 +207,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-25 for code and behavioural-test snapshot `0905b195d82ae14bfbecc850746bb68815f07a29`\./,
+      /Last reviewed: 2026-08-25 for code and behavioural-test snapshot `58ba821f4b655fad1b1e79be9df57600e7409381`\./,
     )
     assert.match(
       contract,
@@ -215,7 +215,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /MAR-2576 bounded payload property inspection, allocation-order enforcement, canonical-output compatibility, and packed API coverage: `0905b195d82ae14bfbecc850746bb68815f07a29`\./,
+      /MAR-2576 bounded payload property inspection, allocation-order enforcement, canonical-output compatibility, and packed API coverage: `58ba821f4b655fad1b1e79be9df57600e7409381`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
