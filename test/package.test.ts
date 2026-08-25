@@ -228,6 +228,7 @@ describe('package contract', () => {
     const publishScript = String(packageJson.scripts?.['check:publish'])
     const eventsStart = workflow.indexOf('\non:\n') + 1
     const permissionsStart = workflow.indexOf('\npermissions:\n', eventsStart)
+    const concurrencyStart = workflow.indexOf('\nconcurrency:\n', permissionsStart)
     const jobsStart = workflow.indexOf('\njobs:\n')
     const releaseStart = workflow.indexOf('\n  release:\n', jobsStart)
     const workflowConfiguration = workflow.slice(0, jobsStart)
@@ -259,7 +260,13 @@ describe('package contract', () => {
 `,
     )
     assert.doesNotMatch(workflow.slice(eventsStart, permissionsStart), /paths|ignore|workflow_dispatch|schedule/)
-    assert.match(workflowConfiguration, /permissions:\n\s+contents: read/)
+    assert.equal(
+      workflow.slice(permissionsStart + 1, concurrencyStart),
+      `permissions:
+  contents: read
+`,
+    )
+    assert.doesNotMatch(workflow, /\$\{\{\s*secrets\./)
     assert.match(
       workflowConfiguration,
       /concurrency:\n\s+group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}\n\s+cancel-in-progress: true/,
@@ -294,7 +301,7 @@ jobs:
 `,
     )
     assert.match(verificationRunner, /^ {4}runs-on: \$\{\{ matrix\.os \}\}\n$/)
-    assert.doesNotMatch(verificationJob, /^ {4}(?:if|continue-on-error):/m)
+    assert.doesNotMatch(verificationJob, /^ {4}(?:if|continue-on-error|permissions):/m)
     assert.match(verificationSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
     assert.match(
       verificationSteps,
@@ -303,8 +310,8 @@ jobs:
     assert.deepEqual(
       [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
       [
-        'bun install --frozen-lockfile',
         'bun run check:generated',
+        'bun install --frozen-lockfile',
         'bun run typecheck',
         'bun run test',
         'bun run lint',
@@ -325,11 +332,12 @@ jobs:
     runs-on: ubuntu-latest
 `,
     )
+    assert.doesNotMatch(releaseJob, /^ {4}permissions:/m)
     assert.match(releaseSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
     assert.match(releaseSteps, /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0/)
     assert.deepEqual(
       [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
-      ['bun install --frozen-lockfile', 'bun run check:generated', 'bun run build', 'bun run check:package'],
+      ['bun run check:generated', 'bun install --frozen-lockfile', 'bun run build', 'bun run check:package'],
     )
     assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 6)
     assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length, 1)

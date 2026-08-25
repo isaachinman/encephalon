@@ -88,13 +88,14 @@ test('generated-version adapters reject stale or missing source without modifyin
   }
 })
 
-test('generated-version check preserves unrelated I/O failures', () => {
+test('generated-version check preserves unrelated generated-source I/O failures', () => {
   const temporaryRoot = createCheckFixture()
+  const generatedVersionPath = resolve(temporaryRoot, 'src', 'generated', 'version.ts')
   try {
-    rmSync(resolve(temporaryRoot, 'package.json'))
+    mkdirSync(generatedVersionPath)
     const result = runFixtureScript(temporaryRoot, 'check-generated-version.ts')
     assert.notEqual(result.status, 0)
-    assert.match(result.stderr, /ENOENT/)
+    assert.match(result.stderr, /EISDIR/)
     assert.equal(result.stderr.includes(staleGeneratedVersionMessage), false)
   } finally {
     rmSync(temporaryRoot, { force: true, recursive: true })
