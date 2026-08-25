@@ -1022,20 +1022,33 @@ const restoreHeldBackup = (
 const restoreQuarantinedFile = (
   path: string,
   quarantinePath: string,
+  plan: FilePlan,
   hooks: AtomicWriteHooks | undefined,
   authority: InstructionRootAuthority,
 ) => {
+  let held: HeldInstructionFile | undefined
   try {
     authority.assertCurrent()
     if (lstatIfExists(path) === undefined && lstatIfExists(quarantinePath) !== undefined) {
+      held = holdInstructionFile(quarantinePath, plan.filename)
+      if (
+        plan.originalIdentity === undefined ||
+        !sameEntryIdentity(plan.originalIdentity, held.identity) ||
+        plan.originalIdentity.birthtimeNs !== held.identity.birthtimeNs
+      ) {
+        return
+      }
+      assertPathIdentifiesDescriptor(quarantinePath, held, plan.filename, true)
       fault(hooks, 'during-quarantine-restore')
-      authority.assertCurrent()
-      linkSync(quarantinePath, path)
-      authority.assertCurrent()
-      rmSync(quarantinePath, { force: true })
+      linkHeldAlias(quarantinePath, path, held, plan.filename, authority, undefined)
+      unlinkHeldSource(quarantinePath, path, held, plan.filename, authority)
     }
   } catch {
     // Keep the quarantined file in place so the inspected bytes remain recoverable.
+  } finally {
+    if (held !== undefined) {
+      closeAfterOperation(held.descriptor, true)
+    }
   }
 }
 
@@ -1102,7 +1115,7 @@ const deletePlan = (
     }
   } catch (error) {
     if (quarantined) {
-      restoreQuarantinedFile(path, quarantinePath, hooks, authority)
+      restoreQuarantinedFile(path, quarantinePath, plan, hooks, authority)
     }
     if (isInstructionIdentityUncertainty(error) || identityBoundaryError(error)) {
       return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)

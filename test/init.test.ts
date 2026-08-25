@@ -5178,6 +5178,37 @@ describe('initialisation', () => {
     assert.equal(readFileSync(path, 'utf8'), replacement)
   })
 
+  test('does not restore a replacement installed at the deletion quarantine path', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const quarantinePath = join(root, '.AGENTS.md.controlled.delete')
+    const displacedPath = join(root, '.AGENTS.md.displaced.delete')
+    const agentsPlan = createDeletePlan(root)
+    const original = readFileSync(path)
+    const replacement = Buffer.from(original)
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-delete-quarantine') {
+              renameSync(quarantinePath, displacedPath)
+              writeFileSync(quarantinePath, replacement)
+            }
+          },
+          generatedPath: (_canonicalPath, suffix) => {
+            assert.equal(suffix, 'delete')
+            return quarantinePath
+          },
+        }),
+      'REPOSITORY_CHANGED',
+    )
+
+    assert.equal(existsSync(path), false)
+    assert.deepEqual(readFileSync(quarantinePath), replacement)
+    assert.deepEqual(readFileSync(displacedPath), original)
+  })
+
   test('accepts a ctime-only retained-metadata change after deletion quarantine', {
     skip: process.platform === 'win32' ? 'Windows does not expose portable hard-link ctime semantics.' : false,
   }, () => {
