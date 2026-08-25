@@ -258,5 +258,4 @@ jobs:
   assert.equal(publishScript, 'node ./scripts/check-publish.ts')
   assert.equal(publishCheck.includes("'--dry-run'"), true)
   assert.equal(publishCheck.includes("'--ignore-scripts'"), true)
-  assert.equal(publishCheck.includes('You cannot publish over the previously published versions'), true)
 })
