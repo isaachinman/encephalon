@@ -488,11 +488,9 @@ describe('package contract', () => {
     const concurrencyStart = workflow.indexOf('\nconcurrency:\n', permissionsStart)
     const jobsStart = workflow.indexOf('\njobs:\n')
     const releaseStart = workflow.indexOf('\n  release:\n', jobsStart)
-    const trustedUploadStart = workflow.indexOf('\n  upload:\n', releaseStart)
     const workflowConfiguration = workflow.slice(0, jobsStart)
     const verificationJob = workflow.slice(jobsStart, releaseStart)
-    const releaseJob = workflow.slice(releaseStart, trustedUploadStart)
-    const trustedUploadJob = workflow.slice(trustedUploadStart)
+    const releaseJob = workflow.slice(releaseStart)
     const matrixStart = verificationJob.indexOf('      matrix:\n')
     const runnerStart = verificationJob.indexOf('    runs-on:', matrixStart)
     const matrixBlock = verificationJob.slice(matrixStart, runnerStart)
@@ -503,13 +501,8 @@ describe('package contract', () => {
     const releaseStepsStart = releaseJob.indexOf('    steps:\n')
     const releaseHeader = releaseJob.slice(0, releaseStepsStart)
     const releaseSteps = releaseJob.slice(releaseStepsStart)
-    const trustedUploadStepsStart = trustedUploadJob.indexOf('    steps:\n')
-    const trustedUploadHeader = trustedUploadJob.slice(0, trustedUploadStepsStart)
-    const trustedUploadSteps = trustedUploadJob.slice(trustedUploadStepsStart)
-    const uploadActionStart = trustedUploadJob.indexOf(
-      '      - name: Upload trusted release-equivalent package artifact\n',
-    )
-    const uploadStep = trustedUploadJob.slice(uploadActionStart)
+    const uploadActionStart = releaseJob.indexOf('      - name: Upload trusted release-equivalent package artifact\n')
+    const uploadStep = releaseJob.slice(uploadActionStart)
 
     assert.equal(
       workflow.slice(eventsStart, permissionsStart),
@@ -534,7 +527,7 @@ describe('package contract', () => {
     assert.equal(workflowContainsSecretsContext(workflow), false)
     assert.match(
       workflowConfiguration,
-      /concurrency:\n\s+group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}\n\s+cancel-in-progress: true/,
+      /concurrency:\n\s+group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.run_id \}\}\n\s+cancel-in-progress: true/,
     )
 
     assert.equal(
@@ -600,6 +593,7 @@ jobs:
       `
   release:
     name: Release-equivalent package gate
+    needs: verify
     runs-on: ubuntu-latest
 `,
     )
@@ -622,7 +616,7 @@ jobs:
       ],
     )
     assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
-    assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length ?? 0, 0)
+    assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length, 1)
     assert.doesNotMatch(releaseSteps, /^\s{8}continue-on-error:/m)
     assert.match(
       releaseJob,
@@ -631,7 +625,11 @@ jobs:
     assert.equal(releaseJob.match(/npm pack --dry-run=false/g)?.length, 1)
     assert.match(releaseJob, /- name: Check npm publish dry run\n\s+run: bun run check:publish/)
     assert.equal(releaseJob.match(/bun run check:publish/g)?.length, 1)
-    assert.equal(releaseJob.match(/actions\/upload-artifact/g)?.length ?? 0, 0)
+    assert.equal(releaseJob.match(/actions\/upload-artifact/g)?.length, 1)
+    assert.match(
+      releaseJob,
+      /- name: Upload trusted release-equivalent package artifact\n\s+if: success\(\) && github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'\n\s+uses: actions\/upload-artifact@\S+/,
+    )
     assert.equal(
       [
         'node ./scripts/check-generated-version.ts',
@@ -640,6 +638,7 @@ jobs:
         'bun run check:package',
         'npm pack',
         'bun run check:publish',
+        'actions/upload-artifact',
       ]
         .map(step => releaseJob.indexOf(step))
         .every(
@@ -648,72 +647,26 @@ jobs:
         ),
       true,
     )
-
-    assert.equal(
-      trustedUploadHeader,
-      `
-  upload:
-    name: Upload trusted release-equivalent package artifact
-    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs:
-      - verify
-      - release
-    runs-on: ubuntu-latest
-`,
-    )
-    assert.doesNotMatch(trustedUploadJob, /^ {4}(?:continue-on-error|permissions):/m)
-    const trustedUploadPrefix =
-      /^ {4}steps:\n {6}- uses: actions\/checkout@\S+\n {8}with:\n {10}persist-credentials: false\n {6}- uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- uses: oven-sh\/setup-bun@v2\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile\n/u
-    assert.match(trustedUploadSteps, trustedUploadPrefix)
-    assert.doesNotMatch(
-      trustedUploadSteps.replace('    steps:\n', '    steps:\n      - run: bun run repair-generated-source\n'),
-      trustedUploadPrefix,
-    )
-    assert.deepEqual(
-      [...trustedUploadSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
-      [
-        'node ./scripts/check-generated-version.ts',
-        'bun install --frozen-lockfile',
-        'bun run build',
-        'git diff --exit-code',
-      ],
-    )
-    assert.equal(trustedUploadSteps.match(/^\s+(?:- )?run:/gm)?.length, 5)
-    assert.equal(trustedUploadJob.match(/npm pack --dry-run=false/g)?.length, 1)
-    assert.equal(trustedUploadJob.match(/actions\/upload-artifact/g)?.length, 1)
     assert.equal(
       uploadStep
         .split('\n')
         .filter(line => !line.includes('uses: actions/upload-artifact@'))
         .slice(1)
         .join('\n'),
-      `        with:
+      `        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
           name: encephalon-npm-package
-          path: package-artifacts/*
+          path: package-artifacts/*.tgz
           if-no-files-found: error
           retention-days: 7
 `,
     )
-    assert.equal(
-      [
-        'node ./scripts/check-generated-version.ts',
-        'bun run build',
-        'git diff --exit-code',
-        'npm pack',
-        'actions/upload-artifact',
-      ]
-        .map(step => trustedUploadJob.indexOf(step))
-        .every(
-          (position, index, positions) =>
-            position >= 0 && (index === 0 || position > (positions[index - 1] ?? Number.POSITIVE_INFINITY)),
-        ),
-      true,
-    )
 
-    assert.equal(workflow.match(/node \.\/scripts\/check-generated-version\.ts/g)?.length, 3)
+    assert.doesNotMatch(workflow, /\n {2}upload:\n/)
+    assert.equal(workflow.match(/node \.\/scripts\/check-generated-version\.ts/g)?.length, 2)
     assert.doesNotMatch(workflow, /^\s+- run: bun run \.\/scripts\/check-generated-version\.ts$/m)
     assert.doesNotMatch(workflow, /^\s+- run: bun run check:generated$/m)
-    assert.equal(workflow.match(/^\s+- run: git diff --exit-code$/gmu)?.length, 3)
+    assert.equal(workflow.match(/^\s+- run: git diff --exit-code$/gmu)?.length, 2)
     assert.match(readme, /four verification lanes/)
     assert.match(readme, /trusted pushes to `main`/)
     assert.match(readme, /release-equivalent package gate/)
