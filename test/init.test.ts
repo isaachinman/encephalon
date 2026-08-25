@@ -5232,6 +5232,38 @@ describe('initialisation', () => {
     )
   })
 
+  test('rejects a mode change after deletion quarantine', {
+    skip: process.platform === 'win32' ? 'Windows does not expose portable POSIX mode changes.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const originalMode = statSync(path, { bigint: true }).mode & 0o7777n
+    const changedMode = originalMode === 0o600n ? 0o644 : 0o600
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-delete-quarantine') {
+              const [quarantineName] = readdirSync(root).filter(
+                filename => filename.startsWith('.AGENTS.md.') && filename.endsWith('.delete'),
+              )
+              assert.ok(quarantineName)
+              chmodSync(join(root, quarantineName), changedMode)
+            }
+          },
+        }),
+      'REPOSITORY_CHANGED',
+    )
+
+    assert.equal(statSync(path, { bigint: true }).mode & 0o7777n, BigInt(changedMode))
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.startsWith('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
   test('does not delete a replacement created after deletion verification', () => {
     const root = createRoot()
     const path = join(root, 'AGENTS.md')

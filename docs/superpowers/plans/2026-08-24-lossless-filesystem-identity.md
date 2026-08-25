@@ -34,7 +34,7 @@
 - Consumes: Node `BigIntStats` only at the projection boundary.
 - Produces: `EntryIdentity`, `EntryMetadata`, `ManifestEntryMetadata`, `entryIdentityFrom()`, `entryMetadataFrom()`, `manifestEntryMetadataFrom()`, `sameEntryIdentity()`, `sameStableEntryMetadata()`, and `sameStableEntryMetadataExceptCtime()`.
 
-- [ ] **Step 1: Write the failing synthetic identity tests**
+- [x] **Step 1: Write the failing synthetic identity tests**
 
   Add a table-driven Node test that constructs structural BigInt metadata with literal values and proves:
   - two `dev`/`ino` values that collapse to the same JavaScript `Number` remain unequal;
@@ -44,13 +44,13 @@
 
   The break each test catches is a rounded numeric identity, a millisecond timestamp comparison, or a comparator that omits more than its documented rename exception.
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
   Run: `node --test test/filesystem-entry.test.ts`
 
   Expected: assertion failure because the new projection/post-rename API is absent.
 
-- [ ] **Step 3: Implement the minimal pure model**
+- [x] **Step 3: Implement the minimal pure model**
 
   In `src/filesystem-entry.ts`:
   - define readonly structural types whose identity fields are `bigint`;
@@ -61,7 +61,7 @@
   - add the explicitly named post-rename comparator that omits only `ctimeNs`;
   - return canonical decimal strings from the manifest projection.
 
-- [ ] **Step 4: Run the focused test and verify GREEN**
+- [x] **Step 4: Run the focused test and verify GREEN**
 
   Run: `node --test test/filesystem-entry.test.ts`
 
@@ -79,19 +79,19 @@
 - Consumes: Task 1 identity/projection types and comparators.
 - Produces: unchanged cache-location and instruction APIs, error behaviour, and on-disk formats.
 
-- [ ] **Step 1: Establish the regression baseline**
+- [x] **Step 1: Establish the regression baseline**
 
   Run the existing focused cache identity and managed-instruction replacement/finalisation tests through the Node runner. These are real-behaviour guards for exact cache path ownership, byte-identical replacement, rename, and recovery.
 
-- [ ] **Step 2: Migrate cache-location mechanically**
+- [x] **Step 2: Migrate cache-location mechanically**
 
   Alias `CacheEntryIdentity` to the shared `EntryIdentity`, replace local `identityFrom` and incarnation field comparisons with shared projections/comparators, and retain `sameCacheEntryIdentity` as a compatibility export delegating to the shared authority. Keep cache path validation, quarantine, hard-link policy, and SQLite ownership local.
 
-- [ ] **Step 3: Migrate instruction identities without changing policy**
+- [x] **Step 3: Migrate instruction identities without changing policy**
 
   Replace the private string-valued `FileIdentity` family with shared BigInt projections. Use complete comparison where the existing code compares the complete descriptor/path observation, and the shared except-ctime comparison only at the existing post-rename/link boundaries. Keep masked permission-mode checks local and preserve every instruction error message and recovery detail.
 
-- [ ] **Step 4: Verify the focused regression suites**
+- [x] **Step 4: Verify the focused regression suites**
 
   Run: `bun run build && node --test test/cache.test.ts test/init.test.ts`
 
@@ -107,17 +107,17 @@
 - Consumes: Task 1 shared identity projections/comparators.
 - Produces: canonical record reads and publication observations based exclusively on `BigIntStats`, with unchanged `BrainRecord`, `ValidateResult`, and `EncephalonError` contracts.
 
-- [ ] **Step 1: Add the canonical-read regression case**
+- [x] **Step 1: Add the canonical-read regression case**
 
   Add one focused test beside the existing record replacement tests that preserves file size/content framing while changing a record between descriptor observations and asserts the existing bounded invalid-record result. Reuse the real `validateRecordsResolved()` fault boundary; do not add a production-only test hook or assert on a mock.
 
   The break it catches is accepting a same-size canonical mutation after an identity or timestamp comparison is weakened.
 
-- [ ] **Step 2: Run the focused test and verify RED where the old precision permits the mutation**
+- [x] **Step 2: Run the focused test and verify RED where the old precision permits the mutation**
 
   Run the named test with Node's test-name filter. If the local filesystem exposes the timestamp change at millisecond precision and the test passes on old code, retain it only as complementary integration coverage; the synthetic Task 1 tests remain the deterministic RED proof for sub-millisecond identity loss.
 
-- [ ] **Step 3: Replace numeric record identities**
+- [x] **Step 3: Replace numeric record identities**
 
   In `src/records.ts`:
   - remove `Stats`, numeric `FileIdentity`, `identityFor`, and private millisecond comparators;
@@ -129,7 +129,7 @@
   - compare byte budgets as BigInt before the one safe `Number` conversion needed for bounded buffer allocation/accounting;
   - preserve every existing validation and repository-change message/detail.
 
-- [ ] **Step 4: Verify record behaviour**
+- [x] **Step 4: Verify record behaviour**
 
   Run: `bun run build && node --test test/filesystem-entry.test.ts test/records.test.ts`
 
@@ -146,15 +146,15 @@
 - Consumes: Task 1 `manifestEntryMetadataFrom()`.
 - Produces: byte-for-byte compatible cache manifest JSON fields and maintained documentation naming the single identity authority.
 
-- [ ] **Step 1: Replace duplicate manifest field conversion**
+- [x] **Step 1: Replace duplicate manifest field conversion**
 
   Use the shared manifest projection for canonical entries and accepted artifact observations while retaining `path` assembly and manifest policy in `src/cache.ts`. Verify exact keys remain `ctimeNanoseconds`, `mtimeNanoseconds`, `size`, and `type` with decimal-string values.
 
-- [ ] **Step 2: Update maintained documentation**
+- [x] **Step 2: Update maintained documentation**
 
   Document that guarded identity decisions use BigInt device/inode and nanosecond metadata, that context-specific comparators deliberately distinguish exact stable reads, parent instances, and post-rename ctime changes, and that this is an internal/backwards-compatible change with no stored-format migration.
 
-- [ ] **Step 3: Run focused cache-manifest and package tests**
+- [x] **Step 3: Run focused cache-manifest and package tests**
 
   Run: `bun run build && node --test test/cache.test.ts test/package.test.ts`
 

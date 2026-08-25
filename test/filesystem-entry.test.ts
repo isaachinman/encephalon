@@ -99,22 +99,32 @@ describe('lossless filesystem entry metadata', () => {
   test('compares complete stable metadata at nanosecond precision', () => {
     assert.equal(typeof filesystemEntry.entryMetadataFrom, 'function')
     const { entryMetadataFrom } = filesystemEntry
-    const baseline = entryMetadataFrom(metadata())
-    const timestampCases = [
-      entryMetadataFrom(metadata({ mtimeNs: 128n })),
-      entryMetadataFrom(metadata({ ctimeNs: 104n })),
+    const roundedIdentity = 9_007_199_254_740_992n
+    const baseline = entryMetadataFrom(metadata({ dev: roundedIdentity, ino: roundedIdentity }))
+    const changedMetadata = (
+      changes: Partial<Pick<BigIntStats, 'birthtimeNs' | 'ctimeNs' | 'dev' | 'ino' | 'mode' | 'mtimeNs' | 'size'>>,
+    ) => entryMetadataFrom(metadata({ dev: roundedIdentity, ino: roundedIdentity, ...changes }))
+    const changedCases = [
+      changedMetadata({ birthtimeNs: 102n }),
+      changedMetadata({ mtimeNs: 128n }),
+      changedMetadata({ ctimeNs: 104n }),
+      changedMetadata({ dev: roundedIdentity + 1n }),
+      changedMetadata({ ino: roundedIdentity + 1n }),
+      changedMetadata({ mode: 0o100_600n }),
+      changedMetadata({ size: 132n }),
     ] as const
 
     assert.deepEqual(baseline, {
       birthtimeNs: 101n,
       ctimeNs: 103n,
-      dev: 107n,
-      ino: 109n,
+      dev: roundedIdentity,
+      ino: roundedIdentity,
       mode: 0o100_644n,
       mtimeNs: 127n,
       size: 131n,
     })
-    for (const changed of timestampCases) {
+    assert.equal(Number(roundedIdentity), Number(roundedIdentity + 1n))
+    for (const changed of changedCases) {
       assert.equal(filesystemEntry.sameStableEntryMetadata(baseline, changed), false)
     }
   })
@@ -123,11 +133,12 @@ describe('lossless filesystem entry metadata', () => {
     assert.equal(typeof filesystemEntry.entryMetadataFrom, 'function')
     assert.equal(typeof filesystemEntry.sameStableEntryMetadataExceptCtime, 'function')
     const { entryMetadataFrom, sameStableEntryMetadataExceptCtime } = filesystemEntry
-    const baseline = entryMetadataFrom(metadata())
+    const roundedIdentity = 9_007_199_254_740_992n
+    const baseline = entryMetadataFrom(metadata({ dev: roundedIdentity, ino: roundedIdentity }))
     const cases = [
       { changes: { ctimeNs: 104n }, expected: true },
-      { changes: { dev: 108n }, expected: false },
-      { changes: { ino: 110n }, expected: false },
+      { changes: { dev: roundedIdentity + 1n, ino: roundedIdentity }, expected: false },
+      { changes: { dev: roundedIdentity, ino: roundedIdentity + 1n }, expected: false },
       { changes: { birthtimeNs: 102n }, expected: false },
       { changes: { mode: 0o100_600n }, expected: false },
       { changes: { mtimeNs: 128n }, expected: false },
@@ -135,7 +146,7 @@ describe('lossless filesystem entry metadata', () => {
     ] as const
 
     for (const { changes, expected } of cases) {
-      const changed = entryMetadataFrom(metadata(changes))
+      const changed = entryMetadataFrom(metadata({ dev: roundedIdentity, ino: roundedIdentity, ...changes }))
       assert.equal(sameStableEntryMetadataExceptCtime(baseline, changed), expected)
     }
   })

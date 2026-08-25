@@ -15,7 +15,7 @@ import {
   revalidateDirectoryWitness,
 } from './directory-witness.ts'
 import { fail } from './errors.ts'
-import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.ts'
+import { sameEntryIdentity, sameStableEntryMetadata, sameStableEntryMetadataExceptCtime } from './filesystem-entry.ts'
 
 /** @internal */
 export const MAX_STAGING_DIRECTORY_ENTRIES = 1000
@@ -43,13 +43,7 @@ type StagingEntry = {
 }
 
 const sameRegularEntryApartFromCtime = (expected: BigIntStats, current: BigIntStats) =>
-  expected.isFile() &&
-  current.isFile() &&
-  sameEntryIdentity(expected, current) &&
-  expected.size === current.size &&
-  expected.mode === current.mode &&
-  expected.birthtimeNs === current.birthtimeNs &&
-  expected.mtimeNs === current.mtimeNs
+  expected.isFile() && current.isFile() && sameStableEntryMetadataExceptCtime(expected, current)
 
 /** @internal */
 export const advanceRegularStagingIncarnation = (
@@ -163,13 +157,7 @@ const inspectStagingEntry = (stagingDirectory: string, name: string): StagingEnt
 }
 
 const sameRecoveredSymbolicLink = (expected: BigIntStats, current: BigIntStats) =>
-  expected.isSymbolicLink() &&
-  current.isSymbolicLink() &&
-  sameEntryIdentity(expected, current) &&
-  expected.size === current.size &&
-  expected.mode === current.mode &&
-  expected.birthtimeNs === current.birthtimeNs &&
-  expected.mtimeNs === current.mtimeNs
+  expected.isSymbolicLink() && current.isSymbolicLink() && sameStableEntryMetadataExceptCtime(expected, current)
 
 const quarantineStagingEntry = (
   stagingDirectory: string,

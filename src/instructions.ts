@@ -23,6 +23,7 @@ import {
   type EntryMetadata,
   entryMetadataFrom,
   sameEntryIdentity,
+  sameStableEntryMetadataExceptCtime,
   sameStableEntryMetadataExceptCtimeAndMode,
   sameStableEntryMetadataExceptMode,
 } from './filesystem-entry.ts'
@@ -1061,7 +1062,7 @@ const assertQuarantinedDeleteTarget = (quarantinePath: string, plan: FilePlan) =
   }
   if (
     plan.originalIdentity === undefined ||
-    !sameStableEntryMetadataExceptCtimeAndMode(plan.originalIdentity, entryMetadataFrom(metadata))
+    !sameStableEntryMetadataExceptCtime(plan.originalIdentity, entryMetadataFrom(metadata))
   ) {
     return fail('REPOSITORY_CHANGED', `${plan.filename} changed after it was preflighted.`)
   }
