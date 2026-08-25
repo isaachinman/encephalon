@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-23 for code and behavioural-test snapshot `30104a049f72ba2e87f51af95d5da11b55045cc3`.
+Last reviewed: 2026-08-25 for code and behavioural-test snapshot `e557e9b16c4996d7cead9e3a5df68d56d154e035`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -203,6 +203,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
+- MAR-2640 required current-Node and release-equivalent pre-merge gates with authoritative generated-source validation: `e557e9b16c4996d7cead9e3a5df68d56d154e035`.
 - MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 - MAR-2554 bounded full, compact, and gather read responses: `b43daf795de35d34602d1018ad509f68e494fe3d`.
 - MAR-2550 exact cached FTS row-text projection validation, bounded pre-mutation writer validation, and recovery: `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`.
