@@ -3581,6 +3581,20 @@ describe('canonical records', () => {
     })
     assert.equal(childVisits, 0)
 
+    const observerFailure = new Error('payload work observer failure')
+    assert.throws(
+      () =>
+        validateJsonValue(
+          { value: null },
+          {
+            onWork: () => {
+              throw observerFailure
+            },
+          },
+        ),
+      (error: unknown) => error === observerFailure,
+    )
+
     const overBudgetAccessorTarget = Object.fromEntries(
       Array.from({ length: MAX_PAYLOAD_NODES }, (_, index) => [`k${index}`, null]),
     )
@@ -3649,7 +3663,7 @@ describe('canonical records', () => {
     })
     assert.deepEqual(validatePayload(acceptedArray), ['first', 'second'])
     assert.deepEqual(acceptedArrayCalls, {
-      descriptors: ['length', '0', '1', 'metadata'],
+      descriptors: ['length', '0', '1', 'metadata', 'length'],
       ownKeys: 1,
     })
 
@@ -3682,6 +3696,41 @@ describe('canonical records', () => {
         assert.deepEqual(actual.details, { field: 'payload.0' })
         return true
       },
+    )
+  })
+
+  test('rejects arrays whose length changes during own-key inspection', () => {
+    const assertChangedLengthRejected = (payload: unknown) => {
+      assert.throws(
+        () => validateJsonValue(payload),
+        (error: unknown) => {
+          const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+          assert.equal(actual.code, 'INVALID_ARGUMENT')
+          assert.equal(actual.message, 'payload contains an invalid array length.')
+          assert.deepEqual(actual.details, { field: 'payload' })
+          return true
+        },
+      )
+    }
+
+    const growingTarget = ['first']
+    assertChangedLengthRejected(
+      new Proxy(growingTarget, {
+        ownKeys: target => {
+          target.push('second')
+          return Reflect.ownKeys(target)
+        },
+      }),
+    )
+
+    const shrinkingTarget = ['first', 'second']
+    assertChangedLengthRejected(
+      new Proxy(shrinkingTarget, {
+        ownKeys: target => {
+          target.length = 1
+          return Reflect.ownKeys(target)
+        },
+      }),
     )
   })
 

@@ -11,7 +11,7 @@ import {
   PROPERTY_INSPECTION_FAILED,
 } from './property-inspection.ts'
 import type { AddRecordInput, BrainRecordFile, JsonValue } from './types.ts'
-import { observeWork } from './work-observer.ts'
+import { observeWork, rethrowWorkObserverError } from './work-observer.ts'
 
 export const MAX_RECORD_BYTES = CANONICAL_BUDGETS.recordBytes
 export const MAX_PAYLOAD_DEPTH = 64
@@ -321,6 +321,20 @@ const validateJsonValueAt = (
     if (values === undefined) {
       return fail('INVALID_ARGUMENT', 'payload contains an invalid array length.', { field: path })
     }
+    const currentLengthDescriptor = assertPayloadDataDescriptor(
+      getPayloadOwnPropertyDescriptor(value, 'length', path),
+      path,
+    )
+    const currentLength = currentLengthDescriptor?.value
+    const currentLengthIsValid = Number.isSafeInteger(currentLength) && currentLength >= 0
+    if (currentLengthIsValid && currentLength > MAX_PAYLOAD_NODES - nodeCount.value) {
+      return fail('INVALID_ARGUMENT', `payload may contain at most ${MAX_PAYLOAD_NODES} JSON nodes.`, {
+        field: path,
+      })
+    }
+    if (!currentLengthIsValid || currentLength !== length) {
+      return fail('INVALID_ARGUMENT', 'payload contains an invalid array length.', { field: path })
+    }
     if (presentIndices !== length) {
       return fail('INVALID_ARGUMENT', 'payload contains a sparse array.', {
         field: path,
@@ -436,33 +450,38 @@ export const validateJsonValue = (value: unknown, hooks: PayloadValidationHooks 
     outputContainer: observeWork(hooks.onWork, 'payload-output-container'),
     retainedValue: observeWork(hooks.onWork, 'payload-retained-value'),
   }
-  let result: JsonValue | undefined
-  while (stack.length > 0) {
-    const item = stack.pop()
-    if (item !== undefined) {
-      if (item.action === 'exit') {
-        seen.delete(item.value)
-      } else {
-        const assigned = validateJsonValueAt(
-          item.value,
-          item.path,
-          item.depth,
-          item.target,
-          stack,
-          seen,
-          nodeCount,
-          observers,
-        )
-        if (item.target === undefined && assigned !== undefined) {
-          result = assigned
+  try {
+    let result: JsonValue | undefined
+    while (stack.length > 0) {
+      const item = stack.pop()
+      if (item !== undefined) {
+        if (item.action === 'exit') {
+          seen.delete(item.value)
+        } else {
+          const assigned = validateJsonValueAt(
+            item.value,
+            item.path,
+            item.depth,
+            item.target,
+            stack,
+            seen,
+            nodeCount,
+            observers,
+          )
+          if (item.target === undefined && assigned !== undefined) {
+            result = assigned
+          }
         }
       }
     }
+    if (result !== undefined) {
+      return result
+    }
+    return fail('INTERNAL_ERROR', 'Payload validation did not produce a value.')
+  } catch (error) {
+    rethrowWorkObserverError(error)
+    throw error
   }
-  if (result !== undefined) {
-    return result
-  }
-  return fail('INTERNAL_ERROR', 'Payload validation did not produce a value.')
 }
 
 const portableArtifactSegments = (value: unknown) => {
