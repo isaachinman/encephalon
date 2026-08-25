@@ -11,6 +11,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
@@ -19,6 +20,42 @@ import { spawnNpmCommand } from '../scripts/npm-command.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
+
+const packageFixturePaths = [
+  'package.json',
+  'scripts/check-package.ts',
+  'scripts/npm-command.ts',
+  'scripts/package-version.ts',
+  'src',
+  'dist',
+  'skills/encephalon/SKILL.md',
+  'assets/encephalon.png',
+  'docs/performance.md',
+  'docs/performance-baseline.json',
+  'docs/performance-budgets.json',
+  'README.md',
+  'LICENSE',
+] as const
+
+const createPackageCheckFixture = (prefix: string) => {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), prefix))
+  const fixtureRoot = resolve(temporaryRoot, 'repository')
+  for (const path of packageFixturePaths) {
+    const destination = resolve(fixtureRoot, path)
+    mkdirSync(dirname(destination), { recursive: true })
+    cpSync(resolve(root, path), destination, { recursive: true })
+  }
+  symlinkSync(resolve(root, 'node_modules'), resolve(fixtureRoot, 'node_modules'), 'junction')
+  const initialise = spawnSync('git', ['init', '--quiet'], { cwd: fixtureRoot, encoding: 'utf8' })
+  assert.equal(initialise.status, 0, `${initialise.stdout}${initialise.stderr}`)
+  const stage = spawnSync(
+    'git',
+    ['add', '--', 'package.json', 'src', 'skills', 'assets', 'docs', 'README.md', 'LICENSE'],
+    { cwd: fixtureRoot, encoding: 'utf8' },
+  )
+  assert.equal(stage.status, 0, `${stage.stdout}${stage.stderr}`)
+  return { fixtureRoot, temporaryRoot }
+}
 
 describe('package contract', () => {
   test('declares a zero-runtime-dependency Node ESM package', () => {
@@ -120,6 +157,7 @@ describe('package contract', () => {
     assert.match(contract, /Cache schema compatibility requires the exact owned ordinary-table semantics/)
     assert.match(contract, /## Package and Release Gates/)
     assert.match(contract, /## Historical Plan Divergence Checklist/)
+    assert.doesNotMatch(contract, /MAR-2640 required current-Node.*`[0-9a-f]{40}`/u)
     assert.match(
       contract,
       /Stable response-budget names are `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes`\./,
@@ -270,30 +308,9 @@ describe('package contract', () => {
   })
 
   test('does not retain a tarball when a late packed CLI check fails', { timeout: 30_000 }, () => {
-    const temporaryRoot = mkdtempSync(join(tmpdir(), 'encephalon-package-late-failure-'))
-    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-late-failure-')
     const retainedDirectory = resolve(fixtureRoot, 'late-package-artifact', 'nested')
     try {
-      for (const path of [
-        'package.json',
-        'scripts/check-package.ts',
-        'scripts/npm-command.ts',
-        'scripts/package-version.ts',
-        'src/generated/version.ts',
-        'dist',
-        'skills/encephalon/SKILL.md',
-        'assets/encephalon.png',
-        'docs/performance.md',
-        'docs/performance-baseline.json',
-        'docs/performance-budgets.json',
-        'README.md',
-        'LICENSE',
-      ]) {
-        const destination = resolve(fixtureRoot, path)
-        mkdirSync(dirname(destination), { recursive: true })
-        cpSync(resolve(root, path), destination, { recursive: true })
-      }
-      symlinkSync(resolve(root, 'node_modules'), resolve(fixtureRoot, 'node_modules'), 'junction')
       appendFileSync(
         resolve(fixtureRoot, 'dist', 'cli.mjs'),
         '\nif (process.argv.includes("gather")) process.exitCode = 91\n',
@@ -311,6 +328,30 @@ describe('package contract', () => {
       assert.equal(existsSync(dirname(retainedDirectory)), false)
     } finally {
       rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects unreviewed files from packaged source and generated output trees', { timeout: 30_000 }, () => {
+    const results = ['skills/encephalon/unreviewed.txt', 'dist/unreviewed.txt'].map(path => {
+      const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-manifest-')
+      try {
+        writeFileSync(resolve(fixtureRoot, path), 'unreviewed package content\n')
+        return spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+          cwd: fixtureRoot,
+          encoding: 'utf8',
+          timeout: 30_000,
+        })
+      } finally {
+        rmSync(temporaryRoot, { force: true, recursive: true })
+      }
+    })
+    assert.deepEqual(
+      results.map(result => result.status === 0),
+      [false, false],
+    )
+    for (const result of results) {
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /reviewed package file manifest/)
     }
   })
 })

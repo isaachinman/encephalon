@@ -289,13 +289,24 @@ try {
     'docs/performance-budgets.json',
     'package.json',
   ])
-  const unexpected = pack.files
-    .map(file => file.path)
-    .filter(path => !(allowedFiles.has(path) || path.startsWith('dist/') || path.startsWith('skills/')))
-  if (unexpected.length > 0) {
-    throw new Error(`The tarball contains unexpected files: ${unexpected.join(', ')}`)
-  }
+  const reviewedInputs = run(['git', 'ls-files', '--cached', '-z', '--'])
+    .split('\0')
+    .filter(path => path.length > 0)
+  const expectedPackagePaths = new Set([
+    ...reviewedInputs.filter(path => allowedFiles.has(path) || path.startsWith('skills/')),
+    ...reviewedInputs
+      .filter(path => path.startsWith('src/') && path.endsWith('.ts') && !path.endsWith('.d.ts'))
+      .map(path => `dist/${path.slice('src/'.length, -'.ts'.length)}.d.ts`),
+    'dist/cli.mjs',
+    'dist/index.mjs',
+  ])
   const packedPaths = new Set(pack.files.map(file => file.path))
+  const differsFromReviewedManifest =
+    pack.files.some(file => !expectedPackagePaths.has(file.path)) ||
+    [...expectedPackagePaths].some(path => !packedPaths.has(path))
+  if (differsFromReviewedManifest) {
+    throw new Error('The tarball differs from the reviewed package file manifest.')
+  }
   const missingReadmeReferences = readmeReferences(readFileSync(resolve(root, 'README.md'), 'utf8')).filter(
     path => !packedPaths.has(path),
   )
