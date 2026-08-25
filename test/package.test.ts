@@ -1,9 +1,19 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import {
+  appendFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve, sep } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import { describe, test } from 'node:test'
 import { spawnNpmCommand } from '../scripts/npm-command.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
@@ -256,6 +266,51 @@ describe('package contract', () => {
     } finally {
       rmSync(artifactParent, { force: true, recursive: true })
       rmSync(referenceDirectory, { force: true, recursive: true })
+    }
+  })
+
+  test('does not retain a tarball when a late packed CLI check fails', { timeout: 30_000 }, () => {
+    const temporaryRoot = mkdtempSync(join(tmpdir(), 'encephalon-package-late-failure-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    const retainedDirectory = resolve(fixtureRoot, 'late-package-artifact', 'nested')
+    try {
+      for (const path of [
+        'package.json',
+        'scripts/check-package.ts',
+        'scripts/npm-command.ts',
+        'scripts/package-version.ts',
+        'src/generated/version.ts',
+        'dist',
+        'skills/encephalon/SKILL.md',
+        'assets/encephalon.png',
+        'docs/performance.md',
+        'docs/performance-baseline.json',
+        'docs/performance-budgets.json',
+        'README.md',
+        'LICENSE',
+      ]) {
+        const destination = resolve(fixtureRoot, path)
+        mkdirSync(dirname(destination), { recursive: true })
+        cpSync(resolve(root, path), destination, { recursive: true })
+      }
+      symlinkSync(resolve(root, 'node_modules'), resolve(fixtureRoot, 'node_modules'), 'junction')
+      appendFileSync(
+        resolve(fixtureRoot, 'dist', 'cli.mjs'),
+        '\nif (process.argv.includes("gather")) process.exitCode = 91\n',
+      )
+
+      const result = spawnSync(
+        process.execPath,
+        ['./scripts/check-package.ts', '--retain-tarball', 'late-package-artifact/nested'],
+        { cwd: fixtureRoot, encoding: 'utf8', timeout: 30_000 },
+      )
+      assert.notEqual(result.status, 0)
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /failed with exit code 91/)
+      assert.equal(existsSync(retainedDirectory), false)
+      assert.equal(existsSync(dirname(retainedDirectory)), false)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
 })

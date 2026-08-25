@@ -157,9 +157,9 @@ jobs:
       'bun run lint',
       'bun run benchmark:check',
       'bun run build',
-      'git diff --exit-code',
+      'git diff --exit-code HEAD',
       'node ./scripts/check-package.ts',
-      'git diff --exit-code',
+      'git diff --exit-code HEAD',
     ],
   )
   assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 10)
@@ -189,8 +189,8 @@ jobs:
       'node ./scripts/check-generated-version.ts',
       'bun install --frozen-lockfile',
       'bun run build',
-      'git diff --exit-code',
-      'git diff --exit-code',
+      'git diff --exit-code HEAD',
+      'git diff --exit-code HEAD',
     ],
   )
   assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
@@ -213,7 +213,7 @@ jobs:
     [
       'node ./scripts/check-generated-version.ts',
       'bun run build',
-      'git diff --exit-code',
+      'git diff --exit-code HEAD',
       'node ./scripts/check-publish.ts',
       'node ./scripts/check-package.ts --retain-tarball package-artifacts',
       'actions/upload-artifact',
@@ -226,7 +226,7 @@ jobs:
     true,
   )
   assert.equal(
-    releaseJob.lastIndexOf('git diff --exit-code') >
+    releaseJob.lastIndexOf('git diff --exit-code HEAD') >
       releaseJob.indexOf('node ./scripts/check-package.ts --retain-tarball package-artifacts'),
     true,
   )
@@ -249,7 +249,7 @@ jobs:
   assert.equal(workflow.match(/node \.\/scripts\/check-generated-version\.ts/g)?.length, 2)
   assert.doesNotMatch(workflow, /^\s+- run: bun run \.\/scripts\/check-generated-version\.ts$/m)
   assert.doesNotMatch(workflow, /^\s+- run: bun run check:generated$/m)
-  assert.equal(workflow.match(/^\s+- run: git diff --exit-code$/gmu)?.length, 4)
+  assert.equal(workflow.match(/^\s+- run: git diff --exit-code HEAD$/gmu)?.length, 4)
   assert.match(readme, /four verification lanes/)
   assert.match(readme, /trusted pushes to `main`/)
   assert.match(readme, /release-equivalent package gate/)
