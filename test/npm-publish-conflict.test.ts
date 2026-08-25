@@ -1,6 +1,40 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { isPublishedVersionConflictOutput } from '../scripts/npm-publish-conflict.ts'
+
+const root = resolve(import.meta.dirname, '..')
+
+const createPublishCheckFixture = () => {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), 'encephalon-publish-check-'))
+  const scriptsDirectory = resolve(temporaryRoot, 'scripts')
+  mkdirSync(scriptsDirectory)
+  cpSync(resolve(root, 'scripts', 'check-publish.ts'), resolve(scriptsDirectory, 'check-publish.ts'))
+  cpSync(resolve(root, 'scripts', 'npm-publish-conflict.ts'), resolve(scriptsDirectory, 'npm-publish-conflict.ts'))
+  writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module"}\n')
+  writeFileSync(
+    resolve(scriptsDirectory, 'npm-command.ts'),
+    `export const spawnNpmCommand = (arguments_, options) => {
+  if (JSON.stringify(arguments_) !== '["publish","--dry-run","--ignore-scripts","--access","public","--json"]') {
+    throw new Error('Unexpected npm arguments.')
+  }
+  if (typeof options.cwd !== 'string') throw new Error('Missing npm working directory.')
+  return JSON.parse(process.env.ENCEPHALON_TEST_NPM_RESULT ?? '{}')
+}
+`,
+  )
+  return temporaryRoot
+}
+
+const runPublishCheckFixture = (temporaryRoot: string, result: object) =>
+  spawnSync(process.execPath, ['./scripts/check-publish.ts'], {
+    cwd: temporaryRoot,
+    encoding: 'utf8',
+    env: { ...process.env, ENCEPHALON_TEST_NPM_RESULT: JSON.stringify(result) },
+  })
 
 test('accepts only npm diagnostics for an already-published package version', () => {
   const accepted = [
@@ -11,10 +45,11 @@ test('accepts only npm diagnostics for an already-published package version', ()
     ['', '{"error":{"code":"E403","summary":"You cannot publish over the previously published versions: 0.2.0."}}'],
     ['{"error":{"summary":"You cannot publish over the previously published versions: 0.2.0."}}', ''],
     ['You cannot publish over the previously published versions: 0.2.0.\n', 'npm error code EPUBLISHCONFLICT\n'],
+    ['You cannot publish over the previously published versions: 0.2.0.\r\n', 'npm error code E403\r\n'],
   ] as const
   assert.deepEqual(
     accepted.map(([stdout, stderr]) => isPublishedVersionConflictOutput(stdout, stderr)),
-    [true, true, true, true],
+    [true, true, true, true, true],
   )
 
   const rejected = [
@@ -28,4 +63,37 @@ test('accepts only npm diagnostics for an already-published package version', ()
     rejected.map(([stdout, stderr]) => isPublishedVersionConflictOutput(stdout, stderr)),
     [false, false, false, false, false],
   )
+})
+
+test('publish checker forwards npm output and rejects unrelated publish failures', () => {
+  const temporaryRoot = createPublishCheckFixture()
+  try {
+    const success = runPublishCheckFixture(temporaryRoot, { status: 0, stderr: '', stdout: 'publish succeeded\n' })
+    assert.equal(success.status, 0, success.stderr)
+    assert.equal(success.stdout, 'publish succeeded\n')
+    assert.equal(success.stderr, '')
+
+    const conflictOutput =
+      '{"error":{"code":"EPUBLISHCONFLICT","summary":"You cannot publish over the previously published versions: 0.2.0."}}\n'
+    const conflict = runPublishCheckFixture(temporaryRoot, {
+      status: 1,
+      stderr: 'npm warning\n',
+      stdout: conflictOutput,
+    })
+    assert.equal(conflict.status, 0, conflict.stderr)
+    assert.equal(conflict.stdout, conflictOutput)
+    assert.equal(conflict.stderr, 'npm warning\n')
+
+    const failure = runPublishCheckFixture(temporaryRoot, {
+      status: 1,
+      stderr: 'npm error code E401\nAuthentication failed.\n',
+      stdout: '',
+    })
+    assert.notEqual(failure.status, 0)
+    assert.equal(failure.stdout, '')
+    assert.match(failure.stderr, /^npm error code E401\nAuthentication failed\.\n/u)
+    assert.match(failure.stderr, /npm publish dry-run failed with exit code 1\./u)
+  } finally {
+    rmSync(temporaryRoot, { force: true, recursive: true })
+  }
 })
