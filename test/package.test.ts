@@ -167,12 +167,15 @@ const partitionWorkflowSource = (source: string) => {
 const workflowContainsSecretsContext = (workflow: string) => {
   const { evaluableSource, structuralSource } = partitionWorkflowSource(workflow)
   const encodedYamlScalar = /\\(?:U[\dA-Fa-f]{8}|u[\dA-Fa-f]{4}|x[\dA-Fa-f]{2})|\\\s*$/mu
+  // Resolving anchors or flow mappings safely would require the excluded YAML parser, so ambiguous forms fail closed.
+  const yamlAnchorOrAlias = /(?:^|\s|:|,|\{|\[|\?)[&*][^\s&*,[\]{}]+/mu
   const flowStyleCondition = /[,{]\s*["']?if["']?\s*:/u
   const implicitConditions = [...structuralSource.matchAll(/^\s+(?:-\s+)?if:\s*(.+)$/gmu)].map(match =>
     stripYamlScalarQuotes(match[1] ?? ''),
   )
   return (
     encodedYamlScalar.test(structuralSource) ||
+    yamlAnchorOrAlias.test(structuralSource) ||
     flowStyleCondition.test(structuralSource) ||
     extractGithubExpressions(evaluableSource).some(expressionContainsSecretsContext) ||
     implicitConditions.some(expression => /^[>|]/u.test(expression) || expressionContainsSecretsContext(expression))
@@ -194,6 +197,7 @@ describe('package contract', () => {
       "jobs:\n  verify:\n    if: secrets.RUN_VERIFY == 'true'\n",
       'jobs:\n  verify:\n    if: >-\n      secrets.RUN_VERIFY\n',
       'jobs: { verify: { if: secrets.RUN_VERIFY, runs-on: ubuntu-latest } }\n',
+      "env:\n  CONDITION: &condition secrets.RUN_VERIFY == 'true'\njobs:\n  verify:\n    if: *condition\n",
       `steps:\n  - run: |\n      # ${githubExpression('secrets.NPM_TOKEN')}\n`,
       `env:\n  "${githubExpression('secrets.DYNAMIC_NAME')}": value\n`,
     ]) {
