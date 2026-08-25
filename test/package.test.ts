@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { describe, test } from 'node:test'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
@@ -186,7 +188,7 @@ const extractImplicitConditions = (source: string) => {
         result.active === undefined
           ? result.expressions
           : [...result.expressions, stripYamlScalarQuotes(result.active.expression)]
-      const match = trimmedLine.match(/^(?<listPrefix>-\s+)?(?:"if"|'if'|if)\s*:\s*(?<expression>.+)$/u)
+      const match = trimmedLine.match(/^(?<listPrefix>-\s+)?(?:"if"|'if'|if)\s*:\s*(?<expression>.*)$/u)
       return {
         active:
           match === null
@@ -241,6 +243,7 @@ describe('package contract', () => {
       'jobs: { verify: { if: secrets.RUN_VERIFY, runs-on: ubuntu-latest } }\n',
       "env:\n  CONDITION: &condition secrets.RUN_VERIFY == 'true'\njobs:\n  verify:\n    if: *condition\n",
       "jobs:\n  verify:\n    if: github.ref == 'refs/heads/main' &&\n      secrets.RUN_VERIFY == 'true'\n",
+      "jobs:\n  verify:\n    if:\n      github.ref == 'refs/heads/main' &&\n      secrets.RUN_VERIFY == 'true'\n",
       `steps:\n  - run: |\n      # ${githubExpression('secrets.NPM_TOKEN')}\n`,
       `env:\n  "${githubExpression('secrets.DYNAMIC_NAME')}": value\n`,
     ]) {
@@ -254,6 +257,7 @@ describe('package contract', () => {
       `env:\n  NOTE: ${githubExpression("'secrets.NPM_TOKEN'")}\n`,
       `env:\n  NOTE: ${githubExpression('github.secrets')}\n`,
       "jobs:\n  verify:\n    if: github.ref ==\n      'refs/heads/main'\n",
+      "jobs:\n  verify:\n    if:\n      github.ref ==\n      'refs/heads/main'\n",
       'env:\n  NOTE: repository secrets are unavailable to pull requests\n',
       '# secrets.NPM_TOKEN must never be used here\nenv:\n  SAFE: true\n',
       `# ${githubExpression('secrets.NPM_TOKEN')} is documentation only\nenv:\n  SAFE: true\n`,
@@ -474,6 +478,27 @@ describe('package contract', () => {
     assert.doesNotMatch(skill, /node \.\/node_modules\/encephalon\/dist\/cli\.mjs/)
   })
 
+  test('retains the exact package tarball exercised by the package checker', { timeout: 30_000 }, () => {
+    const artifactDirectoryName = join('test', `.package-artifacts-test-${randomUUID()}`)
+    const artifactDirectory = resolve(root, artifactDirectoryName)
+    try {
+      const result = spawnSync(
+        process.execPath,
+        ['./scripts/check-package.ts', '--retain-tarball', artifactDirectoryName],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          timeout: 30_000,
+        },
+      )
+      assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+      const retainedFiles = readdirSync(artifactDirectory)
+      assert.deepEqual(retainedFiles, [`encephalon-${PACKAGE_VERSION}.tgz`])
+    } finally {
+      rmSync(artifactDirectory, { force: true, recursive: true })
+    }
+  })
+
   test('runs pull-request and current-Node package checks with a trusted release gate', () => {
     const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
     const readme = readFileSync(resolve(root, 'README.md'), 'utf8')
@@ -482,6 +507,7 @@ describe('package contract', () => {
       scripts?: Record<string, unknown>
     }
     const generatedVersionScript = String(packageJson.scripts?.['check:generated'])
+    const packageScript = String(packageJson.scripts?.['check:package'])
     const publishScript = String(packageJson.scripts?.['check:publish'])
     const eventsStart = workflow.indexOf('\non:\n') + 1
     const permissionsStart = workflow.indexOf('\npermissions:\n', eventsStart)
@@ -581,7 +607,7 @@ jobs:
         'bun run benchmark:check',
         'bun run build',
         'git diff --exit-code',
-        'bun run check:package',
+        'node ./scripts/check-package.ts',
       ],
     )
     assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 9)
@@ -612,19 +638,20 @@ jobs:
         'bun install --frozen-lockfile',
         'bun run build',
         'git diff --exit-code',
-        'bun run check:package',
+        'git diff --exit-code',
       ],
     )
     assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
     assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length, 1)
     assert.doesNotMatch(releaseSteps, /^\s{8}continue-on-error:/m)
+    assert.equal(releaseJob.match(/npm pack --dry-run=false/g)?.length ?? 0, 0)
+    assert.match(releaseJob, /- name: Check npm publish dry run\n\s+run: node \.\/scripts\/check-publish\.ts/)
     assert.match(
       releaseJob,
-      /- name: Create release-equivalent package artifact\n\s+shell: bash\n\s+run: \|\n\s+mkdir -p package-artifacts\n\s+npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts > package-artifacts\/npm-pack\.json/,
+      /- name: Check and retain release-equivalent package artifact\n\s+run: node \.\/scripts\/check-package\.ts --retain-tarball package-artifacts/,
     )
-    assert.equal(releaseJob.match(/npm pack --dry-run=false/g)?.length, 1)
-    assert.match(releaseJob, /- name: Check npm publish dry run\n\s+run: bun run check:publish/)
-    assert.equal(releaseJob.match(/bun run check:publish/g)?.length, 1)
+    assert.equal(releaseJob.match(/node \.\/scripts\/check-publish\.ts/g)?.length, 1)
+    assert.equal(releaseJob.match(/node \.\/scripts\/check-package\.ts --retain-tarball/g)?.length, 1)
     assert.equal(releaseJob.match(/actions\/upload-artifact/g)?.length, 1)
     assert.match(
       releaseJob,
@@ -635,9 +662,8 @@ jobs:
         'node ./scripts/check-generated-version.ts',
         'bun run build',
         'git diff --exit-code',
-        'bun run check:package',
-        'npm pack',
-        'bun run check:publish',
+        'node ./scripts/check-publish.ts',
+        'node ./scripts/check-package.ts --retain-tarball package-artifacts',
         'actions/upload-artifact',
       ]
         .map(step => releaseJob.indexOf(step))
@@ -645,6 +671,11 @@ jobs:
           (position, index, positions) =>
             position >= 0 && (index === 0 || position > (positions[index - 1] ?? Number.POSITIVE_INFINITY)),
         ),
+      true,
+    )
+    assert.equal(
+      releaseJob.lastIndexOf('git diff --exit-code') >
+        releaseJob.indexOf('node ./scripts/check-package.ts --retain-tarball package-artifacts'),
       true,
     )
     assert.equal(
@@ -666,12 +697,13 @@ jobs:
     assert.equal(workflow.match(/node \.\/scripts\/check-generated-version\.ts/g)?.length, 2)
     assert.doesNotMatch(workflow, /^\s+- run: bun run \.\/scripts\/check-generated-version\.ts$/m)
     assert.doesNotMatch(workflow, /^\s+- run: bun run check:generated$/m)
-    assert.equal(workflow.match(/^\s+- run: git diff --exit-code$/gmu)?.length, 2)
+    assert.equal(workflow.match(/^\s+- run: git diff --exit-code$/gmu)?.length, 3)
     assert.match(readme, /four verification lanes/)
     assert.match(readme, /trusted pushes to `main`/)
     assert.match(readme, /release-equivalent package gate/)
     assert.equal(generatedVersionScript, 'bun run scripts/check-generated-version.ts')
-    assert.equal(publishScript, 'bun run scripts/check-publish.ts')
+    assert.equal(packageScript, 'node ./scripts/check-package.ts')
+    assert.equal(publishScript, 'node ./scripts/check-publish.ts')
     assert.equal(publishCheck.includes("'--dry-run'"), true)
     assert.equal(publishCheck.includes("'--ignore-scripts'"), true)
     assert.equal(publishCheck.includes('You cannot publish over the previously published versions'), true)

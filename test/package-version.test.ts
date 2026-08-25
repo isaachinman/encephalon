@@ -42,7 +42,7 @@ test('renders generated package-version source deterministically', () => {
 })
 
 test('accepts complete checkout line endings and rejects every other source shape', () => {
-  const renderedSource = '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.0"\n'
+  const renderedSource = renderPackageVersionSource('0.2.0')
   assert.doesNotThrow(() => assertPackageVersionSource('0.2.0', renderedSource))
   assert.doesNotThrow(() => assertPackageVersionSource('0.2.0', renderedSource.replaceAll('\n', '\r\n')))
 
@@ -50,7 +50,7 @@ test('accepts complete checkout line endings and rejects every other source shap
   assert.equal(misleadingSource.includes('PACKAGE_VERSION = "0.2.0"'), true)
   for (const source of [
     renderedSource.replace('\n', '\r\n'),
-    '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.1"\n',
+    renderPackageVersionSource('0.2.1'),
     misleadingSource,
     `// Unreviewed wrapper\n${renderedSource}`,
   ]) {
@@ -62,14 +62,13 @@ test('generated-version adapters reject stale or missing source without modifyin
   const temporaryRoot = createCheckFixture()
   const generatedVersionPath = resolve(temporaryRoot, 'src', 'generated', 'version.ts')
   try {
-    const currentSource =
-      '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.0"\n'
+    const currentSource = renderPackageVersionSource('0.2.0')
     writeFileSync(generatedVersionPath, currentSource, 'utf8')
     const currentResult = runFixtureScript(temporaryRoot, 'check-generated-version.ts')
     assert.equal(currentResult.status, 0, `${currentResult.stdout}${currentResult.stderr}`)
     assert.equal(readFileSync(generatedVersionPath, 'utf8'), currentSource)
 
-    const staleSource = '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.1"\n'
+    const staleSource = renderPackageVersionSource('0.2.1')
     writeFileSync(generatedVersionPath, staleSource, 'utf8')
     const staleResults = ['check-generated-version.ts', 'check-package.ts'].map(filename =>
       runFixtureScript(temporaryRoot, filename),
@@ -98,8 +97,8 @@ test('direct generated-version check bypasses package lifecycle hooks', () => {
   const temporaryRoot = createCheckFixture()
   const generatedVersionPath = resolve(temporaryRoot, 'src', 'generated', 'version.ts')
   const repairMarkerPath = resolve(temporaryRoot, 'repair-ran')
-  const staleSource = '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.1"\n'
-  const currentSource = '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.0"\n'
+  const staleSource = renderPackageVersionSource('0.2.1')
+  const currentSource = renderPackageVersionSource('0.2.0')
   try {
     writeFileSync(generatedVersionPath, staleSource, 'utf8')
     writeFileSync(
@@ -139,8 +138,8 @@ test('authoritative workflow check bypasses Bun preloads', () => {
   const temporaryRoot = createCheckFixture()
   const generatedVersionPath = resolve(temporaryRoot, 'src', 'generated', 'version.ts')
   const repairMarkerPath = resolve(temporaryRoot, 'preload-ran')
-  const staleSource = '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.1"\n'
-  const currentSource = '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.0"\n'
+  const staleSource = renderPackageVersionSource('0.2.1')
+  const currentSource = renderPackageVersionSource('0.2.0')
   try {
     writeFileSync(generatedVersionPath, staleSource, 'utf8')
     writeFileSync(resolve(temporaryRoot, 'bunfig.toml'), 'preload = ["./repair-generated.ts"]\n', 'utf8')
@@ -223,7 +222,7 @@ test('build regenerates the exact package-version source in an isolated reposito
     assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
     assert.equal(
       readFileSync(resolve(temporaryRoot, 'src', 'generated', 'version.ts'), 'utf8'),
-      '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "1.2.3-fixture"\n',
+      renderPackageVersionSource('1.2.3-fixture'),
     )
   } finally {
     rmSync(temporaryRoot, { force: true, recursive: true })

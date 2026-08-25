@@ -1,22 +1,28 @@
+import { spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const command = ['npm', 'publish', '--dry-run', '--ignore-scripts', '--access', 'public', '--json']
+const npmArguments = ['publish', '--dry-run', '--ignore-scripts', '--access', 'public', '--json']
+const usesWindowsNpm = process.platform === 'win32'
+const executable = usesWindowsNpm ? (process.env.ComSpec ?? 'cmd.exe') : 'npm'
+const arguments_ = usesWindowsNpm ? ['/d', '/s', '/c', 'npm.cmd', ...npmArguments] : npmArguments
 
-const result = Bun.spawnSync({
-  cmd: command,
+const result = spawnSync(executable, arguments_, {
   cwd: root,
-  stderr: 'pipe',
-  stdout: 'pipe',
+  encoding: 'utf8',
 })
-const stdout = result.stdout.toString()
-const stderr = result.stderr.toString()
+if (result.error !== undefined) {
+  throw result.error
+}
+const exitCode = result.status ?? 1
+const stdout = result.stdout ?? ''
+const stderr = result.stderr ?? ''
 
 process.stdout.write(stdout)
 process.stderr.write(stderr)
 
-if (result.exitCode === 0) {
+if (exitCode === 0) {
   process.exit(0)
 }
 
@@ -56,4 +62,4 @@ if (jsonErrors.some(isPublishConflictError) || (hasTextConflictCode && hasTextCo
   process.exit(0)
 }
 
-throw new Error(`npm publish dry-run failed with exit code ${result.exitCode}.`)
+throw new Error(`npm publish dry-run failed with exit code ${exitCode}.`)

@@ -1,4 +1,7 @@
+import { spawnSync } from 'node:child_process'
 import {
+  constants,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -9,41 +12,88 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import { gunzipSync } from 'node:zlib'
 import { assertPackageVersionSource } from './package-version.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const parseRetainedTarballDirectory = (arguments_: string[]) => {
+  if (arguments_.length === 0) {
+    return
+  }
+  const [option, directoryName] = arguments_
+  const directory = directoryName === undefined ? root : resolve(root, directoryName)
+  const repositoryRelativeDirectory = relative(root, directory)
+  if (
+    arguments_.length === 2 &&
+    option === '--retain-tarball' &&
+    directoryName !== undefined &&
+    !isAbsolute(directoryName) &&
+    repositoryRelativeDirectory !== '' &&
+    repositoryRelativeDirectory !== '..' &&
+    !repositoryRelativeDirectory.startsWith(`..${sep}`) &&
+    !isAbsolute(repositoryRelativeDirectory)
+  ) {
+    return directory
+  }
+  throw new Error('Usage: check-package.ts [--retain-tarball <repository-relative-directory>]')
+}
+
+const retainedTarballDirectory = parseRetainedTarballDirectory(process.argv.slice(2))
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-check-'))
 
-const run = (command: string[], cwd = root) => {
-  const result = Bun.spawnSync({
-    cmd: command,
-    cwd,
-    stderr: 'pipe',
-    stdout: 'pipe',
-  })
-  if (result.exitCode === 0) {
-    return result.stdout.toString()
+const execute = (command: string[], cwd = root) => {
+  const [requestedExecutable, ...arguments_] = command
+  if (requestedExecutable !== undefined) {
+    const usesWindowsNpm = requestedExecutable === 'npm' && process.platform === 'win32'
+    const executable = usesWindowsNpm ? (process.env.ComSpec ?? 'cmd.exe') : requestedExecutable
+    const executableArguments = usesWindowsNpm ? ['/d', '/s', '/c', 'npm.cmd', ...arguments_] : arguments_
+    const result = spawnSync(executable, executableArguments, {
+      cwd,
+      encoding: 'utf8',
+    })
+    if (result.error !== undefined) {
+      throw result.error
+    }
+    return {
+      exitCode: result.status ?? 1,
+      stderr: result.stderr ?? '',
+      stdout: result.stdout ?? '',
+    }
   }
-  process.stderr.write(result.stdout.toString())
-  process.stderr.write(result.stderr.toString())
+  throw new Error('Package check command must not be empty.')
+}
+
+const run = (command: string[], cwd = root) => {
+  const result = execute(command, cwd)
+  if (result.exitCode === 0) {
+    return result.stdout
+  }
+  process.stderr.write(result.stdout)
+  process.stderr.write(result.stderr)
   throw new Error(`${command[0]} failed with exit code ${result.exitCode}.`)
 }
 
 const runExpectedFailure = (command: string[], cwd = root) => {
-  const result = Bun.spawnSync({
-    cmd: command,
-    cwd,
-    stderr: 'pipe',
-    stdout: 'pipe',
-  })
+  const result = execute(command, cwd)
   return {
     exitCode: result.exitCode,
-    stderr: result.stderr.toString(),
-    stdout: result.stdout.toString(),
+    stderr: result.stderr,
+    stdout: result.stdout,
+  }
+}
+
+const retainTarball = (tarball: string, filename: string) => {
+  if (retainedTarballDirectory !== undefined) {
+    mkdirSync(retainedTarballDirectory, { mode: 0o700 })
+    try {
+      copyFileSync(tarball, resolve(retainedTarballDirectory, filename), constants.COPYFILE_EXCL)
+    } catch (error) {
+      rmSync(retainedTarballDirectory, { force: true, recursive: true })
+      throw error
+    }
   }
 }
 
@@ -200,7 +250,7 @@ try {
     filename: string
     files: Array<{ path: string; mode?: number }>
   }>
-  if (pack === undefined) {
+  if (pack === undefined || basename(pack.filename) !== pack.filename || !pack.filename.endsWith('.tgz')) {
     throw new Error('npm pack did not return package metadata.')
   }
   const allowedFiles = new Set([
@@ -403,6 +453,7 @@ try {
   if (!(Array.isArray(gathered.records) && Array.isArray(gathered.searches))) {
     throw new Error('The packed Node-only CLI gather command returned an unexpected result.')
   }
+  retainTarball(tarball, pack.filename)
 } finally {
   rmSync(temporaryDirectory, { force: true, recursive: true })
 }

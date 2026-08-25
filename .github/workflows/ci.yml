@@ -58,7 +58,7 @@ jobs:
       - run: bun run benchmark:check
       - run: bun run build
       - run: git diff --exit-code
-      - run: bun run check:package
+      - run: node ./scripts/check-package.ts
 
   release:
     name: Release-equivalent package gate
@@ -78,14 +78,11 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run build
       - run: git diff --exit-code
-      - run: bun run check:package
-      - name: Create release-equivalent package artifact
-        shell: bash
-        run: |
-          mkdir -p package-artifacts
-          npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts > package-artifacts/npm-pack.json
       - name: Check npm publish dry run
-        run: bun run check:publish
+        run: node ./scripts/check-publish.ts
+      - name: Check and retain release-equivalent package artifact
+        run: node ./scripts/check-package.ts --retain-tarball package-artifacts
+      - run: git diff --exit-code
       - name: Upload trusted release-equivalent package artifact
         if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
