@@ -8,10 +8,12 @@ import { npmCommand, spawnNpmCommand } from '../scripts/npm-command.ts'
 test('resolves Windows npm through the provisioned Node installation', () => {
   const nodeExecutable = String.raw`C:\hostedtoolcache\windows\node\24.15.0\x64\node.exe`
   const npmCli = String.raw`C:\hostedtoolcache\windows\node\24.15.0\x64\node_modules\npm\bin\npm-cli.js`
+  const competingNpmExecPath = String.raw`D:\node\node_modules\npm\bin\npm-cli.js`
   assert.deepEqual(
     npmCommand(['pack'], {
       nodeExecutable,
-      pathExists: path => path === npmCli,
+      npmExecPath: competingNpmExecPath,
+      pathExists: path => path === npmCli || path === competingNpmExecPath,
       platform: 'win32',
     }),
     { arguments: [npmCli, 'pack'], executable: nodeExecutable },

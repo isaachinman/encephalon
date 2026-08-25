@@ -20,6 +20,9 @@ import { spawnNpmCommand } from './npm-command.ts'
 import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const retainedTarballUsage = () =>
+  new Error('Usage: check-package.ts [--retain-tarball <repository-relative-directory>]')
+
 const parseRetainedTarballDirectory = (arguments_: string[]) => {
   if (arguments_.length === 0) {
     return
@@ -39,7 +42,7 @@ const parseRetainedTarballDirectory = (arguments_: string[]) => {
   ) {
     return directory
   }
-  throw new Error('Usage: check-package.ts [--retain-tarball <repository-relative-directory>]')
+  throw retainedTarballUsage()
 }
 
 const retainedTarballDirectory = parseRetainedTarballDirectory(process.argv.slice(2))
@@ -96,9 +99,25 @@ const runNpm = (arguments_: readonly string[], cwd = root) => {
   throw new Error(`npm failed with exit code ${result.status ?? 1}.`)
 }
 
+const createRetainedTarballParents = (parentDirectory: string) =>
+  relative(root, parentDirectory)
+    .split(sep)
+    .filter(segment => segment.length > 0)
+    .reduce((parent, segment) => {
+      const directory = resolve(parent, segment)
+      const entry = lstatSync(directory, { throwIfNoEntry: false })
+      if (entry === undefined) {
+        mkdirSync(directory, { mode: 0o700 })
+      } else if (!(entry.isDirectory() && !entry.isSymbolicLink())) {
+        throw retainedTarballUsage()
+      }
+      return directory
+    }, root)
+
 const retainTarball = (tarball: string, filename: string) => {
   if (retainedTarballDirectory !== undefined) {
-    mkdirSync(dirname(retainedTarballDirectory), { mode: 0o700, recursive: true })
+    const parentDirectory = dirname(retainedTarballDirectory)
+    createRetainedTarballParents(parentDirectory)
     mkdirSync(retainedTarballDirectory, { mode: 0o700 })
     const retainedTarball = resolve(retainedTarballDirectory, filename)
     copyFileSync(tarball, retainedTarball, constants.COPYFILE_EXCL)
