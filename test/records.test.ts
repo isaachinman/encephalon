@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import {
   existsSync,
@@ -40,7 +41,14 @@ import {
   validateRecordsResolved,
 } from '../src/records.ts'
 import { discoverRepository, repositoryTestHooks } from '../src/repository.ts'
-import { parseRecordFile, validateAddRecordInput, validateKind } from '../src/schema.ts'
+import {
+  formatRecordFile,
+  MAX_PAYLOAD_NODES,
+  parseRecordFile,
+  validateAddRecordInput,
+  validateJsonValue,
+  validateKind,
+} from '../src/schema.ts'
 import * as stagingInternals from '../src/staging.ts'
 import type { BrainRecord, ValidateResult } from '../src/types.ts'
 import {
@@ -3226,30 +3234,194 @@ describe('canonical records', () => {
         }),
       'INVALID_ARGUMENT',
     )
-  })
 
-  test('returns stable invalid argument errors for hostile payload descriptors', () => {
-    const root = createRoot()
-    const throwingDescriptorProxy = new Proxy(
-      { summary: 'Hidden' },
-      {
-        getOwnPropertyDescriptor: () => {
-          throw new Error('descriptor trap must not escape')
-        },
+    const payloadArray = ['value'] as string[] & { metadata?: string }
+    Object.defineProperty(payloadArray, 'metadata', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1
+        return 'side effect'
       },
-    )
-
+    })
     assertErrorCode(
       () =>
         api.addRecord({
           kind: 'decision',
-          payload: throwingDescriptorProxy,
+          payload: payloadArray,
           root,
           source: 'agent',
-          subject: 'payload.proxy',
+          subject: 'payload.array-accessor',
         }),
       'INVALID_ARGUMENT',
     )
+    assert.equal(getterCalls, 0)
+  })
+
+  test('returns stable invalid argument errors for hostile payload descriptors', () => {
+    const root = createRoot()
+    const hostilePayloads: Array<{ message: string; payload: unknown; secret?: string }> = [
+      {
+        message: 'payload object descriptors could not be inspected.',
+        payload: new Proxy(
+          { summary: 'Hidden' },
+          {
+            getOwnPropertyDescriptor: () => {
+              throw new Error('PRIVATE_DESCRIPTOR_TRAP')
+            },
+          },
+        ),
+        secret: 'PRIVATE_DESCRIPTOR_TRAP',
+      },
+      {
+        message: 'payload object descriptors could not be inspected.',
+        payload: new Proxy(
+          { summary: 'Hidden' },
+          {
+            ownKeys: () => {
+              throw new Error('PRIVATE_OWN_KEYS_TRAP')
+            },
+          },
+        ),
+        secret: 'PRIVATE_OWN_KEYS_TRAP',
+      },
+      {
+        message: 'payload object metadata could not be inspected.',
+        payload: new Proxy(
+          { summary: 'Hidden' },
+          {
+            getPrototypeOf: () => {
+              throw new Error('PRIVATE_PROTOTYPE_TRAP')
+            },
+          },
+        ),
+        secret: 'PRIVATE_PROTOTYPE_TRAP',
+      },
+      {
+        message: 'payload object descriptors could not be inspected.',
+        payload: new Proxy(
+          {},
+          {
+            ownKeys: () => ['duplicate', 'duplicate'],
+          },
+        ),
+      },
+    ]
+
+    for (const { message, payload, secret } of hostilePayloads) {
+      assert.throws(
+        () =>
+          api.addRecord({
+            kind: 'decision',
+            payload: payload as never,
+            root,
+            source: 'agent',
+            subject: 'payload.proxy',
+          }),
+        (error: unknown) => {
+          const actual = error as {
+            cause?: unknown
+            code?: unknown
+            details?: unknown
+            message?: unknown
+            name?: unknown
+          }
+          assert.equal(actual.name, 'EncephalonError')
+          assert.equal(actual.code, 'INVALID_ARGUMENT')
+          assert.equal(actual.message, message)
+          assert.deepEqual(actual.details, { field: 'payload' })
+          assert.equal(actual.cause, undefined)
+          if (secret !== undefined) {
+            assert.equal(JSON.stringify({ details: actual.details, message: actual.message }).includes(secret), false)
+          }
+          return true
+        },
+      )
+    }
+  })
+
+  test('rejects oversized arrays and revoked proxies at the guarded metadata boundary', () => {
+    const oversizedArrayCalls: string[] = []
+    const oversizedArray = new Proxy(new Array(2 ** 32 - 1), {
+      getOwnPropertyDescriptor: (target, key) => {
+        oversizedArrayCalls.push(`descriptor:${String(key)}`)
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      },
+      ownKeys: target => {
+        oversizedArrayCalls.push('ownKeys')
+        throw new Error(`oversized ownKeys must not run for ${Reflect.ownKeys(target).length} keys`)
+      },
+    })
+
+    assert.throws(
+      () => validateJsonValue(oversizedArray),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+        assert.equal(actual.code, 'INVALID_ARGUMENT')
+        assert.equal(actual.message, 'payload may contain at most 10000 JSON nodes.')
+        assert.deepEqual(actual.details, { field: 'payload' })
+        return true
+      },
+    )
+    assert.deepEqual(oversizedArrayCalls, ['descriptor:length'])
+
+    const invalidLengthDescriptor = (target: unknown[], key: PropertyKey) => {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, key)
+      return key === 'length' && descriptor !== undefined ? { ...descriptor, value: -1 } : descriptor
+    }
+    const symbolArray: unknown[] = []
+    Object.defineProperty(symbolArray, Symbol('metadata'), { value: null })
+    const accessorArray: unknown[] = []
+    Object.defineProperty(accessorArray, 'metadata', {
+      get: () => {
+        throw new Error('accessor must not run')
+      },
+    })
+    const invalidLengthCases = [
+      {
+        message: 'payload contains a symbol-keyed property.',
+        payload: new Proxy(symbolArray, { getOwnPropertyDescriptor: invalidLengthDescriptor }),
+      },
+      {
+        message: 'payload contains an accessor property.',
+        payload: new Proxy(accessorArray, { getOwnPropertyDescriptor: invalidLengthDescriptor }),
+      },
+      {
+        message: 'payload object descriptors could not be inspected.',
+        payload: new Proxy([], {
+          getOwnPropertyDescriptor: invalidLengthDescriptor,
+          ownKeys: () => {
+            throw new Error('invalid-length ownKeys trap must remain classified')
+          },
+        }),
+      },
+    ]
+    for (const { message, payload } of invalidLengthCases) {
+      assert.throws(
+        () => validateJsonValue(payload),
+        (error: unknown) => {
+          const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+          assert.equal(actual.code, 'INVALID_ARGUMENT')
+          assert.equal(actual.message, message)
+          assert.deepEqual(actual.details, { field: 'payload' })
+          return true
+        },
+      )
+    }
+
+    for (const target of [{}, []]) {
+      const { proxy, revoke } = Proxy.revocable(target, {})
+      revoke()
+      assert.throws(
+        () => validateJsonValue(proxy),
+        (error: unknown) => {
+          const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+          assert.equal(actual.code, 'INVALID_ARGUMENT')
+          assert.equal(actual.message, 'payload object metadata could not be inspected.')
+          assert.deepEqual(actual.details, { field: 'payload' })
+          return true
+        },
+      )
+    }
   })
 
   test('bounds payload depth and total node count', () => {
@@ -3259,10 +3431,32 @@ describe('canonical records', () => {
     const buildWidePayload = (properties: number) =>
       Object.fromEntries(Array.from({ length: properties }, (_, index) => [`k${index}`, null]))
 
+    const assertCanonicalBoundary = (id: string, payload: unknown, bytes: number, digest: string) => {
+      const formatted = formatRecordFile(
+        parseRecordFile({
+          createdAt: '2026-01-01T00:00:00.000Z',
+          id,
+          kind: 'decision',
+          payload,
+          source: 'test',
+          subject: `payload.${id}`,
+        }),
+      )
+      assert.equal(Buffer.byteLength(formatted), bytes)
+      assert.equal(createHash('sha256').update(formatted).digest('hex'), digest)
+    }
+
+    const deepestPayload = buildNestedPayload(64)
+    assertCanonicalBoundary(
+      'boundary-depth',
+      deepestPayload,
+      9452,
+      '6a04ae78319ead1fedec08327013931bad08971794db94d1dc22c916dbad1ac0',
+    )
     const deepestValid = api.addRecord({
       id: 'payload-depth-limit',
       kind: 'decision',
-      payload: buildNestedPayload(64) as never,
+      payload: deepestPayload as never,
       root,
       source: 'agent',
       subject: 'payload.depth.valid',
@@ -3281,10 +3475,17 @@ describe('canonical records', () => {
       'INVALID_ARGUMENT',
     )
 
+    const widestPayload = buildWidePayload(MAX_PAYLOAD_NODES - 1)
+    assertCanonicalBoundary(
+      'boundary-width',
+      widestPayload,
+      189_043,
+      '098091eb7228eb18c8fad2c45150d5afdacc865db010f2a2c099419b84e31b7e',
+    )
     const widestValid = api.addRecord({
       id: 'payload-node-limit',
       kind: 'decision',
-      payload: buildWidePayload(9999),
+      payload: widestPayload,
       root,
       source: 'agent',
       subject: 'payload.nodes.valid',
@@ -3302,6 +3503,319 @@ describe('canonical records', () => {
         }),
       'INVALID_ARGUMENT',
     )
+
+    const widestArray = Array.from({ length: MAX_PAYLOAD_NODES - 1 }, () => null)
+    const validatedArray = validateJsonValue(widestArray)
+    assert.ok(Array.isArray(validatedArray))
+    assert.equal(validatedArray.length, MAX_PAYLOAD_NODES - 1)
+
+    assert.throws(
+      () => validateJsonValue(Array.from({ length: MAX_PAYLOAD_NODES }, () => null)),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+        assert.equal(actual.code, 'INVALID_ARGUMENT')
+        assert.equal(actual.message, 'payload may contain at most 10000 JSON nodes.')
+        assert.deepEqual(actual.details, { field: 'payload' })
+        return true
+      },
+    )
+  })
+
+  test('bounds wide-object descriptor work before child traversal', () => {
+    const validatePayload = (payload: unknown) =>
+      validateAddRecordInput({
+        kind: 'decision',
+        payload: payload as never,
+        source: 'agent',
+        subject: 'payload.descriptor-budget',
+      }).payload
+
+    const wideObjectCalls = { descriptors: 0, ownKeys: 0 }
+    let childVisits = 0
+    const child = new Proxy(
+      {},
+      {
+        getPrototypeOf: target => {
+          childVisits += 1
+          return Reflect.getPrototypeOf(target)
+        },
+      },
+    )
+    const wideObjectTarget: Record<string, unknown> = Object.fromEntries(
+      Array.from({ length: MAX_PAYLOAD_NODES }, (_, index) => [`k${index}`, null]),
+    )
+    wideObjectTarget.k0 = child
+    const wideObject = new Proxy(wideObjectTarget, {
+      getOwnPropertyDescriptor: (target, key) => {
+        wideObjectCalls.descriptors += 1
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      },
+      ownKeys: target => {
+        wideObjectCalls.ownKeys += 1
+        return Reflect.ownKeys(target)
+      },
+    })
+    const allocationWork = {
+      'payload-output-container': 0,
+      'payload-retained-value': 0,
+    }
+    assert.throws(
+      () =>
+        validateJsonValue(wideObject, {
+          onWork: operation => {
+            allocationWork[operation] += 1
+          },
+        }),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+        assert.equal(actual.code, 'INVALID_ARGUMENT')
+        assert.equal(actual.message, 'payload may contain at most 10000 JSON nodes.')
+        assert.deepEqual(actual.details, { field: 'payload' })
+        return true
+      },
+    )
+    assert.deepEqual(wideObjectCalls, { descriptors: MAX_PAYLOAD_NODES, ownKeys: 1 })
+    assert.deepEqual(allocationWork, {
+      'payload-output-container': 0,
+      'payload-retained-value': MAX_PAYLOAD_NODES - 1,
+    })
+    assert.equal(childVisits, 0)
+
+    const observerFailure = new Error('payload work observer failure')
+    assert.throws(
+      () =>
+        validateJsonValue(
+          { value: null },
+          {
+            onWork: () => {
+              throw observerFailure
+            },
+          },
+        ),
+      (error: unknown) => error === observerFailure,
+    )
+
+    const overBudgetAccessorTarget = Object.fromEntries(
+      Array.from({ length: MAX_PAYLOAD_NODES }, (_, index) => [`k${index}`, null]),
+    )
+    Object.defineProperty(overBudgetAccessorTarget, 'laterAccessor', {
+      enumerable: true,
+      get: () => {
+        throw new Error('accessor must not run')
+      },
+    })
+    assert.throws(
+      () => validatePayload(overBudgetAccessorTarget),
+      (error: unknown) => {
+        assert.equal((error as { message?: unknown }).message, 'payload contains an accessor property.')
+        return true
+      },
+    )
+
+    const boundaryObjectCalls = { descriptors: 0, ownKeys: 0 }
+    const boundaryObject = new Proxy(
+      Object.fromEntries(Array.from({ length: MAX_PAYLOAD_NODES - 1 }, (_, index) => [`k${index}`, null])),
+      {
+        getOwnPropertyDescriptor: (target, key) => {
+          boundaryObjectCalls.descriptors += 1
+          return Reflect.getOwnPropertyDescriptor(target, key)
+        },
+        ownKeys: target => {
+          boundaryObjectCalls.ownKeys += 1
+          return Reflect.ownKeys(target)
+        },
+      },
+    )
+    const boundaryResult = validatePayload(boundaryObject)
+    assert.equal(Object.keys(boundaryResult as Record<string, unknown>).length, MAX_PAYLOAD_NODES - 1)
+    assert.deepEqual(boundaryObjectCalls, { descriptors: MAX_PAYLOAD_NODES - 1, ownKeys: 1 })
+
+    const hiddenWideTarget = { summary: 'Hidden properties do not consume the JSON-node budget' }
+    for (let index = 0; index < MAX_PAYLOAD_NODES; index += 1) {
+      Object.defineProperty(hiddenWideTarget, `hidden${index}`, { value: null })
+    }
+    assert.deepEqual(validatePayload(hiddenWideTarget), {
+      summary: 'Hidden properties do not consume the JSON-node budget',
+    })
+  })
+
+  test('inspects accepted arrays once and preserves numeric traversal order', () => {
+    const validatePayload = (payload: unknown) =>
+      validateAddRecordInput({
+        kind: 'decision',
+        payload: payload as never,
+        source: 'agent',
+        subject: 'payload.descriptor-order',
+      }).payload
+
+    const acceptedArrayCalls = { descriptors: [] as string[], ownKeys: 0 }
+    const acceptedArrayTarget = ['first', 'second'] as string[] & { metadata?: string }
+    acceptedArrayTarget.metadata = 'ignored'
+    const acceptedArray = new Proxy(acceptedArrayTarget, {
+      getOwnPropertyDescriptor: (target, key) => {
+        acceptedArrayCalls.descriptors.push(String(key))
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      },
+      ownKeys: target => {
+        acceptedArrayCalls.ownKeys += 1
+        return Reflect.ownKeys(target)
+      },
+    })
+    assert.deepEqual(validatePayload(acceptedArray), ['first', 'second'])
+    assert.deepEqual(acceptedArrayCalls, {
+      descriptors: ['length', '0', '1', 'metadata', 'length'],
+      ownKeys: 1,
+    })
+
+    const reorderedArray = new Proxy([() => undefined, Symbol('later invalid value')], {
+      ownKeys: () => ['1', '0', 'length'],
+    })
+    assert.throws(
+      () => validatePayload(reorderedArray),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+        assert.equal(actual.code, 'INVALID_ARGUMENT')
+        assert.equal(actual.message, 'payload contains a value that is not JSON serializable.')
+        assert.deepEqual(actual.details, { field: 'payload[0]' })
+        return true
+      },
+    )
+
+    const reorderedObject = new Proxy(
+      { 0: () => undefined, 1: Symbol('later invalid value') },
+      {
+        ownKeys: () => ['1', '0'],
+      },
+    )
+    assert.throws(
+      () => validatePayload(reorderedObject),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+        assert.equal(actual.code, 'INVALID_ARGUMENT')
+        assert.equal(actual.message, 'payload contains a value that is not JSON serializable.')
+        assert.deepEqual(actual.details, { field: 'payload.0' })
+        return true
+      },
+    )
+  })
+
+  test('rejects arrays whose length changes during own-key inspection', () => {
+    const assertChangedLengthRejected = (payload: unknown) => {
+      assert.throws(
+        () => validateJsonValue(payload),
+        (error: unknown) => {
+          const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+          assert.equal(actual.code, 'INVALID_ARGUMENT')
+          assert.equal(actual.message, 'payload contains an invalid array length.')
+          assert.deepEqual(actual.details, { field: 'payload' })
+          return true
+        },
+      )
+    }
+
+    const growingTarget = ['first']
+    assertChangedLengthRejected(
+      new Proxy(growingTarget, {
+        ownKeys: target => {
+          target.push('second')
+          return Reflect.ownKeys(target)
+        },
+      }),
+    )
+
+    const shrinkingTarget = ['first', 'second']
+    assertChangedLengthRejected(
+      new Proxy(shrinkingTarget, {
+        ownKeys: target => {
+          target.length = 1
+          return Reflect.ownKeys(target)
+        },
+      }),
+    )
+  })
+
+  test('preserves canonical bytes for valid descriptor-safe payloads', () => {
+    const shared = Object.create(null) as Record<string, unknown>
+    shared.value = -0
+    Object.defineProperty(shared, 'hidden', { value: 'ignored' })
+
+    const list = ['first', 'second'] as string[] & { metadata?: string }
+    Object.defineProperty(list, 'metadata', {
+      enumerable: true,
+      value: 'ignored',
+    })
+    const payload = new Proxy(
+      {
+        0: 'zero',
+        1: 'one',
+        alpha: 'A',
+        beta: 'B',
+        left: shared,
+        list,
+        right: shared,
+      },
+      {
+        ownKeys: () => ['right', '1', 'alpha', 'list', '0', 'left', 'beta'],
+      },
+    )
+
+    const formatted = formatRecordFile(
+      parseRecordFile({
+        createdAt: '2026-01-01T00:00:00.000Z',
+        id: 'payload-compat',
+        kind: 'decision',
+        payload,
+        source: 'test',
+        subject: 'payload.compat',
+      }),
+    )
+    assert.equal(
+      formatted,
+      `{
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "id": "payload-compat",
+  "kind": "decision",
+  "payload": {
+    "0": "zero",
+    "1": "one",
+    "right": {
+      "value": 0
+    },
+    "alpha": "A",
+    "list": [
+      "first",
+      "second"
+    ],
+    "left": {
+      "value": 0
+    },
+    "beta": "B"
+  },
+  "source": "test",
+  "subject": "payload.compat"
+}
+`,
+    )
+
+    const root = createRoot()
+    const publicRecord = api.addRecord({
+      id: 'payload-compat-public',
+      kind: 'decision',
+      payload: payload as never,
+      root,
+      source: 'test',
+      subject: 'payload.compat.public',
+    })
+    const expectedPublicRecord = parseRecordFile({
+      createdAt: publicRecord.createdAt,
+      id: 'payload-compat-public',
+      kind: 'decision',
+      payload,
+      source: 'test',
+      subject: 'payload.compat.public',
+    })
+    assert.deepEqual(publicRecord.payload, expectedPublicRecord.payload)
+    assert.equal(readFileSync(join(root, publicRecord.path), 'utf8'), formatRecordFile(expectedPublicRecord))
   })
 
   test('normalizes negative zero payload numbers before formatting', () => {

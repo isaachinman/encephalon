@@ -226,7 +226,7 @@ bun run benchmark -- --profile full --output docs/performance-baseline.json
 bun run benchmark:check
 ```
 
-Correctness tests enforce deterministic bounded-work counts without reading production source. `benchmark:check` independently owns timing, memory, and cache-size ceilings.
+Correctness tests enforce deterministic bounded-work counts without reading production source and include one isolated comparative heap-allocation guard for payload descriptor-map amplification. `benchmark:check` independently owns the configured product latency and cache-size ceilings; isolated RSS remains diagnostic unless a budget explicitly selects it.
 
 The full profile runs every operation in fresh child processes with two discarded warmups and five measured samples at 0, 100, and 1,000 records. `benchmark:check` keeps CI to a single 0/100 sample with generous schema-version 2 p95 and cache-size ceilings. See [docs/performance.md](./docs/performance.md) for phase semantics, memory sources, profiles, budgets, baseline distributions, and scale guidance.
 

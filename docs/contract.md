@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-25 for code and behavioural-test snapshot `b6de02d1c5c6eab7d98e7d4525b8dee41035f1ab`.
+Last reviewed: 2026-08-25 for code and behavioural-test snapshot `58ba821f4b655fad1b1e79be9df57600e7409381`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -51,6 +51,7 @@ This document is the concise contract maintainers should update when public beha
 - Artifact files are immutable supporting files under `encephalon/_artifacts/<kind>/<id>/...` and must stay beneath the matching record artifact directory.
 - The runtime-only `path` field is never written to canonical record files.
 - Confidence accepts finite numbers from zero through one. Numeric negative zero is normalised to positive zero before record construction, canonical formatting, cache hydration, and public return; every other accepted confidence value and the existing validation failure remain unchanged.
+- Payload validation remains iterative, accessor-free, and limited to 64 nested levels and 10,000 JSON nodes. Arrays inspect their own length descriptor and reject an over-budget length before own-key enumeration or output allocation. Plain objects obtain one unavoidable own-key list, inspect each reported property descriptor once through the shared guarded inspection primitive, and budget only enumerable data properties before allocating normalised output or traversing children. Sparse arrays, accessors, symbol keys, cycles, non-plain objects, non-finite numbers, and metadata trap failures retain bounded `INVALID_ARGUMENT` handling without exposing trap text.
 - Supersession records must use the same kind and subject as their targets. Active records are records not listed in any other record’s `supersedes`.
 - Existing records are not rewritten or deleted by normal mutations; changed knowledge is represented by a new record that supersedes the active head.
 - Add-record inputs are fully validated, including their eventual fixed-width formatted size, before repository discovery or filesystem mutation. Their `createdAt` value is assigned only after the repository operation lock is held and the current canonical record snapshot has been validated. It is the later of the current millisecond and one millisecond after the latest canonical timestamp. Initialisation validates the complete candidate graph with fixed-width placeholder timestamps before advancing the same cursor once per planned baseline record under its existing lock, so corpus errors retain precedence over timestamp exhaustion. The locked repository location remains part of publication authority through preparation, linking, and final acceptance. Existing record incarnations and byte digests are revalidated before cleanup-induced change-time updates are accepted. Failed pre-commit attempts consume no process-global timestamp state, and a canonical timestamp at the schema ceiling fails validation rather than wrapping or rewriting history.
@@ -143,7 +144,7 @@ This document is the concise contract maintainers should update when public beha
 
 ## Performance Evidence
 
-- Correctness performance guards use per-invocation internal observers to assert deterministic canonical scans, supersession-edge visits, active-group and issue insertion, bounded directory consumption, and baseline accumulator writes. They do not read production source text or set latency, memory, or cache-size thresholds; `benchmark:check` owns those measured ceilings.
+- Correctness performance guards use per-invocation internal observers to assert deterministic canonical scans, supersession-edge visits, active-group and issue insertion, bounded directory consumption, baseline accumulator writes, and payload retained-value and output-container allocation. They do not read production source text. One isolated test compares retained heap allocation against descriptor-map controls for payload validation; `benchmark:check` owns configured product latency and cache-size ceilings, while isolated RSS remains diagnostic unless a budget explicitly selects it.
 - Benchmark report and budget files use schema version 2. Old versions, unknown fields, malformed finite limits, budget cases without at least one cache or operation limit, zero-record amplification limits, duplicate corpus cases, and missing requested corpus cases fail before benchmark repository creation.
 - `ci` measures 0 and 100 records with no warmup and one measured sample; default `baseline` uses one warmup and three measured samples for 0 and 100; `full` uses two warmups and five measured samples for 0, 100, and 1,000. Explicit record counts label the report `custom`.
 - Every warmup and measured operation runs in a fresh Node child against a parent-restored repository state. Because copying changes canonical filesystem metadata, the parent re-prepares every restored non-cold sample outside the measured child and applies the stale mutation only after that preparation. The parent accepts exactly one nonce-bound IPC result followed by a clean close, kills and awaits timed-out or cancelled children, and attempts every owned sample and template repository cleanup on success, cancellation, or setup/worker failure while retaining the primary or first cleanup failure.
@@ -205,6 +206,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
+- MAR-2576 bounded payload property inspection, allocation-order enforcement, canonical-output compatibility, and packed API coverage: `58ba821f4b655fad1b1e79be9df57600e7409381`.
 - MAR-2641 negative-zero confidence normalisation across validation, canonical storage, mutation-cache hydration, public reads, and CLI output: `b6de02d1c5c6eab7d98e7d4525b8dee41035f1ab`.
 - MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 - MAR-2554 bounded full, compact, and gather read responses: `b43daf795de35d34602d1018ad509f68e494fe3d`.

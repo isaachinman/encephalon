@@ -207,11 +207,15 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-25 for code and behavioural-test snapshot `b6de02d1c5c6eab7d98e7d4525b8dee41035f1ab`\./,
+      /Last reviewed: 2026-08-25 for code and behavioural-test snapshot `58ba821f4b655fad1b1e79be9df57600e7409381`\./,
     )
     assert.match(
       contract,
       /MAR-2641 negative-zero confidence normalisation across validation, canonical storage, mutation-cache hydration, public reads, and CLI output: `b6de02d1c5c6eab7d98e7d4525b8dee41035f1ab`\./,
+    )
+    assert.match(
+      contract,
+      /MAR-2576 bounded payload property inspection, allocation-order enforcement, canonical-output compatibility, and packed API coverage: `58ba821f4b655fad1b1e79be9df57600e7409381`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
@@ -312,7 +316,7 @@ describe('package contract', () => {
     assert.doesNotMatch(skill, /node \.\/node_modules\/encephalon\/dist\/cli\.mjs/)
   })
 
-  test('retains the exact package tarball exercised by the package checker', { timeout: 30_000 }, () => {
+  test('retains the exact package tarball exercised by the package checker', { timeout: 75_000 }, () => {
     const artifactParentName = join('test', `.package-artifacts-test-${randomUUID()}`)
     const artifactDirectoryName = join(artifactParentName, 'nested')
     const artifactParent = resolve(root, artifactParentName)
@@ -325,7 +329,7 @@ describe('package contract', () => {
         {
           cwd: root,
           encoding: 'utf8',
-          timeout: 30_000,
+          timeout: 60_000,
         },
       )
       assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)

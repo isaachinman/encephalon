@@ -356,15 +356,17 @@ try {
   mkdirSync(resolve(consumer, '.git'), { recursive: true })
   writeFileSync(resolve(consumer, 'package.json'), '{"name":"encephalon-smoke","private":true,"type":"module"}\n')
   runNpm(['install', '--dry-run=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-dev', tarball], consumer)
-  run(
-    [
-      process.execPath,
-      '--input-type=module',
-      '--eval',
-      "const api = await import('encephalon'); if (typeof api.prepare !== 'function' || typeof api.initEncephalon !== 'function') process.exitCode = 1",
-    ],
-    consumer,
-  )
+  const packedApiContract = [
+    "const api = await import('encephalon')",
+    "if (typeof api.prepare !== 'function' || typeof api.initEncephalon !== 'function') throw new Error('The packed API is incomplete.')",
+    'const descriptors = []',
+    'let ownKeys = 0',
+    'const payload = new Proxy(new Array(10_000), { getOwnPropertyDescriptor: (target, key) => { descriptors.push(String(key)); return Reflect.getOwnPropertyDescriptor(target, key) }, ownKeys: target => { ownKeys += 1; return Reflect.ownKeys(target) } })',
+    'let rejected = false',
+    "try { api.addRecord({ kind: 'decision', payload, root: 'unused-before-payload-validation', source: 'package-check', subject: 'payload.package-budget' }) } catch (error) { rejected = error instanceof api.EncephalonError && error.name === 'EncephalonError' && error.code === 'INVALID_ARGUMENT' && error.message === 'payload may contain at most 10000 JSON nodes.' && error.details?.field === 'payload' && Reflect.ownKeys(error.details).length === 1 }",
+    "if (!rejected || ownKeys !== 0 || JSON.stringify(descriptors) !== '[\"length\"]') throw new Error('The packed Node API payload budget contract failed.')",
+  ].join('\n')
+  run([process.execPath, '--input-type=module', '--eval', packedApiContract], consumer)
   writeFileSync(
     resolve(consumer, 'smoke.ts'),
     [

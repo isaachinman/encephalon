@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
@@ -7,6 +8,7 @@ import { assertRecordGraph, readRecordsResolved, validateRecordsResolved } from 
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
+const payloadValidationWorkFixture = join(import.meta.dirname, 'fixtures', 'payload-validation-work.ts')
 
 const createRoot = () => {
   const root = createTestRepository()
@@ -49,6 +51,39 @@ const writeRecord = (
 }
 
 describe('hot scan performance regressions', () => {
+  test('avoids descriptor-map allocation before payload budgets', () => {
+    const run = (mode: 'bounded' | 'descriptor-map') =>
+      JSON.parse(
+        execFileSync(process.execPath, ['--expose-gc', payloadValidationWorkFixture, mode], {
+          encoding: 'utf8',
+        }),
+      ) as {
+        descriptorMapCalls: number
+        heapGrowthBytes: number
+        mode: string
+        oversizedArrayWork: { descriptors: string[]; ownKeys: number }
+        propertyCount: number
+        retainedDescriptorCount: number
+        work: { descriptors: number; ownKeys: number }
+      }
+
+    const bounded = run('bounded')
+    const descriptorMap = run('descriptor-map')
+
+    assert.equal(bounded.descriptorMapCalls, 0)
+    assert.deepEqual(bounded.work, { descriptors: bounded.propertyCount, ownKeys: 1 })
+    assert.deepEqual(bounded.oversizedArrayWork, { descriptors: ['length'], ownKeys: 0 })
+    assert.equal(descriptorMap.descriptorMapCalls, 2)
+    assert.deepEqual(descriptorMap.work, {
+      descriptors: descriptorMap.propertyCount,
+      ownKeys: 1,
+    })
+    assert.deepEqual(descriptorMap.oversizedArrayWork, { descriptors: ['length'], ownKeys: 1 })
+    assert.equal(bounded.retainedDescriptorCount, 0)
+    assert.equal(descriptorMap.retainedDescriptorCount, descriptorMap.propertyCount)
+    assert.ok(descriptorMap.heapGrowthBytes > bounded.heapGrowthBytes + descriptorMap.propertyCount * 32)
+  })
+
   test('leaves returned baseline results free of instrumentation wrappers', () => {
     const root = createRoot()
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'sample-project' }))

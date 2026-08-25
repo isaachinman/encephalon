@@ -34,6 +34,7 @@ All notable changes to Encephalon are documented here.
 - Classified expected filesystem and SQLite environment failures separately from internal defects.
 - Made committed add failures report the affected post-commit recovery phase explicitly.
 - Normalised negative-zero confidence to canonical numeric zero before publication and public return.
+- Applied payload node budgets before avoidable descriptor and output allocation while preserving guarded iterative validation and canonical results.
 - Made multi-resource initialisation report bounded monotonic commit progress while preserving subsystem errors, with inspect-or-rerun guidance and same-options convergence after partial baseline, cache, instruction, refresh, and removal failures.
 - Finalised managed instruction writes and removals with fixed-root authority, descriptor-bound private staging and durable recovery, canonical hard-link commit aggregation, concurrent-successor preservation, zero operation-owned aliases on success, and bounded safe post-commit phases and repository-relative recovery paths.
 - Made generated baseline refreshes converge on one canonical snapshot.
