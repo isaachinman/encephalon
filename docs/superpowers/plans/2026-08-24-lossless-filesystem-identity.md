@@ -32,7 +32,7 @@
 
 **Interfaces:**
 - Consumes: Node `BigIntStats` only at the projection boundary.
-- Produces: `EntryIdentity`, `EntryMetadata`, `ManifestEntryMetadata`, `entryIdentityFrom()`, `entryMetadataFrom()`, `manifestEntryMetadataFrom()`, `sameEntryIdentity()`, `sameStableEntryMetadata()`, and `sameStableEntryMetadataExceptCtime()`.
+- Produces: `EntryIdentity`, `EntryMetadata`, `ManifestEntryMetadata`, `entryIdentityFrom()`, `entryIdentityKey()`, `entryMetadataFrom()`, `manifestEntryMetadataFrom()`, `sameEntryIdentity()`, `sameStableEntryMetadata()`, and `sameStableEntryMetadataExceptCtime()`.
 
 - [x] **Step 1: Write the failing synthetic identity tests**
 
@@ -67,17 +67,19 @@
 
   Expected: all filesystem-entry tests pass.
 
-### Task 2: Remove Duplicate Cache and Instruction Projections
+### Task 2: Remove Duplicate Cache, Instruction, and Staging Projections
 
 **Files:**
 - Modify: `src/cache-location.ts`
 - Modify: `src/instructions.ts`
+- Modify: `src/staging.ts`
 - Test: `test/cache.test.ts`
 - Test: `test/init.test.ts`
+- Test: `test/records.test.ts`
 
 **Interfaces:**
 - Consumes: Task 1 identity/projection types and comparators.
-- Produces: unchanged cache-location and instruction APIs, error behaviour, and on-disk formats.
+- Produces: unchanged cache-location, instruction, and staging APIs, error behaviour, and on-disk formats.
 
 - [x] **Step 1: Establish the regression baseline**
 
@@ -91,9 +93,13 @@
 
   Replace the private string-valued `FileIdentity` family with shared BigInt projections. Use complete comparison where the existing code compares the complete descriptor/path observation, and the shared except-ctime comparison only at the existing post-rename/link boundaries. Keep masked permission-mode checks local and preserve every instruction error message and recovery detail.
 
-- [x] **Step 4: Verify the focused regression suites**
+- [x] **Step 4: Centralise staging identity keys**
 
-  Run: `bun run build && node --test test/cache.test.ts test/init.test.ts`
+  Use the shared lossless identity-key projection when grouping staging hard-link aliases. Keep staging inspection, quarantine, cleanup ordering, and alias-incarnation policy local.
+
+- [x] **Step 5: Verify the focused regression suites**
+
+  Run: `bun run build && node --test test/cache.test.ts test/init.test.ts test/records.test.ts`
 
   Expected: all tests pass with only existing platform skips.
 
@@ -169,21 +175,27 @@
 - Consumes: completed ticket diff.
 - Produces: one ticket-pure MAR-2573 branch and PR based on current `main`.
 
-- [ ] **Step 1: Run the six-role parallel review**
+- [x] **Step 1: Run the six-role parallel review**
 
   Review the MAR-2573 diff against current `main` for security, correctness, data consistency/races, test coverage, maintainability/separation of concerns, and UX/API regression. Run two complete parallel review rounds, fix every valid finding, and rerun affected tests.
 
-- [ ] **Step 2: Run the full release-equivalent gate**
+- [x] **Step 2: Run the full release-equivalent gate**
 
   Run frozen install, generated/workflow checks, lint, all TypeScript projects, the full Node suite, benchmark budgets, build, packed-package validation, publish-contract validation, repository validation, and `git diff --check`.
 
-- [ ] **Step 3: Record the exact reviewed snapshot**
+- [x] **Step 3: Record the exact reviewed snapshot**
 
   Commit implementation first, then update maintained provenance to the exact implementation SHA in a separate documentation commit. Validate again after the provenance-only commit.
 
 - [ ] **Step 4: Push and update the ticket-pure PR**
 
   Push only `mar-2573-filesystem-use-one-lossless-bigint-identity-model-for` with an explicit `origin <branch>:<branch>` refspec, set/verify upstream, and update PR #71 against current `main`. Require exact-head CI and Pullfrog review before merging.
+
+## Implementation Evidence
+
+- Reviewed implementation snapshot: `4431bf61432eb4ecbffc725c775ca9b874bf8daa`.
+- Fresh local review cycle: all six Luna roles completed both rounds. Round one produced two accepted maintainability clean-ups; round two produced one accepted documentation-inventory correction. No P0, P1, or P2 finding remained.
+- Release-equivalent verification: frozen install made no changes; the direct generated-source check, all TypeScript projects, lint, benchmark budgets, build, packed-package validation, expected publish refusal, and diff hygiene passed. The full suite passed 613 of 616 tests with three established platform skips.
 
 ## Self-Review
 

@@ -213,6 +213,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
+- MAR-2573 lossless BigInt filesystem identities, nanosecond-stable comparisons, shared manifest and staging projections, and descriptor-bound instruction recovery: `4431bf61432eb4ecbffc725c775ca9b874bf8daa`.
 - MAR-2576 bounded payload property inspection, allocation-order enforcement, canonical-output compatibility, and packed API coverage: `58ba821f4b655fad1b1e79be9df57600e7409381`.
 - MAR-2641 negative-zero confidence normalisation across validation, canonical storage, mutation-cache hydration, public reads, and CLI output: `b6de02d1c5c6eab7d98e7d4525b8dee41035f1ab`.
 - MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
