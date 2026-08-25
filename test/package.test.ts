@@ -266,7 +266,7 @@ describe('package contract', () => {
   contents: read
 `,
     )
-    assert.doesNotMatch(workflow, /\$\{\{\s*secrets\./)
+    assert.doesNotMatch(workflow, /\$\{\{(?:[^}]|}(?!}))*\bsecrets\b/)
     assert.match(
       workflowConfiguration,
       /concurrency:\n\s+group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}\n\s+cancel-in-progress: true/,
