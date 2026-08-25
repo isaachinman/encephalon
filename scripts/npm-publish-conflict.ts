@@ -101,6 +101,7 @@ const npmErrorLine = /^(?:npm error|npm ERR!)(?:\s|$)/
 const npmErrorCodeLine = /^(?:npm error|npm ERR!)\s+code\s+(\S+)$/
 const npmConflictLine = /^(?:npm error|npm ERR!)\s+You cannot publish over the previously published versions(?::|\b)/
 const npmLogLine = /^(?:npm error|npm ERR!)\s+A complete log of this run can be found in:/
+const explicitFailureLine = /^(?:error|fatal)(?::|\s|$)/i
 
 export const isPublishedVersionConflictOutput = (stdout: string, stderr: string): boolean => {
   const scans = [stdout, stderr].map(scanNpmDiagnostics)
@@ -115,13 +116,15 @@ export const isPublishedVersionConflictOutput = (stdout: string, stderr: string)
     .filter((code): code is string => code !== undefined)
   const hasTextConflictCode = textErrorCodes.some(code => conflictCodes.has(code))
   const hasTextConflictMessage = /You cannot publish over the previously published versions/.test(text)
-  const hasUnexpectedNpmError = lines.some(line => {
+  const hasUnexpectedError = lines.some(line => {
     const code = npmErrorCodeLine.exec(line)?.[1]
     const isConflictCodeLine = code !== undefined && conflictCodes.has(code)
-    return npmErrorLine.test(line) && !isConflictCodeLine && !npmConflictLine.test(line) && !npmLogLine.test(line)
+    const isUnexpectedNpmError =
+      npmErrorLine.test(line) && !isConflictCodeLine && !npmConflictLine.test(line) && !npmLogLine.test(line)
+    return isUnexpectedNpmError || explicitFailureLine.test(line)
   })
   const hasInvalidJson = scans.some(scan => scan.hasInvalidJson)
   const jsonErrorsAreConflicts = errors.every(isPublishConflictError)
   const hasConflictEvidence = errors.length > 0 || (hasTextConflictCode && hasTextConflictMessage)
-  return !(hasInvalidJson || hasUnexpectedNpmError) && jsonErrorsAreConflicts && hasConflictEvidence
+  return !(hasInvalidJson || hasUnexpectedError) && jsonErrorsAreConflicts && hasConflictEvidence
 }

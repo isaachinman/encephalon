@@ -48,7 +48,7 @@ test('accepts only npm diagnostics for an already-published package version', ()
     [conflictJson, ''],
     ['', '{"error":{"code":"E403","summary":"You cannot publish over the previously published versions: 0.2.0."}}'],
     ['{"error":{"summary":"You cannot publish over the previously published versions: 0.2.0."}}', ''],
-    [`${prettyConflictJson.replaceAll('\n', '\r\n')}\r\nnpm warn using --force\r\n`, ''],
+    [`${prettyConflictJson.replaceAll('\n', '\r\n')}\r\nnpm warn using --force\r\nplain warning text\r\n`, ''],
     ['You cannot publish over the previously published versions: 0.2.0.\n', 'npm error code EPUBLISHCONFLICT\n'],
     ['You cannot publish over the previously published versions: 0.2.0.\r\n', 'npm error code E403\r\n'],
   ] as const
@@ -75,6 +75,7 @@ test('accepts only npm diagnostics for an already-published package version', ()
     ],
     [conflictJson, 'npm error Authentication failed\n'],
     [conflictJson, 'npm ERR! network timeout\n'],
+    [conflictJson, 'fatal: authentication failed\n'],
     [
       '{"id":"encephalon@0.2.0"}\n',
       'npm error code EPUBLISHCONFLICT\nYou cannot publish over the previously published versions: 0.2.0.\n',
@@ -86,7 +87,7 @@ test('accepts only npm diagnostics for an already-published package version', ()
   ] as const
   assert.deepEqual(
     rejected.map(([stdout, stderr]) => isPublishedVersionConflictOutput(stdout, stderr)),
-    [false, false, false, false, false, false, false, false, false, false, false, false, false],
+    [false, false, false, false, false, false, false, false, false, false, false, false, false, false],
   )
 })
 
@@ -112,12 +113,12 @@ test('publish checker forwards npm output and rejects unrelated publish failures
 
     const failure = runPublishCheckFixture(temporaryRoot, {
       status: 1,
-      stderr: 'npm error Authentication failed\n',
+      stderr: 'fatal: authentication failed\n',
       stdout: conflictOutput,
     })
     assert.notEqual(failure.status, 0)
     assert.equal(failure.stdout, conflictOutput)
-    assert.match(failure.stderr, /^npm error Authentication failed\n/u)
+    assert.match(failure.stderr, /^fatal: authentication failed\n/u)
     assert.match(failure.stderr, /npm publish dry-run failed with exit code 1\./u)
   } finally {
     rmSync(temporaryRoot, { force: true, recursive: true })
