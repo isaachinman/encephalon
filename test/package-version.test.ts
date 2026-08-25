@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -83,6 +83,50 @@ test('generated-version adapters reject stale or missing source without modifyin
     assert.notEqual(missingResult.status, 0)
     assert.equal(missingResult.stderr.includes(staleGeneratedVersionMessage), true)
     assert.doesNotMatch(missingResult.stderr, /ENOENT/)
+  } finally {
+    rmSync(temporaryRoot, { force: true, recursive: true })
+  }
+})
+
+test('direct generated-version check bypasses package lifecycle hooks', () => {
+  const temporaryRoot = createCheckFixture()
+  const generatedVersionPath = resolve(temporaryRoot, 'src', 'generated', 'version.ts')
+  const repairMarkerPath = resolve(temporaryRoot, 'repair-ran')
+  const staleSource = '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.1"\n'
+  const currentSource = '// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "0.2.0"\n'
+  try {
+    writeFileSync(generatedVersionPath, staleSource, 'utf8')
+    writeFileSync(
+      resolve(temporaryRoot, 'package.json'),
+      `${JSON.stringify({
+        scripts: {
+          'check:generated': 'bun run scripts/check-generated-version.ts',
+          'precheck:generated': 'node ./repair-generated.mjs',
+        },
+        type: 'module',
+        version: '0.2.0',
+      })}\n`,
+      'utf8',
+    )
+    writeFileSync(
+      resolve(temporaryRoot, 'repair-generated.mjs'),
+      `import { writeFileSync } from 'node:fs'\nwriteFileSync(new URL('./src/generated/version.ts', import.meta.url), ${JSON.stringify(currentSource)})\nwriteFileSync(new URL('./repair-ran', import.meta.url), ${JSON.stringify('true\n')})\n`,
+      'utf8',
+    )
+
+    const directResult = spawnSync('bun', ['run', './scripts/check-generated-version.ts'], {
+      cwd: temporaryRoot,
+      encoding: 'utf8',
+    })
+    assert.notEqual(directResult.status, 0)
+    assert.equal(directResult.stderr.includes(staleGeneratedVersionMessage), true)
+    assert.equal(readFileSync(generatedVersionPath, 'utf8'), staleSource)
+    assert.equal(existsSync(repairMarkerPath), false)
+
+    const aliasResult = spawnSync('bun', ['run', 'check:generated'], { cwd: temporaryRoot, encoding: 'utf8' })
+    assert.equal(aliasResult.status, 0, `${aliasResult.stdout}${aliasResult.stderr}`)
+    assert.equal(readFileSync(generatedVersionPath, 'utf8'), currentSource)
+    assert.equal(readFileSync(repairMarkerPath, 'utf8'), 'true\n')
   } finally {
     rmSync(temporaryRoot, { force: true, recursive: true })
   }

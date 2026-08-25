@@ -307,10 +307,18 @@ jobs:
       verificationSteps,
       /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}/,
     )
+    assert.equal(
+      verificationSteps.includes(`      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.1
+      - run: bun run ./scripts/check-generated-version.ts
+      - run: bun install --frozen-lockfile`),
+      true,
+    )
     assert.deepEqual(
       [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
       [
-        'bun run check:generated',
+        'bun run ./scripts/check-generated-version.ts',
         'bun install --frozen-lockfile',
         'bun run typecheck',
         'bun run test',
@@ -335,9 +343,22 @@ jobs:
     assert.doesNotMatch(releaseJob, /^ {4}permissions:/m)
     assert.match(releaseSteps, /uses: actions\/checkout@\S+\n\s+with:\n\s+persist-credentials: false/)
     assert.match(releaseSteps, /uses: actions\/setup-node@\S+\n\s+with:\n\s+node-version: 24\.15\.0/)
+    assert.equal(
+      releaseSteps.includes(`      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.1
+      - run: bun run ./scripts/check-generated-version.ts
+      - run: bun install --frozen-lockfile`),
+      true,
+    )
     assert.deepEqual(
       [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
-      ['bun run check:generated', 'bun install --frozen-lockfile', 'bun run build', 'bun run check:package'],
+      [
+        'bun run ./scripts/check-generated-version.ts',
+        'bun install --frozen-lockfile',
+        'bun run build',
+        'bun run check:package',
+      ],
     )
     assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 6)
     assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length, 1)
@@ -366,7 +387,7 @@ jobs:
     )
     assert.equal(
       [
-        'bun run check:generated',
+        'bun run ./scripts/check-generated-version.ts',
         'bun run build',
         'bun run check:package',
         'npm pack',
@@ -380,6 +401,8 @@ jobs:
         ),
       true,
     )
+    assert.equal(workflow.match(/bun run \.\/scripts\/check-generated-version\.ts/g)?.length, 2)
+    assert.doesNotMatch(workflow, /^\s+- run: bun run check:generated$/m)
     assert.match(readme, /four verification lanes/)
     assert.match(readme, /trusted pushes to `main`/)
     assert.match(readme, /release-equivalent package gate/)
