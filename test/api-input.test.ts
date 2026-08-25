@@ -210,6 +210,29 @@ describe('API input envelopes', () => {
       },
     })
     assertInvalidInput(() => parseRootInput(changingPrototype), 'root')
+
+    let getterCalls = 0
+    let replaceDataProperty = true
+    const descriptorTarget = { root: '/repository' }
+    const changingDescriptor = new Proxy(descriptorTarget, {
+      getOwnPropertyDescriptor: (target, key) => {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key)
+        if (key === 'root' && replaceDataProperty) {
+          replaceDataProperty = false
+          Object.defineProperty(target, key, {
+            configurable: true,
+            enumerable: true,
+            get: () => {
+              getterCalls += 1
+              return '/replacement'
+            },
+          })
+        }
+        return descriptor
+      },
+    })
+    assertInvalidInput(() => parseRootInput(changingDescriptor), 'root')
+    assert.equal(getterCalls, 0)
   })
 
   test('keeps accepted add-record memory and canonical JSON structurally identical', () => {
@@ -327,6 +350,29 @@ describe('dense data arrays', () => {
       },
     })
     assertInvalidInput(() => parseGatherInput({ searches: unstable }), 'searches')
+
+    let getterCalls = 0
+    let replaceDataProperty = true
+    const descriptorTarget = ['x']
+    const changingDescriptor = new Proxy(descriptorTarget, {
+      getOwnPropertyDescriptor: (array, key) => {
+        const descriptor = Reflect.getOwnPropertyDescriptor(array, key)
+        if (key === '0' && replaceDataProperty) {
+          replaceDataProperty = false
+          Object.defineProperty(array, key, {
+            configurable: true,
+            enumerable: true,
+            get: () => {
+              getterCalls += 1
+              return 'replacement'
+            },
+          })
+        }
+        return descriptor
+      },
+    })
+    assertInvalidInput(() => parseGatherInput({ searches: changingDescriptor }), 'searches')
+    assert.equal(getterCalls, 0)
   })
 
   test('normalises array inspection failures and checks count budgets before own keys', () => {

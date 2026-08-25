@@ -1,5 +1,6 @@
 import { fail } from './errors.ts'
 import {
+  guardedEnumerableDataPropertyMatches,
   guardedGetOwnPropertyDescriptor,
   guardedIsArray,
   guardedOwnKeys,
@@ -94,12 +95,23 @@ export const readDenseDataArray = (inspection: DenseDataArrayInspection): unknow
     }, new Array<unknown>(inspection.length))
     const keysMatch = guardedOwnKeysMatch(inspection.value, keys)
     const lengthDescriptor = guardedGetOwnPropertyDescriptor(inspection.value, 'length')
+    const descriptorsMatch = keys.every(key => {
+      if (key === 'length') {
+        return true
+      }
+      if (typeof key === 'string') {
+        const index = canonicalArrayIndex(key)
+        return index !== undefined && guardedEnumerableDataPropertyMatches(inspection.value, key, values[index])
+      }
+      return false
+    })
     if (
       keysMatch &&
       lengthDescriptor !== PROPERTY_INSPECTION_FAILED &&
       lengthDescriptor !== undefined &&
       'value' in lengthDescriptor &&
-      lengthDescriptor.value === inspection.length
+      lengthDescriptor.value === inspection.length &&
+      descriptorsMatch
     ) {
       return values
     }

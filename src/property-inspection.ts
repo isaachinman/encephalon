@@ -46,3 +46,15 @@ export const guardedGetOwnPropertyDescriptor = (value: object, key: PropertyKey)
     return PROPERTY_INSPECTION_FAILED
   }
 }
+
+/** @internal */
+export const guardedEnumerableDataPropertyMatches = (value: object, key: PropertyKey, expected: unknown) => {
+  const descriptor = guardedGetOwnPropertyDescriptor(value, key)
+  return (
+    descriptor !== PROPERTY_INSPECTION_FAILED &&
+    descriptor !== undefined &&
+    'value' in descriptor &&
+    descriptor.enumerable === true &&
+    Object.is(descriptor.value, expected)
+  )
+}

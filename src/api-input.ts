@@ -2,6 +2,7 @@ import { type DenseDataArrayInspection, inspectDenseDataArray, readDenseDataArra
 import { fail, failBudget } from './errors.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import {
+  guardedEnumerableDataPropertyMatches,
   guardedGetOwnPropertyDescriptor,
   guardedGetPrototypeOf,
   guardedIsArray,
@@ -112,7 +113,8 @@ const objectInput = (value: unknown, name: string, recognizedKeys: ReadonlySet<s
           return failObjectStructure(name)
         }, {})
         const finalPrototype = guardedGetPrototypeOf(object)
-        if (finalPrototype === prototype && guardedOwnKeysMatch(object, keys)) {
+        const descriptorsMatch = keys.every(key => guardedEnumerableDataPropertyMatches(object, key, snapshot[key]))
+        if (finalPrototype === prototype && guardedOwnKeysMatch(object, keys) && descriptorsMatch) {
           return snapshot
         }
       }
