@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript 7, Node.js synchronous filesystem APIs with `{ bigint: true }`, Bun package scripts, Node test runner.
 
-**Spec:** `docs/superpowers/specs/2026-08-23-release-backlog-hardening-design.md`
+**Ticket:** [MAR-2573](https://linear.app/marcoappio/issue/MAR-2573/filesystem-use-one-lossless-bigint-identity-model-for-guarded-paths)
 
 ## Global Constraints
 
@@ -140,7 +140,7 @@
 **Files:**
 - Modify: `src/cache.ts`
 - Modify: `docs/contract.md`
-- Modify: `docs/superpowers/specs/2026-08-23-release-backlog-hardening-design.md`
+- Modify: `docs/superpowers/plans/2026-08-24-lossless-filesystem-identity.md`
 
 **Interfaces:**
 - Consumes: Task 1 `manifestEntryMetadataFrom()`.
@@ -167,11 +167,11 @@
 
 **Interfaces:**
 - Consumes: completed ticket diff.
-- Produces: one clean MAR-2573 branch and draft PR stacked on MAR-2572.
+- Produces: one ticket-pure MAR-2573 branch and PR based on current `main`.
 
 - [ ] **Step 1: Run the six-role parallel review**
 
-  Review the MAR-2573 diff against MAR-2572 for security, correctness, data consistency/races, test coverage, maintainability/separation of concerns, and UX/API regression. Fix every high- or medium-confidence finding and rerun affected tests.
+  Review the MAR-2573 diff against current `main` for security, correctness, data consistency/races, test coverage, maintainability/separation of concerns, and UX/API regression. Run two complete parallel review rounds, fix every valid finding, and rerun affected tests.
 
 - [ ] **Step 2: Run the full release-equivalent gate**
 
@@ -181,9 +181,9 @@
 
   Commit implementation first, then update maintained provenance to the exact implementation SHA in a separate documentation commit. Validate again after the provenance-only commit.
 
-- [ ] **Step 4: Push and open the stacked draft PR**
+- [ ] **Step 4: Push and update the ticket-pure PR**
 
-  Push only `mar-2573-filesystem-use-one-lossless-bigint-identity-model-for` with an explicit `origin <branch>:<branch>` refspec, set/verify upstream, and open the draft PR against `mar-2572-api-reject-sparse-arrays-and-accessor-bearing-input`. Require exact-head bot review and leave every ticket unmerged until the full batch is ready.
+  Push only `mar-2573-filesystem-use-one-lossless-bigint-identity-model-for` with an explicit `origin <branch>:<branch>` refspec, set/verify upstream, and update PR #71 against current `main`. Require exact-head CI and Pullfrog review before merging.
 
 ## Self-Review
 
