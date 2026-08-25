@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve, sep } from 'node:path'
 import { describe, test } from 'node:test'
+import { npmCommand } from '../scripts/npm-command.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
@@ -481,6 +483,7 @@ describe('package contract', () => {
   test('retains the exact package tarball exercised by the package checker', { timeout: 30_000 }, () => {
     const artifactDirectoryName = join('test', `.package-artifacts-test-${randomUUID()}`)
     const artifactDirectory = resolve(root, artifactDirectoryName)
+    const referenceDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-reference-'))
     try {
       const result = spawnSync(
         process.execPath,
@@ -492,10 +495,32 @@ describe('package contract', () => {
         },
       )
       assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
-      const retainedFiles = readdirSync(artifactDirectory)
-      assert.deepEqual(retainedFiles, [`encephalon-${PACKAGE_VERSION}.tgz`])
+      const retainedFilename = `encephalon-${PACKAGE_VERSION}.tgz`
+      assert.equal(result.stdout, `${artifactDirectoryName.split(sep).join('/')}/${retainedFilename}\n`)
+      assert.deepEqual(readdirSync(artifactDirectory), [retainedFilename])
+
+      const [npmExecutable, ...npmArguments] = npmCommand([
+        'pack',
+        '--dry-run=false',
+        '--ignore-scripts',
+        '--json',
+        '--pack-destination',
+        referenceDirectory,
+      ])
+      if (npmExecutable === undefined) {
+        throw new Error('npm package-reference command must not be empty.')
+      }
+      const referenceResult = spawnSync(npmExecutable, npmArguments, { cwd: root, encoding: 'utf8' })
+      assert.equal(referenceResult.status, 0, `${referenceResult.stdout}${referenceResult.stderr}`)
+      const [referencePack] = JSON.parse(referenceResult.stdout) as Array<{ filename?: unknown }>
+      assert.equal(referencePack?.filename, retainedFilename)
+      assert.deepEqual(
+        readFileSync(resolve(artifactDirectory, retainedFilename)),
+        readFileSync(resolve(referenceDirectory, retainedFilename)),
+      )
     } finally {
       rmSync(artifactDirectory, { force: true, recursive: true })
+      rmSync(referenceDirectory, { force: true, recursive: true })
     }
   })
 
@@ -648,7 +673,7 @@ jobs:
     assert.match(releaseJob, /- name: Check npm publish dry run\n\s+run: node \.\/scripts\/check-publish\.ts/)
     assert.match(
       releaseJob,
-      /- name: Check and retain release-equivalent package artifact\n\s+run: node \.\/scripts\/check-package\.ts --retain-tarball package-artifacts/,
+      /- name: Check and retain release-equivalent package artifact\n\s+id: package\n\s+shell: bash\n\s+run: \|\n\s+retained_tarball=\$\(node \.\/scripts\/check-package\.ts --retain-tarball package-artifacts\)\n\s+echo "tarball=\$retained_tarball" >> "\$GITHUB_OUTPUT"/,
     )
     assert.equal(releaseJob.match(/node \.\/scripts\/check-publish\.ts/g)?.length, 1)
     assert.equal(releaseJob.match(/node \.\/scripts\/check-package\.ts --retain-tarball/g)?.length, 1)
@@ -687,7 +712,7 @@ jobs:
       `        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
           name: encephalon-npm-package
-          path: package-artifacts/*.tgz
+          path: \${{ steps.package.outputs.tarball }}
           if-no-files-found: error
           retention-days: 7
 `,

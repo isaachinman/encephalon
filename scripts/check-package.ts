@@ -16,7 +16,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import { gunzipSync } from 'node:zlib'
-import { assertPackageVersionSource } from './package-version.ts'
+import { npmCommand } from './npm-command.ts'
+import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const parseRetainedTarballDirectory = (arguments_: string[]) => {
@@ -44,13 +45,10 @@ const parseRetainedTarballDirectory = (arguments_: string[]) => {
 const retainedTarballDirectory = parseRetainedTarballDirectory(process.argv.slice(2))
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-check-'))
 
-const execute = (command: string[], cwd = root) => {
+const execute = (command: readonly string[], cwd = root) => {
   const [requestedExecutable, ...arguments_] = command
   if (requestedExecutable !== undefined) {
-    const usesWindowsNpm = requestedExecutable === 'npm' && process.platform === 'win32'
-    const executable = usesWindowsNpm ? (process.env.ComSpec ?? 'cmd.exe') : requestedExecutable
-    const executableArguments = usesWindowsNpm ? ['/d', '/s', '/c', 'npm.cmd', ...arguments_] : arguments_
-    const result = spawnSync(executable, executableArguments, {
+    const result = spawnSync(requestedExecutable, arguments_, {
       cwd,
       encoding: 'utf8',
     })
@@ -88,12 +86,9 @@ const runExpectedFailure = (command: string[], cwd = root) => {
 const retainTarball = (tarball: string, filename: string) => {
   if (retainedTarballDirectory !== undefined) {
     mkdirSync(retainedTarballDirectory, { mode: 0o700 })
-    try {
-      copyFileSync(tarball, resolve(retainedTarballDirectory, filename), constants.COPYFILE_EXCL)
-    } catch (error) {
-      rmSync(retainedTarballDirectory, { force: true, recursive: true })
-      throw error
-    }
+    const retainedTarball = resolve(retainedTarballDirectory, filename)
+    copyFileSync(tarball, retainedTarball, constants.COPYFILE_EXCL)
+    return relative(root, retainedTarball).split(sep).join('/')
   }
 }
 
@@ -163,7 +158,7 @@ try {
   if (typeof packageJson.version !== 'string') {
     throw new Error('Package version must be a string.')
   }
-  const generatedVersionSource = readFileSync(resolve(root, 'src', 'generated', 'version.ts'), 'utf8')
+  const generatedVersionSource = readPackageVersionSource(resolve(root, 'src', 'generated', 'version.ts'))
   assertPackageVersionSource(packageJson.version, generatedVersionSource)
   if (
     packageJson.name !== 'encephalon' ||
@@ -232,20 +227,14 @@ try {
   if (/from\s+["'][^"']+\.ts["']/.test(declarations)) {
     throw new Error('The declarations contain unresolved TypeScript source imports.')
   }
-  const cliVersion = run(['node', resolve(root, 'dist', 'cli.mjs'), '--version'])
+  const cliVersion = run([process.execPath, resolve(root, 'dist', 'cli.mjs'), '--version'])
   if (cliVersion !== `${packageJson.version}\n`) {
     throw new Error('The built CLI reports a stale package version.')
   }
 
-  const packOutput = run([
-    'npm',
-    'pack',
-    '--dry-run=false',
-    '--ignore-scripts',
-    '--json',
-    '--pack-destination',
-    temporaryDirectory,
-  ])
+  const packOutput = run(
+    npmCommand(['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', temporaryDirectory]),
+  )
   const [pack] = JSON.parse(packOutput) as Array<{
     filename: string
     files: Array<{ path: string; mode?: number }>
@@ -288,12 +277,12 @@ try {
   mkdirSync(resolve(consumer, '.git'), { recursive: true })
   writeFileSync(resolve(consumer, 'package.json'), '{"name":"encephalon-smoke","private":true,"type":"module"}\n')
   run(
-    ['npm', 'install', '--dry-run=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-dev', tarball],
+    npmCommand(['install', '--dry-run=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-dev', tarball]),
     consumer,
   )
   run(
     [
-      'node',
+      process.execPath,
       '--input-type=module',
       '--eval',
       "const api = await import('encephalon'); if (typeof api.prepare !== 'function' || typeof api.initEncephalon !== 'function') process.exitCode = 1",
@@ -338,8 +327,9 @@ try {
     consumer,
   )
   const installedCli = resolve(consumer, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
-  const cli = (arguments_: string[]) => run(['node', installedCli, ...arguments_], consumer)
-  const cliFailure = (arguments_: string[]) => runExpectedFailure(['node', installedCli, ...arguments_], consumer)
+  const cli = (arguments_: string[]) => run([process.execPath, installedCli, ...arguments_], consumer)
+  const cliFailure = (arguments_: string[]) =>
+    runExpectedFailure([process.execPath, installedCli, ...arguments_], consumer)
   const cliJson = (arguments_: string[]) => JSON.parse(cli(arguments_)) as unknown
 
   const help = cli(['--help'])
@@ -453,7 +443,10 @@ try {
   if (!(Array.isArray(gathered.records) && Array.isArray(gathered.searches))) {
     throw new Error('The packed Node-only CLI gather command returned an unexpected result.')
   }
-  retainTarball(tarball, pack.filename)
+  const retainedTarball = retainTarball(tarball, pack.filename)
+  if (retainedTarball !== undefined) {
+    process.stdout.write(`${retainedTarball}\n`)
+  }
 } finally {
   rmSync(temporaryDirectory, { force: true, recursive: true })
 }

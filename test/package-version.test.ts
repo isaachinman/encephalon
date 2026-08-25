@@ -20,7 +20,7 @@ const createCheckFixture = () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), 'encephalon-package-version-check-'))
   mkdirSync(resolve(temporaryRoot, 'scripts'))
   mkdirSync(resolve(temporaryRoot, 'src', 'generated'), { recursive: true })
-  for (const filename of ['package-version.ts', 'check-generated-version.ts', 'check-package.ts']) {
+  for (const filename of ['package-version.ts', 'npm-command.ts', 'check-generated-version.ts', 'check-package.ts']) {
     writeFileSync(
       resolve(temporaryRoot, 'scripts', filename),
       readFileSync(resolve(root, 'scripts', filename), 'utf8'),
@@ -84,10 +84,20 @@ test('generated-version adapters reject stale or missing source without modifyin
     assert.equal(readFileSync(generatedVersionPath, 'utf8'), staleSource)
 
     rmSync(generatedVersionPath)
-    const missingResult = runFixtureScript(temporaryRoot, 'check-generated-version.ts')
-    assert.notEqual(missingResult.status, 0)
-    assert.equal(missingResult.stderr.includes(staleGeneratedVersionMessage), true)
-    assert.doesNotMatch(missingResult.stderr, /ENOENT/)
+    const missingResults = ['check-generated-version.ts', 'check-package.ts'].map(filename =>
+      runFixtureScript(temporaryRoot, filename),
+    )
+    assert.deepEqual(
+      missingResults.map(result => result.status === 0),
+      [false, false],
+    )
+    assert.deepEqual(
+      missingResults.map(result => result.stderr.includes(staleGeneratedVersionMessage)),
+      [true, true],
+    )
+    for (const result of missingResults) {
+      assert.doesNotMatch(result.stderr, /ENOENT/)
+    }
   } finally {
     rmSync(temporaryRoot, { force: true, recursive: true })
   }
