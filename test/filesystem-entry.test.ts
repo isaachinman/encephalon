@@ -1,21 +1,20 @@
 import assert from 'node:assert/strict'
 import type { BigIntStats } from 'node:fs'
 import { describe, test } from 'node:test'
-import type { EntryIdentity, EntryMetadata, ManifestEntryMetadata } from '../src/filesystem-entry.ts'
-import * as filesystemEntryModule from '../src/filesystem-entry.ts'
-
-type FilesystemEntryModule = typeof filesystemEntryModule & {
-  entryIdentityFrom?: (metadata: BigIntStats) => EntryIdentity
-  entryMetadataFrom?: (metadata: BigIntStats) => EntryMetadata
-  manifestEntryMetadataFrom?: (metadata: BigIntStats) => ManifestEntryMetadata
-  sameStableEntryMetadataExceptCtimeAndMode?: (first: EntryMetadata, second: EntryMetadata) => boolean
-  sameStableEntryMetadataExceptCtime?: (first: EntryMetadata, second: EntryMetadata) => boolean
-  sameStableEntryMetadataExceptMode?: (first: EntryMetadata, second: EntryMetadata) => boolean
-}
+import {
+  entryIdentityFrom,
+  entryIdentityKey,
+  entryMetadataFrom,
+  type ManifestEntryMetadata,
+  manifestEntryMetadataFrom,
+  sameEntryIdentity,
+  sameStableEntryMetadata,
+  sameStableEntryMetadataExceptCtime,
+  sameStableEntryMetadataExceptCtimeAndMode,
+  sameStableEntryMetadataExceptMode,
+} from '../src/filesystem-entry.ts'
 
 type EntryType = ManifestEntryMetadata['type']
-
-const filesystemEntry: FilesystemEntryModule = filesystemEntryModule
 
 const date = new Date(0)
 
@@ -57,9 +56,6 @@ const metadata = (
 
 describe('lossless filesystem entry metadata', () => {
   test('keeps device and inode identities distinct beyond Number precision', () => {
-    assert.equal(typeof filesystemEntry.entryIdentityFrom, 'function')
-    assert.equal(typeof filesystemEntry.entryMetadataFrom, 'function')
-    const { entryIdentityFrom, entryMetadataFrom } = filesystemEntry
     const roundedCases = [
       {
         first: metadata({ dev: 9_007_199_254_740_992n }),
@@ -76,11 +72,12 @@ describe('lossless filesystem entry metadata', () => {
       assert.equal(Number(first.ino), Number(second.ino))
       assert.deepEqual(entryIdentityFrom(first), { dev: first.dev, ino: first.ino })
       assert.deepEqual(entryIdentityFrom(second), { dev: second.dev, ino: second.ino })
-      assert.equal(filesystemEntry.sameEntryIdentity(entryIdentityFrom(first), entryIdentityFrom(second)), false)
+      assert.equal(sameEntryIdentity(entryIdentityFrom(first), entryIdentityFrom(second)), false)
+      assert.notEqual(entryIdentityKey(entryIdentityFrom(first)), entryIdentityKey(entryIdentityFrom(second)))
     }
 
     assert.equal(
-      filesystemEntry.sameEntryIdentity(
+      sameEntryIdentity(
         entryMetadataFrom(metadata()),
         entryMetadataFrom(
           metadata({
@@ -97,8 +94,6 @@ describe('lossless filesystem entry metadata', () => {
   })
 
   test('compares complete stable metadata at nanosecond precision', () => {
-    assert.equal(typeof filesystemEntry.entryMetadataFrom, 'function')
-    const { entryMetadataFrom } = filesystemEntry
     const roundedIdentity = 9_007_199_254_740_992n
     const baseline = entryMetadataFrom(metadata({ dev: roundedIdentity, ino: roundedIdentity }))
     const changedMetadata = (
@@ -125,14 +120,11 @@ describe('lossless filesystem entry metadata', () => {
     })
     assert.equal(Number(roundedIdentity), Number(roundedIdentity + 1n))
     for (const changed of changedCases) {
-      assert.equal(filesystemEntry.sameStableEntryMetadata(baseline, changed), false)
+      assert.equal(sameStableEntryMetadata(baseline, changed), false)
     }
   })
 
   test('post-rename comparison omits only ctime nanoseconds', () => {
-    assert.equal(typeof filesystemEntry.entryMetadataFrom, 'function')
-    assert.equal(typeof filesystemEntry.sameStableEntryMetadataExceptCtime, 'function')
-    const { entryMetadataFrom, sameStableEntryMetadataExceptCtime } = filesystemEntry
     const roundedIdentity = 9_007_199_254_740_992n
     const baseline = entryMetadataFrom(metadata({ dev: roundedIdentity, ino: roundedIdentity }))
     const cases = [
@@ -152,11 +144,6 @@ describe('lossless filesystem entry metadata', () => {
   })
 
   test('instruction comparisons omit only their explicit metadata fields', () => {
-    assert.equal(typeof filesystemEntry.entryMetadataFrom, 'function')
-    assert.equal(typeof filesystemEntry.sameStableEntryMetadataExceptCtimeAndMode, 'function')
-    assert.equal(typeof filesystemEntry.sameStableEntryMetadataExceptMode, 'function')
-    const { entryMetadataFrom, sameStableEntryMetadataExceptCtimeAndMode, sameStableEntryMetadataExceptMode } =
-      filesystemEntry
     const baseline = entryMetadataFrom(metadata())
 
     assert.equal(sameStableEntryMetadataExceptMode(baseline, entryMetadataFrom(metadata({ mode: 0o100_600n }))), true)
@@ -175,8 +162,6 @@ describe('lossless filesystem entry metadata', () => {
   })
 
   test('projects canonical manifest strings and independently derived entry types', () => {
-    assert.equal(typeof filesystemEntry.manifestEntryMetadataFrom, 'function')
-    const { manifestEntryMetadataFrom } = filesystemEntry
     const cases = [
       { expectedType: 'file', type: 'file' },
       { expectedType: 'directory', type: 'directory' },

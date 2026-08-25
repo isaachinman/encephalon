@@ -29,6 +29,9 @@ export const entryIdentityFrom = (metadata: BigIntStats): EntryIdentity => ({
 })
 
 /** @internal */
+export const entryIdentityKey = (identity: EntryIdentity) => `${identity.dev}:${identity.ino}`
+
+/** @internal */
 export const entryMetadataFrom = (metadata: BigIntStats): EntryMetadata => ({
   ...entryIdentityFrom(metadata),
   birthtimeNs: metadata.birthtimeNs,
