@@ -354,4 +354,43 @@ describe('package contract', () => {
       assert.match(result.stderr, /reviewed package file manifest/)
     }
   })
+
+  test('rejects a missing declaration derived from reviewed TypeScript source', { timeout: 30_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-missing-declaration-')
+    try {
+      rmSync(resolve(fixtureRoot, 'dist', 'api-input.d.ts'))
+
+      const result = spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+        cwd: fixtureRoot,
+        encoding: 'utf8',
+        timeout: 30_000,
+      })
+
+      assert.notEqual(result.status, 0)
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /reviewed package file manifest/)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('accepts newly reviewed skill files in the package manifest', { timeout: 30_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-reviewed-skill-')
+    try {
+      const reviewedSkill = 'skills/encephalon/reviewed.txt'
+      writeFileSync(resolve(fixtureRoot, reviewedSkill), 'reviewed package content\n')
+      const stage = spawnSync('git', ['add', '--', reviewedSkill], { cwd: fixtureRoot, encoding: 'utf8' })
+      assert.equal(stage.status, 0, `${stage.stdout}${stage.stderr}`)
+
+      const result = spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+        cwd: fixtureRoot,
+        encoding: 'utf8',
+        timeout: 30_000,
+      })
+
+      assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
 })
