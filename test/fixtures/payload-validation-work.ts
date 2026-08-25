@@ -1,4 +1,3 @@
-import { performance } from 'node:perf_hooks'
 import { validateJsonValue } from '../../src/schema.ts'
 
 const PROPERTY_COUNT = 100_000
@@ -62,15 +61,12 @@ Object.getOwnPropertyDescriptors = ((value: object) => {
 
 const garbageCollect = (globalThis as typeof globalThis & { gc?: () => void }).gc
 garbageCollect?.()
-const before = {
-  heapUsedBytes: process.memoryUsage().heapUsed,
-  peakRssBytes: process.resourceUsage().maxRSS * 1024,
-}
-const startedAt = performance.now()
+const beforeHeapUsedBytes = process.memoryUsage().heapUsed
 let retainedDescriptors: PropertyDescriptorMap | undefined
 
 try {
   if (bounded) {
+    validateJsonValue({ nested: [{ value: null }] })
     assertInvalidPayload(() => validateJsonValue(payload))
     assertInvalidPayload(() => validateJsonValue(oversizedArray))
   } else {
@@ -82,23 +78,17 @@ try {
 }
 
 garbageCollect?.()
-const after = {
-  heapUsedBytes: process.memoryUsage().heapUsed,
-  peakRssBytes: process.resourceUsage().maxRSS * 1024,
-}
+const afterHeapUsedBytes = process.memoryUsage().heapUsed
 const retainedDescriptorCount = retainedDescriptors === undefined ? 0 : Reflect.ownKeys(retainedDescriptors).length
 
 process.stdout.write(
   `${JSON.stringify({
     descriptorMapCalls,
-    elapsedMilliseconds: performance.now() - startedAt,
-    heapGrowthBytes: Math.max(0, after.heapUsedBytes - before.heapUsedBytes),
+    heapGrowthBytes: Math.max(0, afterHeapUsedBytes - beforeHeapUsedBytes),
     mode,
     oversizedArrayWork,
-    peakRssBytes: after.peakRssBytes,
     propertyCount: PROPERTY_COUNT,
     retainedDescriptorCount,
-    rssGrowthBytes: Math.max(0, after.peakRssBytes - before.peakRssBytes),
     work,
   })}\n`,
 )

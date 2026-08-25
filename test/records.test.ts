@@ -3459,6 +3459,22 @@ describe('canonical records', () => {
         }),
       'INVALID_ARGUMENT',
     )
+
+    const widestArray = Array.from({ length: MAX_PAYLOAD_NODES - 1 }, () => null)
+    const validatedArray = validateJsonValue(widestArray)
+    assert.ok(Array.isArray(validatedArray))
+    assert.equal(validatedArray.length, MAX_PAYLOAD_NODES - 1)
+
+    assert.throws(
+      () => validateJsonValue(Array.from({ length: MAX_PAYLOAD_NODES }, () => null)),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+        assert.equal(actual.code, 'INVALID_ARGUMENT')
+        assert.equal(actual.message, 'payload may contain at most 10000 JSON nodes.')
+        assert.deepEqual(actual.details, { field: 'payload' })
+        return true
+      },
+    )
   })
 
   test('bounds wide-object descriptor work before child traversal', () => {
@@ -3674,6 +3690,26 @@ describe('canonical records', () => {
 }
 `,
     )
+
+    const root = createRoot()
+    const publicRecord = api.addRecord({
+      id: 'payload-compat-public',
+      kind: 'decision',
+      payload: payload as never,
+      root,
+      source: 'test',
+      subject: 'payload.compat.public',
+    })
+    const expectedPublicRecord = parseRecordFile({
+      createdAt: publicRecord.createdAt,
+      id: 'payload-compat-public',
+      kind: 'decision',
+      payload,
+      source: 'test',
+      subject: 'payload.compat.public',
+    })
+    assert.deepEqual(publicRecord.payload, expectedPublicRecord.payload)
+    assert.equal(readFileSync(join(root, publicRecord.path), 'utf8'), formatRecordFile(expectedPublicRecord))
   })
 
   test('normalizes negative zero payload numbers before formatting', () => {

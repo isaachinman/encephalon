@@ -59,14 +59,11 @@ describe('hot scan performance regressions', () => {
         }),
       ) as {
         descriptorMapCalls: number
-        elapsedMilliseconds: number
         heapGrowthBytes: number
         mode: string
         oversizedArrayWork: { descriptors: string[]; ownKeys: number }
-        peakRssBytes: number
         propertyCount: number
         retainedDescriptorCount: number
-        rssGrowthBytes: number
         work: { descriptors: number; ownKeys: number }
       }
 
@@ -85,11 +82,6 @@ describe('hot scan performance regressions', () => {
     assert.equal(bounded.retainedDescriptorCount, 0)
     assert.equal(descriptorMap.retainedDescriptorCount, descriptorMap.propertyCount)
     assert.ok(descriptorMap.heapGrowthBytes > bounded.heapGrowthBytes + descriptorMap.propertyCount * 32)
-    for (const report of [bounded, descriptorMap]) {
-      assert.equal(Number.isFinite(report.elapsedMilliseconds), true)
-      assert.equal(Number.isSafeInteger(report.peakRssBytes), true)
-      assert.equal(Number.isSafeInteger(report.rssGrowthBytes), true)
-    }
   })
 
   test('leaves returned baseline results free of instrumentation wrappers', () => {
