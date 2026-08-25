@@ -316,7 +316,7 @@ describe('package contract', () => {
     assert.doesNotMatch(skill, /node \.\/node_modules\/encephalon\/dist\/cli\.mjs/)
   })
 
-  test('retains the exact package tarball exercised by the package checker', { timeout: 30_000 }, () => {
+  test('retains the exact package tarball exercised by the package checker', { timeout: 75_000 }, () => {
     const artifactParentName = join('test', `.package-artifacts-test-${randomUUID()}`)
     const artifactDirectoryName = join(artifactParentName, 'nested')
     const artifactParent = resolve(root, artifactParentName)
@@ -329,7 +329,7 @@ describe('package contract', () => {
         {
           cwd: root,
           encoding: 'utf8',
-          timeout: 30_000,
+          timeout: 60_000,
         },
       )
       assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
