@@ -3,6 +3,13 @@ import { CANONICAL_BUDGETS } from './canonical-budgets.ts'
 import { ARTIFACTS_DIRECTORY_NAME } from './canonical-layout.ts'
 import { fail, failBudget } from './errors.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
+import {
+  guardedGetOwnPropertyDescriptor,
+  guardedGetPrototypeOf,
+  guardedIsArray,
+  guardedOwnKeys,
+  PROPERTY_INSPECTION_FAILED,
+} from './property-inspection.ts'
 import type { AddRecordInput, BrainRecordFile, JsonValue } from './types.ts'
 
 export const MAX_RECORD_BYTES = CANONICAL_BUDGETS.recordBytes
@@ -144,37 +151,75 @@ const assignPayloadValue = (target: PayloadTarget | undefined, value: JsonValue)
 }
 
 const getPayloadPrototype = (value: object, path: string) => {
-  try {
-    return Object.getPrototypeOf(value)
-  } catch {
-    return fail('INVALID_ARGUMENT', 'payload object metadata could not be inspected.', {
-      field: path,
-    })
+  const prototype = guardedGetPrototypeOf(value)
+  if (prototype !== PROPERTY_INSPECTION_FAILED) {
+    return prototype
   }
-}
-
-const getPayloadDescriptors = (value: object, path: string) => {
-  try {
-    return Object.getOwnPropertyDescriptors(value)
-  } catch {
-    return fail('INVALID_ARGUMENT', 'payload object descriptors could not be inspected.', {
-      field: path,
-    })
-  }
-}
-
-const assertPayloadDescriptors = (descriptors: PropertyDescriptorMap, path: string) => {
-  const descriptorKeys = Reflect.ownKeys(descriptors)
-  if (descriptorKeys.some(key => typeof key === 'symbol')) {
-    return fail('INVALID_ARGUMENT', 'payload contains a symbol-keyed property.', { field: path })
-  }
-  const accessorKey = descriptorKeys.find(key => {
-    const descriptor = Reflect.get(descriptors, key) as PropertyDescriptor | undefined
-    return descriptor !== undefined && ('get' in descriptor || 'set' in descriptor)
+  return fail('INVALID_ARGUMENT', 'payload object metadata could not be inspected.', {
+    field: path,
   })
-  if (accessorKey !== undefined) {
+}
+
+const isPayloadArray = (value: unknown, path: string): value is unknown[] => {
+  const isArray = guardedIsArray(value)
+  if (isArray !== PROPERTY_INSPECTION_FAILED) {
+    return isArray
+  }
+  return fail('INVALID_ARGUMENT', 'payload object metadata could not be inspected.', {
+    field: path,
+  })
+}
+
+const getPayloadOwnKeys = (value: object, path: string) => {
+  const keys = guardedOwnKeys(value)
+  if (keys !== PROPERTY_INSPECTION_FAILED) {
+    return keys
+  }
+  return fail('INVALID_ARGUMENT', 'payload object descriptors could not be inspected.', {
+    field: path,
+  })
+}
+
+const getPayloadOwnPropertyDescriptor = (value: object, key: PropertyKey, path: string) => {
+  const descriptor = guardedGetOwnPropertyDescriptor(value, key)
+  if (descriptor !== PROPERTY_INSPECTION_FAILED) {
+    return descriptor
+  }
+  return fail('INVALID_ARGUMENT', 'payload object descriptors could not be inspected.', {
+    field: path,
+  })
+}
+
+const assertPayloadDataDescriptor = (descriptor: PropertyDescriptor | undefined, path: string) => {
+  if (descriptor !== undefined && ('get' in descriptor || 'set' in descriptor)) {
     return fail('INVALID_ARGUMENT', 'payload contains an accessor property.', { field: path })
   }
+  return descriptor
+}
+
+const canonicalArrayIndex = (key: string) => {
+  const index = Number(key)
+  return Number.isInteger(index) && index >= 0 && index < 2 ** 32 - 1 && String(index) === key ? index : undefined
+}
+
+const orderPayloadObjectKeys = (keys: PropertyKey[], length: number) => {
+  keys.length = length
+  keys.sort((left, right) => {
+    if (typeof left === 'string' && typeof right === 'string') {
+      const leftIndex = canonicalArrayIndex(left)
+      const rightIndex = canonicalArrayIndex(right)
+      if (leftIndex !== undefined && rightIndex !== undefined) {
+        return leftIndex - rightIndex
+      }
+      if (leftIndex !== undefined) {
+        return -1
+      }
+      if (rightIndex !== undefined) {
+        return 1
+      }
+    }
+    return 0
+  })
 }
 
 const validateJsonValueAt = (
@@ -208,15 +253,14 @@ const validateJsonValueAt = (
       field: path,
     })
   }
-  if (Array.isArray(value)) {
+  if (isPayloadArray(value, path)) {
     if (seen.has(value)) {
       return fail('INVALID_ARGUMENT', 'payload contains a cycle.', {
         field: path,
       })
     }
-    const descriptors = getPayloadDescriptors(value, path)
-    assertPayloadDescriptors(descriptors, path)
-    const length = descriptors.length?.value
+    const lengthDescriptor = assertPayloadDataDescriptor(getPayloadOwnPropertyDescriptor(value, 'length', path), path)
+    const length = lengthDescriptor?.value
     if (!Number.isSafeInteger(length) || length < 0) {
       return fail('INVALID_ARGUMENT', 'payload contains an invalid array length.', { field: path })
     }
@@ -225,25 +269,56 @@ const validateJsonValueAt = (
         field: path,
       })
     }
+    const keys = getPayloadOwnKeys(value, path)
+    const values: unknown[] = new Array(length)
+    let hasAccessor = false
+    let hasSymbol = false
+    let presentIndices = 0
+    for (const key of keys) {
+      if (key !== 'length') {
+        const descriptor = getPayloadOwnPropertyDescriptor(value, key, path)
+        if (typeof key === 'symbol' && descriptor !== undefined) {
+          hasSymbol = true
+        }
+        if (descriptor !== undefined && ('get' in descriptor || 'set' in descriptor)) {
+          hasAccessor = true
+        }
+        const index = typeof key === 'string' ? canonicalArrayIndex(key) : undefined
+        if (
+          typeof key === 'string' &&
+          descriptor !== undefined &&
+          'value' in descriptor &&
+          index !== undefined &&
+          index < length
+        ) {
+          presentIndices += 1
+          values[index] = descriptor.value
+        }
+      }
+    }
+    if (hasSymbol) {
+      return fail('INVALID_ARGUMENT', 'payload contains a symbol-keyed property.', { field: path })
+    }
+    if (hasAccessor) {
+      return fail('INVALID_ARGUMENT', 'payload contains an accessor property.', { field: path })
+    }
+    if (presentIndices !== length) {
+      return fail('INVALID_ARGUMENT', 'payload contains a sparse array.', {
+        field: path,
+      })
+    }
     seen.add(value)
-    const values: JsonValue[] = new Array(length)
-    const assigned = assignPayloadValue(target, values)
+    const normalizedValues = values as JsonValue[]
+    const assigned = assignPayloadValue(target, normalizedValues)
     stack.push({ action: 'exit', value })
     for (let index = length - 1; index >= 0; index -= 1) {
-      const descriptor = descriptors[String(index)]
-      if (descriptor !== undefined && 'value' in descriptor) {
-        stack.push({
-          action: 'enter',
-          depth: depth + 1,
-          path: `${path}[${index}]`,
-          target: { container: values, key: index },
-          value: descriptor.value,
-        })
-      } else {
-        return fail('INVALID_ARGUMENT', 'payload contains a sparse array.', {
-          field: path,
-        })
-      }
+      stack.push({
+        action: 'enter',
+        depth: depth + 1,
+        path: `${path}[${index}]`,
+        target: { container: normalizedValues, key: index },
+        value: values[index],
+      })
     }
     return assigned
   }
@@ -256,32 +331,70 @@ const validateJsonValueAt = (
           field: path,
         })
       }
-      const descriptors = getPayloadDescriptors(object, path)
-      assertPayloadDescriptors(descriptors, path)
-      seen.add(object)
-      const result: { [key: string]: JsonValue } = {}
-      const assigned = assignPayloadValue(target, result)
-      stack.push({ action: 'exit', value: object })
-      const keys = Object.keys(descriptors).filter(key => descriptors[key]?.enumerable === true)
-      if (keys.length > MAX_PAYLOAD_NODES - nodeCount.value) {
+      const keys = getPayloadOwnKeys(object, path)
+      const values: unknown[] = []
+      const remainingNodes = MAX_PAYLOAD_NODES - nodeCount.value
+      let enumerableKeyCount = 0
+      let hasAccessor = false
+      let hasSymbol = false
+      let overBudget = false
+      for (const key of keys) {
+        const descriptor = getPayloadOwnPropertyDescriptor(object, key, path)
+        if (typeof key === 'symbol' && descriptor !== undefined) {
+          hasSymbol = true
+        }
+        if (descriptor !== undefined && ('get' in descriptor || 'set' in descriptor)) {
+          hasAccessor = true
+        }
+        if (typeof key === 'string' && descriptor?.enumerable === true && 'value' in descriptor) {
+          if (enumerableKeyCount >= remainingNodes) {
+            overBudget = true
+          } else {
+            keys[enumerableKeyCount] = key
+            values[enumerableKeyCount] = descriptor.value
+            enumerableKeyCount += 1
+          }
+        }
+      }
+      if (hasSymbol) {
+        return fail('INVALID_ARGUMENT', 'payload contains a symbol-keyed property.', {
+          field: path,
+        })
+      }
+      if (hasAccessor) {
+        return fail('INVALID_ARGUMENT', 'payload contains an accessor property.', { field: path })
+      }
+      if (overBudget) {
         return fail('INVALID_ARGUMENT', `payload may contain at most ${MAX_PAYLOAD_NODES} JSON nodes.`, {
           field: path,
         })
       }
-      for (let index = keys.length - 1; index >= 0; index -= 1) {
-        const key = keys[index] ?? ''
-        const descriptor = descriptors[key]
-        if (descriptor !== undefined && 'value' in descriptor) {
+      const result: { [key: string]: unknown } = {}
+      for (let index = 0; index < enumerableKeyCount; index += 1) {
+        const key = keys[index]
+        if (typeof key === 'string') {
+          Object.defineProperty(result, key, {
+            configurable: true,
+            enumerable: true,
+            value: values[index],
+            writable: true,
+          })
+        }
+      }
+      orderPayloadObjectKeys(keys, enumerableKeyCount)
+      seen.add(object)
+      const normalizedResult = result as { [key: string]: JsonValue }
+      const assigned = assignPayloadValue(target, normalizedResult)
+      stack.push({ action: 'exit', value: object })
+      for (let index = enumerableKeyCount - 1; index >= 0; index -= 1) {
+        const key = keys[index]
+        if (typeof key === 'string') {
           stack.push({
             action: 'enter',
             depth: depth + 1,
             path: `${path}.${key}`,
-            target: { container: result, key },
-            value: descriptor.value,
-          })
-        } else {
-          return fail('INVALID_ARGUMENT', 'payload contains an invalid property descriptor.', {
-            field: path,
+            target: { container: normalizedResult, key },
+            value: result[key],
           })
         }
       }
