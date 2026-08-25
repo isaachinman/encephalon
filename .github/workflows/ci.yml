@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -42,6 +42,11 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
+          node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
+      - if: matrix.context == 'ubuntu-current'
+        uses: actions/setup-node@v7
+        with:
           node-version: ${{ matrix.node }}
       - uses: oven-sh/setup-bun@v2
         with:
@@ -52,11 +57,15 @@ jobs:
       - run: bun run lint
       - run: bun run benchmark:check
       - run: bun run build
-      - run: bun run check:package
+      - run: git diff --exit-code HEAD
+      - run: node ./scripts/check-package.ts
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+      - run: git diff --exit-code HEAD
 
   release:
     name: Release-equivalent package gate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: verify
     runs-on: ubuntu-latest
     steps:
@@ -66,23 +75,33 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile
       - run: bun run build
-      - run: bun run check:package
-      - name: Create release-equivalent package artifact
-        shell: bash
-        run: |
-          mkdir -p package-artifacts
-          npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts > package-artifacts/npm-pack.json
+      - run: git diff --exit-code HEAD
       - name: Check npm publish dry run
-        run: bun run check:publish
-      - name: Upload release-equivalent package artifact
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+        run: node ./scripts/check-publish.ts
+      - name: Check and retain release-equivalent package artifact
+        id: package
+        shell: bash
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+        run: |
+          retained_tarball=$(node ./scripts/check-package.ts --retain-tarball package-artifacts)
+          echo "tarball=$retained_tarball" >> "$GITHUB_OUTPUT"
+      - run: git diff --exit-code HEAD
+      - name: Upload trusted release-equivalent package artifact
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: encephalon-npm-package
-          path: package-artifacts/*
+          path: ${{ steps.package.outputs.tarball }}
           if-no-files-found: error
           retention-days: 7

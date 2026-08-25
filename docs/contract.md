@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-23 for code and behavioural-test snapshot `30104a049f72ba2e87f51af95d5da11b55045cc3`.
+Last reviewed: 2026-08-25 for code and behavioural-test snapshot `5b0b1dfd982ccc321091bc9d2d930079137ff616`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -165,10 +165,20 @@ MAR-2565 validated mutation cache construction, deterministic disk fallback, and
 ## Package and Release Gates
 
 - Runtime consumers require Node.js 24.15.0 or newer and do not require Bun.
-- The npm package has no runtime dependencies and no install, preinstall, postinstall, or prepare lifecycle scripts.
-- The tarball whitelist is intentionally small and checked by `bun run check:package`.
-- `bun run check:package` must build, pack, install the actual tarball into a temporary Git repository with scripts disabled, import the API, typecheck consumer declarations, and execute the packed CLI through Node.
-- `bun run check:publish` is a dry-run release gate only. Publishing is manual maintainer work and must not be performed by agents.
+- The npm package has no runtime dependencies and no install, preinstall, postinstall, or prepare lifecycle scripts. The package gate rejects `dependencies`, `optionalDependencies`, `peerDependencies`, `peerDependenciesMeta`, `bundledDependencies`, and `bundleDependencies` when present, while development dependencies remain permitted.
+- `bun run check:generated` is contributor convenience for trusted local checkouts. Its target generated-version checker is non-mutating, but package lifecycle hooks and Bun preloads mean the alias is not an authority for untrusted changes. Every CI job must instead run the exact direct command `node ./scripts/check-generated-version.ts` immediately after Node setup and before Bun setup or installation so those hooks and preloads cannot run first. The check compares the complete committed package-version source; stale or missing source receives deterministic build-and-commit guidance, while unrelated I/O failures remain unchanged.
+- The tarball manifest is intentionally small and checked by `bun run check:package`. Every packed path must be either a reviewed tracked package input or an expected declaration/bundle path derived from tracked TypeScript sources and the two fixed public entrypoints; untracked source-tree files and extra generated outputs fail before retention.
+- The release gate or contributor must build before `bun run check:package`; the package check validates that built distribution, packs and installs the actual tarball into a temporary Git repository with scripts disabled, imports the API, typechecks consumer declarations, and executes the packed CLI through Node. Its opt-in retained tarball must be a byte-for-byte copy of that exercised tarball and must be created only after every package check passes. The destination must be repository-relative and cannot traverse a symlink or non-directory ancestor.
+- `bun run check:publish` is a dry-run release gate only. Publishing is manual maintainer work and must not be performed by agents. An already-published version is accepted only when npm terminates normally with exit code `1`, every structured or explicit failure diagnostic is the expected conflict, and no unrelated fatal diagnostic is present. The package and publish contributor commands launch Node scripts; CI invokes those scripts directly so package lifecycle hooks and Bun preloads cannot run at the validation boundary.
+- Every authoritative package or publish Node step that runs after Bun setup explicitly clears `NODE_OPTIONS` and `NODE_PATH`, including for child npm and Node processes, so an earlier untrusted lifecycle or build step cannot preload code into the validation boundary.
+- The release-equivalent package gate runs with read-only workflow permissions and without repository, provider, or npm secrets on pull requests and trusted pushes to `main`. It waits for all verification lanes, then builds, checks the publish contract, and creates, inspects, and retains one real npm tarball in both cases. Every CI build path must leave tracked files unchanged. Pull requests retain the bounded tarball in runner-local storage; on a trusted push to `main`, the gate uploads the exact tarball exercised by the package checker after a final clean-tree check. Pull-request runs cancel superseded work, while trusted pushes use independent runs so a newer push cannot cancel an earlier artifact handoff.
+
+After rollout, branch protection must require exactly `verify (ubuntu-latest)`, `verify (macos-latest)`, `verify (windows-latest)`, `verify (ubuntu-current)`, and `Release-equivalent package gate`. Rollout is maintainer-operated only after an exact pull-request head has emitted all five successful contexts; this repository change does not claim that the external setting has been updated. Re-query the read-only status-check configuration with:
+
+```bash
+gh api repos/isaachinman/encephalon/branches/main/protection/required_status_checks \
+  --jq '{strict, contexts: (.contexts | sort)}'
+```
 
 ## Contract Change Process
 
@@ -187,7 +197,7 @@ When an implementation change intentionally alters this contract:
 | CLI parsing moved from bespoke parsing to `node:util` `parseArgs`. | Completed under MAR-2536; current option semantics remain covered by CLI tests. |
 | Cache versioning and runtime package-version handling drifted from the original plan. | Owned by MAR-2524 and the cache compatibility tests. The maintained contract treats the cache as disposable derived state gated by explicit metadata. |
 | The packaged skill uses `npx --no-install encephalon ...` examples instead of direct `node ./node_modules/encephalon/dist/cli.mjs` examples. | Accepted current contract. Root-install verification prevents ephemeral package execution, and package tests assert the skill guidance. |
-| CI and release gates evolved after the original plan. | Owned by MAR-2527 for CI package gates. The maintained release contract remains the checked package scripts plus manual publishing. |
+| CI and release gates evolved after the original plan. | Owned by MAR-2527 and MAR-2640. The maintained contract requires package and publish checks before merge while npm publication remains manual maintainer work; see `Package and Release Gates`. |
 | Initialisation result and managed-file mutation details changed during implementation. | Implemented and tested in the init, instruction-file, package, and CLI suites; the README and this contract describe the maintained behaviour. |
 | `canonicalRecordPath` was exported from `src/records.ts` without a public API surface. | Retained as an internal helper used by cache path validation; not exported from `src/index.ts`. |
 | Historical plan's wall-clock-only `createdAt` policy predates cross-process mutation ordering. | MAR-2563 assigns timestamps from validated canonical history while the repository operation lock is held; the maintained behaviour is specified in this contract. |

@@ -1,4 +1,7 @@
+import { spawnSync } from 'node:child_process'
 import {
+  constants,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -9,40 +12,136 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import { gunzipSync } from 'node:zlib'
+import { spawnNpmCommand } from './npm-command.ts'
+import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const retainedTarballUsage = () =>
+  new Error('Usage: check-package.ts [--retain-tarball <repository-relative-directory>]')
+
+const parseRetainedTarballDirectory = (arguments_: string[]) => {
+  if (arguments_.length === 0) {
+    return
+  }
+  const [option, directoryName] = arguments_
+  const directory = directoryName === undefined ? root : resolve(root, directoryName)
+  const repositoryRelativeDirectory = relative(root, directory)
+  if (
+    arguments_.length === 2 &&
+    option === '--retain-tarball' &&
+    directoryName !== undefined &&
+    !isAbsolute(directoryName) &&
+    repositoryRelativeDirectory !== '' &&
+    repositoryRelativeDirectory !== '..' &&
+    !repositoryRelativeDirectory.startsWith(`..${sep}`) &&
+    !isAbsolute(repositoryRelativeDirectory)
+  ) {
+    return directory
+  }
+  throw retainedTarballUsage()
+}
+
+const preflightRetainedTarballDirectory = (retainedDirectory: string) => {
+  relative(root, retainedDirectory)
+    .split(sep)
+    .reduce(
+      (state, segment, index, segments) => {
+        const directory = resolve(state.parent, segment)
+        const entry = state.ancestorMissing ? undefined : lstatSync(directory, { throwIfNoEntry: false })
+        const isDestination = index === segments.length - 1
+        if (entry !== undefined && (isDestination || !(entry.isDirectory() && !entry.isSymbolicLink()))) {
+          throw retainedTarballUsage()
+        }
+        return { ancestorMissing: state.ancestorMissing || entry === undefined, parent: directory }
+      },
+      { ancestorMissing: false, parent: root },
+    )
+}
+
+const retainedTarballDirectory = parseRetainedTarballDirectory(process.argv.slice(2))
+if (retainedTarballDirectory !== undefined) {
+  preflightRetainedTarballDirectory(retainedTarballDirectory)
+}
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-check-'))
 
-const run = (command: string[], cwd = root) => {
-  const result = Bun.spawnSync({
-    cmd: command,
-    cwd,
-    stderr: 'pipe',
-    stdout: 'pipe',
-  })
-  if (result.exitCode === 0) {
-    return result.stdout.toString()
+const execute = (command: readonly string[], cwd = root) => {
+  const [requestedExecutable, ...arguments_] = command
+  if (requestedExecutable !== undefined) {
+    const result = spawnSync(requestedExecutable, arguments_, {
+      cwd,
+      encoding: 'utf8',
+    })
+    if (result.error !== undefined) {
+      throw result.error
+    }
+    return {
+      exitCode: result.status ?? 1,
+      stderr: result.stderr ?? '',
+      stdout: result.stdout ?? '',
+    }
   }
-  process.stderr.write(result.stdout.toString())
-  process.stderr.write(result.stderr.toString())
+  throw new Error('Package check command must not be empty.')
+}
+
+const run = (command: string[], cwd = root) => {
+  const result = execute(command, cwd)
+  if (result.exitCode === 0) {
+    return result.stdout
+  }
+  process.stderr.write(result.stdout)
+  process.stderr.write(result.stderr)
   throw new Error(`${command[0]} failed with exit code ${result.exitCode}.`)
 }
 
 const runExpectedFailure = (command: string[], cwd = root) => {
-  const result = Bun.spawnSync({
-    cmd: command,
-    cwd,
-    stderr: 'pipe',
-    stdout: 'pipe',
-  })
+  const result = execute(command, cwd)
   return {
     exitCode: result.exitCode,
-    stderr: result.stderr.toString(),
-    stdout: result.stdout.toString(),
+    stderr: result.stderr,
+    stdout: result.stdout,
+  }
+}
+
+const runNpm = (arguments_: readonly string[], cwd = root) => {
+  const result = spawnNpmCommand(arguments_, { cwd })
+  if (result.error !== undefined) {
+    throw result.error
+  }
+  if (result.status === 0) {
+    return result.stdout ?? ''
+  }
+  process.stderr.write(result.stdout ?? '')
+  process.stderr.write(result.stderr ?? '')
+  throw new Error(`npm failed with exit code ${result.status ?? 1}.`)
+}
+
+const createRetainedTarballParents = (parentDirectory: string) =>
+  relative(root, parentDirectory)
+    .split(sep)
+    .filter(segment => segment.length > 0)
+    .reduce((parent, segment) => {
+      const directory = resolve(parent, segment)
+      const entry = lstatSync(directory, { throwIfNoEntry: false })
+      if (entry === undefined) {
+        mkdirSync(directory, { mode: 0o700 })
+      } else if (!(entry.isDirectory() && !entry.isSymbolicLink())) {
+        throw retainedTarballUsage()
+      }
+      return directory
+    }, root)
+
+const retainTarball = (tarball: string, filename: string) => {
+  if (retainedTarballDirectory !== undefined) {
+    const parentDirectory = dirname(retainedTarballDirectory)
+    createRetainedTarballParents(parentDirectory)
+    mkdirSync(retainedTarballDirectory, { mode: 0o700 })
+    const retainedTarball = resolve(retainedTarballDirectory, filename)
+    copyFileSync(tarball, retainedTarball, constants.COPYFILE_EXCL)
+    return relative(root, retainedTarball).split(sep).join('/')
   }
 }
 
@@ -106,16 +205,19 @@ try {
     bin?: unknown
     exports?: unknown
     files?: unknown
+    bundleDependencies?: unknown
+    bundledDependencies?: unknown
     dependencies?: unknown
+    optionalDependencies?: unknown
+    peerDependencies?: unknown
+    peerDependenciesMeta?: unknown
     scripts?: Record<string, unknown>
   }
   if (typeof packageJson.version !== 'string') {
     throw new Error('Package version must be a string.')
   }
-  const generatedVersionSource = readFileSync(resolve(root, 'src', 'generated', 'version.ts'), 'utf8')
-  if (!generatedVersionSource.includes(`PACKAGE_VERSION = ${JSON.stringify(packageJson.version)}`)) {
-    throw new Error('Generated runtime package version is stale.')
-  }
+  const generatedVersionSource = readPackageVersionSource(resolve(root, 'src', 'generated', 'version.ts'))
+  assertPackageVersionSource(packageJson.version, generatedVersionSource)
   if (
     packageJson.name !== 'encephalon' ||
     packageJson.license !== 'MIT' ||
@@ -137,7 +239,12 @@ try {
         'README.md',
         'LICENSE',
       ]) ||
-    packageJson.dependencies !== undefined
+    packageJson.bundleDependencies !== undefined ||
+    packageJson.bundledDependencies !== undefined ||
+    packageJson.dependencies !== undefined ||
+    packageJson.optionalDependencies !== undefined ||
+    packageJson.peerDependencies !== undefined ||
+    packageJson.peerDependenciesMeta !== undefined
   ) {
     throw new Error('Package identity, exports, engine, files, or zero-runtime-dependency contract is invalid.')
   }
@@ -183,13 +290,12 @@ try {
   if (/from\s+["'][^"']+\.ts["']/.test(declarations)) {
     throw new Error('The declarations contain unresolved TypeScript source imports.')
   }
-  const cliVersion = run(['node', resolve(root, 'dist', 'cli.mjs'), '--version'])
+  const cliVersion = run([process.execPath, resolve(root, 'dist', 'cli.mjs'), '--version'])
   if (cliVersion !== `${packageJson.version}\n`) {
     throw new Error('The built CLI reports a stale package version.')
   }
 
-  const packOutput = run([
-    'npm',
+  const packOutput = runNpm([
     'pack',
     '--dry-run=false',
     '--ignore-scripts',
@@ -201,7 +307,7 @@ try {
     filename: string
     files: Array<{ path: string; mode?: number }>
   }>
-  if (pack === undefined) {
+  if (pack === undefined || basename(pack.filename) !== pack.filename || !pack.filename.endsWith('.tgz')) {
     throw new Error('npm pack did not return package metadata.')
   }
   const allowedFiles = new Set([
@@ -213,13 +319,24 @@ try {
     'docs/performance-budgets.json',
     'package.json',
   ])
-  const unexpected = pack.files
-    .map(file => file.path)
-    .filter(path => !(allowedFiles.has(path) || path.startsWith('dist/') || path.startsWith('skills/')))
-  if (unexpected.length > 0) {
-    throw new Error(`The tarball contains unexpected files: ${unexpected.join(', ')}`)
-  }
+  const reviewedInputs = run(['git', 'ls-files', '--cached', '-z', '--'])
+    .split('\0')
+    .filter(path => path.length > 0)
+  const expectedPackagePaths = new Set([
+    ...reviewedInputs.filter(path => allowedFiles.has(path) || path.startsWith('skills/')),
+    ...reviewedInputs
+      .filter(path => path.startsWith('src/') && path.endsWith('.ts') && !path.endsWith('.d.ts'))
+      .map(path => `dist/${path.slice('src/'.length, -'.ts'.length)}.d.ts`),
+    'dist/cli.mjs',
+    'dist/index.mjs',
+  ])
   const packedPaths = new Set(pack.files.map(file => file.path))
+  const differsFromReviewedManifest =
+    pack.files.some(file => !expectedPackagePaths.has(file.path)) ||
+    [...expectedPackagePaths].some(path => !packedPaths.has(path))
+  if (differsFromReviewedManifest) {
+    throw new Error('The tarball differs from the reviewed package file manifest.')
+  }
   const missingReadmeReferences = readmeReferences(readFileSync(resolve(root, 'README.md'), 'utf8')).filter(
     path => !packedPaths.has(path),
   )
@@ -238,13 +355,10 @@ try {
   const consumer = resolve(temporaryDirectory, 'consumer')
   mkdirSync(resolve(consumer, '.git'), { recursive: true })
   writeFileSync(resolve(consumer, 'package.json'), '{"name":"encephalon-smoke","private":true,"type":"module"}\n')
-  run(
-    ['npm', 'install', '--dry-run=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-dev', tarball],
-    consumer,
-  )
+  runNpm(['install', '--dry-run=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-dev', tarball], consumer)
   run(
     [
-      'node',
+      process.execPath,
       '--input-type=module',
       '--eval',
       "const api = await import('encephalon'); if (typeof api.prepare !== 'function' || typeof api.initEncephalon !== 'function') process.exitCode = 1",
@@ -289,8 +403,9 @@ try {
     consumer,
   )
   const installedCli = resolve(consumer, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
-  const cli = (arguments_: string[]) => run(['node', installedCli, ...arguments_], consumer)
-  const cliFailure = (arguments_: string[]) => runExpectedFailure(['node', installedCli, ...arguments_], consumer)
+  const cli = (arguments_: string[]) => run([process.execPath, installedCli, ...arguments_], consumer)
+  const cliFailure = (arguments_: string[]) =>
+    runExpectedFailure([process.execPath, installedCli, ...arguments_], consumer)
   const cliJson = (arguments_: string[]) => JSON.parse(cli(arguments_)) as unknown
 
   const help = cli(['--help'])
@@ -403,6 +518,10 @@ try {
   ]) as { records?: unknown; searches?: unknown }
   if (!(Array.isArray(gathered.records) && Array.isArray(gathered.searches))) {
     throw new Error('The packed Node-only CLI gather command returned an unexpected result.')
+  }
+  const retainedTarball = retainTarball(tarball, pack.filename)
+  if (retainedTarball !== undefined) {
+    process.stdout.write(`${retainedTarball}\n`)
   }
 } finally {
   rmSync(temporaryDirectory, { force: true, recursive: true })
