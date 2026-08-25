@@ -16,6 +16,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
   writeSync,
@@ -5119,16 +5120,17 @@ describe('initialisation', () => {
     assert.equal(agentsPlan?.action, 'delete')
     type LegacyInstructionIdentity = { dev: number; ino: number }
     type StrengthenedInstructionIdentity = {
-      birthtimeNs: string
-      ctimeNs: string
-      dev: string
-      ino: string
-      mtimeNs: string
-      size: string
+      birthtimeNs: bigint
+      ctimeNs: bigint
+      dev: bigint
+      ino: bigint
+      mode: bigint
+      mtimeNs: bigint
+      size: bigint
     }
     type TestInstructionIdentity = LegacyInstructionIdentity | StrengthenedInstructionIdentity
     const isStrengthenedIdentity = (identity: TestInstructionIdentity): identity is StrengthenedInstructionIdentity =>
-      typeof identity.dev === 'string'
+      typeof identity.dev === 'bigint'
     const mutablePlan = agentsPlan as { originalIdentity?: TestInstructionIdentity }
     const plannedIdentity = mutablePlan.originalIdentity
     assert.ok(plannedIdentity)
@@ -5141,8 +5143,9 @@ describe('initialisation', () => {
       mutablePlan.originalIdentity = {
         birthtimeNs: plannedIdentity.birthtimeNs,
         ctimeNs: plannedIdentity.ctimeNs,
-        dev: replacementMetadata.dev.toString(),
-        ino: replacementMetadata.ino.toString(),
+        dev: replacementMetadata.dev,
+        ino: replacementMetadata.ino,
+        mode: plannedIdentity.mode,
         mtimeNs: plannedIdentity.mtimeNs,
         size: plannedIdentity.size,
       }
@@ -5173,6 +5176,123 @@ describe('initialisation', () => {
     })
 
     assert.equal(readFileSync(path, 'utf8'), replacement)
+  })
+
+  test('does not restore a replacement installed at the deletion quarantine path', () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const quarantinePath = join(root, '.AGENTS.md.controlled.delete')
+    const displacedPath = join(root, '.AGENTS.md.displaced.delete')
+    const agentsPlan = createDeletePlan(root)
+    const original = readFileSync(path)
+    const replacement = Buffer.from(original)
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-delete-quarantine') {
+              renameSync(quarantinePath, displacedPath)
+              writeFileSync(quarantinePath, replacement)
+            }
+          },
+          generatedPath: (_canonicalPath, suffix) => {
+            assert.equal(suffix, 'delete')
+            return quarantinePath
+          },
+        }),
+      'REPOSITORY_CHANGED',
+    )
+
+    assert.equal(existsSync(path), false)
+    assert.deepEqual(readFileSync(quarantinePath), replacement)
+    assert.deepEqual(readFileSync(displacedPath), original)
+  })
+
+  test('accepts a ctime-only retained-metadata change after deletion quarantine', {
+    skip: process.platform === 'win32' ? 'Windows does not expose portable hard-link ctime semantics.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    let witnessedCtimeChange = false
+
+    applyInstructionChanges(root, [agentsPlan], {
+      fault: point => {
+        if (point === 'after-delete-quarantine') {
+          const [quarantineName] = readdirSync(root).filter(
+            filename => filename.startsWith('.AGENTS.md.') && filename.endsWith('.delete'),
+          )
+          assert.ok(quarantineName)
+          const quarantinePath = join(root, quarantineName)
+          const ctimeLinkPath = join(root, '.AGENTS.md.ctime-link')
+          const before = statSync(quarantinePath, { bigint: true })
+          linkSync(quarantinePath, ctimeLinkPath)
+          unlinkSync(ctimeLinkPath)
+          const after = statSync(quarantinePath, { bigint: true })
+
+          assert.deepEqual(
+            {
+              birthtimeNs: after.birthtimeNs,
+              dev: after.dev,
+              ino: after.ino,
+              mode: after.mode,
+              mtimeNs: after.mtimeNs,
+              size: after.size,
+            },
+            {
+              birthtimeNs: before.birthtimeNs,
+              dev: before.dev,
+              ino: before.ino,
+              mode: before.mode,
+              mtimeNs: before.mtimeNs,
+              size: before.size,
+            },
+          )
+          assert.notEqual(after.ctimeNs, before.ctimeNs)
+          witnessedCtimeChange = true
+        }
+      },
+    })
+
+    assert.equal(witnessedCtimeChange, true)
+    assert.equal(existsSync(path), false)
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.startsWith('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
+  })
+
+  test('rejects a mode change after deletion quarantine', {
+    skip: process.platform === 'win32' ? 'Windows does not expose portable POSIX mode changes.' : false,
+  }, () => {
+    const root = createRoot()
+    const path = join(root, 'AGENTS.md')
+    const agentsPlan = createDeletePlan(root)
+    const originalMode = statSync(path, { bigint: true }).mode & 0o7777n
+    const changedMode = originalMode === 0o600n ? 0o644 : 0o600
+
+    assertErrorCode(
+      () =>
+        applyInstructionChanges(root, [agentsPlan], {
+          fault: point => {
+            if (point === 'after-delete-quarantine') {
+              const [quarantineName] = readdirSync(root).filter(
+                filename => filename.startsWith('.AGENTS.md.') && filename.endsWith('.delete'),
+              )
+              assert.ok(quarantineName)
+              chmodSync(join(root, quarantineName), changedMode)
+            }
+          },
+        }),
+      'REPOSITORY_CHANGED',
+    )
+
+    assert.equal(statSync(path, { bigint: true }).mode & 0o7777n, BigInt(changedMode))
+    assert.deepEqual(
+      readdirSync(root).filter(filename => filename.startsWith('.AGENTS.md.') && filename.endsWith('.delete')),
+      [],
+    )
   })
 
   test('does not delete a replacement created after deletion verification', () => {

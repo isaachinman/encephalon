@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import type { BigIntStats, Stats } from 'node:fs'
+import type { BigIntStats } from 'node:fs'
 import {
   closeSync,
   constants,
@@ -44,7 +44,13 @@ import {
 } from './canonical-layout.ts'
 import { type DirectoryWitness, DirectoryWitnessError, revalidateDirectoryWitness } from './directory-witness.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
-import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.ts'
+import {
+  type EntryIdentity,
+  entryIdentityFrom,
+  sameEntryIdentity,
+  sameStableEntryMetadata,
+  sameStableEntryMetadataExceptCtime,
+} from './filesystem-entry.ts'
 import { withOperationLock } from './lock.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { ordinalStringCompare } from './order.ts'
@@ -85,7 +91,7 @@ type RecordScan = {
 
 type RecordObservation = {
   digest: string
-  metadata: Stats
+  metadata: BigIntStats
   path: string
 }
 
@@ -120,11 +126,6 @@ type CanonicalPublicationAuthority = {
     rootExists: boolean
     rootNames: ReadonlySet<string>
   }
-}
-
-type FileIdentity = {
-  dev: number
-  ino: number
 }
 
 type RecordWriteFault =
@@ -345,28 +346,10 @@ const readFault = (hooks: RecordReadHooks | undefined, point: RecordReadFault, p
   hooks?.fault?.(point, path)
 }
 
-const identityFor = (metadata: Stats): FileIdentity => ({ dev: metadata.dev, ino: metadata.ino })
-
-const sameIdentity = (first: FileIdentity, second: FileIdentity) => first.dev === second.dev && first.ino === second.ino
-
-const sameStableMetadata = (first: Stats, second: Stats) =>
-  sameIdentity(identityFor(first), identityFor(second)) &&
-  first.size === second.size &&
-  first.mode === second.mode &&
-  first.mtimeMs === second.mtimeMs &&
-  first.ctimeMs === second.ctimeMs
-
-const sameStableMetadataExceptCtime = (first: Stats, second: Stats) =>
-  sameIdentity(identityFor(first), identityFor(second)) &&
-  first.birthtimeMs === second.birthtimeMs &&
-  first.size === second.size &&
-  first.mode === second.mode &&
-  first.mtimeMs === second.mtimeMs
-
 const recordDigest = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex')
 
 const assertRealDirectory = (root: string, path: string) => {
-  const metadata = lstatSync(path)
+  const metadata = lstatSync(path, { bigint: true })
   if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
     return
   }
@@ -409,27 +392,28 @@ const fsyncDirectory = (path: string) => {
   }
 }
 
-const assertParentIdentity = (root: string, path: string, expected: FileIdentity) => {
-  const metadata = lstatSync(path)
-  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameIdentity(identityFor(metadata), expected)) {
+const assertParentIdentity = (root: string, path: string, expected: EntryIdentity) => {
+  const metadata = lstatSync(path, { bigint: true })
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameEntryIdentity(metadata, expected)) {
     return fail('INVALID_ARGUMENT', 'Record parent directory changed while canonical records were being read.', {
       path: posixRelative(root, path),
     })
   }
 }
 
-const readBoundedDescriptor = (descriptor: number, size: number) => {
-  const buffer = Buffer.alloc(size)
+const readBoundedDescriptor = (descriptor: number, size: bigint) => {
+  const boundedSize = Number(size)
+  const buffer = Buffer.alloc(boundedSize)
   let offset = 0
-  while (offset < size) {
-    const bytesRead = readSync(descriptor, buffer, offset, size - offset, offset)
+  while (offset < boundedSize) {
+    const bytesRead = readSync(descriptor, buffer, offset, boundedSize - offset, offset)
     if (bytesRead === 0) {
       return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
     }
     offset += bytesRead
   }
   const extra = Buffer.alloc(1)
-  if (readSync(descriptor, extra, 0, 1, size) > 0) {
+  if (readSync(descriptor, extra, 0, 1, boundedSize) > 0) {
     return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
   }
   return buffer
@@ -455,37 +439,37 @@ const readRecord = (
   root: string,
   path: string,
   kindPath: string,
-  kindIdentity: FileIdentity,
+  kindIdentity: EntryIdentity,
   hooks?: RecordReadHooks,
-): { digest: string; metadata: Stats; record: BrainRecord } => {
+): { digest: string; metadata: BigIntStats; record: BrainRecord } => {
   const relativePath = posixRelative(root, path)
-  const pathMetadata = lstatSync(path)
+  const pathMetadata = lstatSync(path, { bigint: true })
   readFault(hooks, 'after-record-lstat', path)
   let descriptor: number | undefined
   try {
     descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
     readFault(hooks, 'after-record-open', path)
-    const metadata = fstatSync(descriptor)
+    const metadata = fstatSync(descriptor, { bigint: true })
     assertParentIdentity(root, kindPath, kindIdentity)
     if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink() || !metadata.isFile()) {
       return fail('INVALID_ARGUMENT', 'Record file must be a regular non-symlink JSON file.', {
         path: relativePath,
       })
     }
-    if (!sameIdentity(identityFor(pathMetadata), identityFor(metadata))) {
+    if (!sameStableEntryMetadata(pathMetadata, metadata)) {
       return fail('INVALID_ARGUMENT', 'Record file changed while canonical records were being read.', {
         path: relativePath,
       })
     }
-    if (metadata.size > MAX_RECORD_BYTES) {
+    if (metadata.size > BigInt(MAX_RECORD_BYTES)) {
       return fail('INVALID_ARGUMENT', 'Record file exceeds the 1 MiB limit.', {
         path: relativePath,
       })
     }
     readFault(hooks, 'after-record-fstat', path)
     const bytes = readBoundedDescriptor(descriptor, metadata.size)
-    const finalMetadata = fstatSync(descriptor)
-    if (!sameStableMetadata(metadata, finalMetadata)) {
+    const finalMetadata = fstatSync(descriptor, { bigint: true })
+    if (!sameStableEntryMetadata(metadata, finalMetadata)) {
       return fail('INVALID_ARGUMENT', 'Record file changed while it was being read.', {
         path: relativePath,
       })
@@ -518,9 +502,9 @@ const kindDirectoryIssue = (name: string, path: string) => {
 
 const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}): RecordScan => {
   const brainDirectory = resolve(root, 'encephalon')
-  let rootMetadata: Stats | undefined
+  let rootMetadata: BigIntStats | undefined
   try {
-    rootMetadata = lstatSync(brainDirectory)
+    rootMetadata = lstatSync(brainDirectory, { bigint: true })
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw error
@@ -607,7 +591,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
     const kindDirectoryNames = new Map<string, string>()
     const scanned: RecordScan = { bytes: 0, errors: [], observations: [], records: [] }
     const onWork = options.hooks?.onWork
-    let recordBytes = 0
+    let recordBytes = 0n
     let stopScanning = false
     const addScanError = (validationIssue: ValidationIssue) => {
       scanned.errors.push(validationIssue)
@@ -632,7 +616,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       } else {
         const kindPath = join(brainDirectory, kindEntry.name)
         if (isCanonicalKindDirectoryEntry(kindEntry)) {
-          const kindMetadata = lstatSync(kindPath)
+          const kindMetadata = lstatSync(kindPath, { bigint: true })
           if (!kindMetadata.isDirectory() || kindMetadata.isSymbolicLink()) {
             addScanError(
               issue(
@@ -661,7 +645,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
               ),
             )
           }
-          const kindIdentity = identityFor(kindMetadata)
+          const kindIdentity = entryIdentityFrom(kindMetadata)
           const recordEntries = kindSnapshots.get(kindEntry.name)
           if (recordEntries === undefined) {
             throw new Error('Canonical kind snapshot is missing.')
@@ -676,7 +660,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
             const recordPath = join(kindPath, recordEntry.name)
             const relativePath = posixRelative(root, recordPath)
             if (recordEntry.isFile() && !recordEntry.isSymbolicLink() && recordEntry.name.endsWith('.json')) {
-              const metadata = lstatSync(recordPath)
+              const metadata = lstatSync(recordPath, { bigint: true })
               if (scanned.records.length >= MAX_CANONICAL_RECORDS) {
                 addScanError(
                   corpusIssue(
@@ -688,7 +672,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
                 stopScanning = true
                 break
               }
-              if (recordBytes + metadata.size > MAX_CANONICAL_RECORD_BYTES) {
+              if (recordBytes + metadata.size > BigInt(MAX_CANONICAL_RECORD_BYTES)) {
                 addScanError(
                   corpusIssue(
                     'CORPUS_BYTE_LIMIT',
@@ -769,7 +753,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       }
     }
     return {
-      bytes: recordBytes,
+      bytes: Number(recordBytes),
       errors: scanned.errors,
       layout: { kinds: kindSnapshots, root: rootEntries },
       observations: scanned.observations,
@@ -1173,7 +1157,7 @@ const canonicalPublicationAuthority = (
   let observations = [...initialObservations]
   const currentObservationMetadata = (path: string) => {
     try {
-      return lstatSync(path)
+      return lstatSync(path, { bigint: true })
     } catch (error) {
       const { code } = error as NodeJS.ErrnoException
       if (code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR') {
@@ -1184,7 +1168,7 @@ const canonicalPublicationAuthority = (
   }
   const assertObservedRecordsCurrent = () => {
     for (const observation of observations) {
-      if (!sameStableMetadata(observation.metadata, currentObservationMetadata(observation.path))) {
+      if (!sameStableEntryMetadata(observation.metadata, currentObservationMetadata(observation.path))) {
         return repositoryChangedBeforePublication()
       }
     }
@@ -1195,21 +1179,21 @@ const canonicalPublicationAuthority = (
     let result: RecordObservation | undefined
     try {
       const pathMetadata = currentObservationMetadata(observation.path)
-      if (!sameStableMetadataExceptCtime(observation.metadata, pathMetadata)) {
+      if (!sameStableEntryMetadataExceptCtime(observation.metadata, pathMetadata)) {
         repositoryChangedBeforePublication()
       }
       descriptor = openSync(observation.path, constants.O_RDONLY | noFollowFlag)
-      const descriptorMetadata = fstatSync(descriptor)
-      if (!sameStableMetadata(pathMetadata, descriptorMetadata)) {
+      const descriptorMetadata = fstatSync(descriptor, { bigint: true })
+      if (!sameStableEntryMetadata(pathMetadata, descriptorMetadata)) {
         repositoryChangedBeforePublication()
       }
       const bytes = readBoundedDescriptor(descriptor, descriptorMetadata.size)
-      const finalDescriptorMetadata = fstatSync(descriptor)
+      const finalDescriptorMetadata = fstatSync(descriptor, { bigint: true })
       const finalPathMetadata = currentObservationMetadata(observation.path)
       if (
         !(
-          sameStableMetadata(descriptorMetadata, finalDescriptorMetadata) &&
-          sameStableMetadata(finalDescriptorMetadata, finalPathMetadata)
+          sameStableEntryMetadata(descriptorMetadata, finalDescriptorMetadata) &&
+          sameStableEntryMetadata(finalDescriptorMetadata, finalPathMetadata)
         ) ||
         recordDigest(bytes) !== observation.digest
       ) {
@@ -1304,7 +1288,7 @@ const canonicalPublicationAuthority = (
           ...observations,
           {
             digest,
-            metadata: lstatSync(recordPath),
+            metadata: lstatSync(recordPath, { bigint: true }),
             path: recordPath,
           },
         ]
@@ -1506,7 +1490,7 @@ const assertLayoutWitnessCurrent = (root: string, layout: CanonicalLayoutWitness
   try {
     if (layout.root === null) {
       try {
-        const metadata = lstatSync(brainDirectory)
+        const metadata = lstatSync(brainDirectory, { bigint: true })
         if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
           return repositoryChangedBeforePublication()
         }

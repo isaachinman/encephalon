@@ -1,12 +1,83 @@
 import type { BigIntStats } from 'node:fs'
 
-export const sameEntryIdentity = (first: BigIntStats, second: BigIntStats) =>
+export type EntryIdentity = {
+  readonly dev: bigint
+  readonly ino: bigint
+}
+
+export type EntryMetadata = EntryIdentity & {
+  readonly birthtimeNs: bigint
+  readonly ctimeNs: bigint
+  readonly mode: bigint
+  readonly mtimeNs: bigint
+  readonly size: bigint
+}
+
+type EntryType = 'directory' | 'file' | 'other' | 'symlink'
+
+export type ManifestEntryMetadata = {
+  readonly ctimeNanoseconds: string
+  readonly mtimeNanoseconds: string
+  readonly size: string
+  readonly type: EntryType
+}
+
+/** @internal */
+export const entryIdentityFrom = (metadata: BigIntStats): EntryIdentity => ({
+  dev: metadata.dev,
+  ino: metadata.ino,
+})
+
+/** @internal */
+export const entryIdentityKey = (identity: EntryIdentity) => `${identity.dev}:${identity.ino}`
+
+/** @internal */
+export const entryMetadataFrom = (metadata: BigIntStats): EntryMetadata => ({
+  ...entryIdentityFrom(metadata),
+  birthtimeNs: metadata.birthtimeNs,
+  ctimeNs: metadata.ctimeNs,
+  mode: metadata.mode,
+  mtimeNs: metadata.mtimeNs,
+  size: metadata.size,
+})
+
+const entryTypeFrom = (metadata: BigIntStats): EntryType => {
+  if (metadata.isSymbolicLink()) {
+    return 'symlink'
+  }
+  if (metadata.isDirectory()) {
+    return 'directory'
+  }
+  if (metadata.isFile()) {
+    return 'file'
+  }
+  return 'other'
+}
+
+/** @internal */
+export const manifestEntryMetadataFrom = (metadata: BigIntStats): ManifestEntryMetadata => ({
+  ctimeNanoseconds: metadata.ctimeNs.toString(),
+  mtimeNanoseconds: metadata.mtimeNs.toString(),
+  size: metadata.size.toString(),
+  type: entryTypeFrom(metadata),
+})
+
+export const sameEntryIdentity = (first: EntryIdentity, second: EntryIdentity) =>
   first.dev === second.dev && first.ino === second.ino
 
-export const sameStableEntryMetadata = (first: BigIntStats, second: BigIntStats) =>
+/** @internal */
+export const sameStableEntryMetadataExceptCtimeAndMode = (first: EntryMetadata, second: EntryMetadata) =>
   sameEntryIdentity(first, second) &&
   first.size === second.size &&
-  first.mode === second.mode &&
   first.birthtimeNs === second.birthtimeNs &&
-  first.mtimeNs === second.mtimeNs &&
-  first.ctimeNs === second.ctimeNs
+  first.mtimeNs === second.mtimeNs
+
+/** @internal */
+export const sameStableEntryMetadataExceptMode = (first: EntryMetadata, second: EntryMetadata) =>
+  sameStableEntryMetadataExceptCtimeAndMode(first, second) && first.ctimeNs === second.ctimeNs
+
+export const sameStableEntryMetadataExceptCtime = (first: EntryMetadata, second: EntryMetadata) =>
+  sameStableEntryMetadataExceptCtimeAndMode(first, second) && first.mode === second.mode
+
+export const sameStableEntryMetadata = (first: EntryMetadata, second: EntryMetadata) =>
+  sameStableEntryMetadataExceptCtime(first, second) && first.ctimeNs === second.ctimeNs

@@ -15,7 +15,12 @@ import {
   revalidateDirectoryWitness,
 } from './directory-witness.ts'
 import { fail } from './errors.ts'
-import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.ts'
+import {
+  entryIdentityKey,
+  sameEntryIdentity,
+  sameStableEntryMetadata,
+  sameStableEntryMetadataExceptCtime,
+} from './filesystem-entry.ts'
 
 /** @internal */
 export const MAX_STAGING_DIRECTORY_ENTRIES = 1000
@@ -43,13 +48,7 @@ type StagingEntry = {
 }
 
 const sameRegularEntryApartFromCtime = (expected: BigIntStats, current: BigIntStats) =>
-  expected.isFile() &&
-  current.isFile() &&
-  sameEntryIdentity(expected, current) &&
-  expected.size === current.size &&
-  expected.mode === current.mode &&
-  expected.birthtimeNs === current.birthtimeNs &&
-  expected.mtimeNs === current.mtimeNs
+  expected.isFile() && current.isFile() && sameStableEntryMetadataExceptCtime(expected, current)
 
 /** @internal */
 export const advanceRegularStagingIncarnation = (
@@ -163,13 +162,7 @@ const inspectStagingEntry = (stagingDirectory: string, name: string): StagingEnt
 }
 
 const sameRecoveredSymbolicLink = (expected: BigIntStats, current: BigIntStats) =>
-  expected.isSymbolicLink() &&
-  current.isSymbolicLink() &&
-  sameEntryIdentity(expected, current) &&
-  expected.size === current.size &&
-  expected.mode === current.mode &&
-  expected.birthtimeNs === current.birthtimeNs &&
-  expected.mtimeNs === current.mtimeNs
+  expected.isSymbolicLink() && current.isSymbolicLink() && sameStableEntryMetadataExceptCtime(expected, current)
 
 const quarantineStagingEntry = (
   stagingDirectory: string,
@@ -398,7 +391,7 @@ export const cleanupStaleStagingEntries = (stagingDirectory: string, hooks: Stag
   const regularAliases = new Map<string, StagingEntry[]>()
   for (const entry of entries) {
     if (entry.metadata.isFile()) {
-      const key = `${entry.metadata.dev}:${entry.metadata.ino}`
+      const key = entryIdentityKey(entry.metadata)
       const expected = regularIncarnations.get(key)
       if (expected !== undefined && !sameStableEntryMetadata(expected, entry.metadata)) {
         return repositoryChanged()
@@ -415,7 +408,7 @@ export const cleanupStaleStagingEntries = (stagingDirectory: string, hooks: Stag
   const regularAliasPositions = new Map<string, number>()
   let witness = initialWitness
   for (const entry of entries) {
-    const key = `${entry.metadata.dev}:${entry.metadata.ino}`
+    const key = entryIdentityKey(entry.metadata)
     const expected = entry.metadata.isFile() ? (regularIncarnations.get(key) ?? entry.metadata) : entry.metadata
     const { metadata, witness: nextWitness } = quarantineStagingEntry(
       stagingDirectory,

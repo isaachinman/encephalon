@@ -4011,6 +4011,50 @@ describe('canonical records', () => {
     assertInvalidRecord(result, record.path)
   })
 
+  test('rejects a same-inode record mutation between pathname and descriptor observations', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'record-same-inode-race',
+      kind: 'decision',
+      payload: { summary: 'Original' },
+      root,
+      source: 'agent',
+      subject: 'record.same-inode-race',
+    })
+    const path = join(root, record.path)
+    const originalMetadata = statSync(path, { bigint: true })
+    let changed = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: (point, faultPath) => {
+          if (point === 'after-record-lstat' && faultPath === path && !changed) {
+            changed = true
+            writeFileSync(path, `${readFileSync(path, 'utf8')} `)
+            const changedMetadata = statSync(path, { bigint: true })
+            assert.equal(changedMetadata.dev, originalMetadata.dev)
+            assert.equal(changedMetadata.ino, originalMetadata.ino)
+            assert.notEqual(changedMetadata.size, originalMetadata.size)
+          }
+        },
+      },
+    })
+
+    assert.equal(changed, true)
+    assert.deepEqual(result, {
+      errors: [
+        {
+          code: 'INVALID_RECORD',
+          message: 'Record file changed while canonical records were being read.',
+          path: record.path,
+        },
+      ],
+      recordsChecked: 0,
+      truncated: false,
+      valid: false,
+    })
+  })
+
   test('rejects a brain-root generation replaced after bounded enumeration', () => {
     const root = createRoot()
     const brainDirectory = join(root, 'encephalon')
@@ -4215,6 +4259,46 @@ describe('canonical records', () => {
           if (point === 'after-record-fstat' && !changed) {
             changed = true
             writeFileSync(path, '{"changed":true}')
+          }
+        },
+      },
+    })
+
+    assertInvalidRecord(result, record.path)
+    assert.equal(
+      result.errors.some(error => error.message === 'Record file changed while it was being read.'),
+      true,
+    )
+  })
+
+  test('rejects a same-size record mutation after descriptor verification', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'same-size-change-after-open',
+      kind: 'decision',
+      payload: { summary: 'Original' },
+      root,
+      source: 'agent',
+      subject: 'record.same-size-change-after-open',
+    })
+    const path = join(root, record.path)
+    const originalMetadata = statSync(path)
+    const forcedMtime = new Date(Math.floor(originalMetadata.mtimeMs / 1000) * 1000 - 60_000)
+    let changed = false
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        fault: point => {
+          if (point === 'after-record-fstat' && !changed) {
+            changed = true
+            const original = readFileSync(path, 'utf8')
+            const replacement = original.replace('Original', 'Mutated!')
+            assert.notEqual(replacement, original)
+            assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(original))
+            assert.doesNotThrow(() => JSON.parse(replacement))
+            writeFileSync(path, replacement)
+            utimesSync(path, originalMetadata.atime, forcedMtime)
+            assert.notEqual(statSync(path).mtimeMs, originalMetadata.mtimeMs)
           }
         },
       },
