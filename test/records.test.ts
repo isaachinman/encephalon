@@ -3348,7 +3348,7 @@ describe('canonical records', () => {
       },
       ownKeys: target => {
         oversizedArrayCalls.push('ownKeys')
-        return Reflect.ownKeys(target)
+        throw new Error(`oversized ownKeys must not run for ${Reflect.ownKeys(target).length} keys`)
       },
     })
 
@@ -3363,6 +3363,50 @@ describe('canonical records', () => {
       },
     )
     assert.deepEqual(oversizedArrayCalls, ['descriptor:length'])
+
+    const invalidLengthDescriptor = (target: unknown[], key: PropertyKey) => {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, key)
+      return key === 'length' && descriptor !== undefined ? { ...descriptor, value: -1 } : descriptor
+    }
+    const symbolArray: unknown[] = []
+    Object.defineProperty(symbolArray, Symbol('metadata'), { value: null })
+    const accessorArray: unknown[] = []
+    Object.defineProperty(accessorArray, 'metadata', {
+      get: () => {
+        throw new Error('accessor must not run')
+      },
+    })
+    const invalidLengthCases = [
+      {
+        message: 'payload contains a symbol-keyed property.',
+        payload: new Proxy(symbolArray, { getOwnPropertyDescriptor: invalidLengthDescriptor }),
+      },
+      {
+        message: 'payload contains an accessor property.',
+        payload: new Proxy(accessorArray, { getOwnPropertyDescriptor: invalidLengthDescriptor }),
+      },
+      {
+        message: 'payload object descriptors could not be inspected.',
+        payload: new Proxy([], {
+          getOwnPropertyDescriptor: invalidLengthDescriptor,
+          ownKeys: () => {
+            throw new Error('invalid-length ownKeys trap must remain classified')
+          },
+        }),
+      },
+    ]
+    for (const { message, payload } of invalidLengthCases) {
+      assert.throws(
+        () => validateJsonValue(payload),
+        (error: unknown) => {
+          const actual = error as { code?: unknown; details?: unknown; message?: unknown }
+          assert.equal(actual.code, 'INVALID_ARGUMENT')
+          assert.equal(actual.message, message)
+          assert.deepEqual(actual.details, { field: 'payload' })
+          return true
+        },
+      )
+    }
 
     for (const target of [{}, []]) {
       const { proxy, revoke } = Proxy.revocable(target, {})

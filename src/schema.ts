@@ -261,16 +261,14 @@ const validateJsonValueAt = (
     }
     const lengthDescriptor = assertPayloadDataDescriptor(getPayloadOwnPropertyDescriptor(value, 'length', path), path)
     const length = lengthDescriptor?.value
-    if (!Number.isSafeInteger(length) || length < 0) {
-      return fail('INVALID_ARGUMENT', 'payload contains an invalid array length.', { field: path })
-    }
-    if (length > MAX_PAYLOAD_NODES - nodeCount.value) {
+    const lengthIsValid = Number.isSafeInteger(length) && length >= 0
+    if (lengthIsValid && length > MAX_PAYLOAD_NODES - nodeCount.value) {
       return fail('INVALID_ARGUMENT', `payload may contain at most ${MAX_PAYLOAD_NODES} JSON nodes.`, {
         field: path,
       })
     }
     const keys = getPayloadOwnKeys(value, path)
-    const values: unknown[] = new Array(length)
+    const values = lengthIsValid ? new Array<unknown>(length) : undefined
     let hasAccessor = false
     let hasSymbol = false
     let presentIndices = 0
@@ -289,6 +287,7 @@ const validateJsonValueAt = (
           descriptor !== undefined &&
           'value' in descriptor &&
           index !== undefined &&
+          values !== undefined &&
           index < length
         ) {
           presentIndices += 1
@@ -301,6 +300,9 @@ const validateJsonValueAt = (
     }
     if (hasAccessor) {
       return fail('INVALID_ARGUMENT', 'payload contains an accessor property.', { field: path })
+    }
+    if (values === undefined) {
+      return fail('INVALID_ARGUMENT', 'payload contains an invalid array length.', { field: path })
     }
     if (presentIndices !== length) {
       return fail('INVALID_ARGUMENT', 'payload contains a sparse array.', {

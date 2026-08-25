@@ -58,11 +58,13 @@ describe('hot scan performance regressions', () => {
           encoding: 'utf8',
         }),
       ) as {
+        acceptedOutputWrites: number
         descriptorMapCalls: number
         heapGrowthBytes: number
         mode: string
         oversizedArrayWork: { descriptors: string[]; ownKeys: number }
         propertyCount: number
+        rejectedOutputWrites: number
         retainedDescriptorCount: number
         work: { descriptors: number; ownKeys: number }
       }
@@ -71,6 +73,8 @@ describe('hot scan performance regressions', () => {
     const descriptorMap = run('descriptor-map')
 
     assert.equal(bounded.descriptorMapCalls, 0)
+    assert.ok(bounded.acceptedOutputWrites > 0)
+    assert.equal(bounded.rejectedOutputWrites, 0)
     assert.deepEqual(bounded.work, { descriptors: bounded.propertyCount, ownKeys: 1 })
     assert.deepEqual(bounded.oversizedArrayWork, { descriptors: ['length'], ownKeys: 0 })
     assert.equal(descriptorMap.descriptorMapCalls, 2)
