@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-25 for code and behavioural-test snapshot `18871190d29851a733617dc176afcebe2f3069ab`.
+Last reviewed: 2026-08-25 for code and behavioural-test snapshot `f7e5cb7da3e7853bab6afad8b941ced5a72bc86f`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -166,11 +166,11 @@ MAR-2565 validated mutation cache construction, deterministic disk fallback, and
 
 - Runtime consumers require Node.js 24.15.0 or newer and do not require Bun.
 - The npm package has no runtime dependencies and no install, preinstall, postinstall, or prepare lifecycle scripts.
-- `bun run check:generated` is contributor convenience for trusted local checkouts. Its target generated-version checker is non-mutating, but package lifecycle hooks and Bun preloads mean the alias is not an authority for untrusted changes. Both CI jobs must instead run the exact direct command `node ./scripts/check-generated-version.ts` immediately after Node setup and before Bun setup or installation so those hooks and preloads cannot run first. The check compares the complete committed package-version source; stale or missing source receives deterministic build-and-commit guidance, while unrelated I/O failures remain unchanged.
+- `bun run check:generated` is contributor convenience for trusted local checkouts. Its target generated-version checker is non-mutating, but package lifecycle hooks and Bun preloads mean the alias is not an authority for untrusted changes. Every CI job must instead run the exact direct command `node ./scripts/check-generated-version.ts` immediately after Node setup and before Bun setup or installation so those hooks and preloads cannot run first. The check compares the complete committed package-version source; stale or missing source receives deterministic build-and-commit guidance, while unrelated I/O failures remain unchanged.
 - The tarball whitelist is intentionally small and checked by `bun run check:package`.
 - `bun run check:package` must build, pack, install the actual tarball into a temporary Git repository with scripts disabled, import the API, typecheck consumer declarations, and execute the packed CLI through Node.
 - `bun run check:publish` is a dry-run release gate only. Publishing is manual maintainer work and must not be performed by agents.
-- The release-equivalent package gate runs with read-only workflow permissions and without repository, provider, or npm secrets on pull requests and trusted pushes to `main`. It builds, checks, packs, inspects, and exercises the publish contract in both cases. Only a trusted push to `main` uploads the bounded tarball; pull requests retain it in runner-local storage.
+- The release-equivalent package gate runs with read-only workflow permissions and without repository, provider, or npm secrets on pull requests and trusted pushes to `main`. It builds, checks, packs, inspects, and exercises the publish contract in both cases. Every CI build path must leave tracked files unchanged. Pull requests retain the bounded tarball in runner-local storage; on a trusted push to `main`, a separate upload job waits for both verification and release-equivalent checks to succeed before rebuilding the exact checked-out SHA and uploading one bounded tarball.
 
 After rollout, branch protection must require exactly `verify (ubuntu-latest)`, `verify (macos-latest)`, `verify (windows-latest)`, `verify (ubuntu-current)`, and `Release-equivalent package gate`. Rollout is maintainer-operated only after an exact pull-request head has emitted all five successful contexts; this repository change does not claim that the external setting has been updated. Re-query the read-only status-check configuration with:
 
@@ -203,7 +203,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2640 required current-Node and release-equivalent pre-merge gates with authoritative generated-source validation: `18871190d29851a733617dc176afcebe2f3069ab`.
+- MAR-2640 required current-Node and release-equivalent pre-merge gates with authoritative generated-source validation: `f7e5cb7da3e7853bab6afad8b941ced5a72bc86f`.
 - MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 - MAR-2554 bounded full, compact, and gather read responses: `b43daf795de35d34602d1018ad509f68e494fe3d`.
 - MAR-2550 exact cached FTS row-text projection validation, bounded pre-mutation writer validation, and recovery: `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`.
