@@ -151,8 +151,8 @@ afterEach(() => {
   responseBudgetTestHooks.afterCharge = undefined
   recordWriteTestHooks.fault = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
-  roots.splice(0).forEach(removeTestRepository)
   cacheLocationTestHooks.releaseCloseSafetyLatchesForTests?.()
+  roots.splice(0).forEach(removeTestRepository)
 })
 
 const functionFromApi = <T>(name: string) => (api as unknown as Record<string, T>)[name] as T
