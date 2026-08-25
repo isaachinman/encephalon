@@ -164,15 +164,57 @@ const partitionWorkflowSource = (source: string) => {
   }
 }
 
+const extractImplicitConditions = (source: string) => {
+  const state = source.split('\n').reduce(
+    (result, line) => {
+      const trimmedLine = line.trimStart()
+      const indentation = line.length - trimmedLine.length
+      if (trimmedLine.length === 0) {
+        return result
+      }
+      if (result.active !== undefined && indentation > result.active.keyIndentation) {
+        return {
+          ...result,
+          active: {
+            ...result.active,
+            expression: `${result.active.expression} ${trimmedLine}`,
+          },
+        }
+      }
+
+      const expressions =
+        result.active === undefined
+          ? result.expressions
+          : [...result.expressions, stripYamlScalarQuotes(result.active.expression)]
+      const match = trimmedLine.match(/^(?<listPrefix>-\s+)?(?:"if"|'if'|if)\s*:\s*(?<expression>.+)$/u)
+      return {
+        active:
+          match === null
+            ? undefined
+            : {
+                expression: match.groups?.expression ?? '',
+                keyIndentation: indentation + (match.groups?.listPrefix?.length ?? 0),
+              },
+        expressions,
+      }
+    },
+    {
+      active: undefined as { expression: string; keyIndentation: number } | undefined,
+      expressions: [] as string[],
+    },
+  )
+  return state.active === undefined
+    ? state.expressions
+    : [...state.expressions, stripYamlScalarQuotes(state.active.expression)]
+}
+
 const workflowContainsSecretsContext = (workflow: string) => {
   const { evaluableSource, structuralSource } = partitionWorkflowSource(workflow)
   const encodedYamlScalar = /\\(?:U[\dA-Fa-f]{8}|u[\dA-Fa-f]{4}|x[\dA-Fa-f]{2})|\\\s*$/mu
   // Resolving anchors or flow mappings safely would require the excluded YAML parser, so ambiguous forms fail closed.
   const yamlAnchorOrAlias = /(?:^|\s|:|,|\{|\[|\?)[&*][^\s&*,[\]{}]+/mu
   const flowStyleCondition = /[,{]\s*["']?if["']?\s*:/u
-  const implicitConditions = [...structuralSource.matchAll(/^\s+(?:-\s+)?if:\s*(.+)$/gmu)].map(match =>
-    stripYamlScalarQuotes(match[1] ?? ''),
-  )
+  const implicitConditions = extractImplicitConditions(structuralSource)
   return (
     encodedYamlScalar.test(structuralSource) ||
     yamlAnchorOrAlias.test(structuralSource) ||
@@ -198,6 +240,7 @@ describe('package contract', () => {
       'jobs:\n  verify:\n    if: >-\n      secrets.RUN_VERIFY\n',
       'jobs: { verify: { if: secrets.RUN_VERIFY, runs-on: ubuntu-latest } }\n',
       "env:\n  CONDITION: &condition secrets.RUN_VERIFY == 'true'\njobs:\n  verify:\n    if: *condition\n",
+      "jobs:\n  verify:\n    if: github.ref == 'refs/heads/main' &&\n      secrets.RUN_VERIFY == 'true'\n",
       `steps:\n  - run: |\n      # ${githubExpression('secrets.NPM_TOKEN')}\n`,
       `env:\n  "${githubExpression('secrets.DYNAMIC_NAME')}": value\n`,
     ]) {
@@ -210,6 +253,7 @@ describe('package contract', () => {
       `env:\n  REF: ${githubExpression('github.ref')}\n`,
       `env:\n  NOTE: ${githubExpression("'secrets.NPM_TOKEN'")}\n`,
       `env:\n  NOTE: ${githubExpression('github.secrets')}\n`,
+      "jobs:\n  verify:\n    if: github.ref ==\n      'refs/heads/main'\n",
       'env:\n  NOTE: repository secrets are unavailable to pull requests\n',
       '# secrets.NPM_TOKEN must never be used here\nenv:\n  SAFE: true\n',
       `# ${githubExpression('secrets.NPM_TOKEN')} is documentation only\nenv:\n  SAFE: true\n`,
@@ -444,9 +488,11 @@ describe('package contract', () => {
     const concurrencyStart = workflow.indexOf('\nconcurrency:\n', permissionsStart)
     const jobsStart = workflow.indexOf('\njobs:\n')
     const releaseStart = workflow.indexOf('\n  release:\n', jobsStart)
+    const trustedUploadStart = workflow.indexOf('\n  upload:\n', releaseStart)
     const workflowConfiguration = workflow.slice(0, jobsStart)
     const verificationJob = workflow.slice(jobsStart, releaseStart)
-    const releaseJob = workflow.slice(releaseStart)
+    const releaseJob = workflow.slice(releaseStart, trustedUploadStart)
+    const trustedUploadJob = workflow.slice(trustedUploadStart)
     const matrixStart = verificationJob.indexOf('      matrix:\n')
     const runnerStart = verificationJob.indexOf('    runs-on:', matrixStart)
     const matrixBlock = verificationJob.slice(matrixStart, runnerStart)
@@ -457,8 +503,13 @@ describe('package contract', () => {
     const releaseStepsStart = releaseJob.indexOf('    steps:\n')
     const releaseHeader = releaseJob.slice(0, releaseStepsStart)
     const releaseSteps = releaseJob.slice(releaseStepsStart)
-    const uploadStart = releaseJob.indexOf('      - name: Upload release-equivalent package artifact\n')
-    const uploadStep = releaseJob.slice(uploadStart)
+    const trustedUploadStepsStart = trustedUploadJob.indexOf('    steps:\n')
+    const trustedUploadHeader = trustedUploadJob.slice(0, trustedUploadStepsStart)
+    const trustedUploadSteps = trustedUploadJob.slice(trustedUploadStepsStart)
+    const uploadActionStart = trustedUploadJob.indexOf(
+      '      - name: Upload trusted release-equivalent package artifact\n',
+    )
+    const uploadStep = trustedUploadJob.slice(uploadActionStart)
 
     assert.equal(
       workflow.slice(eventsStart, permissionsStart),
@@ -536,10 +587,11 @@ jobs:
         'bun run lint',
         'bun run benchmark:check',
         'bun run build',
+        'git diff --exit-code',
         'bun run check:package',
       ],
     )
-    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 8)
+    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 9)
     assert.equal(verificationSteps.match(/^\s{6}- if:/gm)?.length, 1)
     assert.doesNotMatch(verificationSteps, /^\s{8}continue-on-error:/m)
 
@@ -565,11 +617,12 @@ jobs:
         'node ./scripts/check-generated-version.ts',
         'bun install --frozen-lockfile',
         'bun run build',
+        'git diff --exit-code',
         'bun run check:package',
       ],
     )
-    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 6)
-    assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length, 1)
+    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
+    assert.equal(releaseSteps.match(/^\s{8}if:/gm)?.length ?? 0, 0)
     assert.doesNotMatch(releaseSteps, /^\s{8}continue-on-error:/m)
     assert.match(
       releaseJob,
@@ -578,15 +631,63 @@ jobs:
     assert.equal(releaseJob.match(/npm pack --dry-run=false/g)?.length, 1)
     assert.match(releaseJob, /- name: Check npm publish dry run\n\s+run: bun run check:publish/)
     assert.equal(releaseJob.match(/bun run check:publish/g)?.length, 1)
-    assert.equal(releaseJob.match(/actions\/upload-artifact/g)?.length, 1)
+    assert.equal(releaseJob.match(/actions\/upload-artifact/g)?.length ?? 0, 0)
+    assert.equal(
+      [
+        'node ./scripts/check-generated-version.ts',
+        'bun run build',
+        'git diff --exit-code',
+        'bun run check:package',
+        'npm pack',
+        'bun run check:publish',
+      ]
+        .map(step => releaseJob.indexOf(step))
+        .every(
+          (position, index, positions) =>
+            position >= 0 && (index === 0 || position > (positions[index - 1] ?? Number.POSITIVE_INFINITY)),
+        ),
+      true,
+    )
+
+    assert.equal(
+      trustedUploadHeader,
+      `
+  upload:
+    name: Upload trusted release-equivalent package artifact
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - verify
+      - release
+    runs-on: ubuntu-latest
+`,
+    )
+    assert.doesNotMatch(trustedUploadJob, /^ {4}(?:continue-on-error|permissions):/m)
+    const trustedUploadPrefix =
+      /^ {4}steps:\n {6}- uses: actions\/checkout@\S+\n {8}with:\n {10}persist-credentials: false\n {6}- uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- uses: oven-sh\/setup-bun@v2\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile\n/u
+    assert.match(trustedUploadSteps, trustedUploadPrefix)
+    assert.doesNotMatch(
+      trustedUploadSteps.replace('    steps:\n', '    steps:\n      - run: bun run repair-generated-source\n'),
+      trustedUploadPrefix,
+    )
+    assert.deepEqual(
+      [...trustedUploadSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
+      [
+        'node ./scripts/check-generated-version.ts',
+        'bun install --frozen-lockfile',
+        'bun run build',
+        'git diff --exit-code',
+      ],
+    )
+    assert.equal(trustedUploadSteps.match(/^\s+(?:- )?run:/gm)?.length, 5)
+    assert.equal(trustedUploadJob.match(/npm pack --dry-run=false/g)?.length, 1)
+    assert.equal(trustedUploadJob.match(/actions\/upload-artifact/g)?.length, 1)
     assert.equal(
       uploadStep
         .split('\n')
         .filter(line => !line.includes('uses: actions/upload-artifact@'))
         .slice(1)
         .join('\n'),
-      `        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        with:
+      `        with:
           name: encephalon-npm-package
           path: package-artifacts/*
           if-no-files-found: error
@@ -597,21 +698,22 @@ jobs:
       [
         'node ./scripts/check-generated-version.ts',
         'bun run build',
-        'bun run check:package',
+        'git diff --exit-code',
         'npm pack',
-        'bun run check:publish',
         'actions/upload-artifact',
       ]
-        .map(step => releaseJob.indexOf(step))
+        .map(step => trustedUploadJob.indexOf(step))
         .every(
           (position, index, positions) =>
             position >= 0 && (index === 0 || position > (positions[index - 1] ?? Number.POSITIVE_INFINITY)),
         ),
       true,
     )
-    assert.equal(workflow.match(/node \.\/scripts\/check-generated-version\.ts/g)?.length, 2)
+
+    assert.equal(workflow.match(/node \.\/scripts\/check-generated-version\.ts/g)?.length, 3)
     assert.doesNotMatch(workflow, /^\s+- run: bun run \.\/scripts\/check-generated-version\.ts$/m)
     assert.doesNotMatch(workflow, /^\s+- run: bun run check:generated$/m)
+    assert.equal(workflow.match(/^\s+- run: git diff --exit-code$/gmu)?.length, 3)
     assert.match(readme, /four verification lanes/)
     assert.match(readme, /trusted pushes to `main`/)
     assert.match(readme, /release-equivalent package gate/)
