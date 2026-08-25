@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -18,15 +18,8 @@ const runAuthoritativeGeneratedVersionCheck = (temporaryRoot: string) =>
 
 const createCheckFixture = () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), 'encephalon-package-version-check-'))
-  mkdirSync(resolve(temporaryRoot, 'scripts'))
   mkdirSync(resolve(temporaryRoot, 'src', 'generated'), { recursive: true })
-  for (const filename of ['package-version.ts', 'npm-command.ts', 'check-generated-version.ts', 'check-package.ts']) {
-    writeFileSync(
-      resolve(temporaryRoot, 'scripts', filename),
-      readFileSync(resolve(root, 'scripts', filename), 'utf8'),
-      'utf8',
-    )
-  }
+  cpSync(resolve(root, 'scripts'), resolve(temporaryRoot, 'scripts'), { recursive: true })
   writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module","version":"0.2.0"}\n', 'utf8')
   return temporaryRoot
 }
