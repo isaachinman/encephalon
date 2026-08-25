@@ -1444,7 +1444,143 @@ describe('cache filesystem containment', () => {
 
 describe('SQLite cache and reads', () => {
   test('rejects invalid public API inputs before repository side effects', () => {
+    const accessorEnvelope = (root: string, fields: Record<string, unknown> = {}) => {
+      const input = { ...fields, root }
+      Object.defineProperty(input, 'unknownAccessor', {
+        enumerable: true,
+        get: () => {
+          throw new Error('hostile input secret')
+        },
+      })
+      return input
+    }
     const cases: [string, (root: string) => void][] = [
+      [
+        'prepare accessor envelope',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')(accessorEnvelope(root))
+        },
+      ],
+      [
+        'prepare unknown envelope field',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root, unknownData: true })
+        },
+      ],
+      [
+        'hydrate accessor envelope',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('hydrate')(accessorEnvelope(root))
+        },
+      ],
+      [
+        'validate accessor envelope',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('validateRecords')(accessorEnvelope(root))
+        },
+      ],
+      [
+        'list accessor envelope',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('listRecords')(accessorEnvelope(root))
+        },
+      ],
+      [
+        'show accessor envelope',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('showRecord')(
+            accessorEnvelope(root, { id: 'record-1' }),
+          )
+        },
+      ],
+      [
+        'full search accessor envelope',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('searchRecords')(
+            accessorEnvelope(root, { query: 'safe' }),
+          )
+        },
+      ],
+      [
+        'compact search accessor envelope',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('searchCompactRecords')(
+            accessorEnvelope(root, { query: 'safe' }),
+          )
+        },
+      ],
+      [
+        'gather accessor envelope',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')(accessorEnvelope(root))
+        },
+      ],
+      [
+        'add accessor envelope',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')(
+            accessorEnvelope(root, {
+              kind: 'context',
+              payload: null,
+              source: 'agent',
+              subject: 'cache.validation',
+            }),
+          )
+        },
+      ],
+      [
+        'init accessor envelope',
+        root => {
+          functionFromApi<(input: Record<string, unknown>) => unknown>('initEncephalon')(accessorEnvelope(root))
+        },
+      ],
+      [
+        'gather sparse searches',
+        root => {
+          const searches = new Array<string>(2)
+          searches[1] = 'ignored'
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ root, searches })
+        },
+      ],
+      [
+        'gather sparse shows',
+        root => {
+          const shows = new Array<string>(2)
+          shows[1] = 'record-2'
+          functionFromApi<(input: Record<string, unknown>) => unknown>('gatherRecords')({ root, shows })
+        },
+      ],
+      [
+        'add sparse supersedes',
+        root => {
+          const supersedes = new Array<string>(2)
+          supersedes[1] = 'record-2'
+          functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')({
+            kind: 'context',
+            payload: null,
+            root,
+            source: 'agent',
+            subject: 'cache.validation',
+            supersedes,
+          })
+        },
+      ],
+      [
+        'add sparse artifacts',
+        root => {
+          const artifacts = new Array<string>(2)
+          artifacts[1] = '_artifacts/context/record-1/file.txt'
+          functionFromApi<(input: Record<string, unknown>) => unknown>('addRecord')({
+            artifacts,
+            id: 'record-1',
+            kind: 'context',
+            payload: null,
+            root,
+            source: 'agent',
+            subject: 'cache.validation',
+          })
+        },
+      ],
       [
         'list includeSuperseded',
         root => {
@@ -1565,6 +1701,7 @@ describe('SQLite cache and reads', () => {
         },
       )
       assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon')), false, name)
+      assert.equal(existsSync(join(root, 'encephalon')), false, name)
       assert.equal(existsSync(join(root, 'AGENTS.md')), false, name)
       assert.equal(existsSync(join(root, 'CLAUDE.md')), false, name)
     }

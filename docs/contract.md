@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-25 for code and behavioural-test snapshot `58ba821f4b655fad1b1e79be9df57600e7409381`.
+Last reviewed: 2026-08-25 for code and behavioural-test snapshot `ac365f666d2031421706bea8190d3d6202ec4b90`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -44,6 +44,11 @@ This document is the concise contract maintainers should update when public beha
 - Snapshot-local maps contain only complete parsed shown records or compact-search results. They are created inside the result-reader callback, never survive a cache recovery retry, and never retain SQLite rows, statements, iterators, database handles, or partial results.
 - Public duplicate occurrences preserve caller order and count but do not share mutable records, nested payloads, result arrays, or compact result objects. Every show envelope, search envelope, shown value or null, result array, and compact result remains charged for each emitted occurrence through the one shared `gatherResponseBytes` ledger.
 - Shows still precede searches and first occurrences execute in input order. Ranking, snippets, active filtering, response failure order, the empty-only no-cache path, exact-generation recovery, and the public API and CLI shapes remain unchanged.
+
+## Public API Inputs
+
+- Public API input envelopes accept ordinary cross-realm or null-prototype objects and snapshot only the exact operation allowlist of enumerable own data properties through guarded reflection before repository, cache, lock, or mutation work. The prototype, own-key set, and captured data descriptors are revalidated after descriptor capture. Unknown string or symbol properties, non-enumerable application fields, accessors, custom prototypes, metadata changes, and reflection failures produce bounded `INVALID_ARGUMENT` errors without invoking getters or exposing trap text.
+- Gather searches and shows, record supersession targets, and artifact paths are copied from dense enumerable own data indices, including cross-realm arrays. Sparse arrays, indexed or extra accessors, symbol or named extra properties, non-enumerable indices, metadata changes, and reflection failures are rejected. Existing count budgets are checked from the guarded length descriptor before own-key enumeration, element inspection, or output allocation; the own-key set, length, and captured index descriptors are revalidated after descriptor capture. Valid dense arrays preserve their order, duplicates, and existing empty-array semantics.
 
 ## Canonical Storage
 

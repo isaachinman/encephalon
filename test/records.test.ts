@@ -4094,6 +4094,7 @@ describe('canonical records', () => {
       subject: 'record.parent-race',
     })
     const kindPath = join(root, 'encephalon', 'decision')
+    const displacedKindPath = join(root, 'displaced-parent-replaced-decision')
     const recordPath = join(root, record.path)
     let replaced = false
 
@@ -4102,7 +4103,7 @@ describe('canonical records', () => {
         fault: point => {
           if (point === 'after-record-lstat' && !replaced) {
             replaced = true
-            rmSync(kindPath, { recursive: true })
+            renameSync(kindPath, displacedKindPath)
             mkdirSync(kindPath)
             writeFileSync(
               recordPath,

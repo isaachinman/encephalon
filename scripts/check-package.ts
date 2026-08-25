@@ -365,6 +365,12 @@ try {
     'let rejected = false',
     "try { api.addRecord({ kind: 'decision', payload, root: 'unused-before-payload-validation', source: 'package-check', subject: 'payload.package-budget' }) } catch (error) { rejected = error instanceof api.EncephalonError && error.name === 'EncephalonError' && error.code === 'INVALID_ARGUMENT' && error.message === 'payload may contain at most 10000 JSON nodes.' && error.details?.field === 'payload' && Reflect.ownKeys(error.details).length === 1 }",
     "if (!rejected || ownKeys !== 0 || JSON.stringify(descriptors) !== '[\"length\"]') throw new Error('The packed Node API payload budget contract failed.')",
+    'let getterCalls = 0',
+    'const input = {}',
+    "Object.defineProperty(input, 'root', { get: () => { getterCalls += 1; throw new Error('hostile input secret') } })",
+    'let inputRejected = false',
+    "try { api.prepare(input) } catch (error) { inputRejected = error instanceof api.EncephalonError && error.code === 'INVALID_ARGUMENT' }",
+    "if (!inputRejected || getterCalls !== 0) throw new Error('The packed Node API input descriptor contract failed.')",
   ].join('\n')
   run([process.execPath, '--input-type=module', '--eval', packedApiContract], consumer)
   writeFileSync(
