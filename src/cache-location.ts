@@ -980,7 +980,8 @@ const quarantineFile = (location: CacheLocation, expected: CacheFile, required: 
     if (
       !quarantinedMetadata.isFile() ||
       quarantinedMetadata.isSymbolicLink() ||
-      !sameCacheEntryIdentity(expected, entryIdentityFrom(quarantinedMetadata))
+      !sameCacheEntryIdentity(expected, entryIdentityFrom(quarantinedMetadata)) ||
+      mutableFileLinkObservation(movedMetadata) !== mutableFileLinkObservation(quarantinedMetadata)
     ) {
       return changedLayout(expected.relativePath, 'stable-quarantine-identity')
     }
