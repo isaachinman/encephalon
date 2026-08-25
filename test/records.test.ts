@@ -3555,8 +3555,17 @@ describe('canonical records', () => {
         return Reflect.ownKeys(target)
       },
     })
+    const allocationWork = {
+      'payload-output-container': 0,
+      'payload-retained-value': 0,
+    }
     assert.throws(
-      () => validatePayload(wideObject),
+      () =>
+        validateJsonValue(wideObject, {
+          onWork: operation => {
+            allocationWork[operation] += 1
+          },
+        }),
       (error: unknown) => {
         const actual = error as { code?: unknown; details?: unknown; message?: unknown }
         assert.equal(actual.code, 'INVALID_ARGUMENT')
@@ -3566,6 +3575,10 @@ describe('canonical records', () => {
       },
     )
     assert.deepEqual(wideObjectCalls, { descriptors: MAX_PAYLOAD_NODES, ownKeys: 1 })
+    assert.deepEqual(allocationWork, {
+      'payload-output-container': 0,
+      'payload-retained-value': MAX_PAYLOAD_NODES - 1,
+    })
     assert.equal(childVisits, 0)
 
     const overBudgetAccessorTarget = Object.fromEntries(
