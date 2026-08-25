@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node
 import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { describe, test } from 'node:test'
-import { npmCommand } from '../scripts/npm-command.ts'
+import { spawnNpmCommand } from '../scripts/npm-command.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
@@ -242,18 +242,10 @@ describe('package contract', () => {
       assert.equal(result.stdout, `${artifactDirectoryName.split(sep).join('/')}/${retainedFilename}\n`)
       assert.deepEqual(readdirSync(artifactDirectory), [retainedFilename])
 
-      const [npmExecutable, ...npmArguments] = npmCommand([
-        'pack',
-        '--dry-run=false',
-        '--ignore-scripts',
-        '--json',
-        '--pack-destination',
-        referenceDirectory,
-      ])
-      if (npmExecutable === undefined) {
-        throw new Error('npm package-reference command must not be empty.')
-      }
-      const referenceResult = spawnSync(npmExecutable, npmArguments, { cwd: root, encoding: 'utf8' })
+      const referenceResult = spawnNpmCommand(
+        ['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', referenceDirectory],
+        { cwd: root },
+      )
       assert.equal(referenceResult.status, 0, `${referenceResult.stdout}${referenceResult.stderr}`)
       const [referencePack] = JSON.parse(referenceResult.stdout) as Array<{ filename?: unknown }>
       assert.equal(referencePack?.filename, retainedFilename)

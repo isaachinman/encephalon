@@ -1,19 +1,10 @@
-import { spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { npmCommand } from './npm-command.ts'
+import { spawnNpmCommand } from './npm-command.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const npmArguments = ['publish', '--dry-run', '--ignore-scripts', '--access', 'public', '--json']
-const [executable, ...arguments_] = npmCommand(npmArguments)
-if (executable === undefined) {
-  throw new Error('npm publish command must not be empty.')
-}
-
-const result = spawnSync(executable, arguments_, {
-  cwd: root,
-  encoding: 'utf8',
-})
+const result = spawnNpmCommand(npmArguments, { cwd: root })
 if (result.error !== undefined) {
   throw result.error
 }

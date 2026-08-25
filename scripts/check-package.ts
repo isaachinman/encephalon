@@ -16,7 +16,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import { gunzipSync } from 'node:zlib'
-import { npmCommand } from './npm-command.ts'
+import { spawnNpmCommand } from './npm-command.ts'
 import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -81,6 +81,19 @@ const runExpectedFailure = (command: string[], cwd = root) => {
     stderr: result.stderr,
     stdout: result.stdout,
   }
+}
+
+const runNpm = (arguments_: readonly string[], cwd = root) => {
+  const result = spawnNpmCommand(arguments_, { cwd })
+  if (result.error !== undefined) {
+    throw result.error
+  }
+  if (result.status === 0) {
+    return result.stdout ?? ''
+  }
+  process.stderr.write(result.stdout ?? '')
+  process.stderr.write(result.stderr ?? '')
+  throw new Error(`npm failed with exit code ${result.status ?? 1}.`)
 }
 
 const retainTarball = (tarball: string, filename: string) => {
@@ -233,9 +246,14 @@ try {
     throw new Error('The built CLI reports a stale package version.')
   }
 
-  const packOutput = run(
-    npmCommand(['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', temporaryDirectory]),
-  )
+  const packOutput = runNpm([
+    'pack',
+    '--dry-run=false',
+    '--ignore-scripts',
+    '--json',
+    '--pack-destination',
+    temporaryDirectory,
+  ])
   const [pack] = JSON.parse(packOutput) as Array<{
     filename: string
     files: Array<{ path: string; mode?: number }>
@@ -277,10 +295,7 @@ try {
   const consumer = resolve(temporaryDirectory, 'consumer')
   mkdirSync(resolve(consumer, '.git'), { recursive: true })
   writeFileSync(resolve(consumer, 'package.json'), '{"name":"encephalon-smoke","private":true,"type":"module"}\n')
-  run(
-    npmCommand(['install', '--dry-run=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-dev', tarball]),
-    consumer,
-  )
+  runNpm(['install', '--dry-run=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-dev', tarball], consumer)
   run(
     [
       process.execPath,
