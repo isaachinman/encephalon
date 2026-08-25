@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-25 for code and behavioural-test snapshot `5b0b1dfd982ccc321091bc9d2d930079137ff616`.
+Last reviewed: 2026-08-25 for code and behavioural-test snapshot `b6de02d1c5c6eab7d98e7d4525b8dee41035f1ab`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -50,6 +50,7 @@ This document is the concise contract maintainers should update when public beha
 - Canonical knowledge is append-only JSON under `encephalon/<kind>/<id>.json`.
 - Artifact files are immutable supporting files under `encephalon/_artifacts/<kind>/<id>/...` and must stay beneath the matching record artifact directory.
 - The runtime-only `path` field is never written to canonical record files.
+- Confidence accepts finite numbers from zero through one. Numeric negative zero is normalised to positive zero before record construction, canonical formatting, cache hydration, and public return; every other accepted confidence value and the existing validation failure remain unchanged.
 - Supersession records must use the same kind and subject as their targets. Active records are records not listed in any other record’s `supersedes`.
 - Existing records are not rewritten or deleted by normal mutations; changed knowledge is represented by a new record that supersedes the active head.
 - Add-record inputs are fully validated, including their eventual fixed-width formatted size, before repository discovery or filesystem mutation. Their `createdAt` value is assigned only after the repository operation lock is held and the current canonical record snapshot has been validated. It is the later of the current millisecond and one millisecond after the latest canonical timestamp. Initialisation validates the complete candidate graph with fixed-width placeholder timestamps before advancing the same cursor once per planned baseline record under its existing lock, so corpus errors retain precedence over timestamp exhaustion. The locked repository location remains part of publication authority through preparation, linking, and final acceptance. Existing record incarnations and byte digests are revalidated before cleanup-induced change-time updates are accepted. Failed pre-commit attempts consume no process-global timestamp state, and a canonical timestamp at the schema ceiling fails validation rather than wrapping or rewriting history.
@@ -204,6 +205,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
+- MAR-2641 negative-zero confidence normalisation across validation, canonical storage, mutation-cache hydration, public reads, and CLI output: `b6de02d1c5c6eab7d98e7d4525b8dee41035f1ab`.
 - MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `eae98315e53ce568c62f6854a8542b285b7f9e4f`.
 - MAR-2554 bounded full, compact, and gather read responses: `b43daf795de35d34602d1018ad509f68e494fe3d`.
 - MAR-2550 exact cached FTS row-text projection validation, bounded pre-mutation writer validation, and recovery: `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`.

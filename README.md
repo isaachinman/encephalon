@@ -126,7 +126,7 @@ encephalon/
   _artifacts/<kind>/<id>/...
 ```
 
-The runtime-only `path` field is not written to record files. Optional fields are omitted rather than written as `null`.
+The runtime-only `path` field is not written to record files. Optional fields are omitted rather than written as `null`. Confidence accepts finite numbers from zero through one; numeric negative zero is normalised to positive zero before publication, cache hydration, and public return.
 
 ```ts
 type BrainRecordFile = {
