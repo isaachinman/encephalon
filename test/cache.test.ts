@@ -244,6 +244,20 @@ const cacheDirectoryPath = (root: string) => join(root, 'node_modules', '.cache'
 
 const cacheDatabasePath = (root: string) => join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
 
+const createRecoveredOperationMarker = (root: string, token: string) => {
+  const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
+  const owner = {
+    acquiredAt: '2026-08-24T10:00:00.000Z',
+    phase: 'recovering',
+    pid: process.pid,
+    token,
+  } as const
+  mkdirSync(recoveryPath, { recursive: true })
+  writeFileSync(join(recoveryPath, 'owner.json'), `${JSON.stringify(owner)}\n`)
+  writeFileSync(join(recoveryPath, 'owner.recovered.json'), `${JSON.stringify({ ...owner, phase: 'recovered' })}\n`)
+  return { owner, recoveryPath }
+}
+
 const logicalCacheProjection = (root: string) => {
   const database = new DatabaseSync(cacheDatabasePath(root), { readOnly: true })
   try {
@@ -8113,6 +8127,143 @@ describe('SQLite cache and reads', () => {
       'entered after recovered marker reclaim',
     )
     assert.ok(witnessOpens >= 2)
+  })
+
+  test('retries a transient sharing violation while reclaiming an observed recovered marker', () => {
+    const root = createRoot()
+    createRecoveredOperationMarker(root, 'shared-recovered-marker')
+    let reclaimAttempts = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'operation-lock.recovery') {
+        reclaimAttempts += 1
+        if (reclaimAttempts === 1) {
+          throw Object.assign(new Error('observed recovery marker is temporarily shared'), { code: 'EPERM' })
+        }
+        cacheLocationTestHooks.beforeQuarantineRename = undefined
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered after sharing violation'),
+      'entered after sharing violation',
+    )
+    assert.equal(reclaimAttempts, 2)
+  })
+
+  test('bounds persistent sharing violations while reclaiming an observed recovered marker', () => {
+    const root = createRoot()
+    const { recoveryPath } = createRecoveredOperationMarker(root, 'persistently-shared-recovered-marker')
+    let operationEntered = false
+    let reclaimAttempts = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'operation-lock.recovery') {
+        reclaimAttempts += 1
+        throw Object.assign(new Error('observed recovery marker remains shared'), { code: 'EPERM' })
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'IO_ERROR')
+        assert.equal(((error as { cause?: unknown }).cause as { code?: unknown }).code, 'EPERM')
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.equal(reclaimAttempts, 3)
+    assert.equal(existsSync(recoveryPath), true)
+  })
+
+  test('reobserves changed recovery evidence before retrying a sharing violation', () => {
+    const root = createRoot()
+    const { owner, recoveryPath } = createRecoveredOperationMarker(root, 'replaced-after-sharing-violation')
+    const successor = { ...owner, token: 'successor-after-sharing-violation' }
+    let reclaimAttempts = 0
+    let recoveryObservations = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'operation-lock.recovery') {
+        reclaimAttempts += 1
+        if (reclaimAttempts === 1) {
+          writeFileSync(join(recoveryPath, 'owner.json'), `${JSON.stringify(successor)}\n`)
+          writeFileSync(
+            join(recoveryPath, 'owner.recovered.json'),
+            `${JSON.stringify({ ...successor, phase: 'recovered' })}\n`,
+          )
+          throw Object.assign(new Error('predecessor recovery marker is temporarily shared'), { code: 'EPERM' })
+        }
+        if (recoveryObservations === 1) {
+          throw new Error('Recovery marker reclaim retried before re-observing changed evidence.')
+        }
+        cacheLocationTestHooks.beforeQuarantineRename = undefined
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered after evidence re-observation', {
+        duringRecoveryObservation: () => {
+          recoveryObservations += 1
+        },
+      }),
+      'entered after evidence re-observation',
+    )
+    assert.equal(recoveryObservations, 2)
+    assert.equal(reclaimAttempts, 2)
+  })
+
+  test('stops recovery-marker sharing retries at the operation-lock deadline', () => {
+    const root = createRoot()
+    const { recoveryPath } = createRecoveredOperationMarker(root, 'deadline-shared-recovered-marker')
+    let deadlineExpired = false
+    let operationEntered = false
+    let reclaimAttempts = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'operation-lock.recovery') {
+        reclaimAttempts += 1
+        deadlineExpired = true
+        throw Object.assign(new Error('recovery marker remained shared until the deadline'), { code: 'EPERM' })
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(
+          root,
+          () => {
+            operationEntered = true
+          },
+          { now: () => (deadlineExpired ? 60_000 : 0) },
+        ),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'CACHE_BUSY')
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.equal(reclaimAttempts, 1)
+    assert.equal(existsSync(recoveryPath), true)
+  })
+
+  test('continues when another contender reclaims an observed recovered marker', () => {
+    const root = createRoot()
+    createRecoveredOperationMarker(root, 'concurrently-reclaimed-marker')
+    let reclaimed = false
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'operation-lock.recovery') {
+        cacheLocationTestHooks.beforeQuarantineRename = undefined
+        rmSync(path, { recursive: true })
+        reclaimed = true
+      }
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'entered after concurrent reclaim'),
+      'entered after concurrent reclaim',
+    )
+    assert.equal(reclaimed, true)
   })
 
   test('retries when recovered evidence changes during initial marker observation', () => {
