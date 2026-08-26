@@ -41,9 +41,9 @@ Workflow job policy distinguishes reusable-workflow callers from runners. Runner
 
 Diagnostics keep the `file:location: rule` prefix and append exhaustive remediation: exact protected environment, movement of local credentials from `with` to `secrets`, omission of external `secrets` and direct secret-context inputs, lowercase 64-character SHA-256 image digest under `external-image-digest`, lowercase 40-character repository pin under `external-reference-sha`, allowed contained local target, location-aware literal permission maps, or stable unambiguous sources for `source-integrity`.
 
-Pullfrog continues using its hosted OIDC mode. Provider-secret mappings are removed, `id-token: write` remains narrowly scoped to the pinned Pullfrog job, checkout credentials are not persisted, pushes are disabled, and the workflow targets the `pullfrog-review` environment. The checked-in target does not provision or protect that GitHub environment. Before any dispatch, maintainers must create and protect it, require approval, and allow only exact `main` plus the exact ticket branch currently under review. Repository action SHA enforcement must be enabled only after the pinned workflow reaches `main`.
+Pullfrog continues using its hosted OIDC mode. Provider-secret mappings are removed, `id-token: write` remains narrowly scoped to the pinned Pullfrog job, checkout credentials are not persisted, pushes are disabled, and the workflow targets the existing `pullfrog-review` environment. The checked-in target does not protect that GitHub environment. Before any dispatch, maintainers must require independent approval, prevent self-review, and allow only exact `main` plus the exact ticket branch currently under review. Repository action SHA enforcement must be enabled only after the pinned workflow reaches `main`.
 
-The exact reviewed repository-controlled MAR-2574 code and behavioural-test snapshot is `7666139ad3d1f4853cfee8710ddc841dc3978aec`. Detailed remediation lineage and gate evidence are recorded once in the [MAR-2574 implementation plan](../plans/2026-08-23-workflow-supply-chain-hardening.md#implementation-evidence). These repository-policy changes preserve the Node runtime API, package exports, canonical data, cache schema, and generated declarations.
+The exact reviewed repository-controlled MAR-2574 code and behavioural-test snapshot is `177320d368627c2bb6421afe73fafe4bad9de58c`. Detailed remediation lineage and gate evidence are recorded once in the [MAR-2574 implementation plan](../plans/2026-08-23-workflow-supply-chain-hardening.md#implementation-evidence). These repository-policy changes preserve the Node runtime API, package exports, canonical data, cache schema, and generated declarations.
 
 This snapshot does not claim complete upstream immutability, MAR-2574 acceptance, or external rollout completion: both the pinned v0.1.60 release and the latest audited upstream v0.1.64 still mint an internal MCP token with `contents: write` despite `push: disabled`, and their later exact-version agent-runtime production dependencies resolve outside the action lock. Both require an upstream least-authority release before the protected-environment rollout can complete acceptance.
 
@@ -126,7 +126,7 @@ Pullfrog reviews the exact head. Six parallel reviewers then assess security, co
 
 MAR-2574 requires external repository configuration after its workflow diff is ready:
 
-- before any Pullfrog dispatch, create and protect the exact `pullfrog-review` environment, require approval, and allow only exact `main` plus the exact ticket branch currently under review;
+- before any Pullfrog dispatch, protect the existing exact `pullfrog-review` environment with independent approval, self-review prevention, and deployment policies allowing only exact `main` plus the exact ticket branch currently under review;
 - enable repository action SHA-pin enforcement only after the pinned workflow reaches `main`;
 - dispatch only an approved exact-head Pullfrog validation whose ref is allowed by the environment policy, because the environment changes the OIDC subject.
 

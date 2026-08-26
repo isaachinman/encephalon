@@ -210,6 +210,14 @@ describe('package contract', () => {
       resolve(root, 'docs', 'superpowers', 'specs', '2026-08-22-validated-mutation-cache-design.md'),
       'utf8',
     )
+    const workflowHardeningPlan = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'plans', '2026-08-23-workflow-supply-chain-hardening.md'),
+      'utf8',
+    )
+    const releaseBacklogHardeningDesign = readFileSync(
+      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-23-release-backlog-hardening-design.md'),
+      'utf8',
+    )
 
     assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
     assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
@@ -223,6 +231,7 @@ describe('package contract', () => {
     assert.match(contract, /## Cache Compatibility/)
     assert.match(contract, /## Bounded Disposable Cache Validation/)
     assert.match(contract, /## Gather Deduplication/)
+    assert.match(contract, /## Workflow Trust Boundary/)
     assert.match(contract, /Cache schema compatibility requires the exact owned ordinary-table semantics/)
     assert.match(contract, /## Package and Release Gates/)
     assert.match(contract, /## Historical Plan Divergence Checklist/)
@@ -275,6 +284,18 @@ describe('package contract', () => {
     assert.match(
       contract,
       /MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `30104a049f72ba2e87f51af95d5da11b55045cc3`\./,
+    )
+    assert.match(
+      contract,
+      /The exact reviewed repository-controlled code and behavioural-test snapshot for this boundary is `177320d368627c2bb6421afe73fafe4bad9de58c`\./,
+    )
+    assert.match(
+      workflowHardeningPlan,
+      /The exact current-main-integrated MAR-2574 code and behavioural-test implementation snapshot is `177320d368627c2bb6421afe73fafe4bad9de58c`\./,
+    )
+    assert.match(
+      releaseBacklogHardeningDesign,
+      /The exact reviewed repository-controlled MAR-2574 code and behavioural-test snapshot is `177320d368627c2bb6421afe73fafe4bad9de58c`\./,
     )
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /implementing the MAR-2566 benchmark guarantees above/)
