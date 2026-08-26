@@ -14,7 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
@@ -3071,11 +3071,12 @@ jobs:
   const root = createFixture({ '.github/workflows/fail.yml': staleWorkflow })
   const workflowPath = join(root, '.github', 'workflows', 'fail.yml')
   const repairMarkerPath = join(root, 'repair-ran')
+  const portablePolicyPath = relative(realpathSync(root), realpathSync(policyPath)).replaceAll('\\', '/')
   writeFileSync(
     join(root, 'package.json'),
     `${JSON.stringify({
       scripts: {
-        'check:workflows': `bun run ${policyPath}`,
+        'check:workflows': `node ${JSON.stringify(portablePolicyPath)}`,
         'precheck:workflows': 'node ./repair-workflow.mjs',
       },
       type: 'module',
