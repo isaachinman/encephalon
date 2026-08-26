@@ -165,6 +165,7 @@ type CacheLocationTestHooks = {
   beforeQuarantinedFileCleanup?: ((path: string) => void) | undefined
   duringOwnedDirectoryInspection?: ((path: string) => void) | undefined
   fsyncOwnedDirectory?: ((path: string) => void) | undefined
+  ownedDirectoryRealpath?: ((path: string) => string) | undefined
   regularFileRealpath?: ((path: string, actual: string) => string) | undefined
   releaseCloseSafetyLatchesForTests?: (() => void) | undefined
 }
@@ -1042,6 +1043,9 @@ const safeOwnedDirectoryName = (name: string) =>
 const ownedDirectoryRelativePath = (name: string) =>
   `node_modules/.cache/encephalon/${name.startsWith('operation.lock.') ? 'operation.lock' : name}`
 
+const ownedDirectoryRealpath = (path: string) =>
+  cacheLocationTestHooks.ownedDirectoryRealpath?.(path) ?? realpathSync.native(path)
+
 type CacheOwnedDirectoryObservation =
   | { kind: 'changed' }
   | { kind: 'missing' }
@@ -1080,10 +1084,24 @@ const observeOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
   cacheLocationTestHooks.duringOwnedDirectoryInspection?.(path)
   let actualRealpath: string
   try {
-    actualRealpath = realpathSync.native(path)
+    actualRealpath = ownedDirectoryRealpath(path)
   } catch (error) {
     if (missingPath(error)) {
       return { kind: 'changed' }
+    }
+    try {
+      const currentMetadata = lstatSync(path, { bigint: true })
+      if (
+        !currentMetadata.isDirectory() ||
+        currentMetadata.isSymbolicLink() ||
+        !sameCacheEntryIdentity(captured, entryIdentityFrom(currentMetadata))
+      ) {
+        return { kind: 'changed' }
+      }
+    } catch (candidate) {
+      if (missingPath(candidate)) {
+        return { kind: 'changed' }
+      }
     }
     throw error
   }

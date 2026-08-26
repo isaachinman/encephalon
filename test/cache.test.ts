@@ -152,6 +152,7 @@ afterEach(() => {
   cacheLocationTestHooks.beforeQuarantinedFileCleanup = undefined
   cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
   cacheLocationTestHooks.fsyncOwnedDirectory = undefined
+  cacheLocationTestHooks.ownedDirectoryRealpath = undefined
   cacheLocationTestHooks.regularFileRealpath = undefined
   cacheReadTestHooks.afterCanonicalCacheEqualityValidation = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
@@ -9808,6 +9809,51 @@ describe('SQLite cache and reads', () => {
       withOperationLock(root, () => 'entered'),
       'entered',
     )
+  })
+
+  test('reclassifies an owned-directory realpath failure only after identity loss', () => {
+    const root = createRoot()
+    const recoveryPath = join(cacheDirectoryPath(root), 'operation-lock.recovery')
+    const displacedPath = join(root, 'owned-directory-realpath-failure-predecessor')
+    mkdirSync(recoveryPath, { recursive: true })
+    const location = inspectCacheLocation(root)
+    const failure = Object.assign(new Error('simulated Windows realpath race'), { code: 'EBADF' })
+
+    cacheLocationTestHooks.ownedDirectoryRealpath = () => {
+      throw failure
+    }
+    assert.throws(
+      () => inspectCacheOwnedDirectory(location, 'operation-lock.recovery'),
+      error => error === failure,
+    )
+
+    cacheLocationTestHooks.ownedDirectoryRealpath = path => {
+      rmSync(path, { recursive: true })
+      throw failure
+    }
+    assert.throws(
+      () => inspectCacheOwnedDirectory(location, 'operation-lock.recovery'),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+
+    mkdirSync(recoveryPath)
+    const predecessor = statSync(recoveryPath, { bigint: true })
+    cacheLocationTestHooks.ownedDirectoryRealpath = path => {
+      renameSync(path, displacedPath)
+      mkdirSync(path)
+      throw failure
+    }
+    assert.throws(
+      () => inspectCacheOwnedDirectory(location, 'operation-lock.recovery'),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(sameCacheEntryIdentity(predecessor, statSync(recoveryPath, { bigint: true })), false)
   })
 
   test('reports a recovery marker missing only after a stable absent observation', () => {
