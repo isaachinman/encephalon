@@ -57,7 +57,7 @@
     "check:publish": "node ./scripts/check-publish.ts",
     "lint": "ultracite check",
     "prepack": "bun run build && bun run check:package",
-    "test": "bun run build && node --test test/*.test.ts",
+    "test": "bun run build && node --test scripts/*.test.ts test/*.test.ts",
     "typecheck": "tsc --project tsconfig.src.json --noEmit && tsc --project tsconfig.scripts.json --noEmit && tsc --project tsconfig.test.json --noEmit && tsc --project tsconfig.runtime-guard.json --noEmit"
   },
   "devDependencies": {

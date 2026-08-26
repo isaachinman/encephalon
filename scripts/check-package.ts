@@ -12,60 +12,16 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
-import { gunzipSync } from 'node:zlib'
 import { spawnNpmCommand } from './npm-command.ts'
+import { packageTarballDigests, parsePackageCheckArguments, readPackageTarEntries } from './package-tarball.ts'
 import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const retainedTarballUsage = () =>
-  new Error('Usage: check-package.ts [--retain-tarball <repository-relative-directory>]')
-
-const parseRetainedTarballDirectory = (arguments_: string[]) => {
-  if (arguments_.length === 0) {
-    return
-  }
-  const [option, directoryName] = arguments_
-  const directory = directoryName === undefined ? root : resolve(root, directoryName)
-  const repositoryRelativeDirectory = relative(root, directory)
-  if (
-    arguments_.length === 2 &&
-    option === '--retain-tarball' &&
-    directoryName !== undefined &&
-    !isAbsolute(directoryName) &&
-    repositoryRelativeDirectory !== '' &&
-    repositoryRelativeDirectory !== '..' &&
-    !repositoryRelativeDirectory.startsWith(`..${sep}`) &&
-    !isAbsolute(repositoryRelativeDirectory)
-  ) {
-    return directory
-  }
-  throw retainedTarballUsage()
-}
-
-const preflightRetainedTarballDirectory = (retainedDirectory: string) => {
-  relative(root, retainedDirectory)
-    .split(sep)
-    .reduce(
-      (state, segment, index, segments) => {
-        const directory = resolve(state.parent, segment)
-        const entry = state.ancestorMissing ? undefined : lstatSync(directory, { throwIfNoEntry: false })
-        const isDestination = index === segments.length - 1
-        if (entry !== undefined && (isDestination || !(entry.isDirectory() && !entry.isSymbolicLink()))) {
-          throw retainedTarballUsage()
-        }
-        return { ancestorMissing: state.ancestorMissing || entry === undefined, parent: directory }
-      },
-      { ancestorMissing: false, parent: root },
-    )
-}
-
-const retainedTarballDirectory = parseRetainedTarballDirectory(process.argv.slice(2))
-if (retainedTarballDirectory !== undefined) {
-  preflightRetainedTarballDirectory(retainedTarballDirectory)
-}
+const options = parsePackageCheckArguments(process.argv.slice(2))
+const retainedTarballDirectory = options.retainedDirectory
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-check-'))
 
 const execute = (command: readonly string[], cwd = root) => {
@@ -119,6 +75,26 @@ const runNpm = (arguments_: readonly string[], cwd = root) => {
   throw new Error(`npm failed with exit code ${result.status ?? 1}.`)
 }
 
+const createNpmTarball = () => {
+  const packOutput = runNpm([
+    'pack',
+    '--dry-run=false',
+    '--ignore-scripts',
+    '--json',
+    '--pack-destination',
+    temporaryDirectory,
+  ])
+  const [pack] = JSON.parse(packOutput) as Array<{ filename?: unknown }>
+  if (
+    typeof pack?.filename === 'string' &&
+    basename(pack.filename) === pack.filename &&
+    pack.filename.endsWith('.tgz')
+  ) {
+    return { filename: pack.filename, path: resolve(temporaryDirectory, pack.filename) }
+  }
+  throw new Error('npm pack did not return package metadata.')
+}
+
 const createRetainedTarballParents = (parentDirectory: string) =>
   relative(root, parentDirectory)
     .split(sep)
@@ -129,7 +105,7 @@ const createRetainedTarballParents = (parentDirectory: string) =>
       if (entry === undefined) {
         mkdirSync(directory, { mode: 0o700 })
       } else if (!(entry.isDirectory() && !entry.isSymbolicLink())) {
-        throw retainedTarballUsage()
+        throw new Error('The retained tarball destination changed after validation.')
       }
       return directory
     }, root)
@@ -167,32 +143,6 @@ const readmeReferences = (content: string) => {
       const [path = ''] = reference.split(/[?#]/u, 1)
       return path.startsWith('./') ? path.slice(2) : path
     })
-}
-
-const packedMode = (tarball: string, expectedPath: string) => {
-  const archive = gunzipSync(readFileSync(tarball))
-  const field = (fieldOffset: number, fieldLength: number) =>
-    archive
-      .subarray(fieldOffset, fieldOffset + fieldLength)
-      .toString('utf8')
-      .split('\0', 1)[0] ?? ''
-  const octal = (fieldOffset: number, fieldLength: number) =>
-    Number.parseInt(field(fieldOffset, fieldLength).trim() || '0', 8)
-  let offset = 0
-  while (offset + 512 <= archive.length) {
-    const name = field(offset, 100)
-    if (name.length === 0) {
-      return
-    }
-    const prefix = field(offset + 345, 155)
-    const path = prefix.length > 0 ? `${prefix}/${name}` : name
-    const mode = octal(offset + 100, 8)
-    const size = octal(offset + 124, 12)
-    if (path === expectedPath) {
-      return mode
-    }
-    offset += 512 + Math.ceil(size / 512) * 512
-  }
 }
 
 try {
@@ -295,21 +245,12 @@ try {
     throw new Error('The built CLI reports a stale package version.')
   }
 
-  const packOutput = runNpm([
-    'pack',
-    '--dry-run=false',
-    '--ignore-scripts',
-    '--json',
-    '--pack-destination',
-    temporaryDirectory,
-  ])
-  const [pack] = JSON.parse(packOutput) as Array<{
-    filename: string
-    files: Array<{ path: string; mode?: number }>
-  }>
-  if (pack === undefined || basename(pack.filename) !== pack.filename || !pack.filename.endsWith('.tgz')) {
-    throw new Error('npm pack did not return package metadata.')
+  const createdTarball = options.suppliedTarball === undefined ? createNpmTarball() : undefined
+  const tarball = options.suppliedTarball ?? createdTarball?.path
+  if (tarball === undefined) {
+    throw new Error('Package tarball acquisition failed.')
   }
+  const entries = readPackageTarEntries(tarball)
   const allowedFiles = new Set([
     'LICENSE',
     'README.md',
@@ -330,9 +271,16 @@ try {
     'dist/cli.mjs',
     'dist/index.mjs',
   ])
-  const packedPaths = new Set(pack.files.map(file => file.path))
+  const packedEntries = entries.map(entry => {
+    if (entry.path.startsWith('package/') && entry.path.length > 'package/'.length) {
+      return { ...entry, path: entry.path.slice('package/'.length) }
+    }
+    throw new Error('The tarball differs from the reviewed package file manifest.')
+  })
+  const packedPaths = new Set(packedEntries.map(entry => entry.path))
   const differsFromReviewedManifest =
-    pack.files.some(file => !expectedPackagePaths.has(file.path)) ||
+    packedEntries.length !== packedPaths.size ||
+    packedEntries.some(entry => !expectedPackagePaths.has(entry.path)) ||
     [...expectedPackagePaths].some(path => !packedPaths.has(path))
   if (differsFromReviewedManifest) {
     throw new Error('The tarball differs from the reviewed package file manifest.')
@@ -343,11 +291,9 @@ try {
   if (missingReadmeReferences.length > 0) {
     throw new Error(`The packed README references missing files: ${missingReadmeReferences.join(', ')}`)
   }
-  const tarball = resolve(temporaryDirectory, pack.filename)
-  const packedCli = pack.files.find(file => file.path === 'dist/cli.mjs')
-  const packedCliMode = packedMode(tarball, 'package/dist/cli.mjs')
+  const packedCli = packedEntries.find(entry => entry.path === 'dist/cli.mjs')
   const lacksPackedExecutableMode =
-    process.platform !== 'win32' && (packedCliMode === undefined || (packedCliMode & 0o111) === 0)
+    process.platform !== 'win32' && (packedCli === undefined || (packedCli.mode & 0o111) === 0)
   if (packedCli === undefined || lacksPackedExecutableMode) {
     throw new Error('The packed CLI is missing or not executable.')
   }
@@ -550,7 +496,8 @@ try {
   if (!(Array.isArray(gathered.records) && Array.isArray(gathered.searches))) {
     throw new Error('The packed Node-only CLI gather command returned an unexpected result.')
   }
-  const retainedTarball = retainTarball(tarball, pack.filename)
+  process.stderr.write(`${JSON.stringify(packageTarballDigests(tarball))}\n`)
+  const retainedTarball = retainTarball(tarball, basename(tarball))
   if (retainedTarball !== undefined) {
     process.stdout.write(`${retainedTarball}\n`)
   }

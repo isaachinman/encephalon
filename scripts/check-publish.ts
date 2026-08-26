@@ -2,9 +2,14 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnNpmCommand } from './npm-command.ts'
 import { isPublishedVersionConflictOutput } from './npm-publish-conflict.ts'
+import { parsePackageCheckArguments } from './package-tarball.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const npmArguments = ['publish', '--dry-run', '--ignore-scripts', '--access', 'public', '--json']
+const { suppliedTarball: tarball } = parsePackageCheckArguments(['--tarball', ...process.argv.slice(2)])
+if (tarball === undefined) {
+  throw new Error('Usage: check-publish.ts <repository-relative-tarball>')
+}
+const npmArguments = ['publish', tarball, '--dry-run', '--ignore-scripts', '--access', 'public', '--json']
 const result = spawnNpmCommand(npmArguments, { cwd: root })
 if (result.error !== undefined) {
   throw result.error

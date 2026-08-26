@@ -14,11 +14,15 @@ const createPublishCheckFixture = () => {
   mkdirSync(scriptsDirectory)
   cpSync(resolve(root, 'scripts', 'check-publish.ts'), resolve(scriptsDirectory, 'check-publish.ts'))
   cpSync(resolve(root, 'scripts', 'npm-publish-conflict.ts'), resolve(scriptsDirectory, 'npm-publish-conflict.ts'))
+  cpSync(resolve(root, 'scripts', 'package-tarball.ts'), resolve(scriptsDirectory, 'package-tarball.ts'))
   writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module"}\n')
+  writeFileSync(resolve(temporaryRoot, 'candidate.tgz'), 'candidate tarball')
   writeFileSync(
     resolve(scriptsDirectory, 'npm-command.ts'),
-    `export const spawnNpmCommand = (arguments_, options) => {
-  if (JSON.stringify(arguments_) !== '["publish","--dry-run","--ignore-scripts","--access","public","--json"]') {
+    `import { resolve } from 'node:path'
+export const spawnNpmCommand = (arguments_, options) => {
+  const expected = ['publish', resolve(options.cwd, 'candidate.tgz'), '--dry-run', '--ignore-scripts', '--access', 'public', '--json']
+  if (JSON.stringify(arguments_) !== JSON.stringify(expected)) {
     throw new Error('Unexpected npm arguments.')
   }
   if (typeof options.cwd !== 'string') throw new Error('Missing npm working directory.')
@@ -30,7 +34,7 @@ const createPublishCheckFixture = () => {
 }
 
 const runPublishCheckFixture = (temporaryRoot: string, result: object) =>
-  spawnSync(process.execPath, ['./scripts/check-publish.ts'], {
+  spawnSync(process.execPath, ['./scripts/check-publish.ts', 'candidate.tgz'], {
     cwd: temporaryRoot,
     encoding: 'utf8',
     env: { ...process.env, ENCEPHALON_TEST_NPM_RESULT: JSON.stringify(result) },

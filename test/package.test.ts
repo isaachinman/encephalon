@@ -9,13 +9,15 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve, sep } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
 import { describe, test } from 'node:test'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import { spawnNpmCommand } from '../scripts/npm-command.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
@@ -33,6 +35,7 @@ const packageFixturePaths = [
   'package.json',
   'scripts/check-package.ts',
   'scripts/npm-command.ts',
+  'scripts/package-tarball.ts',
   'scripts/package-version.ts',
   'src',
   'dist',
@@ -64,6 +67,40 @@ const createPackageCheckFixture = (prefix: string) => {
   assert.equal(stage.status, 0, `${stage.stdout}${stage.stderr}`)
   return { fixtureRoot, temporaryRoot }
 }
+
+const createPublishCheckFixture = () => {
+  const temporaryRoot = realpathSync(mkdtempSync(join(tmpdir(), 'encephalon-publish-tarball-')))
+  const scriptsDirectory = resolve(temporaryRoot, 'scripts')
+  const tarball = resolve(temporaryRoot, 'candidate.tgz')
+  const capturedArguments = resolve(temporaryRoot, 'npm-arguments.json')
+  mkdirSync(scriptsDirectory)
+  cpSync(resolve(root, 'scripts', 'check-publish.ts'), resolve(scriptsDirectory, 'check-publish.ts'))
+  cpSync(resolve(root, 'scripts', 'npm-publish-conflict.ts'), resolve(scriptsDirectory, 'npm-publish-conflict.ts'))
+  cpSync(resolve(root, 'scripts', 'package-tarball.ts'), resolve(scriptsDirectory, 'package-tarball.ts'))
+  writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module"}\n')
+  writeFileSync(tarball, 'candidate tarball')
+  writeFileSync(
+    resolve(scriptsDirectory, 'npm-command.ts'),
+    `import { writeFileSync } from 'node:fs'
+export const spawnNpmCommand = (arguments_, options) => {
+  writeFileSync(process.env.ENCEPHALON_TEST_NPM_CAPTURE, JSON.stringify({ arguments: arguments_, cwd: options.cwd }))
+  return JSON.parse(process.env.ENCEPHALON_TEST_NPM_RESULT)
+}
+`,
+  )
+  return { capturedArguments, tarball, temporaryRoot }
+}
+
+const runPublishCheckFixture = (temporaryRoot: string, arguments_: readonly string[], result: object) =>
+  spawnSync(process.execPath, ['./scripts/check-publish.ts', ...arguments_], {
+    cwd: temporaryRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ENCEPHALON_TEST_NPM_CAPTURE: resolve(temporaryRoot, 'npm-arguments.json'),
+      ENCEPHALON_TEST_NPM_RESULT: JSON.stringify(result),
+    },
+  })
 
 describe('package contract', () => {
   test('declares a zero-runtime-dependency Node ESM package', () => {
@@ -353,9 +390,175 @@ describe('package contract', () => {
         readFileSync(resolve(artifactDirectory, retainedFilename)),
         readFileSync(resolve(referenceDirectory, retainedFilename)),
       )
+
+      const suppliedResult = spawnSync(
+        process.execPath,
+        ['./scripts/check-package.ts', '--tarball', `${artifactDirectoryName}/${retainedFilename}`],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          timeout: 60_000,
+        },
+      )
+      assert.equal(suppliedResult.status, 0, `${suppliedResult.stdout}${suppliedResult.stderr}`)
+      assert.equal(suppliedResult.stdout, '')
     } finally {
       rmSync(artifactParent, { force: true, recursive: true })
       rmSync(referenceDirectory, { force: true, recursive: true })
+    }
+  })
+
+  test('supplied package mode never invokes npm pack', { timeout: 75_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-supplied-')
+    const packageDirectory = resolve(fixtureRoot, 'package-artifacts')
+    try {
+      mkdirSync(packageDirectory)
+      const packResult = spawnNpmCommand(
+        ['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', packageDirectory],
+        { cwd: fixtureRoot },
+      )
+      assert.equal(packResult.status, 0, `${packResult.stdout}${packResult.stderr}`)
+      const [pack] = JSON.parse(packResult.stdout) as Array<{ filename?: unknown }>
+      assert.equal(typeof pack?.filename, 'string')
+      cpSync(resolve(fixtureRoot, 'scripts', 'npm-command.ts'), resolve(fixtureRoot, 'scripts', 'npm-command-real.ts'))
+      writeFileSync(
+        resolve(fixtureRoot, 'scripts', 'npm-command.ts'),
+        `import { spawnNpmCommand as spawnRealNpmCommand } from './npm-command-real.ts'
+export const spawnNpmCommand = (arguments_, options) => {
+  if (arguments_[0] === 'pack') throw new Error('supplied mode invoked npm pack')
+  return spawnRealNpmCommand(arguments_, options)
+}
+`,
+      )
+
+      const result = spawnSync(
+        process.execPath,
+        ['./scripts/check-package.ts', '--tarball', `package-artifacts/${String(pack?.filename)}`],
+        { cwd: fixtureRoot, encoding: 'utf8', timeout: 60_000 },
+      )
+      assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects byte-modified and wrong-version supplied package tarballs', { timeout: 120_000 }, () => {
+    const artifactParentName = join('test', `.package-invalid-test-${randomUUID()}`)
+    const artifactParent = resolve(root, artifactParentName)
+    try {
+      mkdirSync(artifactParent)
+      const packResult = spawnNpmCommand(
+        ['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', artifactParent],
+        { cwd: root },
+      )
+      assert.equal(packResult.status, 0, `${packResult.stdout}${packResult.stderr}`)
+      const [pack] = JSON.parse(packResult.stdout) as Array<{ filename?: unknown }>
+      assert.equal(typeof pack?.filename, 'string')
+      const originalTarball = resolve(artifactParent, String(pack?.filename))
+      const modifiedTarball = resolve(artifactParent, 'byte-modified.tgz')
+      const modifiedBytes = Buffer.from(readFileSync(originalTarball))
+      modifiedBytes[0] = (modifiedBytes[0] ?? 0) ^ 0xff
+      writeFileSync(modifiedTarball, modifiedBytes)
+
+      const wrongVersionTarball = resolve(artifactParent, 'wrong-version.tgz')
+      const archive = gunzipSync(readFileSync(originalTarball))
+      const expectedVersion = Buffer.from(`"version": "${PACKAGE_VERSION}"`, 'utf8')
+      const wrongVersion = Buffer.from('"version": "9.9.9"', 'utf8')
+      const versionOffset = archive.indexOf(expectedVersion)
+      assert.notEqual(versionOffset, -1)
+      wrongVersion.copy(archive, versionOffset)
+      writeFileSync(wrongVersionTarball, gzipSync(archive))
+
+      const failures = [modifiedTarball, wrongVersionTarball].map(tarball =>
+        spawnSync(process.execPath, ['./scripts/check-package.ts', '--tarball', relative(root, tarball)], {
+          cwd: root,
+          encoding: 'utf8',
+          timeout: 60_000,
+        }),
+      )
+      assert.deepEqual(
+        failures.map(result => result.status === 0),
+        [false, false],
+      )
+      assert.equal(
+        failures.every(result => result.stdout === ''),
+        true,
+      )
+      assert.equal(
+        failures.every(result => !/Usage: check-package\.ts/u.test(result.stderr)),
+        true,
+      )
+    } finally {
+      rmSync(artifactParent, { force: true, recursive: true })
+    }
+  })
+
+  test('publishes only the supplied repository-relative tarball path', () => {
+    const { capturedArguments, tarball, temporaryRoot } = createPublishCheckFixture()
+    try {
+      const result = runPublishCheckFixture(temporaryRoot, ['candidate.tgz'], {
+        signal: null,
+        status: 0,
+        stderr: '',
+        stdout: 'publish succeeded\n',
+      })
+      assert.equal(result.status, 0, result.stderr)
+      assert.deepEqual(JSON.parse(readFileSync(capturedArguments, 'utf8')) as unknown, {
+        arguments: ['publish', tarball, '--dry-run', '--ignore-scripts', '--access', 'public', '--json'],
+        cwd: temporaryRoot,
+      })
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects invalid publish targets before invoking npm', () => {
+    const { capturedArguments, temporaryRoot } = createPublishCheckFixture()
+    const realDirectory = resolve(temporaryRoot, 'real')
+    const symlinkDirectory = resolve(temporaryRoot, 'symlink')
+    try {
+      mkdirSync(realDirectory)
+      writeFileSync(resolve(realDirectory, 'candidate.tgz'), 'candidate tarball')
+      symlinkSync(realDirectory, symlinkDirectory, 'junction')
+      const invalidArguments = [
+        [],
+        ['.'],
+        ['candidate.tgz', 'extra.tgz'],
+        ['../candidate.tgz'],
+        ['symlink/candidate.tgz'],
+        ['missing.tgz'],
+      ] as const
+      const failures = invalidArguments.map(arguments_ =>
+        runPublishCheckFixture(temporaryRoot, arguments_, {
+          signal: null,
+          status: 0,
+          stderr: '',
+          stdout: '',
+        }),
+      )
+      assert.equal(
+        failures.every(result => result.status !== 0),
+        true,
+      )
+      assert.equal(existsSync(capturedArguments), false)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('accepts supplied-tarball publish conflicts only through the existing conflict authority', () => {
+    const { temporaryRoot } = createPublishCheckFixture()
+    try {
+      const conflict = runPublishCheckFixture(temporaryRoot, ['candidate.tgz'], {
+        signal: null,
+        status: 1,
+        stderr: '',
+        stdout:
+          '{"error":{"code":"EPUBLISHCONFLICT","summary":"You cannot publish over the previously published versions: 0.3.0."}}\n',
+      })
+      assert.equal(conflict.status, 0, conflict.stderr)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
 
