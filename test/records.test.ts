@@ -4154,6 +4154,49 @@ describe('canonical records', () => {
     assert.deepEqual(counts, { canonicalScans: 2, graphValidations: 2 })
   })
 
+  test('stable canonical snapshot retries an artifact changed during closing record validation', () => {
+    const root = createRoot()
+    const id = 'stable-artifact-during-record-validation'
+    const artifact = `_artifacts/decision/${id}/evidence.txt`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, 'old evidence')
+    writeCanonicalRecord(root, {
+      artifacts: [artifact],
+      id,
+      subject: 'stable.artifact-during-record-validation',
+    })
+    const recordPath = join(root, 'encephalon', 'decision', `${id}.json`)
+    const counts = { canonicalScans: 0, graphValidations: 0 }
+    let changed = false
+    let recordOpenCalls = 0
+
+    const records = readRecordsResolved(root, {
+      canonicalScan: () => {
+        counts.canonicalScans += 1
+      },
+      fault: (point, path) => {
+        if (point === 'before-record-open' && path === recordPath) {
+          recordOpenCalls += 1
+          if (recordOpenCalls === 2) {
+            writeFileSync(artifactPath, 'new evidence')
+            changed = true
+          }
+        }
+      },
+      graphValidation: () => {
+        counts.graphValidations += 1
+      },
+    })
+
+    assert.equal(changed, true)
+    assert.deepEqual(
+      records.map(record => record.id),
+      [id],
+    )
+    assert.deepEqual(counts, { canonicalScans: 2, graphValidations: 2 })
+  })
+
   test('canonical snapshot churn attempts exactly three complete scans without leaking repository evidence', () => {
     const root = createRoot()
     const id = 'stable-continuous-churn'
@@ -4859,6 +4902,41 @@ describe('canonical records', () => {
         assert.equal(cause.code, 'EIO')
         assert.equal(cause.message, 'A record filesystem operation failed.')
         assert.equal(causeChainText(error).includes(root), false)
+        return true
+      },
+    )
+
+    assert.equal(injected, true)
+  })
+
+  test('keeps stable kind-directory lstat failures path-safe', () => {
+    const root = createRoot()
+    const id = 'kind-lstat-operational-io'
+    writeCanonicalRecord(root, { id, subject: 'kind.lstat-operational-io' })
+    const kindPath = join(root, 'encephalon', 'decision')
+    let injected = false
+
+    assert.throws(
+      () =>
+        validateRecordsResolved(root, {
+          hooks: {
+            fault: (point, path) => {
+              if (point === 'before-kind-lstat' && path === kindPath && !injected) {
+                injected = true
+                throw Object.assign(new Error(`simulated kind I/O at ${path}`), { code: 'EIO' })
+              }
+            },
+          },
+        }),
+      (error: unknown) => {
+        const actual = error as Error & { cause?: unknown; code?: unknown; details?: unknown }
+        assert.equal(actual.code, 'IO_ERROR')
+        assert.equal(actual.message, 'Unable to validate Encephalon records.')
+        assert.deepEqual(actual.details, {})
+        assert.equal(actual.cause instanceof Error, true)
+        assert.equal((actual.cause as Error & { code?: unknown }).code, 'EIO')
+        assert.equal((actual.cause as Error).message, 'A record filesystem operation failed.')
+        assert.equal(causeChainText(actual).includes(root), false)
         return true
       },
     )

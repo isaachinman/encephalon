@@ -787,7 +787,7 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
             if (isCanonicalDirectoryReplacementError(error)) {
               return canonicalGenerationChanged()
             }
-            throw error
+            throw preserveRecordAuthorityError(error)
           }
           if (!kindMetadata.isDirectory() || kindMetadata.isSymbolicLink()) {
             addScanError(
@@ -1467,6 +1467,7 @@ const assertCanonicalSnapshotCurrent = (
       assertRejectedRecordEvidenceCurrent(evidence, changed, hooks)
       return verified
     }, undefined)
+    assertArtifactEvidenceCurrent(root, artifactEvidence, changed)
     if (!sameCanonicalLayoutGeneration(root, scan.layout)) {
       changed()
     }
