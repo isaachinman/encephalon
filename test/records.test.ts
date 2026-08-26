@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import {
+import fs, {
   chmodSync,
   existsSync,
   fsyncSync,
@@ -18,6 +18,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
@@ -67,6 +68,11 @@ import {
 } from '../test/helpers.ts'
 
 const roots: string[] = []
+const mutableFs = fs as {
+  closeSync: typeof fs.closeSync
+  lstatSync: typeof fs.lstatSync
+  openSync: typeof fs.openSync
+}
 const mutationRecordWriteTestHooks = recordWriteTestHooks as typeof recordWriteTestHooks & {
   readHooks?: RecordReadHooks | undefined
 }
@@ -4099,6 +4105,55 @@ describe('canonical records', () => {
     assert.deepEqual(counts, { canonicalScans: 2, graphValidations: 2 })
   })
 
+  test('stable canonical snapshot retries a record changed during closing artifact validation', () => {
+    const root = createRoot()
+    const id = 'stable-record-during-artifact-validation'
+    const artifact = `_artifacts/decision/${id}/evidence.txt`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, 'stable evidence')
+    writeCanonicalRecord(root, {
+      artifacts: [artifact],
+      id,
+      payload: { summary: 'old' },
+      subject: 'stable.record-during-artifact-validation',
+    })
+    const counts = { canonicalScans: 0, graphValidations: 0 }
+    let artifactLstatCalls = 0
+    let changed = false
+
+    artifactInspectionTestHooks.fault = point => {
+      if (point === 'after-artifact-lstat') {
+        artifactLstatCalls += 1
+        if (artifactLstatCalls === 3) {
+          writeCanonicalRecord(root, {
+            artifacts: [artifact],
+            id,
+            payload: { summary: 'new' },
+            subject: 'stable.record-during-artifact-validation',
+          })
+          changed = true
+        }
+      }
+    }
+
+    const records = readRecordsResolved(root, {
+      canonicalScan: () => {
+        counts.canonicalScans += 1
+      },
+      graphValidation: () => {
+        counts.graphValidations += 1
+      },
+    })
+
+    assert.equal(changed, true)
+    assert.deepEqual(
+      records.map(record => record.payload),
+      [{ summary: 'new' }],
+    )
+    assert.deepEqual(counts, { canonicalScans: 2, graphValidations: 2 })
+  })
+
   test('canonical snapshot churn attempts exactly three complete scans without leaking repository evidence', () => {
     const root = createRoot()
     const id = 'stable-continuous-churn'
@@ -4885,6 +4940,40 @@ describe('canonical records', () => {
     assert.equal(scans, 1)
   })
 
+  test('preserves initial record-lstat failures as path-safe IO errors', () => {
+    const root = createRoot()
+    const id = 'record-lstat-operational-io'
+    writeCanonicalRecord(root, { id, subject: 'record.lstat-operational-io' })
+    const path = join(root, 'encephalon', 'decision', `${id}.json`)
+    const originalLstatSync = fs.lstatSync
+    let thrown: unknown
+
+    mutableFs.lstatSync = ((...arguments_: unknown[]) => {
+      if (arguments_[0] === path) {
+        throw Object.assign(new Error(`simulated initial record I/O at ${path}`), { code: 'EIO' })
+      }
+      return Reflect.apply(originalLstatSync, fs, arguments_)
+    }) as typeof fs.lstatSync
+    syncBuiltinESMExports()
+    try {
+      validateRecordsResolved(root)
+    } catch (error) {
+      thrown = error
+    } finally {
+      mutableFs.lstatSync = originalLstatSync
+      syncBuiltinESMExports()
+    }
+
+    const actual = thrown as Error & { cause?: unknown; code?: unknown; details?: unknown }
+    assert.equal(actual.code, 'IO_ERROR')
+    assert.equal(actual.message, 'Unable to validate Encephalon records.')
+    assert.deepEqual(actual.details, {})
+    assert.equal(actual.cause instanceof Error, true)
+    assert.equal((actual.cause as Error & { code?: unknown }).code, 'EIO')
+    assert.equal((actual.cause as Error).message, 'A record filesystem operation failed.')
+    assert.equal(causeChainText(actual).includes(root), false)
+  })
+
   test('does not swallow an operational failure while closing unreadable evidence', () => {
     const root = createRoot()
     const id = 'unreadable-closing-operational-io'
@@ -4938,27 +5027,57 @@ describe('canonical records', () => {
     let injected = false
     let rejectedReads = 0
     let scans = 0
+    const originalCloseSync = fs.closeSync
+    const originalOpenSync = fs.openSync
+    const activeRecordDescriptors = new Set<number>()
+    let closedRecordDescriptors = 0
+    let openedRecordDescriptors = 0
+    let result!: ValidateResult
 
-    const result = validateRecordsResolved(root, {
-      hooks: {
-        canonicalScan: () => {
-          scans += 1
+    mutableFs.openSync = ((...arguments_: unknown[]) => {
+      const descriptor = Reflect.apply(originalOpenSync, fs, arguments_) as number
+      if (arguments_[0] === path) {
+        activeRecordDescriptors.add(descriptor)
+        openedRecordDescriptors += 1
+      }
+      return descriptor
+    }) as typeof fs.openSync
+    mutableFs.closeSync = ((descriptor: number) => {
+      if (activeRecordDescriptors.has(descriptor)) {
+        activeRecordDescriptors.delete(descriptor)
+        closedRecordDescriptors += 1
+      }
+      return originalCloseSync(descriptor)
+    }) as typeof fs.closeSync
+    syncBuiltinESMExports()
+    try {
+      result = validateRecordsResolved(root, {
+        hooks: {
+          canonicalScan: () => {
+            scans += 1
+          },
+          fault: (point, faultPath) => {
+            if (point === 'after-record-open' && faultPath === path && !injected) {
+              injected = true
+              throw Object.assign(new Error('simulated readability failure'), { code: 'EACCES' })
+            }
+            if (point === 'before-rejected-record-read' && faultPath === path) {
+              rejectedReads += 1
+            }
+          },
         },
-        fault: (point, faultPath) => {
-          if (point === 'after-record-open' && faultPath === path && !injected) {
-            injected = true
-            throw Object.assign(new Error('simulated readability failure'), { code: 'EACCES' })
-          }
-          if (point === 'before-rejected-record-read' && faultPath === path) {
-            rejectedReads += 1
-          }
-        },
-      },
-    })
+      })
+    } finally {
+      mutableFs.closeSync = originalCloseSync
+      mutableFs.openSync = originalOpenSync
+      syncBuiltinESMExports()
+    }
 
     assert.equal(injected, true)
     assert.equal(rejectedReads, 0)
     assert.equal(scans, 2)
+    assert.equal(closedRecordDescriptors, openedRecordDescriptors)
+    assert.equal(activeRecordDescriptors.size, 0)
     assert.deepEqual(result, {
       errors: [
         {

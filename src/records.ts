@@ -568,7 +568,7 @@ const readRecord = (
     if (isCanonicalDirectoryReplacementError(error)) {
       return canonicalGenerationChanged()
     }
-    throw error
+    throw preserveRecordAuthorityError(error)
   }
   readFault(hooks, 'after-record-lstat', path)
   let descriptor: number | undefined
@@ -1387,9 +1387,6 @@ const assertRejectedRecordEvidenceCurrent = (
     readBoundedDescriptor(descriptor, metadata.size, changed)
     becameReadable = true
   } catch (error) {
-    if (error instanceof CanonicalGenerationChanged) {
-      throw error
-    }
     primaryError = error
   }
   let closeError: unknown
@@ -1401,6 +1398,9 @@ const assertRejectedRecordEvidenceCurrent = (
     }
   }
   if (primaryError !== undefined) {
+    if (primaryError instanceof CanonicalGenerationChanged) {
+      throw primaryError
+    }
     assertPathObservationCurrent(evidence, changed)
     assertParentIdentity(evidence.kindPath, evidence.kindIdentity, changed, hooks)
     if (isRecordReadabilityError(primaryError)) {
@@ -1458,6 +1458,7 @@ const assertCanonicalSnapshotCurrent = (
     if (!sameCanonicalLayoutGeneration(root, scan.layout)) {
       changed()
     }
+    assertArtifactEvidenceCurrent(root, artifactEvidence, changed)
     scan.observations.reduce<undefined>((verified, observation) => {
       reinspectRecordObservation(observation, changed, hooks)
       return verified
@@ -1466,7 +1467,6 @@ const assertCanonicalSnapshotCurrent = (
       assertRejectedRecordEvidenceCurrent(evidence, changed, hooks)
       return verified
     }, undefined)
-    assertArtifactEvidenceCurrent(root, artifactEvidence, changed)
     if (!sameCanonicalLayoutGeneration(root, scan.layout)) {
       changed()
     }
