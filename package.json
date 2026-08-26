@@ -52,6 +52,7 @@
     "benchmark": "node scripts/benchmark.ts",
     "benchmark:check": "node scripts/benchmark.ts --profile ci --budget docs/performance-budgets.json",
     "build": "bun run scripts/build.ts",
+    "check:compatibility": "node ./scripts/check-release-compatibility.ts",
     "check:generated": "bun run scripts/check-generated-version.ts",
     "check:package": "node ./scripts/check-package.ts",
     "check:publish": "node ./scripts/check-publish.ts",
