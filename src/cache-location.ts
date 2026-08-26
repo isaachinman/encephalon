@@ -1822,9 +1822,11 @@ export const quarantineCacheOwnedDirectory = (
   ownershipIsCurrent?: () => boolean,
   options?:
     | {
+        assertCleanupAuthority?: (() => void) | undefined
         expectedChildren?: readonly string[] | undefined
         expectedFiles?: { owner: CacheOwnedFileObservation; recoveryWitness: CacheOwnedFileObservation } | undefined
         onMove?: (() => void) | undefined
+        onRename?: (() => void) | undefined
       }
     | undefined,
 ) => {
@@ -1847,12 +1849,13 @@ export const quarantineCacheOwnedDirectory = (
     const quarantineName = `.${directory.name}.${randomUUID()}.quarantine`
     const quarantinePath = resolve(location.directory, quarantineName)
     renameSync(directory.path, quarantinePath)
-    options?.onMove?.()
+    options?.onRename?.()
     assertCacheLocation(location)
     const movedMetadata = quarantineMetadata(quarantinePath, ownedDirectoryRelativePath(directory.name))
     if (!(movedMetadata.isDirectory() && sameCacheEntryIdentity(directory, entryIdentityFrom(movedMetadata)))) {
       return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-quarantine-identity')
     }
+    options?.onMove?.()
     const movedIncarnation = entryMetadataFrom(movedMetadata)
     cacheLocationTestHooks.afterQuarantineRename?.(quarantinePath)
     assertCacheLocation(location)
@@ -1878,6 +1881,7 @@ export const quarantineCacheOwnedDirectory = (
         options.expectedFiles.recoveryWitness,
       )
     }
+    options?.assertCleanupAuthority?.()
     cacheLocationTestHooks.beforeQuarantinedOwnerRemoval?.(quarantinePath)
     cacheLocationTestHooks.beforeQuarantinedFileCleanup?.(quarantinePath)
     if (options?.expectedFiles === undefined) {

@@ -59,14 +59,14 @@ Expected: failures demonstrate the unbounded pre-gate scan, missing maintenance 
 
 **Interfaces:**
 - Produces `DirectoryReader<Entry>` and `readBoundedDirectoryEntries(reader, maximum, onEntry?) => { entries, exhausted }` without opening, sorting, or closing the reader.
-- Produces private candidate maintenance with limits 64/16/4 and a path-plus-BigInt-identity LRU cursor cap of 8.
+- Produces private candidate maintenance with limits 64/16/4 and a path-plus-BigInt-identity LRU cursor cap of 8; native Windows readers close after each call.
 - Preserves `collectBoundedDirectoryEntries()` behaviour: maximum-plus-one overflow detection, bounded-result sorting, and primary read-error precedence over close failure.
 
 - [x] **Step 1: Add failing primitive tests.** Cover zero reads, exact limit, early EOF, lazy 100,000-entry input, read failure, and caller-owned close semantics.
 - [x] **Step 2: Implement the minimal dependency-free read loop.** Read until `entries.length === maximum` or `readSync()` returns null; invoke `onEntry` exactly once per returned entry; return `exhausted: true` only after observing null.
 - [x] **Step 3: Refactor canonical collection through the primitive.** Open one reader, request `maximum + 1`, hide entries when overflow is observed, sort only bounded success, and retain existing close/error semantics.
 - [x] **Step 4: Add failing cursor tests.** Cover continuation across calls, EOF close/reopen, exact cache-directory identity replacement, reader failure, injected-reader change, and LRU eviction after the ninth repository.
-- [x] **Step 5: Implement the capped cursor layer.** Key by canonical directory path plus exact `dev`/`ino`, close stale same-path cursors, touch LRU order on reuse, close on EOF/error/eviction, and never retain more than eight readers.
+- [x] **Step 5: Implement the capped cursor layer.** Key by canonical directory path plus exact `dev`/`ino`, close stale same-path cursors, touch LRU order on reuse, close on EOF/error/eviction or each native Windows call, and never retain more than eight readers.
 - [x] **Step 6: Run bounded-reader, canonical-layout, and cursor tests until GREEN.**
 
 ```bash

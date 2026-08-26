@@ -38,6 +38,7 @@ import {
   observeCacheRecoveryWitness,
   openVerifiedCacheDatabase,
   publishCacheOwnerRecovery,
+  quarantineCacheOwnedDirectory,
   sameCacheEntryIdentity,
   writeCacheOwner,
 } from '../src/cache-location.ts'
@@ -9813,6 +9814,62 @@ describe('SQLite cache and reads', () => {
       assert.equal(readFileSync(join(quarantinePath, 'replacement-sentinel'), 'utf8'), name)
       cacheLocationTestHooks.afterQuarantineRename = undefined
     }
+  })
+
+  test('reports a quarantine move only after verifying the moved directory identity', () => {
+    const root = createRoot()
+    const location = inspectCacheLocation(root)
+    const directory = createCacheOwnedDirectory(location, 'operation-lock.recovery')
+    const predecessorPath = join(location.directory, '.recovery-predecessor')
+    let ownershipChecks = 0
+    let moved = false
+    let renamed = false
+
+    assert.throws(
+      () =>
+        quarantineCacheOwnedDirectory(
+          location,
+          directory,
+          () => {
+            ownershipChecks += 1
+            if (ownershipChecks === 2) {
+              renameSync(directory.path, predecessorPath)
+              mkdirSync(directory.path)
+              writeFileSync(join(directory.path, 'successor-sentinel'), 'successor')
+            }
+            return true
+          },
+          {
+            onMove: () => {
+              moved = true
+            },
+            onRename: () => {
+              renamed = true
+            },
+          },
+        ),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.recovery',
+          invariant: 'stable-quarantine-identity',
+        })
+        return true
+      },
+    )
+
+    const quarantines = readdirSync(location.directory).filter(
+      name => name.startsWith('.operation-lock.recovery.') && name.endsWith('.quarantine'),
+    )
+    assert.equal(ownershipChecks, 2)
+    assert.equal(moved, false)
+    assert.equal(renamed, true)
+    assert.equal(quarantines.length, 1)
+    assert.equal(
+      readFileSync(join(location.directory, quarantines[0] as string, 'successor-sentinel'), 'utf8'),
+      'successor',
+    )
+    assert.equal(existsSync(predecessorPath), true)
   })
 
   test('serialises two contenders recovering the same malformed operation gate', async () => {

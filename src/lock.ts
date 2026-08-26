@@ -300,6 +300,11 @@ const transientSharingViolation = (error: unknown) => {
   return code === 'EACCES' || code === 'EBUSY' || code === 'EPERM'
 }
 
+const unverifiedQuarantineRace = (error: unknown) =>
+  error instanceof EncephalonError &&
+  error.code === 'REPOSITORY_CHANGED' &&
+  error.details.invariant === 'stable-quarantine-identity'
+
 const releaseOwnedLock = (
   location: CacheLocation,
   directory: CacheOwnedDirectory,
@@ -348,6 +353,7 @@ const releaseOwnedRecoveryMarker = (
   }
   for (const attempt of Array.from({ length: maximumAttempts }, (_, index) => index)) {
     let movedByThisAttempt = false
+    let renamedByThisAttempt = false
     if (markerRemainsCurrent()) {
       try {
         const expectedOwner: CacheOwnedFileObservation = marker.ownerFile
@@ -360,10 +366,13 @@ const releaseOwnedRecoveryMarker = (
           onMove: () => {
             movedByThisAttempt = true
           },
+          onRename: () => {
+            renamedByThisAttempt = true
+          },
         })
         complete = true
       } catch (error) {
-        if (movedByThisAttempt) {
+        if (movedByThisAttempt || (renamedByThisAttempt && !unverifiedQuarantineRace(error))) {
           throw error
         }
         if (cacheOwnedDirectoryIsCurrent(location, marker.directory)) {
@@ -510,6 +519,7 @@ export const withOperationLock = <Result>(
     let complete = false
     for (const attempt of Array.from({ length: RECOVERY_RELEASE_ATTEMPTS }, (_, index) => index)) {
       let movedByThisAttempt = false
+      let renamedByThisAttempt = false
       if (remainingMilliseconds() === 0) {
         complete = true
       } else if (cacheOwnedDirectoryIsCurrent(location, observation.directory)) {
@@ -526,11 +536,14 @@ export const withOperationLock = <Result>(
               onMove: () => {
                 movedByThisAttempt = true
               },
+              onRename: () => {
+                renamedByThisAttempt = true
+              },
             },
           )
           complete = true
         } catch (error) {
-          if (movedByThisAttempt) {
+          if (movedByThisAttempt || (renamedByThisAttempt && !unverifiedQuarantineRace(error))) {
             throw error
           }
           if (cacheOwnedDirectoryIsCurrent(location, observation.directory)) {

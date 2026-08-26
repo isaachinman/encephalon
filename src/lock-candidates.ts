@@ -64,7 +64,9 @@ const candidateCursors = new Map<string, CandidateCursor>()
 const defaultOpenDirectory: OpenLockCandidateDirectory = path => opendirSync(path) as DirectoryReader<Dirent>
 
 const closeCursor = (path: string, cursor: CandidateCursor) => {
-  candidateCursors.delete(path)
+  if (candidateCursors.get(path) === cursor) {
+    candidateCursors.delete(path)
+  }
   try {
     cursor.reader.closeSync()
   } catch {
@@ -222,10 +224,7 @@ const reclaimCandidate = (
   let moved = false
   let authorityFailed = false
   let authorityFailure: unknown
-  const remainsAbandoned = () => {
-    const current = captureCandidateEvidence(location, name)
-    const abandoned =
-      current !== undefined && sameEvidence(evidence, current) && candidateIsAbandoned(current, token, now)
+  const assertCandidateAuthority = () => {
     try {
       assertCurrentLock()
     } catch (error) {
@@ -233,11 +232,18 @@ const reclaimCandidate = (
       authorityFailure = error
       throw error
     }
+  }
+  const remainsAbandoned = () => {
+    const current = captureCandidateEvidence(location, name)
+    const abandoned =
+      current !== undefined && sameEvidence(evidence, current) && candidateIsAbandoned(current, token, now)
+    assertCandidateAuthority()
     return abandoned
   }
   let failed = false
   try {
     quarantineCacheOwnedDirectory(location, evidence.directory, remainsAbandoned, {
+      assertCleanupAuthority: assertCandidateAuthority,
       expectedChildren: evidence.children,
       expectedFiles: { owner: evidence.owner, recoveryWitness: evidence.recoveryWitness },
       onMove: () => {
@@ -282,62 +288,72 @@ export const maintainLockCandidates = (
     assertAuthority()
     return Object.freeze({ ...stats })
   }
-  while (
-    stats.directoryEntriesVisited < MAXIMUM_DIRECTORY_ENTRIES &&
-    stats.candidatesInspected < MAXIMUM_CANDIDATE_INSPECTIONS &&
-    stats.reclamationAttempts < MAXIMUM_RECLAMATION_ATTEMPTS
-  ) {
-    let entry: CandidateEntry | null
-    try {
-      entry = cursor.reader.readSync()
-    } catch {
-      closeCursor(location.directory, cursor)
-      assertAuthority()
-      break
-    }
-    if (entry === null) {
-      stats.cursorExhausted = true
-      closeCursor(location.directory, cursor)
-      break
-    }
-    stats.directoryEntriesVisited += 1
-    const match = LOCK_CANDIDATE_PATTERN.exec(entry.name)
-    if (match === null) {
-      continue
-    }
-    stats.candidatesInspected += 1
-    let candidateAuthorityFailed = false
-    let candidateAuthorityFailure: unknown
-    let candidateFailed = false
-    try {
-      const evidence = captureCandidateEvidence(location, entry.name)
-      const token = match[1] as string
-      if (evidence !== undefined && candidateIsAbandoned(evidence, token, (options.now ?? Date.now)())) {
-        stats.reclamationAttempts += 1
-        const reclaim = reclaimCandidate(
-          location,
-          entry.name,
-          token,
-          evidence,
-          (options.now ?? Date.now)(),
-          options.assertCurrentLock,
-        )
-        candidateAuthorityFailed = reclaim.authorityFailed
-        candidateAuthorityFailure = reclaim.authorityFailure
-        candidateFailed = reclaim.failed
-        if (reclaim.moved) {
-          stats.candidatesReclaimed += 1
-        }
+  try {
+    while (
+      stats.directoryEntriesVisited < MAXIMUM_DIRECTORY_ENTRIES &&
+      stats.candidatesInspected < MAXIMUM_CANDIDATE_INSPECTIONS &&
+      stats.reclamationAttempts < MAXIMUM_RECLAMATION_ATTEMPTS
+    ) {
+      let entry: CandidateEntry | null
+      try {
+        entry = cursor.reader.readSync()
+      } catch {
+        closeCursor(location.directory, cursor)
+        assertAuthority()
+        break
       }
-    } catch {
-      candidateFailed = true
+      if (entry === null) {
+        stats.cursorExhausted = true
+        closeCursor(location.directory, cursor)
+        break
+      }
+      stats.directoryEntriesVisited += 1
+      const match = LOCK_CANDIDATE_PATTERN.exec(entry.name)
+      if (match === null) {
+        continue
+      }
+      stats.candidatesInspected += 1
+      let candidateAuthorityFailed = false
+      let candidateAuthorityFailure: unknown
+      let candidateFailed = false
+      try {
+        const evidence = captureCandidateEvidence(location, entry.name)
+        const token = match[1] as string
+        if (evidence !== undefined && candidateIsAbandoned(evidence, token, (options.now ?? Date.now)())) {
+          stats.reclamationAttempts += 1
+          const reclaim = reclaimCandidate(
+            location,
+            entry.name,
+            token,
+            evidence,
+            (options.now ?? Date.now)(),
+            options.assertCurrentLock,
+          )
+          candidateAuthorityFailed = reclaim.authorityFailed
+          candidateAuthorityFailure = reclaim.authorityFailure
+          candidateFailed = reclaim.failed
+          if (reclaim.moved) {
+            stats.candidatesReclaimed += 1
+          }
+        }
+      } catch {
+        candidateFailed = true
+      }
+      if (candidateAuthorityFailed) {
+        throw candidateAuthorityFailure
+      }
+      if (candidateFailed) {
+        assertAuthority()
+      }
     }
-    if (candidateAuthorityFailed) {
-      throw candidateAuthorityFailure
-    }
-    if (candidateFailed) {
-      assertAuthority()
+    return Object.freeze({ ...stats })
+  } finally {
+    if (
+      process.platform === 'win32' &&
+      openDirectory === defaultOpenDirectory &&
+      candidateCursors.get(location.directory) === cursor
+    ) {
+      closeCursor(location.directory, cursor)
     }
   }
-  return Object.freeze({ ...stats })
 }

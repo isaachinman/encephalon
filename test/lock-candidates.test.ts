@@ -50,6 +50,7 @@ const age = (path: string) => utimesSync(path, new Date(0), new Date(0))
 afterEach(() => {
   cacheLocationTestHooks.beforeCacheLocationAssertion = undefined
   cacheLocationTestHooks.beforeCacheOwnerOpen = undefined
+  cacheLocationTestHooks.afterQuarantineRename = undefined
   cacheLocationTestHooks.beforeOwnedDirectoryPromotionRename = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
   cacheLocationTestHooks.beforeQuarantinedFileCleanup = undefined
@@ -266,6 +267,33 @@ describe('lock candidate maintenance', () => {
     )
   })
 
+  test('releases the native Windows directory reader after a bounded maintenance pass', () => {
+    const root = createRoot()
+    const directory = cacheDirectory(root)
+    mkdirSync(directory, { recursive: true })
+    for (const index of Array.from({ length: 70 }, (_, value) => value)) {
+      writeFileSync(join(directory, `inert-${index}`), 'inert')
+    }
+
+    let maintenanceStats: Readonly<Record<string, unknown>> | undefined
+    withOperationLock(root, () => 'entered', {
+      afterCandidateMaintenance: stats => {
+        maintenanceStats = stats
+      },
+    })
+
+    if (process.platform === 'win32') {
+      assert.ok(maintenanceStats)
+      assert.equal(maintenanceStats.directoryEntriesVisited, 64)
+      assert.equal(maintenanceStats.cursorExhausted, false)
+    }
+    removeTestRepository(root)
+    assert.equal(existsSync(root), false)
+    mkdirSync(root)
+    removeTestRepository(root)
+    assert.equal(existsSync(root), false)
+  })
+
   test('enforces exact inspection and reclamation-attempt budgets', () => {
     const inspectionRoot = createRoot()
     const inspectionEntries = Array.from({ length: 17 }, (_, index) => entryFor(tokenFor(0x1_00 + index)))
@@ -426,6 +454,43 @@ describe('lock candidate maintenance', () => {
     assert.equal(readFileSync(join(lockPath, 'successor'), 'utf8'), successorBytes)
   })
 
+  test('retains a moved candidate when current-lock authority changes before cleanup', () => {
+    const root = createRoot()
+    const token = tokenFor(0x2_15)
+    const path = candidatePath(root, token)
+    const lockPath = join(cacheDirectory(root), 'operation.lock')
+    const displaced = join(root, 'displaced-post-move-lock')
+    let operationEntered = false
+    let quarantinePath: string | undefined
+    mkdirSync(path, { recursive: true })
+    age(path)
+    cacheLocationTestHooks.afterQuarantineRename = current => {
+      if (basename(current).startsWith(`.operation.lock.${token}.`)) {
+        cacheLocationTestHooks.afterQuarantineRename = undefined
+        quarantinePath = current
+        renameSync(lockPath, displaced)
+        mkdirSync(lockPath)
+        writeFileSync(join(lockPath, 'successor'), 'successor current lock')
+      }
+    }
+
+    assert.throws(
+      () =>
+        withOperationLock(root, () => {
+          operationEntered = true
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        return true
+      },
+    )
+    assert.equal(operationEntered, false)
+    assert.ok(quarantinePath)
+    assert.equal(existsSync(path), false)
+    assert.equal(existsSync(quarantinePath), true)
+    assert.equal(readFileSync(join(lockPath, 'successor'), 'utf8'), 'successor current lock')
+  })
+
   test('asserts the current lock in the final candidate ownership callback before rename', () => {
     const root = createRoot()
     const token = tokenFor(0x2_12)
@@ -564,6 +629,45 @@ describe('lock candidate maintenance', () => {
     mkdirSync(cachePath)
     withOperationLock(replacementRoot, () => 'fourth', { openCandidateDirectory: identityReaders })
     assert.equal(identityCloses, 1)
+  })
+
+  test('keeps a reentrant replacement cursor when the stale reader closes', () => {
+    const root = createRoot()
+    const location = inspectCacheLocation(root)
+    let replacementOpens = 0
+    const replacementReader: DirectoryReader<Entry> = {
+      closeSync: () => undefined,
+      readSync: () => ({ name: 'inert' }),
+    }
+    const openReplacement = () => {
+      replacementOpens += 1
+      return replacementReader
+    }
+    let nested = false
+    const outerReader: DirectoryReader<Entry> = {
+      closeSync: () => undefined,
+      readSync: () => {
+        if (!nested) {
+          nested = true
+          maintainLockCandidates(location, {
+            assertCurrentLock: () => undefined,
+            openDirectory: openReplacement,
+          })
+        }
+        return null
+      },
+    }
+
+    maintainLockCandidates(location, {
+      assertCurrentLock: () => undefined,
+      openDirectory: () => outerReader,
+    })
+    maintainLockCandidates(location, {
+      assertCurrentLock: () => undefined,
+      openDirectory: openReplacement,
+    })
+
+    assert.equal(replacementOpens, 1)
   })
 
   test('refreshes cursor recency and evicts the true least-recently-used repository', () => {

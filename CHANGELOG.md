@@ -31,7 +31,7 @@ All notable changes to Encephalon are documented here.
 
 ### Fixed
 
-- Bounded operation-lock candidate discovery to 64 raw entries, 16 candidate inspections, and 4 reclamation attempts per operation, with at most 8 process-local cursors and exact under-gate reclamation that leaves unrelated or ambiguous entries inert without changing the public contract.
+- Bounded operation-lock candidate discovery to 64 raw entries, 16 candidate inspections, and 4 reclamation attempts per operation, with at most 8 process-local cursors, per-call native Windows reader cleanup, and exact under-gate reclamation that leaves unrelated or ambiguous entries inert without changing the public contract.
 - Classified expected filesystem and SQLite environment failures separately from internal defects.
 - Made committed add failures report the affected post-commit recovery phase explicitly.
 - Normalised negative-zero confidence to canonical numeric zero before publication and public return.
