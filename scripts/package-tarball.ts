@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, type Stats } from 'node:fs'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, type Stats, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, posix, relative, resolve, sep, win32 } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gunzipSync } from 'node:zlib'
@@ -21,6 +21,11 @@ export type PackageTarballDigests = Readonly<{
   sha1: string
   sha256: string
   sha512: string
+}>
+
+export type PackageTarballSnapshot = Readonly<{
+  digests: PackageTarballDigests
+  path: string
 }>
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -182,7 +187,15 @@ export const readPackageTarEntries = (path: string): readonly PackageTarEntry[] 
     const header = archive.subarray(offset, offset + 512)
     const isEnd = header.every(byte => byte === 0)
     if (isEnd) {
-      foundEnd = true
+      const endOffset = offset + 1024
+      const hasSecondEndBlock =
+        endOffset <= archive.length && archive.subarray(offset + 512, endOffset).every(byte => byte === 0)
+      const hasOnlyZeroTrailingBytes = hasSecondEndBlock && archive.subarray(endOffset).every(byte => byte === 0)
+      if (hasOnlyZeroTrailingBytes) {
+        foundEnd = true
+      } else {
+        throw new Error('Package tarball has an incomplete end marker or non-zero trailing bytes.')
+      }
     } else {
       const expectedChecksum = tarOctal(header, 148, 8)
       const actualChecksum = header.reduce(
@@ -218,6 +231,10 @@ export const readPackageTarEntries = (path: string): readonly PackageTarEntry[] 
 
 export const packageTarballDigests = (path: string): PackageTarballDigests => {
   const bytes = readVerifiedRegularFile(path)
+  return packageDigests(bytes)
+}
+
+const packageDigests = (bytes: Buffer): PackageTarballDigests => {
   const sha1 = createHash('sha1').update(bytes).digest('hex')
   const sha256 = createHash('sha256').update(bytes).digest('hex')
   const sha512Hash = createHash('sha512').update(bytes)
@@ -228,5 +245,15 @@ export const packageTarballDigests = (path: string): PackageTarballDigests => {
     sha1,
     sha256,
     sha512,
+  })
+}
+
+export const snapshotPackageTarball = (sourcePath: string, directory: string): PackageTarballSnapshot => {
+  const bytes = readVerifiedRegularFile(sourcePath)
+  const snapshotPath = resolve(directory, 'package.tgz')
+  writeFileSync(snapshotPath, bytes, { flag: 'wx', mode: 0o400 })
+  return Object.freeze({
+    digests: packageDigests(bytes),
+    path: snapshotPath,
   })
 }

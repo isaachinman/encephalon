@@ -157,6 +157,24 @@ describe('package tarball authority', () => {
     }
   })
 
+  test('requires two zero end blocks and rejects non-zero trailing archive bytes', () => {
+    const fixtureDirectory = mkdtempSync(resolve(root, 'scripts', '.package-tarball-termination-'))
+    const entry = tarEntry('package/package.json', 0o644, Buffer.from('{}\n'))
+    const invalidArchives = [
+      Buffer.concat([entry, Buffer.alloc(512)]),
+      Buffer.concat([entry, Buffer.alloc(1024), Buffer.from('non-zero trailing bytes')]),
+    ]
+    try {
+      invalidArchives.forEach((archive, index) => {
+        const tarball = resolve(fixtureDirectory, `invalid-${index}.tgz`)
+        writeFileSync(tarball, gzipSync(archive))
+        assert.throws(() => readPackageTarEntries(tarball))
+      })
+    } finally {
+      rmSync(fixtureDirectory, { force: true, recursive: true })
+    }
+  })
+
   test('derives all package digests and size from the literal tarball bytes', () => {
     const fixtureDirectory = mkdtempSync(resolve(root, 'scripts', '.package-tarball-digests-'))
     const tarball = resolve(fixtureDirectory, `fixture-${randomUUID()}.tgz`)

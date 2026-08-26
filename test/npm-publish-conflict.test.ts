@@ -19,12 +19,15 @@ const createPublishCheckFixture = () => {
   writeFileSync(resolve(temporaryRoot, 'candidate.tgz'), 'candidate tarball')
   writeFileSync(
     resolve(scriptsDirectory, 'npm-command.ts'),
-    `import { resolve } from 'node:path'
+    `import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 export const spawnNpmCommand = (arguments_, options) => {
-  const expected = ['publish', resolve(options.cwd, 'candidate.tgz'), '--dry-run', '--ignore-scripts', '--access', 'public', '--json']
-  if (JSON.stringify(arguments_) !== JSON.stringify(expected)) {
+  const expectedTail = ['--dry-run', '--ignore-scripts', '--access', 'public', '--json']
+  const source = resolve(options.cwd, 'candidate.tgz')
+  if (arguments_[0] !== 'publish' || arguments_[1] === source || JSON.stringify(arguments_.slice(2)) !== JSON.stringify(expectedTail)) {
     throw new Error('Unexpected npm arguments.')
   }
+  if (readFileSync(arguments_[1], 'utf8') !== 'candidate tarball') throw new Error('Unexpected publish bytes.')
   if (typeof options.cwd !== 'string') throw new Error('Missing npm working directory.')
   return JSON.parse(process.env.ENCEPHALON_TEST_NPM_RESULT ?? '{}')
 }

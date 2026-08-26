@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   appendFileSync,
   cpSync,
@@ -81,9 +81,16 @@ const createPublishCheckFixture = () => {
   writeFileSync(tarball, 'candidate tarball')
   writeFileSync(
     resolve(scriptsDirectory, 'npm-command.ts'),
-    `import { writeFileSync } from 'node:fs'
+    `import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 export const spawnNpmCommand = (arguments_, options) => {
-  writeFileSync(process.env.ENCEPHALON_TEST_NPM_CAPTURE, JSON.stringify({ arguments: arguments_, cwd: options.cwd }))
+  const source = process.env.ENCEPHALON_TEST_NPM_SOURCE
+  renameSync(source, source + '.original')
+  writeFileSync(source, 'replacement tarball bytes')
+  writeFileSync(process.env.ENCEPHALON_TEST_NPM_CAPTURE, JSON.stringify({
+    arguments: arguments_,
+    cwd: options.cwd,
+    targetBytes: readFileSync(arguments_[1], 'utf8'),
+  }))
   return JSON.parse(process.env.ENCEPHALON_TEST_NPM_RESULT)
 }
 `,
@@ -99,6 +106,7 @@ const runPublishCheckFixture = (temporaryRoot: string, arguments_: readonly stri
       ...process.env,
       ENCEPHALON_TEST_NPM_CAPTURE: resolve(temporaryRoot, 'npm-arguments.json'),
       ENCEPHALON_TEST_NPM_RESULT: JSON.stringify(result),
+      ENCEPHALON_TEST_NPM_SOURCE: resolve(temporaryRoot, 'candidate.tgz'),
     },
   })
 
@@ -408,9 +416,10 @@ describe('package contract', () => {
     }
   })
 
-  test('supplied package mode never invokes npm pack', { timeout: 75_000 }, () => {
+  test('binds supplied package checks to one private snapshot without invoking npm pack', { timeout: 75_000 }, () => {
     const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-supplied-')
     const packageDirectory = resolve(fixtureRoot, 'package-artifacts')
+    const capturedInstall = resolve(fixtureRoot, 'captured-install.json')
     try {
       mkdirSync(packageDirectory)
       const packResult = spawnNpmCommand(
@@ -420,12 +429,24 @@ describe('package contract', () => {
       assert.equal(packResult.status, 0, `${packResult.stdout}${packResult.stderr}`)
       const [pack] = JSON.parse(packResult.stdout) as Array<{ filename?: unknown }>
       assert.equal(typeof pack?.filename, 'string')
+      const suppliedTarball = resolve(packageDirectory, String(pack?.filename))
+      const suppliedBytes = readFileSync(suppliedTarball)
+      const expectedSha256 = createHash('sha256').update(suppliedBytes).digest('hex')
       cpSync(resolve(fixtureRoot, 'scripts', 'npm-command.ts'), resolve(fixtureRoot, 'scripts', 'npm-command-real.ts'))
       writeFileSync(
         resolve(fixtureRoot, 'scripts', 'npm-command.ts'),
-        `import { spawnNpmCommand as spawnRealNpmCommand } from './npm-command-real.ts'
+        `import { createHash } from 'node:crypto'
+import { readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { spawnNpmCommand as spawnRealNpmCommand } from './npm-command-real.ts'
 export const spawnNpmCommand = (arguments_, options) => {
   if (arguments_[0] === 'pack') throw new Error('supplied mode invoked npm pack')
+  renameSync(process.env.ENCEPHALON_TEST_SUPPLIED_TARBALL, process.env.ENCEPHALON_TEST_SUPPLIED_TARBALL + '.original')
+  writeFileSync(process.env.ENCEPHALON_TEST_SUPPLIED_TARBALL, 'replacement tarball bytes')
+  const target = arguments_.at(-1)
+  writeFileSync(process.env.ENCEPHALON_TEST_CAPTURED_INSTALL, JSON.stringify({
+    sha256: createHash('sha256').update(readFileSync(target)).digest('hex'),
+    target,
+  }))
   return spawnRealNpmCommand(arguments_, options)
 }
 `,
@@ -434,9 +455,24 @@ export const spawnNpmCommand = (arguments_, options) => {
       const result = spawnSync(
         process.execPath,
         ['./scripts/check-package.ts', '--tarball', `package-artifacts/${String(pack?.filename)}`],
-        { cwd: fixtureRoot, encoding: 'utf8', timeout: 60_000 },
+        {
+          cwd: fixtureRoot,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            ENCEPHALON_TEST_CAPTURED_INSTALL: capturedInstall,
+            ENCEPHALON_TEST_SUPPLIED_TARBALL: suppliedTarball,
+          },
+          timeout: 60_000,
+        },
       )
       assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+      const captured = JSON.parse(readFileSync(capturedInstall, 'utf8')) as { sha256?: unknown; target?: unknown }
+      assert.equal(captured.sha256, expectedSha256)
+      assert.notEqual(captured.target, suppliedTarball)
+      assert.equal(existsSync(String(captured.target)), false)
+      assert.equal(JSON.parse(result.stderr).sha256, expectedSha256)
+      assert.equal(readFileSync(suppliedTarball, 'utf8'), 'replacement tarball bytes')
     } finally {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
@@ -493,7 +529,7 @@ export const spawnNpmCommand = (arguments_, options) => {
     }
   })
 
-  test('publishes only the supplied repository-relative tarball path', () => {
+  test('publishes only an immutable private snapshot of the supplied repository-relative tarball', () => {
     const { capturedArguments, tarball, temporaryRoot } = createPublishCheckFixture()
     try {
       const result = runPublishCheckFixture(temporaryRoot, ['candidate.tgz'], {
@@ -503,10 +539,18 @@ export const spawnNpmCommand = (arguments_, options) => {
         stdout: 'publish succeeded\n',
       })
       assert.equal(result.status, 0, result.stderr)
-      assert.deepEqual(JSON.parse(readFileSync(capturedArguments, 'utf8')) as unknown, {
-        arguments: ['publish', tarball, '--dry-run', '--ignore-scripts', '--access', 'public', '--json'],
-        cwd: temporaryRoot,
-      })
+      const captured = JSON.parse(readFileSync(capturedArguments, 'utf8')) as {
+        arguments?: unknown[]
+        cwd?: unknown
+        targetBytes?: unknown
+      }
+      assert.deepEqual(captured.arguments?.slice(0, 1), ['publish'])
+      assert.deepEqual(captured.arguments?.slice(2), ['--dry-run', '--ignore-scripts', '--access', 'public', '--json'])
+      assert.notEqual(captured.arguments?.[1], tarball)
+      assert.equal(captured.targetBytes, 'candidate tarball')
+      assert.equal(captured.cwd, temporaryRoot)
+      assert.equal(readFileSync(tarball, 'utf8'), 'replacement tarball bytes')
+      assert.equal(existsSync(String(captured.arguments?.[1])), false)
     } finally {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
@@ -538,6 +582,14 @@ export const spawnNpmCommand = (arguments_, options) => {
       )
       assert.equal(
         failures.every(result => result.status !== 0),
+        true,
+      )
+      assert.equal(
+        failures.every(result => /Usage: check-publish\.ts <repository-relative-tarball>/u.test(result.stderr)),
+        true,
+      )
+      assert.equal(
+        failures.every(result => !/Usage: check-package\.ts/u.test(result.stderr)),
         true,
       )
       assert.equal(existsSync(capturedArguments), false)

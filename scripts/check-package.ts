@@ -16,7 +16,7 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import { spawnNpmCommand } from './npm-command.ts'
-import { packageTarballDigests, parsePackageCheckArguments, readPackageTarEntries } from './package-tarball.ts'
+import { parsePackageCheckArguments, readPackageTarEntries, snapshotPackageTarball } from './package-tarball.ts'
 import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -246,10 +246,12 @@ try {
   }
 
   const createdTarball = options.suppliedTarball === undefined ? createNpmTarball() : undefined
-  const tarball = options.suppliedTarball ?? createdTarball?.path
-  if (tarball === undefined) {
+  const sourceTarball = options.suppliedTarball ?? createdTarball?.path
+  if (sourceTarball === undefined) {
     throw new Error('Package tarball acquisition failed.')
   }
+  const snapshot = snapshotPackageTarball(sourceTarball, temporaryDirectory)
+  const tarball = snapshot.path
   const entries = readPackageTarEntries(tarball)
   const allowedFiles = new Set([
     'LICENSE',
@@ -496,8 +498,8 @@ try {
   if (!(Array.isArray(gathered.records) && Array.isArray(gathered.searches))) {
     throw new Error('The packed Node-only CLI gather command returned an unexpected result.')
   }
-  process.stderr.write(`${JSON.stringify(packageTarballDigests(tarball))}\n`)
-  const retainedTarball = retainTarball(tarball, basename(tarball))
+  process.stderr.write(`${JSON.stringify(snapshot.digests)}\n`)
+  const retainedTarball = retainTarball(tarball, basename(sourceTarball))
   if (retainedTarball !== undefined) {
     process.stdout.write(`${retainedTarball}\n`)
   }
