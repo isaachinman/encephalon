@@ -38,6 +38,7 @@ import {
   observeCacheRecoveryWitness,
   openVerifiedCacheDatabase,
   publishCacheOwnerRecovery,
+  quarantineCacheOwnedDirectory,
   sameCacheEntryIdentity,
   writeCacheOwner,
 } from '../src/cache-location.ts'
@@ -139,12 +140,15 @@ afterEach(() => {
   cacheLocationTestHooks.afterOwnerRecoveryCreation = undefined
   cacheLocationTestHooks.beforeDatabaseOpen = undefined
   cacheLocationTestHooks.beforeCacheOwnerOpen = undefined
+  cacheLocationTestHooks.beforeCacheLocationAssertion = undefined
   cacheLocationTestHooks.beforeLocationInspection = undefined
+  cacheLocationTestHooks.beforeOwnedDirectoryPromotionRename = undefined
   cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = undefined
   cacheLocationTestHooks.beforeOwnerRecoveryFsync = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
   cacheLocationTestHooks.beforeQuarantinedOwnerRemoval = undefined
   cacheLocationTestHooks.beforeQuarantinedOwnerValidation = undefined
+  cacheLocationTestHooks.beforeQuarantinedFileCleanup = undefined
   cacheLocationTestHooks.duringOwnedDirectoryInspection = undefined
   cacheLocationTestHooks.fsyncOwnedDirectory = undefined
   cacheLocationTestHooks.regularFileRealpath = undefined
@@ -2666,7 +2670,7 @@ describe('cache filesystem containment', () => {
     assert.equal(readFileSync(join(outside, 'sentinel'), 'utf8'), 'outside recovery')
   })
 
-  test('rejects an operation lock candidate symlink without changing its target', () => {
+  test('ignores an unrelated operation lock candidate symlink without changing its target', () => {
     const root = createRoot()
     const outside = createOutsideDirectory()
     mkdirSync(cacheDirectoryPath(root), { recursive: true })
@@ -2677,8 +2681,18 @@ describe('cache filesystem containment', () => {
       process.platform === 'win32' ? 'junction' : 'dir',
     )
 
-    assertCacheLayoutRejected(() => withOperationLock(root, () => 'entered'))
+    const linkPath = join(cacheDirectoryPath(root), 'operation.lock.00000000-0000-4000-8000-000000000000')
+    const before = lstatSync(linkPath, { bigint: true })
+
+    assert.equal(
+      withOperationLock(root, () => 'entered'),
+      'entered',
+    )
     assert.equal(readFileSync(join(outside, 'sentinel'), 'utf8'), 'outside candidate')
+    const after = lstatSync(linkPath, { bigint: true })
+    assert.equal(after.isSymbolicLink(), true)
+    assert.equal(after.dev, before.dev)
+    assert.equal(after.ino, before.ino)
   })
 })
 
@@ -7624,6 +7638,54 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 0 })
   })
 
+  test('preserves established IO errors for fixed lock and recovery-marker extra children', () => {
+    const cases = [
+      {
+        create: (root: string) => {
+          const path = join(cacheDirectoryPath(root), 'operation.lock')
+          mkdirSync(path, { recursive: true })
+          writeFileSync(join(path, 'owner.json'), '{malformed fixed lock owner')
+          writeFileSync(join(path, 'extra'), 'fixed lock extra child')
+        },
+        name: 'fixed operation lock',
+      },
+      {
+        create: (root: string) => {
+          const path = join(cacheDirectoryPath(root), 'operation-lock.recovery')
+          const owner = {
+            acquiredAt: '2026-08-24T10:00:00.000Z',
+            phase: 'recovering',
+            pid: process.pid,
+            token: 'fixed-recovery-extra-child',
+          } as const
+          mkdirSync(path, { recursive: true })
+          writeFileSync(join(path, 'owner.json'), `${JSON.stringify(owner)}\n`)
+          writeFileSync(join(path, 'owner.recovered.json'), `${JSON.stringify({ ...owner, phase: 'recovered' })}\n`)
+          writeFileSync(join(path, 'extra'), 'fixed recovery extra child')
+        },
+        name: 'fixed recovery marker',
+      },
+    ] as const
+
+    for (const fixedCase of cases) {
+      const root = createRoot()
+      fixedCase.create(root)
+      let operationEntered = false
+
+      assert.throws(
+        () =>
+          withOperationLock(root, () => {
+            operationEntered = true
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'IO_ERROR', fixedCase.name)
+          return true
+        },
+      )
+      assert.equal(operationEntered, false, fixedCase.name)
+    }
+  })
+
   test('ignores stale owner metadata with a reused live PID after acquiring the gate', () => {
     const root = createRoot()
     const lockPath = join(root, 'node_modules', '.cache', 'encephalon', 'operation.lock')
@@ -9752,6 +9814,62 @@ describe('SQLite cache and reads', () => {
       assert.equal(readFileSync(join(quarantinePath, 'replacement-sentinel'), 'utf8'), name)
       cacheLocationTestHooks.afterQuarantineRename = undefined
     }
+  })
+
+  test('reports a quarantine move only after verifying the moved directory identity', () => {
+    const root = createRoot()
+    const location = inspectCacheLocation(root)
+    const directory = createCacheOwnedDirectory(location, 'operation-lock.recovery')
+    const predecessorPath = join(location.directory, '.recovery-predecessor')
+    let ownershipChecks = 0
+    let moved = false
+    let renamed = false
+
+    assert.throws(
+      () =>
+        quarantineCacheOwnedDirectory(
+          location,
+          directory,
+          () => {
+            ownershipChecks += 1
+            if (ownershipChecks === 2) {
+              renameSync(directory.path, predecessorPath)
+              mkdirSync(directory.path)
+              writeFileSync(join(directory.path, 'successor-sentinel'), 'successor')
+            }
+            return true
+          },
+          {
+            onMove: () => {
+              moved = true
+            },
+            onRename: () => {
+              renamed = true
+            },
+          },
+        ),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, 'REPOSITORY_CHANGED')
+        assert.deepEqual((error as { details?: unknown }).details, {
+          entry: 'node_modules/.cache/encephalon/operation-lock.recovery',
+          invariant: 'stable-quarantine-identity',
+        })
+        return true
+      },
+    )
+
+    const quarantines = readdirSync(location.directory).filter(
+      name => name.startsWith('.operation-lock.recovery.') && name.endsWith('.quarantine'),
+    )
+    assert.equal(ownershipChecks, 2)
+    assert.equal(moved, false)
+    assert.equal(renamed, true)
+    assert.equal(quarantines.length, 1)
+    assert.equal(
+      readFileSync(join(location.directory, quarantines[0] as string, 'successor-sentinel'), 'utf8'),
+      'successor',
+    )
+    assert.equal(existsSync(predecessorPath), true)
   })
 
   test('serialises two contenders recovering the same malformed operation gate', async () => {

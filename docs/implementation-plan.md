@@ -608,21 +608,13 @@ The following operations share one lock:
 - `prepare` when it needs to rebuild.
 - Explicit `hydrate`.
 
-Use an atomically created lock directory under the cache directory. Its owner file contains a random token, the process ID, acquisition timestamp, package version, and repository identity.
+The authoritative lock is a verified SQLite `BEGIN IMMEDIATE` transaction on `operation-lock.sqlite`, acquired within one 60-second deadline. Acquisition is serialised through the fixed `operation-lock.recovery` marker. New recovery owners contain canonical `{ acquiredAt, phase: 'recovering', pid, token }` metadata; after the exact gate transaction begins, a matching durable `owner.recovered.json` witness records `phase: 'recovered'`. Exact recovered evidence is reclaimable across processes, while live recovering and phase-less legacy owners remain fail-closed. Corrupt or not-a-database gate recovery requires confirmation against the exact captured gate identity before quarantine and exclusive replacement.
 
-Lock acquisition rules:
+Each operation separately creates an exclusive random `operation.lock.<uuid>` candidate and publishes an exact canonical `{ acquiredAt, pid, token }` owner whose token is the UUID. Before the gate, it validates only that current candidate. After the gate succeeds, it removes stale fixed metadata, promotes the exact captured candidate to `operation.lock`, performs bounded maintenance while the gate remains held, and only then runs the protected operation. Promotion and release require unchanged directory identity, owner identity/metadata/raw bytes, missing recovery witness, and an exact `owner.json`-only child set. Failed-acquisition cleanup acts only on the captured candidate and never reopens its pathname or adopts a successor.
 
-1. Attempt atomic directory creation.
-2. If the lock exists, inspect its owner metadata.
-3. Reclaim a malformed lock only after the stale threshold.
-4. For a well-formed lock, test process liveness using the safest platform mechanism available through Node.
-5. Never break a valid lock only because it is old.
-6. Treat permission errors or uncertain liveness as still owned.
-7. Poll with a short bounded interval for at most 60 seconds.
-8. Return `CACHE_BUSY` after the deadline; never continue unlocked.
-9. Only the matching random owner token may release the lock.
+Candidate maintenance is private and best effort for unrelated entries. Per operation it visits at most 64 raw cache-directory entries, inspects at most 16 canonical lowercase UUID-v4 candidates, and attempts at most 4 quarantines. It retains at most 8 path-plus-BigInt-identity cursors so operations in one live process can resume a directory pass; native Windows readers are closed after each call so directory-search handles cannot prevent repository deletion on filesystems without POSIX delete semantics. Restart or each native Windows call may return to the beginning, and there is no persistent or cross-process cursor. A candidate may be reclaimed only with unchanged exact directory, child, owner, and missing-witness evidence: either a canonical matching owner whose PID positively returns `ESRCH`, or missing/malformed supported owner evidence aged strictly more than 5,000 ms. Oversized, live, permission-denied, ambiguous, linked, unreadable, recovery-witness, extra-child, and changed evidence is preserved. Candidate-local failures are suppressed only after authoritative cache-location and current-lock checks remain exact; fixed lock/recovery, current-candidate, cache-location, and gate failures remain fail-closed.
 
-Tests must cover contention, crash-like orphan metadata, malformed stale metadata, uncertain liveness, owner-token mismatch, and timeout.
+Tests cover contention and deadline behaviour; corrupt-gate recovery; durable recovered-marker cleanup; current-candidate identity, owner, and child replacement; lazy work bounds; in-process cursor progress and restart limitations; crash-like ownerless and dead-owner candidates; grace handling; unrelated linked or malformed entries; uncertain liveness; and unchanged protected-operation results and errors.
 
 ### 11.6 `prepare()`
 
