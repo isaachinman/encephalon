@@ -176,6 +176,8 @@ const assertCommittedRepositoryChange = (operation: () => unknown, path: string,
 
 const postCommitRecoveryAction = {
   cacheHydration: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+  operationCleanup:
+    'Run validate and inspect the canonical record before any retry; this record ID is already committed.',
   publicationFlush:
     'Confirm the canonical record file is present; prepare does not re-fsync the kind directory, so treat durability as unverified until that sync succeeds.',
   publicationVerification:
@@ -195,8 +197,13 @@ const assertPostCommitError = (
     const actual = error as {
       code?: unknown
       details?: Record<string, unknown>
+      message?: unknown
     }
     assert.equal(actual.code, 'IO_ERROR')
+    assert.equal(
+      actual.message,
+      `Record ${expected.recordId} was committed, but the ${expected.phase} post-commit phase failed. ${postCommitRecoveryAction[expected.phase]}`,
+    )
     assert.deepEqual(actual.details, {
       canonicalCommitted: true,
       path: expected.path,
@@ -247,6 +254,7 @@ afterEach(() => {
   recordWriteTestHooks.afterOperationLock = undefined
   recordWriteTestHooks.beforeOperationLock = undefined
   recordWriteTestHooks.fault = undefined
+  recordWriteTestHooks.gateClose = undefined
   mutationRecordWriteTestHooks.readHooks = undefined
   stagingInternals.stagingTestHooks.fsyncDirectory = undefined
   roots.splice(0).forEach(removeTestRepository)
@@ -2262,6 +2270,176 @@ describe('canonical records', () => {
         }),
       'RECORD_EXISTS',
     )
+  })
+
+  test('reports operation-gate cleanup failure after public add as committed', () => {
+    const root = createRoot()
+    const id = 'operation-cleanup-failure'
+    const relativePath = `encephalon/decision/${id}.json`
+    recordWriteTestHooks.gateClose = database => {
+      database.close()
+      throw Object.assign(new Error(`Injected private cleanup failure at ${root}`), { code: 'EIO' })
+    }
+
+    assertPostCommitError(
+      () =>
+        api.addRecord({
+          id,
+          kind: 'decision',
+          payload: { summary: 'Published before operation cleanup' },
+          root,
+          source: 'agent',
+          subject: 'operation.cleanup',
+        }),
+      {
+        path: relativePath,
+        phase: 'operationCleanup',
+        recordId: id,
+      },
+    )
+
+    const canonical = JSON.parse(readFileSync(join(root, ...relativePath.split('/')), 'utf8')) as { id?: unknown }
+    assert.equal(canonical.id, id)
+    recordWriteTestHooks.gateClose = undefined
+    assertErrorCode(
+      () =>
+        api.addRecord({
+          id,
+          kind: 'decision',
+          payload: { summary: 'Retry' },
+          root,
+          source: 'agent',
+          subject: 'operation.cleanup',
+        }),
+      'RECORD_EXISTS',
+    )
+  })
+
+  test('preserves a structured operation-gate cleanup classification and details', () => {
+    const root = createRoot()
+    const id = 'structured-operation-cleanup'
+    const cause = new Error('Injected private structured cleanup cause')
+    recordWriteTestHooks.gateClose = database => {
+      database.close()
+      throw new api.EncephalonError(
+        'REPOSITORY_CHANGED',
+        'The Encephalon cache layout changed during the operation.',
+        {
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+          invariant: 'stable-identity',
+        },
+        { cause },
+      )
+    }
+
+    assert.throws(
+      () =>
+        api.addRecord({
+          id,
+          kind: 'decision',
+          payload: { summary: 'Committed before structured cleanup failure' },
+          root,
+          source: 'agent',
+          subject: 'operation.cleanup.structured',
+        }),
+      (error: unknown) => {
+        const actual = error as {
+          cause?: unknown
+          code?: unknown
+          details?: Record<string, unknown>
+          message?: unknown
+        }
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(
+          actual.message,
+          `Record ${id} was committed, but the operationCleanup post-commit phase failed. ` +
+            'Run validate and inspect the canonical record before any retry; this record ID is already committed.',
+        )
+        assert.deepEqual(actual.details, {
+          canonicalCommitted: true,
+          entry: 'node_modules/.cache/encephalon/operation-lock.sqlite',
+          invariant: 'stable-identity',
+          path: `encephalon/decision/${id}.json`,
+          postCommitPhase: 'operationCleanup',
+          recordId: id,
+          recoveryAction:
+            'Run validate and inspect the canonical record before any retry; this record ID is already committed.',
+        })
+        assert.equal(actual.cause, cause)
+        return true
+      },
+    )
+  })
+
+  test('preserves an earlier committed add failure over operation-gate cleanup failure', () => {
+    const root = createRoot()
+    let gateCloseAttempts = 0
+    recordWriteTestHooks.gateClose = database => {
+      gateCloseAttempts += 1
+      database.close()
+      throw Object.assign(new Error('Injected secondary operation cleanup failure'), { code: 'EIO' })
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'during-hydration') {
+        throw Object.assign(new Error('Injected primary cache hydration failure'), { code: 'EIO' })
+      }
+    }
+
+    assertPostCommitError(
+      () =>
+        api.addRecord({
+          id: 'primary-committed-failure',
+          kind: 'decision',
+          payload: { summary: 'Committed before both failures' },
+          root,
+          source: 'agent',
+          subject: 'operation.cleanup.primary',
+        }),
+      {
+        path: 'encephalon/decision/primary-committed-failure.json',
+        phase: 'cacheHydration',
+        recordId: 'primary-committed-failure',
+      },
+    )
+    assert.equal(gateCloseAttempts, 1)
+  })
+
+  test('does not claim a commit when operation-gate cleanup follows a pre-publication failure', () => {
+    const root = createRoot()
+    const id = 'pre-publication-primary-failure'
+    let gateCloseAttempts = 0
+    recordWriteTestHooks.gateClose = database => {
+      gateCloseAttempts += 1
+      database.close()
+      throw Object.assign(new Error('Injected secondary operation cleanup failure'), { code: 'EIO' })
+    }
+    recordWriteTestHooks.fault = point => {
+      if (point === 'during-staging-write') {
+        throw Object.assign(new Error('Injected primary staging write failure'), { code: 'EIO' })
+      }
+    }
+
+    assert.throws(
+      () =>
+        api.addRecord({
+          id,
+          kind: 'decision',
+          payload: { summary: 'Never published' },
+          root,
+          source: 'agent',
+          subject: 'operation.cleanup.pre-publication',
+        }),
+      (error: unknown) => {
+        const actual = error as { code?: unknown; details?: Record<string, unknown> }
+        assert.equal(actual.code, 'IO_ERROR')
+        assert.notEqual(actual.details?.canonicalCommitted, true)
+        assert.equal(actual.details?.recordId, undefined)
+        assert.equal(actual.details?.postCommitPhase, undefined)
+        return true
+      },
+    )
+    assert.equal(gateCloseAttempts, 1)
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', `${id}.json`)), false)
   })
 
   test('preserves operational artifact I/O during mutation-snapshot hydration', () => {
