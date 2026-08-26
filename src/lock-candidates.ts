@@ -73,8 +73,17 @@ const closeCursor = (path: string, cursor: CandidateCursor) => {
 }
 
 const cursorFor = (location: CacheLocation, openDirectory: OpenLockCandidateDirectory) => {
-  const metadata = lstatSync(location.directory, { bigint: true })
   const existing = candidateCursors.get(location.directory)
+  const metadata = (() => {
+    try {
+      return lstatSync(location.directory, { bigint: true })
+    } catch (error) {
+      if (existing !== undefined) {
+        closeCursor(location.directory, existing)
+      }
+      throw error
+    }
+  })()
   const reusable =
     existing !== undefined &&
     existing.dev === metadata.dev &&
