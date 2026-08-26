@@ -990,6 +990,45 @@ test('revalidates absent workflow discovery without callbacks in the second fina
   ])
 })
 
+// Mutation caught: omitting retained source witnesses from sweep two would accept a post-sweep replacement.
+test('revalidates retained workflow sources in the second final sweep', () => {
+  const root = createFixture({
+    '.github/workflows/mutable.yml': `name: Mutable
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/action@v1
+`,
+  })
+
+  const findings = inspectWorkflowPolicy(root, {
+    afterFirstFinalRevalidation: () => {
+      writeFileSync(
+        join(root, '.github/workflows/mutable.yml'),
+        `name: Replaced
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs: {}
+`,
+        'utf8',
+      )
+    },
+  })
+
+  assert.deepEqual(findings, [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
 // Mutation caught: retaining only the selected action manifest would accept a second candidate added after target resolution.
 test('rejects action-manifest ambiguity introduced after target selection', () => {
   const root = createFixture({
@@ -1227,6 +1266,36 @@ jobs:
   assert.deepEqual(inspectWorkflowPolicy(root), [])
 })
 
+// Mutation caught: deduplicating alias objects by identity would suppress executable diagnostics at later locations.
+test('reports aliased executable steps at every location', () => {
+  const root = createFixture({
+    '.github/workflows/aliases.yml': `name: Aliases
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  template: &template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/action@v1
+  alias: *template
+`,
+  })
+
+  assert.deepEqual(inspectWorkflowPolicy(root), [
+    {
+      file: '.github/workflows/aliases.yml',
+      location: 'jobs.alias.steps[0].uses',
+      rule: 'external-reference-sha',
+    },
+    {
+      file: '.github/workflows/aliases.yml',
+      location: 'jobs.template.steps[0].uses',
+      rule: 'external-reference-sha',
+    },
+  ])
+})
+
 // Mutation caught: permissive parsing would silently overwrite ambiguous keys, accept extra documents, or expand aliases without a ceiling.
 test('rejects ambiguous or unsafe YAML documents as source integrity failures', () => {
   const aliases = Array.from({ length: 100 }, () => '  - *item').join('\n')
@@ -1288,6 +1357,9 @@ jobs:
   verify: {}
   "verify": {}
 `,
+    '.github/workflows/root-null.yml': 'null\n',
+    '.github/workflows/root-scalar.yml': 'workflow\n',
+    '.github/workflows/root-sequence.yml': '- workflow\n',
     '.github/workflows/unknown-tag.yml': `name: !unknown Tagged
 on: workflow_dispatch
 permissions: { contents: read }
@@ -1304,6 +1376,9 @@ jobs: {}
     { file: '.github/workflows/multiple-documents.yml', location: '$', rule: 'source-integrity' },
     { file: '.github/workflows/non-scalar-key.yml', location: '$', rule: 'source-integrity' },
     { file: '.github/workflows/quoted-equivalent.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/root-null.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/root-scalar.yml', location: '$', rule: 'source-integrity' },
+    { file: '.github/workflows/root-sequence.yml', location: '$', rule: 'source-integrity' },
     { file: '.github/workflows/unknown-tag.yml', location: '$', rule: 'source-integrity' },
   ])
 })
@@ -2795,6 +2870,42 @@ jobs:
   const findings = inspectWorkflowPolicy(root, {
     beforeFinalRevalidation: () => {
       writeFileSync(join(root, '.github/actions/docker/Dockerfile'), 'FROM alpine:latest\n', 'utf8')
+    },
+  })
+
+  assert.deepEqual(findings, [
+    {
+      file: '.github/workflows',
+      location: '$',
+      rule: 'source-integrity',
+    },
+  ])
+})
+
+// Mutation caught: retaining only present Dockerfiles would allow a missing nested target to appear after traversal.
+test('rejects a nested Dockerfile created after action traversal', () => {
+  const root = createFixture({
+    '.github/actions/docker/action.yml': `name: Docker action
+runs:
+  using: docker
+  image: nested/Dockerfile
+`,
+    '.github/actions/docker/nested/.keep': '',
+    '.github/workflows/docker.yml': `name: Docker action
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/docker
+`,
+  })
+
+  const findings = inspectWorkflowPolicy(root, {
+    beforeFinalRevalidation: () => {
+      writeFileSync(join(root, '.github/actions/docker/nested/Dockerfile'), 'FROM alpine:3.20\n', 'utf8')
     },
   })
 

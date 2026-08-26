@@ -142,7 +142,7 @@ jobs:
   assert.match(verificationRunner, /^ {4}runs-on: \$\{\{ matrix\.os \}\}\n$/)
   assert.doesNotMatch(verificationJob, /^ {4}(?:if|continue-on-error|permissions):/m)
   const trustedVerificationPrefix =
-    /^ {4}steps:\n {6}- uses: actions\/checkout@[^\n]+\n {8}with:\n {10}persist-credentials: false\n {6}- uses: actions\/setup-node@[^\n]+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- if: matrix\.context == 'ubuntu-current'\n {8}uses: actions\/setup-node@[^\n]+\n {8}with:\n {10}node-version: \$\{\{ matrix\.node \}\}\n {6}- uses: oven-sh\/setup-bun@[^\n]+\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile\n/u
+    /^ {4}steps:\n {6}- uses: actions\/checkout@[^\n]+\n {8}with:\n {10}persist-credentials: false\n {6}- uses: actions\/setup-node@[^\n]+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- if: matrix\.context == 'ubuntu-current'\n {8}uses: actions\/setup-node@[^\n]+\n {8}with:\n {10}node-version: \$\{\{ matrix\.node \}\}\n {6}- uses: oven-sh\/setup-bun@[^\n]+\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile --ignore-scripts\n/u
   assert.match(verificationSteps, trustedVerificationPrefix)
   assert.doesNotMatch(
     verificationSteps.replace('    steps:\n', '    steps:\n      - uses: ./.github/actions/repair-generated-source\n'),
@@ -152,7 +152,7 @@ jobs:
     [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
     [
       'node ./scripts/check-generated-version.ts',
-      'bun install --frozen-lockfile',
+      'bun install --frozen-lockfile --ignore-scripts',
       'bun test scripts/workflow-policy.test.ts',
       'bun run ./scripts/workflow-policy.ts',
       'bun run typecheck',
@@ -184,7 +184,7 @@ jobs:
   )
   assert.doesNotMatch(releaseJob, /^ {4}permissions:/m)
   const trustedReleasePrefix =
-    /^ {4}steps:\n {6}- uses: actions\/checkout@[^\n]+\n {8}with:\n {10}persist-credentials: false\n {6}- uses: actions\/setup-node@[^\n]+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- uses: oven-sh\/setup-bun@[^\n]+\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile\n/u
+    /^ {4}steps:\n {6}- uses: actions\/checkout@[^\n]+\n {8}with:\n {10}persist-credentials: false\n {6}- uses: actions\/setup-node@[^\n]+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- uses: oven-sh\/setup-bun@[^\n]+\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile --ignore-scripts\n/u
   assert.match(releaseSteps, trustedReleasePrefix)
   assert.doesNotMatch(
     releaseSteps.replace('    steps:\n', '    steps:\n      - run: bun run repair-generated-source\n'),
@@ -194,7 +194,7 @@ jobs:
     [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
     [
       'node ./scripts/check-generated-version.ts',
-      'bun install --frozen-lockfile',
+      'bun install --frozen-lockfile --ignore-scripts',
       'bun test scripts/workflow-policy.test.ts',
       'bun run ./scripts/workflow-policy.ts',
       'bun run build',
@@ -262,6 +262,8 @@ jobs:
   assert.doesNotMatch(workflow, /^\s+- run: bun run \.\/scripts\/check-generated-version\.ts$/m)
   assert.doesNotMatch(workflow, /^\s+- run: bun run check:generated$/m)
   assert.doesNotMatch(workflow, /^\s+- run: bun run check:workflows$/m)
+  assert.equal(workflow.match(/^\s+- run: bun install --frozen-lockfile --ignore-scripts$/gmu)?.length, 2)
+  assert.doesNotMatch(workflow, /^\s+- run: bun install --frozen-lockfile$/m)
   const pinnedActionReferences = [...workflow.matchAll(/^\s+(?:- )?uses: [^@\s]+@([^\s#]+)/gmu)].map(match => match[1])
   assert.equal(pinnedActionReferences.length, 8)
   assert.equal(

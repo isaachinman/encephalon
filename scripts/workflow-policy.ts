@@ -113,6 +113,11 @@ type SourceFileObservation =
   | Readonly<{ kind: 'invalid' }>
   | Readonly<{ kind: 'missing' }>
 
+type SourceFileObservationWitness = Readonly<{
+  observation: SourceFileObservation
+  path: string
+}>
+
 type ActionManifestWitness = Readonly<{
   observation: Exclude<SourceFileObservation, Readonly<{ kind: 'invalid' }>>
   path: string
@@ -589,16 +594,16 @@ const resolveLocalTarget = (root: string, reference: string, kind: ExecutableRef
   return result
 }
 
-const sameAcceptedFileObservation = (
-  expected: ActionManifestWitness['observation'],
-  current: SourceFileObservation,
-) => {
-  let matches = expected.kind === 'missing' && current.kind === 'missing'
+const sameSourceFileObservation = (expected: SourceFileObservation, current: SourceFileObservation) => {
+  let matches = expected.kind === current.kind
   if (expected.kind === 'file' && current.kind === 'file') {
     matches = sameStableEntryMetadata(expected.metadata, current.metadata)
   }
   return matches
 }
+
+const sameAcceptedFileObservation = (expected: ActionManifestWitness['observation'], current: SourceFileObservation) =>
+  sameSourceFileObservation(expected, current)
 
 const sameActionDirectoryWitness = (left: ActionDirectoryWitness, right: ActionDirectoryWitness) =>
   samePath(left.path, right.path) &&
@@ -618,6 +623,12 @@ const revalidateFileWitness = (root: string, witness: FileWitness, afterRealpath
   const current = observeNativeFile(root, witness.path, afterRealpath)
   return current.kind === 'file' && sameStableEntryMetadata(witness.metadata, current.metadata)
 }
+
+const revalidateSourceFileObservationWitness = (
+  root: string,
+  witness: SourceFileObservationWitness,
+  afterRealpath?: (path: string) => void,
+) => sameSourceFileObservation(witness.observation, observeNativeFile(root, witness.path, afterRealpath))
 
 const revalidateActionDirectoryWitness = (
   root: string,
@@ -681,11 +692,15 @@ const revalidateWorkflowPolicyWitnesses = (
   root: string,
   discoveryWitness: WorkflowDiscoveryWitness,
   fileWitnesses: readonly FileWitness[],
+  sourceFileObservationWitnesses: readonly SourceFileObservationWitness[],
   actionDirectoryWitnesses: readonly ActionDirectoryWitness[],
   options: WorkflowPolicyOptions = {},
 ) =>
   revalidateWorkflowDiscovery(root, discoveryWitness, options.afterFinalDirectoryRealpath) &&
   fileWitnesses.every(witness => revalidateFileWitness(root, witness, options.afterFinalFileRealpath)) &&
+  sourceFileObservationWitnesses.every(witness =>
+    revalidateSourceFileObservationWitness(root, witness, options.afterFinalFileRealpath),
+  ) &&
   actionDirectoryWitnesses.every(witness => revalidateActionDirectoryWitness(root, witness, options))
 
 type StepReferenceFrame =
@@ -1089,6 +1104,7 @@ export const inspectWorkflowPolicy = (
     const findings: WorkflowPolicyFinding[] = []
     const roleVisits = new Set<string>()
     const fileWitnesses = new Map<string, FileWitness>()
+    const sourceFileObservationWitnesses = new Map<string, SourceFileObservationWitness>()
     const actionDirectoryWitnesses = new Map<string, ActionDirectoryWitness>()
     const sourceQueue: ExecutableSource[] = []
     const parsedTreeBudget: ParsedTreeBudget = { maximum: limits.maximumSecretTreeNodes, nodes: 0 }
@@ -1161,19 +1177,18 @@ export const inspectWorkflowPolicy = (
                   const dockerfilePath = resolve(dirname(source.path), reference.reference)
                   if (isContainedPath(nativeRoot, dockerfilePath)) {
                     const observation = observeNativeFile(nativeRoot, dockerfilePath)
+                    const witnessKey = comparablePath(dockerfilePath)
+                    const witness = { observation, path: dockerfilePath }
+                    const existingWitness = sourceFileObservationWitnesses.get(witnessKey)
+                    if (existingWitness === undefined) {
+                      sourceFileObservationWitnesses.set(witnessKey, witness)
+                    } else if (!sameSourceFileObservation(existingWitness.observation, observation)) {
+                      traversalIntegrityAccepted = false
+                    }
                     if (observation.kind === 'missing') {
                       findings.push({ file, location: reference.location, rule: 'local-reference' })
                     } else if (observation.kind === 'invalid') {
                       findings.push({ file, location: reference.location, rule: 'source-integrity' })
-                    } else {
-                      const witnessKey = `dockerfile\0${comparablePath(dockerfilePath)}`
-                      const witness = { metadata: observation.metadata, path: dockerfilePath }
-                      const existingWitness = fileWitnesses.get(witnessKey)
-                      if (existingWitness === undefined) {
-                        fileWitnesses.set(witnessKey, witness)
-                      } else if (!sameStableEntryMetadata(existingWitness.metadata, witness.metadata)) {
-                        traversalIntegrityAccepted = false
-                      }
                     }
                   } else {
                     findings.push({ file, location: reference.location, rule: 'local-reference' })
@@ -1357,12 +1372,14 @@ export const inspectWorkflowPolicy = (
     if (finalIntegrityAccepted && discoveryWitness !== undefined) {
       try {
         const finalFileWitnesses = Array.from(fileWitnesses.values())
+        const finalSourceFileObservationWitnesses = Array.from(sourceFileObservationWitnesses.values())
         const finalActionDirectoryWitnesses = Array.from(actionDirectoryWitnesses.values())
         options.beforeFinalRevalidation?.()
         finalIntegrityAccepted = revalidateWorkflowPolicyWitnesses(
           nativeRoot,
           discoveryWitness,
           finalFileWitnesses,
+          finalSourceFileObservationWitnesses,
           finalActionDirectoryWitnesses,
           options,
         )
@@ -1372,6 +1389,7 @@ export const inspectWorkflowPolicy = (
             nativeRoot,
             discoveryWitness,
             finalFileWitnesses,
+            finalSourceFileObservationWitnesses,
             finalActionDirectoryWitnesses,
           )
         }
