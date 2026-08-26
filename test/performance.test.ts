@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'no
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
-import { assertRecordGraph, readRecordsResolved, validateRecordsResolved } from '../src/records.ts'
+import { addRecordResolved, assertRecordGraph, readRecordsResolved, validateRecordsResolved } from '../src/records.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -282,6 +282,67 @@ describe('hot scan performance regressions', () => {
       })
 
       assert.equal(result.recordsChecked, recordCount)
+      assert.deepEqual(work, {
+        canonicalEntries: recordCount,
+        canonicalScans: 1,
+        graphValidations: 1,
+      })
+      return verified
+    }, undefined)
+  })
+
+  test('stable add planning uses one pipeline through the 1,000-record boundary', () => {
+    ;[0, 100, 999, 1000].reduce<undefined>((verified, recordCount) => {
+      const root = createRoot()
+      mkdirSync(join(root, 'encephalon', '_staging'), { recursive: true })
+      mkdirSync(join(root, 'encephalon', 'context'), { recursive: true })
+      Array.from({ length: recordCount }, (_, index) =>
+        writeRecord(root, {
+          createdAt: new Date(Date.UTC(2026, 0, 1) + index).toISOString(),
+          id: `stable-add-${index.toString().padStart(4, '0')}`,
+          ...(index === 0 ? {} : { supersedes: [`stable-add-${(index - 1).toString().padStart(4, '0')}`] }),
+        }),
+      )
+      const work = { canonicalEntries: 0, canonicalScans: 0, graphValidations: 0 }
+      const add = () =>
+        addRecordResolved(
+          root,
+          {
+            id: `stable-add-candidate-${recordCount}`,
+            kind: 'context',
+            payload: {},
+            source: 'test',
+            subject: 'dense.history',
+            ...(recordCount === 0
+              ? {}
+              : { supersedes: [`stable-add-${(recordCount - 1).toString().padStart(4, '0')}`] }),
+          },
+          {
+            hydrate: false,
+            readHooks: {
+              canonicalScan: () => {
+                work.canonicalScans += 1
+              },
+              graphValidation: () => {
+                work.graphValidations += 1
+              },
+              onWork: operation => {
+                if (operation === 'canonical-entry') {
+                  work.canonicalEntries += 1
+                }
+              },
+            },
+          },
+        )
+
+      if (recordCount < 1000) {
+        assert.equal(add().id, `stable-add-candidate-${recordCount}`)
+      } else {
+        assert.throws(add, (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
+          return true
+        })
+      }
       assert.deepEqual(work, {
         canonicalEntries: recordCount,
         canonicalScans: 1,
