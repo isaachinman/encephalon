@@ -73,7 +73,7 @@ Deterministic behavioural hooks, not wall-clock thresholds, enforce one show rea
 
 ## Stable canonical read snapshots
 
-Stable validation and canonical reads perform one bounded canonical scan, one graph-validation pass, one artifact-validation pass, and one closing evidence revalidation. Behavioural work-count tests cover empty, 100-record, and 1,000-record corpora. A detected generation change discards that attempt and adds exactly one complete pipeline; no per-directory or per-record retry resets the shared maximum of three attempts or its non-resetting 60-second deadline.
+Stable validation and canonical reads perform one bounded canonical scan, one graph-validation pass, one initial artifact-validation pass, and one closing artifact-record-artifact evidence sandwich. Behavioural work-count tests cover empty, 100-record, and 1,000-record corpora. A detected generation change discards that attempt and adds exactly one complete pipeline; no per-directory or per-record retry resets the shared maximum of three attempts or its non-resetting 60-second deadline.
 
 This change introduces no new latency, memory, cache-size, or amplification threshold. The existing schema-version 2 benchmark remains the release authority for configured public-operation budgets, while deterministic work observers enforce the stable and retry pipeline counts.
 

@@ -208,11 +208,11 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-26 for code and behavioural-test snapshot `422c3a20e1ee13e69dcf87ea219a8a0dab4ff071`\./,
+      /Last reviewed: 2026-08-26 for code and behavioural-test snapshot `c17834e5d4f4129c8f8374713be224c54ab4a39f`\./,
     )
     assert.match(
       contract,
-      /MAR-2575 stable canonical read and validation snapshots with one bounded operation-scoped retry ledger: `78ca415858eb3a3b7ad1c2a97ee4da38560e4937`\./,
+      /MAR-2575 stable canonical read and validation snapshots with one bounded operation-scoped retry ledger: `c17834e5d4f4129c8f8374713be224c54ab4a39f`\./,
     )
     assert.match(
       contract,

@@ -1,7 +1,7 @@
 # Encephalon Maintained Contract
 
 Status: maintained for the current v0.x implementation.
-Last reviewed: 2026-08-26 for code and behavioural-test snapshot `422c3a20e1ee13e69dcf87ea219a8a0dab4ff071`.
+Last reviewed: 2026-08-26 for code and behavioural-test snapshot `c17834e5d4f4129c8f8374713be224c54ab4a39f`.
 
 This document is the concise contract maintainers should update when public behaviour or safety invariants intentionally change. The historical implementation plan remains design input and provenance context, not the normative source of truth.
 
@@ -224,7 +224,7 @@ When an implementation change intentionally alters this contract:
 
 ## Change Provenance
 
-- MAR-2575 stable canonical read and validation snapshots with one bounded operation-scoped retry ledger: `78ca415858eb3a3b7ad1c2a97ee4da38560e4937`.
+- MAR-2575 stable canonical read and validation snapshots with one bounded operation-scoped retry ledger: `c17834e5d4f4129c8f8374713be224c54ab4a39f`.
 - MAR-2573 lossless BigInt filesystem identities, nanosecond-stable comparisons, shared manifest and staging projections, and descriptor-bound instruction recovery: `4431bf61432eb4ecbffc725c775ca9b874bf8daa`.
 - MAR-2576 bounded payload property inspection, allocation-order enforcement, canonical-output compatibility, and packed API coverage: `58ba821f4b655fad1b1e79be9df57600e7409381`.
 - MAR-2641 negative-zero confidence normalisation across validation, canonical storage, mutation-cache hydration, public reads, and CLI output: `b6de02d1c5c6eab7d98e7d4525b8dee41035f1ab`.
