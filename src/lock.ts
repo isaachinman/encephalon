@@ -495,19 +495,58 @@ export const withOperationLock = <Result>(
 
   const reclaimRecoveryMarker = (observation: Extract<RecoveryMarkerObservation, { kind: 'observed' }>) => {
     testHooks.afterRecoveryStaleObservation?.()
-    if (cacheOwnedDirectoryIsCurrent(location, observation.directory)) {
-      const reclaimed = quarantineCacheOwnedDirectory(
-        location,
-        observation.directory,
-        () => recoveryMarkerRemainsStale(observation),
-        {
-          expectedFiles: {
-            owner: observation.ownerFile,
-            recoveryWitness: observation.witness,
-          },
-        },
-      )
-      return reclaimed
+    let complete = false
+    for (const attempt of Array.from({ length: RECOVERY_RELEASE_ATTEMPTS }, (_, index) => index)) {
+      let movedByThisAttempt = false
+      if (remainingMilliseconds() === 0) {
+        complete = true
+      } else if (cacheOwnedDirectoryIsCurrent(location, observation.directory)) {
+        try {
+          quarantineCacheOwnedDirectory(
+            location,
+            observation.directory,
+            () => recoveryMarkerRemainsStale(observation),
+            {
+              expectedFiles: {
+                owner: observation.ownerFile,
+                recoveryWitness: observation.witness,
+              },
+              onMove: () => {
+                movedByThisAttempt = true
+              },
+            },
+          )
+          complete = true
+        } catch (error) {
+          if (movedByThisAttempt) {
+            throw error
+          }
+          if (cacheOwnedDirectoryIsCurrent(location, observation.directory)) {
+            if (transientSharingViolation(error)) {
+              if (remainingMilliseconds() === 0) {
+                complete = true
+              } else if (recoveryMarkerRemainsStale(observation)) {
+                if (attempt < RECOVERY_RELEASE_ATTEMPTS - 1) {
+                  wait(Math.min(RECOVERY_POLL_MILLISECONDS, remainingMilliseconds()))
+                } else {
+                  throw error
+                }
+              } else {
+                complete = true
+              }
+            } else {
+              throw error
+            }
+          } else {
+            complete = true
+          }
+        }
+      } else {
+        complete = true
+      }
+      if (complete) {
+        break
+      }
     }
   }
 
