@@ -23,6 +23,9 @@ export type VerifiedRegularFileObservation = Readonly<{
   path: string
 }>
 
+/** @internal */
+export type VerifiedRegularFileEvidence = Readonly<Omit<VerifiedRegularFileObservation, 'bytes'>>
+
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
 const decoder = new TextDecoder('utf-8', { fatal: true })
 const digestBytes = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
@@ -157,7 +160,7 @@ export const readObservedVerifiedRegularFile = (
 }
 
 /** @internal */
-export const revalidateObservedVerifiedRegularFile = (observation: VerifiedRegularFileObservation) => {
+export const revalidateObservedVerifiedRegularFile = (observation: VerifiedRegularFileEvidence) => {
   const current = readObservedVerifiedRegularFile(observation.path, Number(observation.metadata.size))
   if (
     current === undefined ||

@@ -21,6 +21,7 @@ import {
   readObservedVerifiedRegularFile,
   revalidateObservedVerifiedRegularFile,
   VerifiedFileError,
+  type VerifiedRegularFileEvidence,
   type VerifiedRegularFileObservation,
 } from './verified-file.ts'
 import { observedArray, observedMap, observeWork, rethrowWorkObserverError } from './work-observer.ts'
@@ -198,8 +199,7 @@ type BaselineReason =
   | 'workflow-entry-limit'
   | 'workflow-enumeration-error'
 
-type BaselineObservationSource = 'language' | 'root' | 'top-level' | 'workflow'
-type BaselineProofFailure = BaselineObservationSource | 'package'
+type BaselineExpectedFailureClassification = 'directory-witness' | `filesystem:${string}` | 'verified-file'
 
 class BaselineGenerationChanged extends Error {
   constructor() {
@@ -214,6 +214,8 @@ class PackageMetadataValidationError extends Error {
     this.name = 'PackageMetadataValidationError'
   }
 }
+
+class BaselineHookError extends Error {}
 
 const baselineGenerationChanged = (): never => {
   throw new BaselineGenerationChanged()
@@ -230,49 +232,126 @@ const isObservedSourceReplacement = (error: unknown) => {
   )
 }
 
-class BaselineObservationAuthority {
-  private readonly directories: { source: BaselineObservationSource; witness: DirectoryWitness }[] = []
-  private packageObservation: VerifiedRegularFileObservation | undefined
+const expectedFailureClassification = (error: unknown): BaselineExpectedFailureClassification | undefined => {
+  if (error instanceof DirectoryWitnessError) {
+    return 'directory-witness'
+  }
+  if (error instanceof VerifiedFileError) {
+    return 'verified-file'
+  }
+  if (isRecognizedFilesystemError(error)) {
+    return `filesystem:${(error as NodeJS.ErrnoException).code as string}`
+  }
+}
 
-  readonly observeDirectory = (source: BaselineObservationSource, witness: DirectoryWitness) => {
-    this.directories.push({ source, witness })
+const invokeBaselineHook = (hook: (() => void) | undefined) => {
+  if (hook !== undefined) {
+    try {
+      hook()
+    } catch (error) {
+      throw new BaselineHookError('An internal baseline hook failed.', { cause: error })
+    }
+  }
+}
+
+const invokeBaselinePathHook = (hook: ((path: string) => void) | undefined, path: string) => {
+  if (hook !== undefined) {
+    try {
+      hook(path)
+    } catch (error) {
+      throw new BaselineHookError('An internal baseline hook failed.', { cause: error })
+    }
+  }
+}
+
+const rethrowBaselineHookError = (error: unknown) => {
+  if (error instanceof BaselineHookError) {
+    throw error.cause
+  }
+}
+
+type BaselineExpectedFailureObservation = Readonly<{
+  classification: BaselineExpectedFailureClassification
+  probe: () => void
+}>
+
+class BaselineObservationAuthority {
+  private readonly directories: DirectoryWitness[] = []
+  private readonly expectedFailures: BaselineExpectedFailureObservation[] = []
+  private packageObservation: VerifiedRegularFileEvidence | undefined
+
+  readonly observeDirectory = (witness: DirectoryWitness) => {
+    this.directories.push(witness)
   }
 
   readonly observePackage = (observation: VerifiedRegularFileObservation) => {
-    this.packageObservation = observation
+    this.packageObservation = Object.freeze({
+      digest: observation.digest,
+      metadata: observation.metadata,
+      path: observation.path,
+    })
+  }
+
+  readonly observeExpectedFailure = (error: unknown, probe: () => void) => {
+    const classification = expectedFailureClassification(error)
+    if (classification === undefined) {
+      throw error
+    }
+    this.expectedFailures.push(Object.freeze({ classification, probe }))
   }
 
   readonly proveCurrent = () => {
-    const failures = new Set<BaselineProofFailure>()
-    for (const { source, witness } of this.directories) {
+    for (const witness of this.directories) {
       try {
         revalidateDirectoryWitness(witness)
       } catch (error) {
-        if (isObservedSourceReplacement(error)) {
+        if (isObservedSourceReplacement(error) || isRecognizedFilesystemError(error)) {
           baselineGenerationChanged()
         }
-        if (isRecognizedFilesystemError(error)) {
-          failures.add(source)
-        } else {
-          throw error
-        }
+        throw error
       }
     }
     if (this.packageObservation !== undefined) {
       try {
         revalidateObservedVerifiedRegularFile(this.packageObservation)
       } catch (error) {
-        if (error instanceof VerifiedFileError || isObservedSourceReplacement(error)) {
+        if (
+          error instanceof VerifiedFileError ||
+          isObservedSourceReplacement(error) ||
+          isRecognizedFilesystemError(error)
+        ) {
           return baselineGenerationChanged()
         }
-        if (isRecognizedFilesystemError(error)) {
-          failures.add('package')
-        } else {
-          throw error
-        }
+        throw error
       }
     }
-    return failures
+    for (const observation of this.expectedFailures) {
+      let failed = false
+      let currentFailure: unknown
+      try {
+        observation.probe()
+      } catch (error) {
+        failed = true
+        currentFailure = error
+      }
+      if (failed) {
+        if (
+          currentFailure instanceof BaselineGenerationChanged ||
+          currentFailure instanceof CanonicalDirectoryChangedError
+        ) {
+          baselineGenerationChanged()
+        }
+        const currentClassification = expectedFailureClassification(currentFailure)
+        if (currentClassification === undefined) {
+          throw currentFailure
+        }
+        if (currentClassification !== observation.classification) {
+          baselineGenerationChanged()
+        }
+      } else {
+        baselineGenerationChanged()
+      }
+    }
   }
 }
 
@@ -389,17 +468,21 @@ const readPackageFacts = (
   let manifestObserved = false
   let observation: VerifiedRegularFileObservation | undefined
   try {
-    hooks.beforePackageMetadataRead?.()
+    invokeBaselineHook(hooks.beforePackageMetadataRead)
     observation = readObservedVerifiedRegularFile(path, MAX_PACKAGE_BYTES, {
       fault: point => {
         if (point === 'after-lstat') {
           manifestObserved = true
-          hooks.afterPackageMetadataLstat?.()
+          invokeBaselineHook(hooks.afterPackageMetadataLstat)
         }
       },
     })
   } catch (error) {
+    rethrowBaselineHookError(error)
     if (error instanceof VerifiedFileError || isRecognizedFilesystemError(error)) {
+      authority.observeExpectedFailure(error, () => {
+        readObservedVerifiedRegularFile(path, MAX_PACKAGE_BYTES)
+      })
       return packageMetadataError(sourceName, expected || manifestObserved)
     }
     throw error
@@ -462,7 +545,7 @@ const readBoundedDirectoryEntries = (
   authority: BaselineObservationAuthority,
   parent?: DirectoryWitness,
 ) => {
-  hooks.beforeLanguageDirectoryCapture?.(directory)
+  invokeBaselinePathHook(hooks.beforeLanguageDirectoryCapture, directory)
   if (parent !== undefined) {
     revalidateDirectoryWitness(parent)
   }
@@ -472,11 +555,11 @@ const readBoundedDirectoryEntries = (
     undefined,
     observeWork(hooks.onWork, 'language-entry'),
   )
-  hooks.afterLanguageDirectoryCapture?.(directory)
+  invokeBaselinePathHook(hooks.afterLanguageDirectoryCapture, directory)
   if (parent !== undefined) {
     revalidateDirectoryWitness(parent)
   }
-  authority.observeDirectory('language', snapshot.witness)
+  authority.observeDirectory(snapshot.witness)
   return {
     entries: snapshot.entries.filter(entry => {
       const excludedDirectory = entry.isDirectory() && EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())
@@ -502,7 +585,7 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks, authority: Baseli
   const maximumFiles = hooks.maximumScannedFiles ?? MAX_SCANNED_FILES
   const queue: { depth: number; directory: string; parent?: DirectoryWitness }[] = [{ depth: 0, directory: root }]
   let directoriesScheduled = 1
-  hooks.onLanguageDirectoryScheduled?.()
+  invokeBaselineHook(hooks.onLanguageDirectoryScheduled)
   scanDirectories: for (const { depth, directory, parent } of queue) {
     try {
       const { entries, overflow, witness } = readBoundedDirectoryEntries(directory, hooks, authority, parent)
@@ -520,7 +603,7 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks, authority: Baseli
             } else {
               queue.push({ depth: depth + 1, directory: path, parent: witness })
               directoriesScheduled += 1
-              hooks.onLanguageDirectoryScheduled?.()
+              invokeBaselineHook(hooks.onLanguageDirectoryScheduled)
             }
           } else if (entry.isFile()) {
             if (state.filesSeen >= maximumFiles) {
@@ -537,6 +620,7 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks, authority: Baseli
       }
     } catch (error) {
       rethrowWorkObserverError(error)
+      rethrowBaselineHookError(error)
       if (error instanceof BaselineGenerationChanged) {
         throw error
       }
@@ -544,6 +628,9 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks, authority: Baseli
         return baselineGenerationChanged()
       }
       if (isRecognizedFilesystemError(error)) {
+        authority.observeExpectedFailure(error, () => {
+          captureCanonicalDirectory(directory, MAX_LANGUAGE_DIRECTORY_ENTRIES)
+        })
         state.truncationReasons.add('unreadable-directory')
       } else {
         throw error
@@ -574,8 +661,20 @@ const captureOptionalDirectory = (path: string, hooks: BaselineScanHooks, expect
     }
     return { kind: 'invalid' as const }
   }
-  hooks.afterOptionalDirectoryLstat?.(path)
+  invokeBaselinePathHook(hooks.afterOptionalDirectoryLstat, path)
   return { kind: 'observed' as const, witness: captureDirectoryWitness(path, { allowLink: false }) }
+}
+
+const probeWorkflowSource = (root: string, expectedGithub: boolean) => {
+  const github = captureOptionalDirectory(resolve(root, '.github'), {}, expectedGithub)
+  if (github.kind === 'observed') {
+    const workflows = captureOptionalDirectory(resolve(github.witness.canonicalPath, 'workflows'), {})
+    if (workflows.kind === 'observed') {
+      collectBoundedDirectoryEntries(workflows.witness.canonicalPath, MAX_WORKFLOW_ENTRIES)
+      revalidateDirectoryWitness(workflows.witness)
+    }
+    revalidateDirectoryWitness(github.witness)
+  }
 }
 
 const workflowFiles = (
@@ -586,12 +685,12 @@ const workflowFiles = (
 ): SourceResult<string[]> => {
   let result: SourceResult<string[]> = { reasons: [], value: [] }
   try {
-    hooks.beforeWorkflowDirectoryCapture?.()
+    invokeBaselineHook(hooks.beforeWorkflowDirectoryCapture)
     const github = captureOptionalDirectory(resolve(root, '.github'), hooks, expectedGithub)
     if (github.kind === 'invalid') {
       result = { reasons: ['workflow-enumeration-error'], value: [] }
     } else if (github.kind === 'observed') {
-      authority.observeDirectory('workflow', github.witness)
+      authority.observeDirectory(github.witness)
       const workflowsPath = resolve(github.witness.canonicalPath, 'workflows')
       const workflows = captureOptionalDirectory(workflowsPath, hooks)
       if (workflows.kind === 'absent') {
@@ -600,14 +699,14 @@ const workflowFiles = (
         revalidateDirectoryWitness(github.witness)
         result = { reasons: ['workflow-enumeration-error'], value: [] }
       } else {
-        authority.observeDirectory('workflow', workflows.witness)
+        authority.observeDirectory(workflows.witness)
         const collected = collectBoundedDirectoryEntries(
           workflows.witness.canonicalPath,
           MAX_WORKFLOW_ENTRIES,
           undefined,
           observeWork(hooks.onWork, 'workflow-entry'),
         )
-        hooks.afterWorkflowEnumeration?.()
+        invokeBaselineHook(hooks.afterWorkflowEnumeration)
         revalidateDirectoryWitness(workflows.witness)
         revalidateDirectoryWitness(github.witness)
         if (collected.overflow) {
@@ -627,6 +726,7 @@ const workflowFiles = (
     }
   } catch (error) {
     rethrowWorkObserverError(error)
+    rethrowBaselineHookError(error)
     if (error instanceof BaselineGenerationChanged) {
       throw error
     }
@@ -634,6 +734,9 @@ const workflowFiles = (
       return baselineGenerationChanged()
     }
     if (isRecognizedFilesystemError(error)) {
+      authority.observeExpectedFailure(error, () => {
+        probeWorkflowSource(root, expectedGithub)
+      })
       result = { reasons: ['workflow-enumeration-error'], value: [] }
     } else {
       throw error
@@ -659,7 +762,7 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks, authority: Baseli
       undefined,
       observeWork(hooks.onWork, 'top-level-entry'),
     )
-    authority.observeDirectory('top-level', snapshot.witness)
+    authority.observeDirectory(snapshot.witness)
     if (snapshot.overflow) {
       result = { reasons: ['top-level-entry-limit'], value: emptyTopLevelFacts() }
     } else {
@@ -673,12 +776,13 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks, authority: Baseli
           }
           return candidate
         }, emptyTopLevelFacts(hooks))
-      hooks.beforeTopLevelRevalidation?.()
+      invokeBaselineHook(hooks.beforeTopLevelRevalidation)
       revalidateCanonicalDirectory(snapshot)
       result = { reasons: [], value: facts }
     }
   } catch (error) {
     rethrowWorkObserverError(error)
+    rethrowBaselineHookError(error)
     if (error instanceof BaselineGenerationChanged) {
       throw error
     }
@@ -686,6 +790,9 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks, authority: Baseli
       return baselineGenerationChanged()
     }
     if (isRecognizedFilesystemError(error)) {
+      authority.observeExpectedFailure(error, () => {
+        captureCanonicalDirectory(root, MAX_TOP_LEVEL_ENTRIES)
+      })
       result = { reasons: ['unreadable-directory'], value: emptyTopLevelFacts() }
     } else {
       throw error
@@ -719,73 +826,22 @@ type CollectedBaselineSources = {
   workflowResult: SourceResult<string[]>
 }
 
-const emptyCollectedBaselineSources = (
-  globalReasons: readonly BaselineReason[],
-  observed: Omit<CollectedBaselineSources, 'globalReasons'> = {
-    layoutResult: { reasons: [], value: emptyTopLevelFacts() },
-    packageResult: { reasons: [], value: { facts: emptyPackageFacts() } },
-    scan: emptyScanState(),
-    workflowResult: { reasons: [], value: [] },
-  },
-): CollectedBaselineSources => ({
+const emptyCollectedBaselineSources = (globalReasons: readonly BaselineReason[]): CollectedBaselineSources => ({
   globalReasons,
   layoutResult: {
-    reasons: observed.layoutResult.reasons,
+    reasons: [],
     value: emptyTopLevelFacts(),
   },
   packageResult: {
-    reasons: observed.packageResult.reasons,
+    reasons: [],
     value: { facts: emptyPackageFacts() },
   },
-  scan: {
-    ...emptyScanState(),
-    truncationReasons: new Set(observed.scan.truncationReasons),
-  },
+  scan: emptyScanState(),
   workflowResult: {
-    reasons: observed.workflowResult.reasons,
+    reasons: [],
     value: [],
   },
 })
-
-const applyBaselineProofFailures = (
-  observed: CollectedBaselineSources,
-  failures: ReadonlySet<BaselineProofFailure>,
-): CollectedBaselineSources => {
-  if (failures.has('root')) {
-    return emptyCollectedBaselineSources(['unreadable-directory'], observed)
-  }
-  const manifestSource = observed.packageResult.value.manifestSource ?? observed.packageResult.value.source
-  return {
-    globalReasons: observed.globalReasons,
-    layoutResult: failures.has('top-level')
-      ? {
-          reasons: [...observed.layoutResult.reasons, 'unreadable-directory'],
-          value: emptyTopLevelFacts(),
-        }
-      : observed.layoutResult,
-    packageResult: failures.has('package')
-      ? {
-          reasons: [...observed.packageResult.reasons, 'package-metadata-error'],
-          value: {
-            facts: emptyPackageFacts(),
-            ...(manifestSource === undefined ? {} : { manifestSource }),
-          },
-        }
-      : observed.packageResult,
-    scan: failures.has('language')
-      ? {
-          ...emptyScanState(),
-          truncationReasons: new Set<BaselineReason>([...observed.scan.truncationReasons, 'unreadable-directory']),
-        }
-      : observed.scan,
-    workflowResult: failures.has('workflow')
-      ? {
-          reasons: [...observed.workflowResult.reasons, 'workflow-enumeration-error'],
-          value: [],
-        }
-      : observed.workflowResult,
-  }
-}
 
 const collectBaselineSources = (root: string, hooks: BaselineScanHooks, authority: BaselineObservationAuthority) => {
   let rootWitness: DirectoryWitness
@@ -793,11 +849,14 @@ const collectBaselineSources = (root: string, hooks: BaselineScanHooks, authorit
     rootWitness = captureDirectoryWitness(root, { allowLink: false })
   } catch (error) {
     if (error instanceof DirectoryWitnessError || isRecognizedFilesystemError(error)) {
+      authority.observeExpectedFailure(error, () => {
+        captureDirectoryWitness(root, { allowLink: false })
+      })
       return emptyCollectedBaselineSources(['unreadable-directory'])
     }
     throw error
   }
-  authority.observeDirectory('root', rootWitness)
+  authority.observeDirectory(rootWitness)
 
   const layoutResult = topLevelFacts(root, hooks, authority)
   const packageSource =
@@ -930,6 +989,7 @@ const withBaselineObservationRetry = <Result>(
   try {
     return operation()
   } catch (error) {
+    rethrowBaselineHookError(error)
     if (error instanceof BaselineGenerationChanged) {
       if (ledger.attempt < ledger.maximumAttempts) {
         return withBaselineObservationRetry(operation, ledger)
@@ -944,11 +1004,8 @@ const scanBaselineAttempt = (root: string, hooks: BaselineScanHooks) => {
   const authority = new BaselineObservationAuthority()
   const collected = collectBaselineSources(root, hooks, authority)
   const provisional = buildBaselineRecords(collected)
-  hooks.afterBaselineSources?.()
-  const proofFailures = authority.proveCurrent()
-  if (proofFailures.size > 0) {
-    return buildBaselineRecords(applyBaselineProofFailures(collected, proofFailures))
-  }
+  invokeBaselineHook(hooks.afterBaselineSources)
+  authority.proveCurrent()
   return provisional
 }
 
