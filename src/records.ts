@@ -50,6 +50,7 @@ import { EncephalonError, fail, wrapIo } from './errors.ts'
 import {
   type EntryIdentity,
   entryIdentityFrom,
+  manifestEntryMetadataFrom,
   sameEntryIdentity,
   sameStableEntryMetadata,
   sameStableEntryMetadataExceptCtime,
@@ -57,6 +58,7 @@ import {
 import { withOperationLock } from './lock.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { ordinalStringCompare } from './order.ts'
+import { recordCorpusFingerprint } from './record-corpus-fingerprint.ts'
 import { resolveRepository } from './repository.ts'
 import {
   createRecordFile,
@@ -130,6 +132,15 @@ type StableCanonicalSnapshot = {
   scan: RecordScan
   validation: ValidatedRecordScan
 }
+
+/** @internal */
+export type CanonicalCacheManifestEntry = Readonly<{
+  ctimeNanoseconds?: string
+  mtimeNanoseconds?: string
+  path: string
+  size?: string
+  type: 'directory' | 'file' | 'missing' | 'other' | 'symlink'
+}>
 
 type CanonicalLayoutWitness = {
   kinds: Map<string, CanonicalDirectorySnapshot>
@@ -372,6 +383,73 @@ export const MAX_VALIDATION_ISSUES = 100
 const decoder = new TextDecoder('utf-8', { fatal: true })
 
 const posixRelative = (root: string, path: string) => relative(root, path).replaceAll('\\', '/')
+
+const cacheManifestEntry = (path: string, metadata: BigIntStats): CanonicalCacheManifestEntry => {
+  const { ctimeNanoseconds, mtimeNanoseconds, size, type } = manifestEntryMetadataFrom(metadata)
+  return {
+    ctimeNanoseconds,
+    mtimeNanoseconds,
+    path,
+    size,
+    type,
+  }
+}
+
+const artifactCacheManifestEntry = (artifact: ArtifactObservation): CanonicalCacheManifestEntry =>
+  cacheManifestEntry(`encephalon/${artifact.path}`, artifact.metadata)
+
+/** @internal */
+export const canonicalCacheManifest = (
+  recordEntries: readonly CanonicalCacheManifestEntry[],
+  artifacts: readonly ArtifactObservation[],
+) => {
+  const entries = [
+    ...recordEntries,
+    ...[...artifacts]
+      .sort((first, second) => ordinalStringCompare(first.path, second.path))
+      .map(artifactCacheManifestEntry),
+  ]
+  return createHash('sha256').update(JSON.stringify(entries)).digest('hex')
+}
+
+const canonicalRecordCacheManifestEntries = (
+  root: string,
+  scan: RecordScan,
+): readonly CanonicalCacheManifestEntry[] => {
+  const { layout } = scan
+  if (layout !== undefined) {
+    const { root: rootSnapshot } = layout
+    if (rootSnapshot === null) {
+      return [{ path: 'encephalon', type: 'missing' }]
+    }
+    const observationsByPath = new Map(scan.observations.map(observation => [observation.path, observation]))
+    const children = rootSnapshot.entries
+      .filter(entry => !isCanonicalReservedDirectory(entry.name))
+      .flatMap(kindEntry => {
+        const kindSnapshot = layout.kinds.get(kindEntry.name)
+        if (kindSnapshot === undefined) {
+          return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')
+        }
+        const records = kindSnapshot.entries.map(recordEntry => {
+          const path = resolve(kindSnapshot.witness.path, recordEntry.name)
+          const observation = observationsByPath.get(path)
+          if (observation === undefined) {
+            return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')
+          }
+          return cacheManifestEntry(posixRelative(root, path), observation.metadata)
+        })
+        return [
+          cacheManifestEntry(posixRelative(root, kindSnapshot.witness.path), kindSnapshot.witness.pathMetadata),
+          ...records,
+        ]
+      })
+    return [
+      cacheManifestEntry(posixRelative(root, rootSnapshot.witness.path), rootSnapshot.witness.pathMetadata),
+      ...children,
+    ]
+  }
+  return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')
+}
 
 const issue = (code: string, message: string, path?: string, recordId?: string): ValidationIssue => ({
   code,
@@ -1586,7 +1664,11 @@ const acceptValidatedRecordScan = (
   const { result } = validation
   if (allowed === undefined) {
     if (result.valid) {
-      return { artifactEvidence: validation.artifactEvidence, artifacts: validation.artifacts, scan }
+      return {
+        artifactEvidence: validation.artifactEvidence,
+        artifacts: validation.artifacts,
+        scan,
+      }
     }
     return fail('VALIDATION_FAILED', 'Canonical records are invalid.', {
       errors: result.errors.map(error => ({
@@ -1690,7 +1772,11 @@ const canonicalPublicationAuthority = (
       ) {
         repositoryChangedBeforePublication()
       }
-      result = { digest: observation.digest, metadata: finalDescriptorMetadata, path: observation.path }
+      result = {
+        digest: observation.digest,
+        metadata: finalDescriptorMetadata,
+        path: observation.path,
+      }
     } catch (error) {
       primaryError = error
     }
@@ -1880,9 +1966,24 @@ export const readValidatedRecordSnapshotResolved = (
   allowed?: AllowedMultiHead[],
 ) => {
   const validated = preserveWorkObserverFailure(() => readRecordScanAttemptResolvedUnchecked(root, hooks, allowed))
+  const artifacts = Object.freeze([...validated.artifacts])
+  const records = freezeAcceptedRecords(validated.scan.records)
+  const assertCurrent = () =>
+    preserveWorkObserverFailure(() =>
+      assertCanonicalSnapshotCurrent(
+        root,
+        validated.scan,
+        validated.artifactEvidence,
+        () => fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.'),
+        hooks,
+      ),
+    )
   return Object.freeze({
-    artifacts: validated.artifacts,
-    records: freezeAcceptedRecords(validated.scan.records),
+    artifacts,
+    assertCurrent,
+    manifest: canonicalCacheManifest(canonicalRecordCacheManifestEntries(root, validated.scan), artifacts),
+    recordFingerprint: recordCorpusFingerprint(records),
+    records,
   })
 }
 

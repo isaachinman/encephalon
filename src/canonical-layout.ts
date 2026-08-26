@@ -6,7 +6,7 @@ import {
   DirectoryWitnessError,
   revalidateDirectoryWitness,
 } from './directory-witness.ts'
-import { sameEntryIdentity } from './filesystem-entry.ts'
+import { sameStableEntryMetadata } from './filesystem-entry.ts'
 import { ordinalStringCompare } from './order.ts'
 
 export const MAX_CANONICAL_BRAIN_ROOT_ENTRIES = 1002
@@ -131,8 +131,8 @@ export const sameCanonicalDirectoryGeneration = (
 ) =>
   first.witness.path === second.witness.path &&
   first.witness.canonicalPath === second.witness.canonicalPath &&
-  sameEntryIdentity(first.witness.pathMetadata, second.witness.pathMetadata) &&
-  sameEntryIdentity(first.witness.canonicalMetadata, second.witness.canonicalMetadata) &&
+  sameStableEntryMetadata(first.witness.pathMetadata, second.witness.pathMetadata) &&
+  sameStableEntryMetadata(first.witness.canonicalMetadata, second.witness.canonicalMetadata) &&
   first.overflow === second.overflow &&
   first.entries.length === second.entries.length &&
   first.entries.every((entry, index) => {

@@ -545,10 +545,13 @@ The cache directory also contains the repository operation lock. The database st
 - Diagnostic Encephalon package version.
 - Normalised repository realpath.
 - Complete source manifest fingerprint.
+- Complete normalised record-corpus fingerprint.
 - Indexed record count.
 - Referenced artifact path and metadata set.
 
 Schema version, not package version, decides cache compatibility. Package version remains diagnostic metadata.
+
+Current writers emit schema version 2 with the record-corpus fingerprint. Exact schema-version-1 generations remain readable only after their bounded rows are independently proved equal to the current canonical snapshot; explicit preparation rebuilds them to version 2.
 
 Repository identity uses the native realpath, normalised separators, and Windows case folding. If an existing database belongs to another repository identity, return `CACHE_SCOPE_MISMATCH`. Do not silently rebind or rebuild it. This deliberately rejects multiple worktrees that share one physical `node_modules` cache.
 

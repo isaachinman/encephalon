@@ -32,6 +32,47 @@
         "fullSearch": { "totalMs": { "p95": 5000 } },
         "gather": { "totalMs": { "p95": 5000 } }
       }
+    },
+    {
+      "records": 1000,
+      "cache": {
+        "amplification": { "maximum": 100 },
+        "totalBytes": { "maximum": 67108864 }
+      },
+      "operations": {
+        "coldHydrate": {
+          "preparationIntegrityMs": { "p95": 30000 },
+          "totalMs": { "p95": 30000 }
+        },
+        "unchangedPrepare": {
+          "preparationIntegrityMs": { "p95": 10000 },
+          "totalMs": { "p95": 10000 }
+        },
+        "stalePrepare": {
+          "preparationIntegrityMs": { "p95": 30000 },
+          "totalMs": { "p95": 30000 }
+        },
+        "list": {
+          "preparationIntegrityMs": { "p95": 10000 },
+          "totalMs": { "p95": 10000 }
+        },
+        "show": {
+          "preparationIntegrityMs": { "p95": 10000 },
+          "totalMs": { "p95": 10000 }
+        },
+        "compactSearch": {
+          "preparationIntegrityMs": { "p95": 10000 },
+          "totalMs": { "p95": 10000 }
+        },
+        "fullSearch": {
+          "preparationIntegrityMs": { "p95": 10000 },
+          "totalMs": { "p95": 10000 }
+        },
+        "gather": {
+          "preparationIntegrityMs": { "p95": 10000 },
+          "totalMs": { "p95": 15000 }
+        }
+      }
     }
   ]
 }
