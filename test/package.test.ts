@@ -287,15 +287,15 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /The exact reviewed repository-controlled code and behavioural-test snapshot for this boundary is `dfd30801332e8fbcdd7e72bfd4c38e03b37a6cdd`\./,
+      /The exact reviewed repository-controlled code and behavioural-test snapshot for this boundary is `7afd091af302f14200637f8798ed3b693a126c87`\./,
     )
     assert.match(
       workflowHardeningPlan,
-      /The exact current-main-integrated MAR-2574 code and behavioural-test implementation snapshot is `dfd30801332e8fbcdd7e72bfd4c38e03b37a6cdd`\./,
+      /The exact current-main-integrated MAR-2574 code and behavioural-test implementation snapshot is `7afd091af302f14200637f8798ed3b693a126c87`\./,
     )
     assert.match(
       releaseBacklogHardeningDesign,
-      /The exact reviewed repository-controlled MAR-2574 code and behavioural-test snapshot is `dfd30801332e8fbcdd7e72bfd4c38e03b37a6cdd`\./,
+      /The exact reviewed repository-controlled MAR-2574 code and behavioural-test snapshot is `7afd091af302f14200637f8798ed3b693a126c87`\./,
     )
     assert.match(contract, /## Performance Evidence/)
     assert.match(contract, /implementing the MAR-2566 benchmark guarantees above/)
