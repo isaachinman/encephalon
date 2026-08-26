@@ -216,6 +216,72 @@ describe('command-line interface', () => {
     assert.equal(JSON.parse(retry.stderr).error.code, 'RECORD_EXISTS')
   })
 
+  test('redacts operation-gate cleanup failure after a committed add', () => {
+    const root = createRoot()
+    const id = 'cli-operation-cleanup'
+    const result = spawnSync(
+      process.execPath,
+      [
+        join(projectRoot, 'test', 'fixtures', 'add-record-operation-cleanup-failure.ts'),
+        'add',
+        '--root',
+        root,
+        '--id',
+        id,
+        '--kind',
+        'decision',
+        '--subject',
+        'operation.cleanup',
+        '--source',
+        'agent',
+        '--data',
+        '{"summary":"Published before operation cleanup"}',
+      ],
+      { cwd: root, encoding: 'utf8' },
+    )
+
+    assert.equal(result.status, 2)
+    assert.equal(result.stdout, '')
+    assert.equal(result.stderr.endsWith('\n'), true)
+    assert.equal(result.stderr.includes(root), false)
+    assert.equal(result.stderr.includes('SQLite'), false)
+    assert.deepEqual(errorJson(result), {
+      error: {
+        code: 'IO_ERROR',
+        details: {
+          canonicalCommitted: true,
+          path: `encephalon/decision/${id}.json`,
+          postCommitPhase: 'operationCleanup',
+          recordId: id,
+          recoveryAction:
+            'Run validate and inspect the canonical record before any retry; this record ID is already committed.',
+        },
+        message:
+          `Record ${id} was committed, but the operationCleanup post-commit phase failed. ` +
+          'Run validate and inspect the canonical record before any retry; this record ID is already committed.',
+      },
+    })
+    assert.equal(existsSync(join(root, 'encephalon', 'decision', `${id}.json`)), true)
+
+    const retry = run(root, [
+      'add',
+      '--root',
+      root,
+      '--id',
+      id,
+      '--kind',
+      'decision',
+      '--subject',
+      'operation.cleanup',
+      '--source',
+      'agent',
+      '--data',
+      '{"summary":"Retry"}',
+    ])
+    assert.equal(retry.status, 2)
+    assert.equal(errorJson(retry).error.code, 'RECORD_EXISTS')
+  })
+
   test('redacts CLI details that contain absolute repository paths', () => {
     const root = createRoot()
     const prepared = run(root, ['prepare', '--root', root])

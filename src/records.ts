@@ -212,6 +212,7 @@ export type RecordWriteHooks = {
 type AddRecordTestHooks = RecordWriteHooks & {
   afterOperationLock?: (() => void) | undefined
   beforeOperationLock?: (() => void) | undefined
+  gateClose?: NonNullable<Parameters<typeof withOperationLock>[2]>['gateClose']
   readHooks?: RecordReadHooks | undefined
 }
 
@@ -305,15 +306,18 @@ type RecordPlanningSnapshot = Readonly<{
 }>
 
 type PostCommitPhase = 'cacheHydration' | 'publicationFlush' | 'publicationVerification' | 'stagingCleanup'
+type AddPostCommitPhase = PostCommitPhase | 'operationCleanup'
 
 const postCommitRecoveryAction = {
   cacheHydration: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+  operationCleanup:
+    'Run validate and inspect the canonical record before any retry; this record ID is already committed.',
   publicationFlush:
     'Confirm the canonical record file is present; prepare does not re-fsync the kind directory, so treat durability as unverified until that sync succeeds.',
   publicationVerification:
     'Inspect the canonical directory generation before retrying; the linked record may have been displaced by a concurrent replacement.',
   stagingCleanup: 'Inspect encephalon/_staging and remove only a confirmed leftover from this operation.',
-} as const satisfies Record<PostCommitPhase, string>
+} as const satisfies Record<AddPostCommitPhase, string>
 
 const postCommitPriority: Record<PostCommitPhase, number> = {
   cacheHydration: 2,
@@ -322,7 +326,7 @@ const postCommitPriority: Record<PostCommitPhase, number> = {
   stagingCleanup: 1,
 }
 
-const postCommitMessage = (recordId: string, phase: PostCommitPhase) =>
+const postCommitMessage = (recordId: string, phase: AddPostCommitPhase) =>
   `Record ${recordId} was committed, but the ${phase} post-commit phase failed. ${postCommitRecoveryAction[phase]}`
 
 const postCommitError = (record: BrainRecord, phase: PostCommitPhase, cause: unknown) =>
@@ -337,6 +341,35 @@ const postCommitError = (record: BrainRecord, phase: PostCommitPhase, cause: unk
       recoveryAction: postCommitRecoveryAction[phase],
     },
     { cause },
+  )
+
+const normaliseAddError = (error: unknown): EncephalonError => {
+  if (error instanceof EncephalonError) {
+    return error
+  }
+  try {
+    return wrapIo('Unable to add the Encephalon record.', error)
+  } catch (wrappedError) {
+    if (wrappedError instanceof EncephalonError) {
+      return wrappedError
+    }
+    throw wrappedError
+  }
+}
+
+const addOperationCleanupError = (record: BrainRecord, error: EncephalonError) =>
+  new EncephalonError(
+    error.code,
+    postCommitMessage(record.id, 'operationCleanup'),
+    {
+      ...error.details,
+      canonicalCommitted: true,
+      path: record.path,
+      postCommitPhase: 'operationCleanup',
+      recordId: record.id,
+      recoveryAction: postCommitRecoveryAction.operationCleanup,
+    },
+    { cause: error.cause },
   )
 
 const committedRecordIds = (records: readonly Pick<BrainRecord, 'id'>[]): string[] => {
@@ -2828,21 +2861,30 @@ export const addRecordResolved = (root: string, input: AddRecordInput, options: 
 export const addRecord = (input: AddRecordInput): BrainRecord => {
   const parsed = parseAddRecordInput(input)
   const root = resolveRepository(parsed)
+  const progress: { phase: 'operation' | 'operationCleanup'; record?: BrainRecord } = { phase: 'operation' }
   try {
     recordWriteTestHooks.beforeOperationLock?.()
-    return withOperationLock(root, cacheLocation => {
-      recordWriteTestHooks.afterOperationLock?.()
-      return addRecordFileResolved(root, parsed.recordDraft, {
-        cacheLocation,
-        hooks: recordWriteTestHooks,
-        readHooks: recordWriteTestHooks.readHooks,
-      })
-    })
+    return withOperationLock(
+      root,
+      cacheLocation => {
+        recordWriteTestHooks.afterOperationLock?.()
+        const record = addRecordFileResolved(root, parsed.recordDraft, {
+          cacheLocation,
+          hooks: recordWriteTestHooks,
+          readHooks: recordWriteTestHooks.readHooks,
+        })
+        progress.record = record
+        progress.phase = 'operationCleanup'
+        return record
+      },
+      recordWriteTestHooks.gateClose === undefined ? undefined : { gateClose: recordWriteTestHooks.gateClose },
+    )
   } catch (error) {
-    if (error instanceof EncephalonError) {
-      throw error
+    const normalised = normaliseAddError(error)
+    if (progress.phase === 'operationCleanup' && progress.record !== undefined) {
+      throw addOperationCleanupError(progress.record, normalised)
     }
-    return wrapIo('Unable to add the Encephalon record.', error)
+    throw normalised
   }
 }
 
