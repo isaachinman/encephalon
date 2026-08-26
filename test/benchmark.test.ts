@@ -344,6 +344,15 @@ describe('isolated benchmark authority', () => {
       timeoutMilliseconds: 30_000,
       warmups: 2,
     })
+    assert.deepEqual(parseBenchmarkArguments(['--profile', 'ci']), {
+      budget: undefined,
+      output: undefined,
+      profile: 'ci',
+      records: [0, 100, 1000],
+      repetitions: 1,
+      timeoutMilliseconds: 30_000,
+      warmups: 0,
+    })
     assert.deepEqual(
       parseBenchmarkArguments([
         '--profile=ci',

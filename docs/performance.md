@@ -18,7 +18,7 @@ bun run benchmark:check
 
 The profiles are fixed:
 
-- `ci`: 0 and 100 records, no warmup, one measured sample;
+- `ci`: 0, 100, and 1,000 records, no warmup, one measured sample;
 - `baseline` (the default): 0 and 100 records, one warmup and three measured samples;
 - `full`: 0, 100, and 1,000 records, two warmups and five measured samples.
 
@@ -40,11 +40,13 @@ The committed schema-version 2 baseline was measured on Node.js v26.5.0 on darwi
 
 | Records | Cold hydrate | Unchanged prepare | Stale prepare | Compact search | Full search | Gather | Cache amplification |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 11.2 / 11.5 ms | 4.5 / 4.8 ms | n/a | 5.0 / 5.1 ms | 5.0 / 5.1 ms | 5.5 / 5.6 ms | n/a |
-| 100 | 35.4 / 35.5 ms | 15.7 / 16.2 ms | 56.1 / 56.5 ms | 17.4 / 17.8 ms | 16.7 / 16.9 ms | 308.0 / 310.8 ms | 2.46x |
-| 1,000 | 208.7 / 210.5 ms | 85.0 / 85.9 ms | 377.3 / 380.5 ms | 94.7 / 94.9 ms | 88.5 / 102.0 ms | 3.08 / 3.20 s | 2.32x |
+| 0 | 30.5 / 32.1 ms | 5.3 / 5.4 ms | n/a | 5.9 / 6.0 ms | 5.9 / 5.9 ms | 6.4 / 6.5 ms | n/a |
+| 100 | 103.0 / 104.0 ms | 50.5 / 57.0 ms | 126.2 / 128.4 ms | 54.6 / 55.5 ms | 51.1 / 52.8 ms | 344.1 / 345.4 ms | 2.46x |
+| 1,000 | 666.0 / 673.3 ms | 382.0 / 392.3 ms | 885.4 / 890.1 ms | 417.7 / 519.2 ms | 399.4 / 409.6 ms | 3.37 / 3.38 s | 2.32x |
 
-The CI profile intentionally runs only 0 and 100 records with one measured process and generous ceilings. It catches runaway cache rebuild, automatic preparation, search, gather, and cache-size regressions without treating noisy cross-platform timings as precise performance claims. Stable comparisons should use the full profile and its distributions.
+The CI profile runs 0, 100, and 1,000 records with one measured process and generous ceilings. The product-limit case explicitly budgets the preparation/integrity phase that proves canonical/cache record equivalence, as well as total operation latency and cache size. It catches runaway cache rebuild, automatic preparation, search, gather, equivalence validation, and cache-size regressions without treating noisy cross-platform timings as precise performance claims. Stable comparisons should use the full profile and its distributions.
+
+At 1,000 records, canonical/cache equality validation is included in the measured preparation/integrity phase: median / p95 is 382.0 / 392.3 ms for unchanged preparation and 257.0 / 267.7 ms for list. Across list, show, compact search, full search, and gather, that phase remains below 300 ms p95 in this full profile; unchanged preparation is reported separately above. The committed product-limit budget permits at most 10 seconds for each read preparation/integrity phase, leaving cross-platform headroom while still detecting unbounded or duplicated validation work.
 
 ## Single-pass read comparison
 
@@ -90,7 +92,7 @@ The deterministic work counts are the regression authority: every measured snaps
 
 ## Scale guidance
 
-The current full-rebuild cache is suitable for repository knowledge bases up to the product limit of 1,000 canonical records. On the baseline machine, cold hydration remained near a quarter second at that limit; unchanged prepare, list, show, and search remained near or below two tenths of a second, stale rebuilding remained below half a second, and the maximum-envelope duplicate-heavy gather remained the expensive path because it still constructs and charges every requested output occurrence.
+The current full-rebuild cache is suitable for repository knowledge bases up to the product limit of 1,000 canonical records. On the baseline machine, cold hydration remained below 0.7 seconds at that limit; unchanged prepare, list, show, and full search remained near 0.4 seconds, stale rebuilding remained below 0.9 seconds, and the maximum-envelope duplicate-heavy gather remained the expensive path because it still constructs and charges every requested output occurrence.
 
 Prefer specific terms, compact search, and targeted `show` calls when exploring larger corpora. Explicit record counts above the product limit remain exploratory and still fail if canonical record or byte budgets are exceeded.
 

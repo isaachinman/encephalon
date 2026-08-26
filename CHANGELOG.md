@@ -23,6 +23,7 @@ All notable changes to Encephalon are documented here.
 - Verified each bounded cached FTS row against the exact UTF-8 search projection derived from its cached record before serving reads or mutating an existing cache.
 - Validated each successful public cache read once and materialised its result from the same verified SQLite transaction, removing the duplicate preparation pass.
 - Rebuilt the disposable cache from the strictly validated add/init mutation snapshot, with identity-bound acceptance, deterministic bounded disk fallback, and unchanged public and post-commit error semantics.
+- Proved every accepted disposable-cache record corpus exactly equals the current validated canonical JSON snapshot before reads, with schema-version-1 read compatibility and automatic schema-version-2 preparation.
 - Deduplicated exact repeated gather shows and searches within each verified cache snapshot while preserving duplicate output order, independent result values, retry isolation, and per-occurrence response charging.
 - Preserved Unicode letter and number terms in literal FTS queries with shared NFC normalization for queries and derived cache search documents.
 - Made compact search avoid materialising full record JSON and removed persistent-style copying from hot scans.

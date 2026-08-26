@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
@@ -197,6 +197,16 @@ describe('canonical directory generation', () => {
     mkdirSync(directory)
     writeFileSync(join(directory, 'alpha'), '')
     writeFileSync(join(directory, 'beta'), '')
+
+    assert.equal(same(first, recapture(first)), false)
+  })
+
+  test('detects changed directory metadata with identical identity, names, and types', () => {
+    const { recapture, same } = generationExports()
+    const { directory } = createGenerationDirectory()
+    const first = canonicalLayout.captureCanonicalDirectory(directory, 2)
+
+    utimesSync(directory, new Date(0), new Date(0))
 
     assert.equal(same(first, recapture(first)), false)
   })
