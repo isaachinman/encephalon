@@ -90,12 +90,25 @@ type RecordScan = {
   bytes: number
   layout?: CanonicalLayoutWitness
   observations: RecordObservation[]
+  rejections: RecordRejectionEvidence[]
+  rootObservation?: PathObservation
 }
 
 type RecordObservation = {
   digest: string
   metadata: BigIntStats
   path: string
+}
+
+type PathObservation = {
+  metadata: BigIntStats
+  path: string
+}
+
+type RecordRejectionEvidence = PathObservation & {
+  kindIdentity: EntryIdentity
+  kindPath: string
+  reason: 'metadata' | 'unreadable'
 }
 
 type ValidatedRecordScan = {
@@ -109,6 +122,7 @@ class CanonicalGenerationChanged extends Error {}
 type CanonicalSnapshotRetryLedger = {
   readonly deadline: number
   readonly maximumAttempts: number
+  readonly now: () => number
   attempt: number
 }
 
@@ -178,7 +192,15 @@ type AddRecordTestHooks = RecordWriteHooks & {
 /** @internal */
 export const recordWriteTestHooks: AddRecordTestHooks = {}
 
-type RecordReadFault = 'after-record-fstat' | 'after-record-lstat' | 'after-record-open' | 'after-record-read'
+type RecordReadFault =
+  | 'after-record-fstat'
+  | 'after-record-lstat'
+  | 'after-record-open'
+  | 'after-record-read'
+  | 'before-kind-lstat'
+  | 'before-parent-lstat'
+  | 'before-record-open'
+  | 'before-rejected-record-read'
 
 type RecordWork =
   | 'active-group-read'
@@ -205,6 +227,7 @@ export type RecordReadHooks = {
   beforeFinalWitnessValidation?: (() => void) | undefined
   fault?: (point: RecordReadFault, path: string) => void
   graphValidation?: () => void
+  now?: (() => number) | undefined
   onWork?: ((operation: RecordWork) => void) | undefined
 }
 
@@ -333,6 +356,9 @@ const canonicalRecordBytes = (record: BrainRecord) => {
 
 const directoryFlag = constants.O_DIRECTORY ?? 0
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
+const nonBlockFlag = constants.O_NONBLOCK ?? 0
+const noControllingTerminalFlag = constants.O_NOCTTY ?? 0
+const recordOpenFlags = constants.O_RDONLY | noFollowFlag | nonBlockFlag | noControllingTerminalFlag
 /** @internal */
 export const MAX_CANONICAL_RECORDS = CANONICAL_BUDGETS.records
 /** @internal */
@@ -411,16 +437,7 @@ const fsyncDirectory = (path: string) => {
   }
 }
 
-const assertParentIdentity = (path: string, expected: EntryIdentity) => {
-  const metadata = lstatSync(path, { bigint: true })
-  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameEntryIdentity(metadata, expected)) {
-    canonicalGenerationChanged()
-  }
-}
-
-const invalidRecordReadChange = (): never => fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
-
-const readBoundedDescriptor = (descriptor: number, size: bigint, changed: () => never = invalidRecordReadChange) => {
+const readBoundedDescriptor = (descriptor: number, size: bigint, changed: () => never) => {
   const boundedSize = Number(size)
   const buffer = Buffer.alloc(boundedSize)
   let offset = 0
@@ -436,6 +453,88 @@ const readBoundedDescriptor = (descriptor: number, size: bigint, changed: () => 
     return changed()
   }
   return buffer
+}
+
+const invalidChangedRecord = (): never => fail('INVALID_ARGUMENT', 'Record file changed while it was being read.')
+
+const currentRecordPathMetadata = (path: string, changed: () => never) => {
+  try {
+    return lstatSync(path, { bigint: true })
+  } catch (error) {
+    if (isCanonicalDirectoryReplacementError(error)) {
+      return changed()
+    }
+    throw preserveRecordAuthorityError(error)
+  }
+}
+
+const isRecordReadabilityError = (error: unknown) => {
+  const { code } = error as NodeJS.ErrnoException
+  return code === 'EACCES' || code === 'EPERM'
+}
+
+const pathSafeRecordOperationalError = (error: unknown) => {
+  const { code } = error as NodeJS.ErrnoException
+  return typeof code === 'string' ? Object.assign(new Error('A record filesystem operation failed.'), { code }) : error
+}
+
+const preserveRecordAuthorityError = (error: unknown) =>
+  error instanceof CanonicalGenerationChanged || error instanceof EncephalonError
+    ? error
+    : pathSafeRecordOperationalError(error)
+
+const assertParentIdentity = (path: string, expected: EntryIdentity, changed: () => never, hooks?: RecordReadHooks) => {
+  let metadata: BigIntStats
+  try {
+    readFault(hooks, 'before-parent-lstat', path)
+    metadata = lstatSync(path, { bigint: true })
+  } catch (error) {
+    if (isCanonicalDirectoryReplacementError(error)) {
+      return changed()
+    }
+    throw preserveRecordAuthorityError(error)
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameEntryIdentity(metadata, expected)) {
+    return changed()
+  }
+}
+
+const openObservedRecordDescriptor = (
+  path: string,
+  expected: BigIntStats,
+  changed: () => never,
+  hooks?: RecordReadHooks,
+) => {
+  let descriptor: number
+  try {
+    readFault(hooks, 'before-record-open', path)
+    descriptor = openSync(path, recordOpenFlags)
+  } catch (error) {
+    if (error instanceof CanonicalGenerationChanged || error instanceof EncephalonError) {
+      throw error
+    }
+    const current = currentRecordPathMetadata(path, changed)
+    if (!sameStableEntryMetadata(expected, current)) {
+      return changed()
+    }
+    throw pathSafeRecordOperationalError(error)
+  }
+  let metadata: BigIntStats
+  try {
+    metadata = fstatSync(descriptor, { bigint: true })
+  } catch (error) {
+    try {
+      closeSync(descriptor)
+    } catch {}
+    throw preserveRecordAuthorityError(error)
+  }
+  if (!(metadata.isFile() && sameStableEntryMetadata(expected, metadata))) {
+    try {
+      closeSync(descriptor)
+    } catch {}
+    return changed()
+  }
+  return { descriptor, metadata }
 }
 
 const decodeRecordBytes = (bytes: Buffer) => {
@@ -455,13 +554,13 @@ const parseRecordJson = (content: string) => {
 }
 
 const readRecord = (
-  root: string,
   path: string,
   kindPath: string,
   kindIdentity: EntryIdentity,
   hooks?: RecordReadHooks,
-): { bytes: Buffer; observation: RecordObservation } => {
-  const relativePath = posixRelative(root, path)
+):
+  | { bytes: Buffer; kind: 'accepted'; observation: RecordObservation }
+  | { evidence: RecordRejectionEvidence; kind: 'rejected'; message: string } => {
   let pathMetadata: BigIntStats
   try {
     pathMetadata = lstatSync(path, { bigint: true })
@@ -473,30 +572,43 @@ const readRecord = (
   }
   readFault(hooks, 'after-record-lstat', path)
   let descriptor: number | undefined
+  let descriptorMetadata: BigIntStats | undefined
   try {
-    descriptor = openSync(path, constants.O_RDONLY | noFollowFlag)
+    if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink()) {
+      return canonicalGenerationChanged()
+    }
+    const { descriptor: openedDescriptor, metadata: openedMetadata } = openObservedRecordDescriptor(
+      path,
+      pathMetadata,
+      canonicalGenerationChanged,
+      hooks,
+    )
+    descriptor = openedDescriptor
+    descriptorMetadata = openedMetadata
     readFault(hooks, 'after-record-open', path)
-    const metadata = fstatSync(descriptor, { bigint: true })
-    assertParentIdentity(kindPath, kindIdentity)
-    if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink() || !metadata.isFile()) {
-      return canonicalGenerationChanged()
-    }
-    if (!sameStableEntryMetadata(pathMetadata, metadata)) {
-      return canonicalGenerationChanged()
-    }
-    if (metadata.size > BigInt(MAX_RECORD_BYTES)) {
-      return fail('INVALID_ARGUMENT', 'Record file exceeds the 1 MiB limit.', {
-        path: relativePath,
-      })
+    assertParentIdentity(kindPath, kindIdentity, canonicalGenerationChanged, hooks)
+    if (descriptorMetadata.size > BigInt(MAX_RECORD_BYTES)) {
+      return {
+        evidence: {
+          kindIdentity,
+          kindPath,
+          metadata: Object.freeze(descriptorMetadata),
+          path,
+          reason: 'metadata',
+        },
+        kind: 'rejected',
+        message: 'Record file exceeds the 1 MiB limit.',
+      }
     }
     readFault(hooks, 'after-record-fstat', path)
-    const bytes = readBoundedDescriptor(descriptor, metadata.size, canonicalGenerationChanged)
+    const bytes = readBoundedDescriptor(descriptor, descriptorMetadata.size, canonicalGenerationChanged)
     const finalMetadata = fstatSync(descriptor, { bigint: true })
-    if (!sameStableEntryMetadata(metadata, finalMetadata)) {
+    if (!sameStableEntryMetadata(descriptorMetadata, finalMetadata)) {
       return canonicalGenerationChanged()
     }
     return {
       bytes,
+      kind: 'accepted',
       observation: Object.freeze({
         digest: recordDigest(bytes),
         metadata: Object.freeze(finalMetadata),
@@ -513,9 +625,25 @@ const readRecord = (
     if (isCanonicalDirectoryReplacementError(error)) {
       return canonicalGenerationChanged()
     }
-    return fail('INVALID_ARGUMENT', 'Record file must be a readable regular non-symlink JSON file.', {
-      path: relativePath,
-    })
+    const current = currentRecordPathMetadata(path, canonicalGenerationChanged)
+    assertParentIdentity(kindPath, kindIdentity, canonicalGenerationChanged, hooks)
+    if (!sameStableEntryMetadata(pathMetadata, current)) {
+      return canonicalGenerationChanged()
+    }
+    if (!isRecordReadabilityError(error)) {
+      throw pathSafeRecordOperationalError(error)
+    }
+    return {
+      evidence: {
+        kindIdentity,
+        kindPath,
+        metadata: Object.freeze(descriptorMetadata ?? current),
+        path,
+        reason: 'unreadable',
+      },
+      kind: 'rejected',
+      message: 'Record file must be a readable regular non-symlink JSON file.',
+    }
   } finally {
     if (descriptor !== undefined) {
       closeSync(descriptor)
@@ -554,6 +682,8 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
         errors: [issue('INVALID_RECORD_LAYOUT', 'encephalon must be a real directory.', 'encephalon')],
         observations: [],
         records: [],
+        rejections: [],
+        rootObservation: { metadata: Object.freeze(rootMetadata), path: brainDirectory },
       }
     }
 
@@ -572,8 +702,10 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       return {
         bytes: 0,
         errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_BRAIN_ROOT_ENTRIES)],
+        layout: { kinds: new Map(), root: rootEntries },
         observations: [],
         records: [],
+        rejections: [],
       }
     }
     const kindEntries = rootEntries.entries.filter(isCanonicalKindDirectoryEntry)
@@ -581,8 +713,10 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       return {
         bytes: 0,
         errors: [directoryEntryLimitIssue('encephalon', MAX_CANONICAL_KIND_DIRECTORIES, 'kind directories')],
+        layout: { kinds: new Map(), root: rootEntries },
         observations: [],
         records: [],
+        rejections: [],
       }
     }
     const kindSnapshots = new Map<string, CanonicalDirectorySnapshot>()
@@ -598,19 +732,27 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
         }
         throw error
       }
+      kindSnapshots.set(kindEntry.name, snapshot)
       if (snapshot.overflow) {
         return {
           bytes: 0,
           errors: [directoryEntryLimitIssue(relativeKindPath, MAX_CANONICAL_KIND_ENTRIES)],
+          layout: { kinds: kindSnapshots, root: rootEntries },
           observations: [],
           records: [],
+          rejections: [],
         }
       }
-      kindSnapshots.set(kindEntry.name, snapshot)
     }
 
     const kindDirectoryNames = new Map<string, string>()
-    const scanned: RecordScan = { bytes: 0, errors: [], observations: [], records: [] }
+    const scanned: RecordScan = {
+      bytes: 0,
+      errors: [],
+      observations: [],
+      records: [],
+      rejections: [],
+    }
     const onWork = options.hooks?.onWork
     let recordBytes = 0n
     let stopScanning = false
@@ -637,7 +779,16 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       } else {
         const kindPath = join(brainDirectory, kindEntry.name)
         if (isCanonicalKindDirectoryEntry(kindEntry)) {
-          const kindMetadata = lstatSync(kindPath, { bigint: true })
+          let kindMetadata: BigIntStats
+          try {
+            readFault(options.hooks, 'before-kind-lstat', kindPath)
+            kindMetadata = lstatSync(kindPath, { bigint: true })
+          } catch (error) {
+            if (isCanonicalDirectoryReplacementError(error)) {
+              return canonicalGenerationChanged()
+            }
+            throw error
+          }
           if (!kindMetadata.isDirectory() || kindMetadata.isSymbolicLink()) {
             addScanError(
               issue(
@@ -681,7 +832,6 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
             const recordPath = join(kindPath, recordEntry.name)
             const relativePath = posixRelative(root, recordPath)
             if (recordEntry.isFile() && !recordEntry.isSymbolicLink() && recordEntry.name.endsWith('.json')) {
-              const metadata = lstatSync(recordPath, { bigint: true })
               if (scanned.records.length >= MAX_CANONICAL_RECORDS) {
                 addScanError(
                   corpusIssue(
@@ -693,21 +843,26 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
                 stopScanning = true
                 break
               }
-              if (recordBytes + metadata.size > BigInt(MAX_CANONICAL_RECORD_BYTES)) {
-                addScanError(
-                  corpusIssue(
-                    'CORPUS_BYTE_LIMIT',
-                    `Canonical corpus may contain at most ${MAX_CANONICAL_RECORD_BYTES} bytes of record JSON.`,
-                    relativePath,
-                  ),
-                )
-                stopScanning = true
-                break
-              }
-              recordBytes += metadata.size
               try {
-                const observed = readRecord(root, recordPath, kindPath, kindIdentity, options.hooks)
+                const observed = readRecord(recordPath, kindPath, kindIdentity, options.hooks)
+                if (observed.kind === 'rejected') {
+                  scanned.rejections.push(observed.evidence)
+                  addScanError(issue('INVALID_RECORD', observed.message, relativePath))
+                  continue
+                }
                 scanned.observations.push(observed.observation)
+                if (recordBytes + observed.observation.metadata.size > BigInt(MAX_CANONICAL_RECORD_BYTES)) {
+                  addScanError(
+                    corpusIssue(
+                      'CORPUS_BYTE_LIMIT',
+                      `Canonical corpus may contain at most ${MAX_CANONICAL_RECORD_BYTES} bytes of record JSON.`,
+                      relativePath,
+                    ),
+                  )
+                  stopScanning = true
+                  break
+                }
+                recordBytes += observed.observation.metadata.size
                 const record = parseObservedRecord(root, recordPath, observed.bytes)
                 const expectedName = `${record.id}.json`
                 if (!(recordEntry.name === expectedName && record.kind === kindEntry.name)) {
@@ -725,8 +880,11 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
                 if (error instanceof CanonicalGenerationChanged) {
                   throw error
                 }
-                const message = error instanceof Error ? error.message : 'Record could not be parsed.'
-                addScanError(issue('INVALID_RECORD', message, relativePath))
+                if (error instanceof EncephalonError && error.code === 'INVALID_ARGUMENT') {
+                  addScanError(issue('INVALID_RECORD', error.message, relativePath))
+                } else {
+                  throw error
+                }
               }
             } else {
               addScanError(
@@ -779,9 +937,17 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
         (first, second) =>
           ordinalStringCompare(first.createdAt, second.createdAt) || ordinalStringCompare(first.id, second.id),
       ),
+      rejections: scanned.rejections,
     }
   }
-  return { bytes: 0, errors: [], layout: { kinds: new Map(), root: null }, observations: [], records: [] }
+  return {
+    bytes: 0,
+    errors: [],
+    layout: { kinds: new Map(), root: null },
+    observations: [],
+    records: [],
+    rejections: [],
+  }
 }
 
 const duplicateAndCaseIssues = (records: BrainRecord[], hooks: RecordReadHooks) => {
@@ -1029,20 +1195,28 @@ const corpusBudgetIssues = (scan: RecordScan) => {
   ]
 }
 
-const validatedArtifactIssues = (root: string, records: BrainRecord[]) => {
+const validatedArtifactIssues = (root: string, records: BrainRecord[], changed?: (() => never) | undefined) => {
   try {
     return artifactIssues(root, records)
   } catch (error) {
     if (error instanceof ArtifactChangedError) {
+      if (changed !== undefined) {
+        return changed()
+      }
       return fail('REPOSITORY_CHANGED', 'An artifact changed while canonical records were being validated.')
     }
     throw error
   }
 }
 
-const validateScannedSnapshot = (root: string, scan: RecordScan, hooks: RecordReadHooks = {}): ValidatedRecordScan => {
+const validateScannedSnapshot = (
+  root: string,
+  scan: RecordScan,
+  hooks: RecordReadHooks = {},
+  changed?: (() => never) | undefined,
+): ValidatedRecordScan => {
   hooks.graphValidation?.()
-  const artifactValidation = validatedArtifactIssues(root, scan.records)
+  const artifactValidation = validatedArtifactIssues(root, scan.records, changed)
   const collectedErrors = [
     ...scan.errors,
     ...corpusBudgetIssues(scan),
@@ -1073,10 +1247,11 @@ const canonicalGenerationChanged = (): never => {
 const canonicalSnapshotRetryExhausted = (): never =>
   fail('REPOSITORY_CHANGED', 'The canonical repository changed repeatedly during the operation.')
 
-const createCanonicalSnapshotRetryLedger = (): CanonicalSnapshotRetryLedger => ({
+const createCanonicalSnapshotRetryLedger = (now: () => number = Date.now): CanonicalSnapshotRetryLedger => ({
   attempt: 0,
-  deadline: Date.now() + OPERATION_BUDGETS.canonicalSnapshotRetryMilliseconds.maximum,
+  deadline: now() + OPERATION_BUDGETS.canonicalSnapshotRetryMilliseconds.maximum,
   maximumAttempts: OPERATION_BUDGETS.canonicalSnapshotAttempts.maximum,
+  now,
 })
 
 const canonicalRootMissing = (root: string) => {
@@ -1113,41 +1288,16 @@ const sameCanonicalLayoutGeneration = (root: string, layout: CanonicalLayoutWitn
   return current
 }
 
-const currentRecordObservationMetadata = (path: string, changed: () => never) => {
-  try {
-    return lstatSync(path, { bigint: true })
-  } catch (error) {
-    if (isCanonicalDirectoryReplacementError(error)) {
-      return changed()
-    }
-    throw error
-  }
-}
-
-const readObservedRecordBytes = (descriptor: number, size: bigint, changed: () => never) => {
-  const boundedSize = Number(size)
-  const bytes = Buffer.alloc(boundedSize)
-  let offset = 0
-  while (offset < boundedSize) {
-    const bytesRead = readSync(descriptor, bytes, offset, boundedSize - offset, offset)
-    if (bytesRead === 0) {
-      return changed()
-    }
-    offset += bytesRead
-  }
-  const extra = Buffer.alloc(1)
-  if (readSync(descriptor, extra, 0, 1, boundedSize) > 0) {
-    return changed()
-  }
-  return bytes
-}
-
-const reinspectRecordObservation = (observation: RecordObservation, changed: () => never): RecordObservation => {
+const reinspectRecordObservation = (
+  observation: RecordObservation,
+  changed: () => never,
+  hooks: RecordReadHooks,
+): RecordObservation => {
   let descriptor: number | undefined
   let primaryError: unknown
   let result: RecordObservation | undefined
   try {
-    const pathMetadata = currentRecordObservationMetadata(observation.path, changed)
+    const pathMetadata = currentRecordPathMetadata(observation.path, changed)
     if (
       !pathMetadata.isFile() ||
       pathMetadata.isSymbolicLink() ||
@@ -1155,14 +1305,16 @@ const reinspectRecordObservation = (observation: RecordObservation, changed: () 
     ) {
       changed()
     }
-    descriptor = openSync(observation.path, constants.O_RDONLY | noFollowFlag)
-    const descriptorMetadata = fstatSync(descriptor, { bigint: true })
-    if (!sameStableEntryMetadata(pathMetadata, descriptorMetadata)) {
-      changed()
-    }
-    const bytes = readObservedRecordBytes(descriptor, observation.metadata.size, changed)
+    const { descriptor: openedDescriptor } = openObservedRecordDescriptor(
+      observation.path,
+      pathMetadata,
+      changed,
+      hooks,
+    )
+    descriptor = openedDescriptor
+    const bytes = readBoundedDescriptor(descriptor, observation.metadata.size, changed)
     const finalDescriptorMetadata = fstatSync(descriptor, { bigint: true })
-    const finalPathMetadata = currentRecordObservationMetadata(observation.path, changed)
+    const finalPathMetadata = currentRecordPathMetadata(observation.path, changed)
     if (
       !(
         sameStableEntryMetadata(observation.metadata, finalDescriptorMetadata) &&
@@ -1200,6 +1352,70 @@ const reinspectRecordObservation = (observation: RecordObservation, changed: () 
   return result ?? changed()
 }
 
+const assertPathObservationCurrent = (observation: PathObservation, changed: () => never) => {
+  const current = currentRecordPathMetadata(observation.path, changed)
+  if (!sameStableEntryMetadata(observation.metadata, current)) {
+    return changed()
+  }
+}
+
+const assertRejectedRecordEvidenceCurrent = (
+  evidence: RecordRejectionEvidence,
+  changed: () => never,
+  hooks: RecordReadHooks,
+) => {
+  assertPathObservationCurrent(evidence, changed)
+  assertParentIdentity(evidence.kindPath, evidence.kindIdentity, changed, hooks)
+  if (evidence.reason === 'metadata') {
+    return
+  }
+  let descriptor: number | undefined
+  let primaryError: unknown
+  let becameReadable = false
+  try {
+    const { descriptor: openedDescriptor, metadata } = openObservedRecordDescriptor(
+      evidence.path,
+      evidence.metadata,
+      changed,
+      hooks,
+    )
+    descriptor = openedDescriptor
+    if (metadata.size > BigInt(MAX_RECORD_BYTES)) {
+      return changed()
+    }
+    readFault(hooks, 'before-rejected-record-read', evidence.path)
+    readBoundedDescriptor(descriptor, metadata.size, changed)
+    becameReadable = true
+  } catch (error) {
+    if (error instanceof CanonicalGenerationChanged) {
+      throw error
+    }
+    primaryError = error
+  }
+  let closeError: unknown
+  if (descriptor !== undefined) {
+    try {
+      closeSync(descriptor)
+    } catch (error) {
+      closeError = error
+    }
+  }
+  if (primaryError !== undefined) {
+    assertPathObservationCurrent(evidence, changed)
+    assertParentIdentity(evidence.kindPath, evidence.kindIdentity, changed, hooks)
+    if (isRecordReadabilityError(primaryError)) {
+      return
+    }
+    throw preserveRecordAuthorityError(primaryError)
+  }
+  if (closeError !== undefined) {
+    throw closeError
+  }
+  if (becameReadable) {
+    return changed()
+  }
+}
+
 const artifactEvidencePath = (evidence: ArtifactInspectionResult) =>
   evidence.kind === 'stable' ? evidence.observation.path : evidence.path
 
@@ -1233,13 +1449,21 @@ const assertCanonicalSnapshotCurrent = (
   scan: RecordScan,
   artifactEvidence: readonly ArtifactInspectionResult[],
   changed: () => never,
+  hooks: RecordReadHooks = {},
 ) => {
+  if (scan.rootObservation !== undefined) {
+    assertPathObservationCurrent(scan.rootObservation, changed)
+  }
   if (scan.layout !== undefined) {
     if (!sameCanonicalLayoutGeneration(root, scan.layout)) {
       changed()
     }
     scan.observations.reduce<undefined>((verified, observation) => {
-      reinspectRecordObservation(observation, changed)
+      reinspectRecordObservation(observation, changed, hooks)
+      return verified
+    }, undefined)
+    scan.rejections.reduce<undefined>((verified, evidence) => {
+      assertRejectedRecordEvidenceCurrent(evidence, changed, hooks)
       return verified
     }, undefined)
     assertArtifactEvidenceCurrent(root, artifactEvidence, changed)
@@ -1253,7 +1477,7 @@ const withCanonicalSnapshotRetry = <Result>(
   operation: () => Result,
   ledger: CanonicalSnapshotRetryLedger = createCanonicalSnapshotRetryLedger(),
 ): Result => {
-  if (ledger.attempt > 0 && Date.now() >= ledger.deadline) {
+  if (ledger.attempt >= ledger.maximumAttempts || (ledger.attempt > 0 && ledger.now() >= ledger.deadline)) {
     return canonicalSnapshotRetryExhausted()
   }
   ledger.attempt += 1
@@ -1270,22 +1494,27 @@ const withCanonicalSnapshotRetry = <Result>(
   }
 }
 
+const readCanonicalSnapshotAttempt = (root: string, hooks: RecordReadHooks = {}): StableCanonicalSnapshot => {
+  hooks.canonicalScan?.()
+  const scan = scanCanonicalRecords(root, { hooks })
+  const validation = validateScannedSnapshot(root, scan, hooks, canonicalGenerationChanged)
+  assertCanonicalSnapshotCurrent(root, scan, validation.artifactEvidence, canonicalGenerationChanged, hooks)
+  return { scan, validation }
+}
+
 const readStableCanonicalSnapshot = (root: string, hooks: RecordReadHooks = {}): StableCanonicalSnapshot =>
-  withCanonicalSnapshotRetry(() => {
-    hooks.canonicalScan?.()
-    const scan = scanCanonicalRecords(root, { hooks })
-    const validation = validateScannedSnapshot(root, scan, hooks)
-    assertCanonicalSnapshotCurrent(root, scan, validation.artifactEvidence, canonicalGenerationChanged)
-    return { scan, validation }
-  })
+  withCanonicalSnapshotRetry(
+    () => readCanonicalSnapshotAttempt(root, hooks),
+    createCanonicalSnapshotRetryLedger(hooks.now),
+  )
 
 const readStableCanonicalPlanningScan = (root: string, hooks: RecordReadHooks = {}) =>
   withCanonicalSnapshotRetry(() => {
     hooks.canonicalScan?.()
     const scan = scanCanonicalRecords(root, { hooks })
-    assertCanonicalSnapshotCurrent(root, scan, [], canonicalGenerationChanged)
+    assertCanonicalSnapshotCurrent(root, scan, [], canonicalGenerationChanged, hooks)
     return scan
-  })
+  }, createCanonicalSnapshotRetryLedger(hooks.now))
 
 const allowedMultiHeadRecordIds = (
   records: readonly BrainRecord[],
@@ -1347,8 +1576,12 @@ export const validateRecords = (input: RootInput = {}): ValidateResult => {
   return validateRecordsResolved(root)
 }
 
-const readRecordScanResolvedUnchecked = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
-  const { scan, validation } = readStableCanonicalSnapshot(root, hooks)
+const acceptValidatedRecordScan = (
+  snapshot: StableCanonicalSnapshot,
+  hooks: RecordReadHooks,
+  allowed?: AllowedMultiHead[],
+) => {
+  const { scan, validation } = snapshot
   const { result } = validation
   if (allowed === undefined) {
     if (result.valid) {
@@ -1377,6 +1610,24 @@ const readRecordScanResolvedUnchecked = (root: string, hooks: RecordReadHooks = 
   })
 }
 
+const readRecordScanResolvedUnchecked = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
+  acceptValidatedRecordScan(readStableCanonicalSnapshot(root, hooks), hooks, allowed)
+
+const readRecordScanAttemptResolvedUnchecked = (
+  root: string,
+  hooks: RecordReadHooks = {},
+  allowed?: AllowedMultiHead[],
+) => {
+  try {
+    return acceptValidatedRecordScan(readCanonicalSnapshotAttempt(root, hooks), hooks, allowed)
+  } catch (error) {
+    if (error instanceof CanonicalGenerationChanged) {
+      return fail('REPOSITORY_CHANGED', 'The canonical repository changed during the operation.')
+    }
+    throw error
+  }
+}
+
 const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
   preserveWorkObserverFailure(() => readRecordScanResolvedUnchecked(root, hooks, allowed))
 
@@ -1390,12 +1641,10 @@ const canonicalPublicationAuthority = (
   root: string,
   initialLayout: CanonicalLayoutWitness,
   initialObservations: readonly RecordObservation[],
-  initialArtifactEvidence: readonly ArtifactInspectionResult[],
   cacheLocation?: CacheLocation,
 ): CanonicalPublicationAuthority => {
   let layout = initialLayout
   let observations = [...initialObservations]
-  const artifactEvidence = [...initialArtifactEvidence]
   const currentObservationMetadata = (path: string) => {
     try {
       return lstatSync(path, { bigint: true })
@@ -1405,6 +1654,13 @@ const canonicalPublicationAuthority = (
         return repositoryChangedBeforePublication()
       }
       throw error
+    }
+  }
+  const assertObservedRecordsCurrent = () => {
+    for (const observation of observations) {
+      if (!sameStableEntryMetadata(observation.metadata, currentObservationMetadata(observation.path))) {
+        return repositoryChangedBeforePublication()
+      }
     }
   }
   const inspectObservation = (observation: RecordObservation): RecordObservation => {
@@ -1421,7 +1677,7 @@ const canonicalPublicationAuthority = (
       if (!sameStableEntryMetadata(pathMetadata, descriptorMetadata)) {
         repositoryChangedBeforePublication()
       }
-      const bytes = readBoundedDescriptor(descriptor, descriptorMetadata.size)
+      const bytes = readBoundedDescriptor(descriptor, descriptorMetadata.size, invalidChangedRecord)
       const finalDescriptorMetadata = fstatSync(descriptor, { bigint: true })
       const finalPathMetadata = currentObservationMetadata(observation.path)
       if (
@@ -1490,7 +1746,8 @@ const canonicalPublicationAuthority = (
       const kindGenerationAccepted =
         previousKind === undefined
           ? kindSnapshot.entries.length === 0
-          : sameCanonicalDirectoryGeneration(previousKind, kindSnapshot)
+          : sameDirectoryGeneration(previousKind, kindSnapshot) &&
+            sameEntryNames(previousKind.entries, kindSnapshot.entries)
       if (!(rootGenerationAccepted && rootEntriesAccepted && kindGenerationAccepted)) {
         return repositoryChangedBeforePublication()
       }
@@ -1542,12 +1799,9 @@ const canonicalPublicationAuthority = (
       if (cacheLocation !== undefined) {
         assertCacheLocation(cacheLocation)
       }
-      assertCanonicalSnapshotCurrent(
-        root,
-        { bytes: 0, errors: [], layout, observations, records: [] },
-        artifactEvidence,
-        repositoryChangedBeforePublication,
-      )
+      assertObservedRecordsCurrent()
+      assertLayoutWitnessCurrent(root, layout)
+      assertObservedRecordsCurrent()
       if (cacheLocation !== undefined) {
         assertCacheLocation(cacheLocation)
       }
@@ -1564,20 +1818,11 @@ export const readRecordPlanningSnapshotResolved = (
   cacheLocation?: CacheLocation,
 ): RecordPlanningSnapshot => {
   const scan = readStableCanonicalPlanningScan(root, hooks)
-  let artifactEvidence: readonly ArtifactInspectionResult[] = []
-  let publicationAuthority: CanonicalPublicationAuthority | undefined
   const authority = () => {
     if (scan.layout === undefined) {
       return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')
     }
-    publicationAuthority ??= canonicalPublicationAuthority(
-      root,
-      scan.layout,
-      scan.observations,
-      artifactEvidence,
-      cacheLocation,
-    )
-    return publicationAuthority
+    return canonicalPublicationAuthority(root, scan.layout, scan.observations, cacheLocation)
   }
   const validateFinal = (
     records: readonly BrainRecord[],
@@ -1594,8 +1839,6 @@ export const readRecordPlanningSnapshotResolved = (
       },
       hooks,
     )
-    const { artifactEvidence: validatedArtifactEvidence, artifacts: validatedArtifacts } = validation
-    assertCanonicalSnapshotCurrent(root, scan, validatedArtifactEvidence, repositoryChangedBeforePublication)
     const blockingErrors = (() => {
       if (allowed === undefined) {
         return validation.result.errors
@@ -1607,8 +1850,7 @@ export const readRecordPlanningSnapshotResolved = (
       )
     })()
     if (blockingErrors.length === 0) {
-      artifactEvidence = validatedArtifactEvidence
-      return validatedArtifacts
+      return validation.artifacts
     }
     return fail('VALIDATION_FAILED', message, {
       errors: blockingErrors.map(error => ({
@@ -1621,7 +1863,7 @@ export const readRecordPlanningSnapshotResolved = (
     authority,
     bytes: scan.bytes,
     errors: Object.freeze([...scan.errors]),
-    records: freezeAcceptedRecords(scan.records),
+    records: Object.freeze([...scan.records]),
     validateFinal,
   })
 }
@@ -1636,7 +1878,7 @@ export const readValidatedRecordSnapshotResolved = (
   hooks: RecordReadHooks = {},
   allowed?: AllowedMultiHead[],
 ) => {
-  const validated = readRecordScanResolved(root, hooks, allowed)
+  const validated = preserveWorkObserverFailure(() => readRecordScanAttemptResolvedUnchecked(root, hooks, allowed))
   return Object.freeze({
     artifacts: validated.artifacts,
     records: freezeAcceptedRecords(validated.scan.records),
@@ -1650,13 +1892,13 @@ export const readRecordSnapshotResolved = (
   allowed?: AllowedMultiHead[],
   cacheLocation?: CacheLocation,
 ) => {
-  const { artifactEvidence, scan } = readRecordScanResolved(root, hooks, allowed)
+  const { scan } = readRecordScanResolved(root, hooks, allowed)
   if (scan.layout === undefined) {
     return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')
   }
   return {
-    authority: canonicalPublicationAuthority(root, scan.layout, scan.observations, artifactEvidence, cacheLocation),
-    records: freezeAcceptedRecords(scan.records),
+    authority: canonicalPublicationAuthority(root, scan.layout, scan.observations, cacheLocation),
+    records: scan.records,
   }
 }
 
@@ -1717,6 +1959,7 @@ export const assertRecordGraph = (
         errors: [],
         observations: [],
         records,
+        rejections: [],
       },
       hooks,
     ),
@@ -1734,6 +1977,35 @@ export const assertRecordGraph = (
 
 const repositoryChangedBeforePublication = (): never =>
   fail('REPOSITORY_CHANGED', 'Canonical layout changed before publication.')
+
+const assertLayoutWitnessCurrent = (root: string, layout: CanonicalLayoutWitness) => {
+  const brainDirectory = resolve(root, 'encephalon')
+  try {
+    if (layout.root === null) {
+      try {
+        const metadata = lstatSync(brainDirectory, { bigint: true })
+        if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+          return repositoryChangedBeforePublication()
+        }
+        return repositoryChangedBeforePublication()
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw error
+        }
+      }
+    } else {
+      for (const snapshot of layout.kinds.values()) {
+        revalidateCanonicalDirectory(snapshot)
+      }
+      revalidateCanonicalDirectory(layout.root)
+    }
+  } catch (error) {
+    if (isCanonicalDirectoryReplacementError(error)) {
+      return repositoryChangedBeforePublication()
+    }
+    throw error
+  }
+}
 
 /** @internal */
 export const projectedKindDirectoryOverflow = (

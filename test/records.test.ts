@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import {
+  chmodSync,
   existsSync,
   fsyncSync,
   linkSync,
@@ -21,6 +22,11 @@ import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
+import {
+  MAX_CANONICAL_BRAIN_ROOT_ENTRIES,
+  MAX_CANONICAL_KIND_DIRECTORIES,
+  MAX_CANONICAL_KIND_ENTRIES,
+} from '../src/canonical-layout.ts'
 import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
@@ -45,6 +51,7 @@ import { discoverRepository, repositoryTestHooks } from '../src/repository.ts'
 import {
   formatRecordFile,
   MAX_PAYLOAD_NODES,
+  MAX_RECORD_BYTES,
   parseRecordFile,
   validateAddRecordInput,
   validateJsonValue,
@@ -117,6 +124,15 @@ const assertErrorCode = (operation: () => unknown, code: string) => {
     assert.equal((error as { code?: unknown }).code, code)
     return true
   })
+}
+
+const causeChainText = (value: unknown, seen = new Set<object>()): string => {
+  if (value !== null && typeof value === 'object' && !seen.has(value)) {
+    seen.add(value)
+    const current = value instanceof Error ? `${value.name}: ${value.message}` : String(value)
+    return `${current}\n${causeChainText((value as { cause?: unknown }).cause, seen)}`
+  }
+  return String(value)
 }
 
 const assertCommittedRepositoryChange = (operation: () => unknown, path: string, recordId: string) => {
@@ -4302,6 +4318,891 @@ describe('canonical records', () => {
     )
     assert.equal(changes, 3)
     assert.deepEqual(counts, { canonicalScans: 3, graphValidations: 3 })
+  })
+
+  test('retries an invalid brain-root entry that becomes a valid directory during validation', () => {
+    const root = createRoot()
+    const brainDirectory = join(root, 'encephalon')
+    writeFileSync(brainDirectory, 'not a directory')
+    const counts = { canonicalScans: 0, graphValidations: 0 }
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        canonicalScan: () => {
+          counts.canonicalScans += 1
+        },
+        graphValidation: () => {
+          counts.graphValidations += 1
+          if (counts.graphValidations === 1) {
+            rmSync(brainDirectory)
+            mkdirSync(brainDirectory)
+          }
+        },
+      },
+    })
+
+    assert.deepEqual(result, { errors: [], recordsChecked: 0, truncated: false, valid: true })
+    assert.deepEqual(counts, { canonicalScans: 2, graphValidations: 2 })
+  })
+
+  test('retries invalid root, kind, and record entries that settle valid during closing validation', () => {
+    const scenarios = [
+      {
+        expectedRecords: 0,
+        prepare: (root: string) => {
+          const path = join(root, 'encephalon', 'settled-kind')
+          ensureParent(path)
+          writeFileSync(path, 'not a directory')
+          return () => {
+            rmSync(path)
+            mkdirSync(path)
+          }
+        },
+      },
+      {
+        expectedRecords: 1,
+        prepare: (root: string) => {
+          const path = join(root, 'encephalon', 'decision', 'settled-entry.json')
+          mkdirSync(path, { recursive: true })
+          return () => {
+            rmSync(path, { recursive: true })
+            writeCanonicalRecord(root, { id: 'settled-entry', subject: 'layout.settled-entry' })
+          }
+        },
+      },
+      {
+        expectedRecords: 1,
+        prepare: (root: string) => {
+          const path = join(root, 'encephalon', 'decision', 'settled-record.json')
+          ensureParent(path)
+          writeFileSync(path, '{"unfinished":')
+          return () => {
+            writeCanonicalRecord(root, { id: 'settled-record', subject: 'layout.settled-record' })
+          }
+        },
+      },
+    ] as const
+
+    for (const scenario of scenarios) {
+      const root = createRoot()
+      const settle = scenario.prepare(root)
+      let graphValidations = 0
+
+      const result = validateRecordsResolved(root, {
+        hooks: {
+          graphValidation: () => {
+            graphValidations += 1
+            if (graphValidations === 1) {
+              settle()
+            }
+          },
+        },
+      })
+
+      assert.deepEqual(result, {
+        errors: [],
+        recordsChecked: scenario.expectedRecords,
+        truncated: false,
+        valid: true,
+      })
+      assert.equal(graphValidations, 2)
+    }
+  })
+
+  test('retries root and kind directory overflows that settle within their exact bounds', () => {
+    const rootOverflow = createRoot()
+    const rootDirectory = join(rootOverflow, 'encephalon')
+    mkdirSync(join(rootDirectory, '_artifacts'), { recursive: true })
+    mkdirSync(join(rootDirectory, '_staging'))
+    const kindNames = Array.from(
+      { length: MAX_CANONICAL_KIND_DIRECTORIES + 1 },
+      (_, index) => `kind${index.toString().padStart(4, '0')}`,
+    )
+    for (const name of kindNames) {
+      mkdirSync(join(rootDirectory, name))
+    }
+    assert.equal(kindNames.length + 2, MAX_CANONICAL_BRAIN_ROOT_ENTRIES + 1)
+    let rootGraphValidations = 0
+
+    const rootResult = validateRecordsResolved(rootOverflow, {
+      hooks: {
+        graphValidation: () => {
+          rootGraphValidations += 1
+          if (rootGraphValidations === 1) {
+            rmSync(join(rootDirectory, kindNames.at(-1) as string), { recursive: true })
+          }
+        },
+      },
+    })
+
+    assert.deepEqual(rootResult, { errors: [], recordsChecked: 0, truncated: false, valid: true })
+    assert.equal(rootGraphValidations, 2)
+
+    const kindOverflow = createRoot()
+    for (const index of Array.from({ length: MAX_CANONICAL_KIND_ENTRIES + 1 }, (_, entryIndex) => entryIndex)) {
+      writeCanonicalRecord(kindOverflow, {
+        createdAt: timestampAt(index),
+        id: `overflow${index.toString().padStart(4, '0')}`,
+        subject: `overflow.kind.${index}`,
+      })
+    }
+    const overflowPath = join(
+      kindOverflow,
+      'encephalon',
+      'decision',
+      `overflow${MAX_CANONICAL_KIND_ENTRIES.toString().padStart(4, '0')}.json`,
+    )
+    let kindGraphValidations = 0
+
+    const kindResult = validateRecordsResolved(kindOverflow, {
+      hooks: {
+        graphValidation: () => {
+          kindGraphValidations += 1
+          if (kindGraphValidations === 1) {
+            rmSync(overflowPath)
+          }
+        },
+      },
+    })
+
+    assert.deepEqual(kindResult, {
+      errors: [],
+      recordsChecked: MAX_CANONICAL_KIND_ENTRIES,
+      truncated: false,
+      valid: true,
+    })
+    assert.equal(kindGraphValidations, 2)
+  })
+
+  test('retries rejected per-file and aggregate byte evidence after it shrinks to a valid generation', () => {
+    const oversizedRoot = createRoot()
+    const oversizedPath = join(oversizedRoot, 'encephalon', 'decision', 'oversized-repair.json')
+    ensureParent(oversizedPath)
+    writeFileSync(oversizedPath, 'x'.repeat(MAX_RECORD_BYTES + 1))
+    let oversizedGraphValidations = 0
+
+    const oversizedResult = validateRecordsResolved(oversizedRoot, {
+      hooks: {
+        graphValidation: () => {
+          oversizedGraphValidations += 1
+          if (oversizedGraphValidations === 1) {
+            writeCanonicalRecord(oversizedRoot, {
+              id: 'oversized-repair',
+              subject: 'overflow.per-file.repaired',
+            })
+          }
+        },
+      },
+    })
+
+    assert.deepEqual(oversizedResult, {
+      errors: [],
+      recordsChecked: 1,
+      truncated: false,
+      valid: true,
+    })
+    assert.equal(oversizedGraphValidations, 2)
+
+    const aggregateRoot = createRoot()
+    const payloadLength = MAX_RECORD_BYTES - 512
+    const largePaths = Array.from({ length: 8 }, (_, index) => {
+      const id = `aggregate${index}`
+      writeCanonicalRecord(aggregateRoot, {
+        createdAt: timestampAt(index),
+        id,
+        payload: { text: 'x'.repeat(payloadLength) },
+        subject: `overflow.aggregate.${index}`,
+      })
+      return join(aggregateRoot, 'encephalon', 'decision', `${id}.json`)
+    })
+    const acceptedBytes = largePaths.reduce((total, largePath) => total + statSync(largePath).size, 0)
+    assert.equal(acceptedBytes < MAX_CANONICAL_RECORD_BYTES, true)
+    const rejectedId = 'aggregate-rejected'
+    writeCanonicalRecord(aggregateRoot, {
+      createdAt: timestampAt(8),
+      id: rejectedId,
+      payload: { text: 'y'.repeat(MAX_CANONICAL_RECORD_BYTES - acceptedBytes + 1024) },
+      subject: 'overflow.aggregate.rejected',
+    })
+    const rejectedPath = join(aggregateRoot, 'encephalon', 'decision', `${rejectedId}.json`)
+    assert.equal(statSync(rejectedPath).size <= MAX_RECORD_BYTES, true)
+    assert.equal(acceptedBytes + statSync(rejectedPath).size > MAX_CANONICAL_RECORD_BYTES, true)
+    let aggregateGraphValidations = 0
+
+    const aggregateResult = validateRecordsResolved(aggregateRoot, {
+      hooks: {
+        graphValidation: () => {
+          aggregateGraphValidations += 1
+          if (aggregateGraphValidations === 1) {
+            writeCanonicalRecord(aggregateRoot, {
+              createdAt: timestampAt(8),
+              id: rejectedId,
+              subject: 'overflow.aggregate.repaired',
+            })
+          }
+        },
+      },
+    })
+
+    assert.equal(aggregateResult.valid, true)
+    assert.equal(aggregateResult.recordsChecked, 9)
+    assert.equal(aggregateGraphValidations, 2)
+  })
+
+  test('charges aggregate bytes from the accepted descriptor generation after pathname growth', () => {
+    const root = createRoot()
+    const payloadLength = MAX_RECORD_BYTES - 512
+    const largePaths = Array.from({ length: 8 }, (_, index) => {
+      const id = `descriptor-bound${index}`
+      writeCanonicalRecord(root, {
+        createdAt: timestampAt(index),
+        id,
+        payload: { text: 'x'.repeat(payloadLength) },
+        subject: `descriptor.bound.${index}`,
+      })
+      return join(root, 'encephalon', 'decision', `${id}.json`)
+    })
+    const acceptedBytes = largePaths.reduce((total, largePath) => total + statSync(largePath).size, 0)
+    const id = 'zz-descriptor-growth'
+    writeCanonicalRecord(root, {
+      createdAt: timestampAt(8),
+      id,
+      subject: 'descriptor.bound.growth',
+    })
+    const path = join(root, 'encephalon', 'decision', `${id}.json`)
+    const growthPayload = MAX_CANONICAL_RECORD_BYTES - acceptedBytes + 1024
+    assert.equal(growthPayload < MAX_RECORD_BYTES - 512, true)
+    let changed = false
+    let canonicalScans = 0
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        canonicalScan: () => {
+          canonicalScans += 1
+        },
+        fault: (point, faultPath) => {
+          if (point === 'after-record-lstat' && faultPath === path && !changed) {
+            changed = true
+            writeCanonicalRecord(root, {
+              createdAt: timestampAt(8),
+              id,
+              payload: { text: 'y'.repeat(growthPayload) },
+              subject: 'descriptor.bound.growth',
+            })
+          }
+        },
+      },
+    })
+
+    assert.equal(changed, true)
+    assert.equal(canonicalScans, 2)
+    assert.equal(result.valid, false)
+    assert.equal(
+      result.errors.some(error => error.code === 'CORPUS_BYTE_LIMIT'),
+      true,
+    )
+  })
+
+  test('retries traversal metadata replacement paths and bounds persistent churn', () => {
+    const kindRoot = createRoot()
+    writeCanonicalRecord(kindRoot, {
+      id: 'kind-metadata-settled',
+      subject: 'traversal.kind-metadata',
+    })
+    const kindDirectory = join(kindRoot, 'encephalon', 'decision')
+    let kindScans = 0
+    let kindRemoved = false
+    const kindResult = validateRecordsResolved(kindRoot, {
+      hooks: {
+        canonicalScan: () => {
+          kindScans += 1
+          if (kindScans === 2) {
+            writeCanonicalRecord(kindRoot, {
+              id: 'kind-metadata-settled',
+              subject: 'traversal.kind-metadata',
+            })
+          }
+        },
+        fault: (point, path) => {
+          if (point === 'before-kind-lstat' && path === kindDirectory && !kindRemoved) {
+            kindRemoved = true
+            rmSync(kindDirectory, { recursive: true })
+          }
+        },
+      },
+    })
+    assert.deepEqual(kindResult, { errors: [], recordsChecked: 1, truncated: false, valid: true })
+    assert.equal(kindScans, 2)
+
+    const recordRoot = createRoot()
+    const recordId = 'record-metadata-settled'
+    const recordPath = join(recordRoot, 'encephalon', 'decision', `${recordId}.json`)
+    writeCanonicalRecord(recordRoot, { id: recordId, subject: 'traversal.record-metadata' })
+    let recordScans = 0
+    let recordRemoved = false
+    const recordResult = validateRecordsResolved(recordRoot, {
+      hooks: {
+        canonicalScan: () => {
+          recordScans += 1
+          if (recordScans === 2) {
+            writeCanonicalRecord(recordRoot, {
+              id: recordId,
+              subject: 'traversal.record-metadata',
+            })
+          }
+        },
+        onWork: operation => {
+          if (operation === 'canonical-entry' && !recordRemoved) {
+            recordRemoved = true
+            rmSync(recordPath)
+          }
+        },
+      },
+    })
+    assert.deepEqual(recordResult, {
+      errors: [],
+      recordsChecked: 1,
+      truncated: false,
+      valid: true,
+    })
+    assert.equal(recordScans, 2)
+
+    const churnRoot = createRoot()
+    const churnKind = join(churnRoot, 'encephalon', 'decision')
+    writeCanonicalRecord(churnRoot, { id: 'kind-metadata-churn', subject: 'traversal.kind-churn' })
+    let churnScans = 0
+    assertErrorCode(
+      () =>
+        validateRecordsResolved(churnRoot, {
+          hooks: {
+            canonicalScan: () => {
+              churnScans += 1
+              if (!existsSync(churnKind)) {
+                writeCanonicalRecord(churnRoot, {
+                  id: 'kind-metadata-churn',
+                  subject: 'traversal.kind-churn',
+                })
+              }
+            },
+            fault: point => {
+              if (point === 'before-kind-lstat') {
+                rmSync(churnKind, { recursive: true })
+              }
+            },
+          },
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(churnScans, 3)
+
+    const operationalRoot = createRoot()
+    writeCanonicalRecord(operationalRoot, { id: 'kind-metadata-io', subject: 'traversal.kind-io' })
+    let operationalScans = 0
+    assertErrorCode(
+      () =>
+        validateRecordsResolved(operationalRoot, {
+          hooks: {
+            canonicalScan: () => {
+              operationalScans += 1
+            },
+            fault: point => {
+              if (point === 'before-kind-lstat') {
+                throw Object.assign(new Error('stable metadata failure'), { code: 'EIO' })
+              }
+            },
+          },
+        }),
+      'IO_ERROR',
+    )
+    assert.equal(operationalScans, 1)
+  })
+
+  test('retries a stable unreadable record after it becomes readable', {
+    skip:
+      process.platform === 'win32' || process.getuid?.() === 0
+        ? 'Windows permission handling differs or root bypasses POSIX file permissions.'
+        : false,
+  }, () => {
+    const root = createRoot()
+    const id = 'unreadable-repair'
+    writeCanonicalRecord(root, { id, subject: 'record.unreadable-repair' })
+    const path = join(root, 'encephalon', 'decision', `${id}.json`)
+    chmodSync(path, 0o000)
+    let graphValidations = 0
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        graphValidation: () => {
+          graphValidations += 1
+          if (graphValidations === 1) {
+            chmodSync(path, 0o644)
+          }
+        },
+      },
+    })
+
+    assert.deepEqual(result, { errors: [], recordsChecked: 1, truncated: false, valid: true })
+    assert.equal(graphValidations, 2)
+  })
+
+  test('retries a parent disappearance at the exact record-parent identity boundary', () => {
+    const root = createRoot()
+    const id = 'record-parent-disappearance'
+    writeCanonicalRecord(root, { id, subject: 'record.parent-disappearance' })
+    const kindPath = join(root, 'encephalon', 'decision')
+    const displacedKindPath = join(root, 'displaced-record-parent')
+    let displaced = false
+    let scans = 0
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        canonicalScan: () => {
+          scans += 1
+          if (scans === 2 && displaced) {
+            renameSync(displacedKindPath, kindPath)
+          }
+        },
+        fault: (point, faultPath) => {
+          if ((point as string) === 'before-parent-lstat' && faultPath === kindPath && !displaced) {
+            displaced = true
+            renameSync(kindPath, displacedKindPath)
+          }
+        },
+      },
+    })
+
+    assert.equal(displaced, true)
+    assert.equal(scans, 2)
+    assert.deepEqual(result, { errors: [], recordsChecked: 1, truncated: false, valid: true })
+  })
+
+  test('keeps stable parent identity I/O failures path-safe', () => {
+    const root = createRoot()
+    const id = 'record-parent-operational-io'
+    writeCanonicalRecord(root, { id, subject: 'record.parent-operational-io' })
+    const kindPath = join(root, 'encephalon', 'decision')
+    let injected = false
+
+    assert.throws(
+      () =>
+        validateRecordsResolved(root, {
+          hooks: {
+            fault: (point, faultPath) => {
+              if ((point as string) === 'before-parent-lstat' && faultPath === kindPath && !injected) {
+                injected = true
+                throw Object.assign(new Error(`stable parent identity I/O at ${kindPath}`), { code: 'EIO' })
+              }
+            },
+          },
+        }),
+      (error: unknown) => {
+        const actual = error as Error & { cause?: unknown; code?: unknown; details?: unknown }
+        assert.equal(actual.code, 'IO_ERROR')
+        assert.equal(actual.message, 'Unable to validate Encephalon records.')
+        assert.deepEqual(actual.details, {})
+        const cause = actual.cause as Error & { code?: unknown }
+        assert.equal(cause.code, 'EIO')
+        assert.equal(cause.message, 'A record filesystem operation failed.')
+        assert.equal(causeChainText(error).includes(root), false)
+        return true
+      },
+    )
+
+    assert.equal(injected, true)
+  })
+
+  test('normalises stable precommit record-open failures at the shared descriptor boundary', () => {
+    const root = createRoot()
+    const id = 'record-open-precommit-privacy'
+    writeCanonicalRecord(root, { id, subject: 'record.open-precommit-privacy' })
+    const path = join(root, 'encephalon', 'decision', `${id}.json`)
+    let injected = false
+
+    assert.throws(
+      () =>
+        validateRecordsResolved(root, {
+          hooks: {
+            fault: (point, faultPath) => {
+              if ((point as string) === 'before-record-open' && faultPath === path && !injected) {
+                injected = true
+                throw Object.assign(new Error(`stable record-open I/O at ${path}`), { code: 'EIO' })
+              }
+            },
+          },
+        }),
+      (error: unknown) => {
+        const actual = error as Error & { cause?: unknown; code?: unknown; details?: unknown }
+        assert.equal(actual.code, 'IO_ERROR')
+        assert.equal(actual.message, 'Unable to validate Encephalon records.')
+        assert.deepEqual(actual.details, {})
+        const cause = actual.cause as Error & { code?: unknown }
+        assert.equal(cause.code, 'EIO')
+        assert.equal(cause.message, 'A record filesystem operation failed.')
+        assert.equal(causeChainText(error).includes(root), false)
+        return true
+      },
+    )
+
+    assert.equal(injected, true)
+  })
+
+  test('preserves stable operational record-open failures as path-safe IO errors', () => {
+    const root = createRoot()
+    const id = 'record-open-operational-io'
+    writeCanonicalRecord(root, { id, subject: 'record.open-operational-io' })
+    const path = join(root, 'encephalon', 'decision', `${id}.json`)
+    let injected = false
+    let scans = 0
+
+    assert.throws(
+      () =>
+        validateRecordsResolved(root, {
+          hooks: {
+            canonicalScan: () => {
+              scans += 1
+            },
+            fault: (point, faultPath) => {
+              if (point === 'after-record-open' && faultPath === path && !injected) {
+                injected = true
+                throw Object.assign(new Error(`simulated stable record I/O at ${path}`), { code: 'EIO' })
+              }
+            },
+          },
+        }),
+      (error: unknown) => {
+        const actual = error as Error & { code?: unknown; details?: unknown }
+        assert.equal(actual.code, 'IO_ERROR')
+        assert.equal(actual.message, 'Unable to validate Encephalon records.')
+        assert.deepEqual(actual.details, {})
+        assert.equal(actual.cause instanceof Error, true)
+        assert.equal((actual.cause as Error & { code?: unknown }).code, 'EIO')
+        assert.equal((actual.cause as Error).message.includes(root), false)
+        return true
+      },
+    )
+
+    assert.equal(injected, true)
+    assert.equal(scans, 1)
+  })
+
+  test('does not swallow an operational failure while closing unreadable evidence', () => {
+    const root = createRoot()
+    const id = 'unreadable-closing-operational-io'
+    writeCanonicalRecord(root, { id, subject: 'record.unreadable-closing-operational-io' })
+    const path = join(root, 'encephalon', 'decision', `${id}.json`)
+    let initialUnreadable = false
+    let closingFailure = false
+
+    assert.throws(
+      () =>
+        validateRecordsResolved(root, {
+          hooks: {
+            fault: (point, faultPath) => {
+              if (point === 'after-record-open' && faultPath === path && !initialUnreadable) {
+                initialUnreadable = true
+                throw Object.assign(new Error('simulated initial unreadable record'), { code: 'EACCES' })
+              }
+              if (point === 'before-rejected-record-read' && faultPath === path) {
+                closingFailure = true
+                throw Object.assign(new Error(`closing record I/O at ${path}`), { code: 'EIO' })
+              }
+            },
+          },
+        }),
+      (error: unknown) => {
+        const actual = error as Error & { cause?: unknown; code?: unknown; details?: unknown }
+        assert.equal(actual.code, 'IO_ERROR')
+        assert.equal(actual.message, 'Unable to validate Encephalon records.')
+        assert.deepEqual(actual.details, {})
+        const cause = actual.cause as Error & { code?: unknown }
+        assert.equal(cause.code, 'EIO')
+        assert.equal(cause.message, 'A record filesystem operation failed.')
+        assert.equal(causeChainText(error).includes(root), false)
+        return true
+      },
+    )
+
+    assert.equal(initialUnreadable, true)
+    assert.equal(closingFailure, true)
+  })
+
+  test('does not read oversized evidence that becomes readable during closing validation', () => {
+    const root = createRoot()
+    const id = 'oversized-unreadable-evidence'
+    writeCanonicalRecord(root, {
+      id,
+      payload: { text: 'x'.repeat(MAX_RECORD_BYTES) },
+      subject: 'record.oversized-unreadable-evidence',
+    })
+    const path = join(root, 'encephalon', 'decision', `${id}.json`)
+    let injected = false
+    let rejectedReads = 0
+    let scans = 0
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        canonicalScan: () => {
+          scans += 1
+        },
+        fault: (point, faultPath) => {
+          if (point === 'after-record-open' && faultPath === path && !injected) {
+            injected = true
+            throw Object.assign(new Error('simulated readability failure'), { code: 'EACCES' })
+          }
+          if (point === 'before-rejected-record-read' && faultPath === path) {
+            rejectedReads += 1
+          }
+        },
+      },
+    })
+
+    assert.equal(injected, true)
+    assert.equal(rejectedReads, 0)
+    assert.equal(scans, 2)
+    assert.deepEqual(result, {
+      errors: [
+        {
+          code: 'INVALID_RECORD',
+          message: 'Record file exceeds the 1 MiB limit.',
+          path: `encephalon/decision/${id}.json`,
+        },
+      ],
+      recordsChecked: 0,
+      truncated: false,
+      valid: false,
+    })
+  })
+
+  test('settles a permission replacement at record open without leaking its path', {
+    skip:
+      process.platform === 'win32' || process.getuid?.() === 0
+        ? 'Windows permission handling differs or root bypasses POSIX file permissions.'
+        : false,
+  }, () => {
+    const root = createRoot()
+    const id = 'permission-open-race'
+    writeCanonicalRecord(root, { id, subject: 'record.permission-open-race' })
+    const path = join(root, 'encephalon', 'decision', `${id}.json`)
+    let changed = false
+    let scans = 0
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        canonicalScan: () => {
+          scans += 1
+        },
+        fault: (point, faultPath) => {
+          if (point === 'after-record-lstat' && faultPath === path && !changed) {
+            changed = true
+            chmodSync(path, 0o000)
+          }
+        },
+      },
+    })
+
+    assert.equal(changed, true)
+    assert.equal(scans, 2)
+    assert.deepEqual(result, {
+      errors: [
+        {
+          code: 'INVALID_RECORD',
+          message: 'Record file must be a readable regular non-symlink JSON file.',
+          path: `encephalon/decision/${id}.json`,
+        },
+      ],
+      recordsChecked: 0,
+      truncated: false,
+      valid: false,
+    })
+    assert.equal(JSON.stringify(result).includes(root), false)
+  })
+
+  test('retries one-shot artifact inspection churn through the shared canonical ledger', () => {
+    const root = createRoot()
+    const id = 'artifact-open-retry'
+    const artifact = `_artifacts/decision/${id}/evidence.txt`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, 'original evidence')
+    writeCanonicalRecord(root, { artifacts: [artifact], id, subject: 'artifact.open-retry' })
+    const counts = { canonicalScans: 0, graphValidations: 0 }
+    let changed = false
+    artifactInspectionTestHooks.fault = point => {
+      if (point === 'after-artifact-lstat' && !changed) {
+        changed = true
+        writeFileSync(artifactPath, 'settled replacement evidence')
+      }
+    }
+
+    const result = validateRecordsResolved(root, {
+      hooks: {
+        canonicalScan: () => {
+          counts.canonicalScans += 1
+        },
+        graphValidation: () => {
+          counts.graphValidations += 1
+        },
+      },
+    })
+
+    assert.deepEqual(result, { errors: [], recordsChecked: 1, truncated: false, valid: true })
+    assert.deepEqual(counts, { canonicalScans: 2, graphValidations: 2 })
+  })
+
+  test('bounds persistent artifact inspection churn to the shared canonical ledger', () => {
+    const root = createRoot()
+    const id = 'artifact-open-churn'
+    const artifact = `_artifacts/decision/${id}/evidence.txt`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, 'version-a')
+    writeCanonicalRecord(root, { artifacts: [artifact], id, subject: 'artifact.open-churn' })
+    let scans = 0
+    let changes = 0
+    artifactInspectionTestHooks.fault = point => {
+      if (point === 'after-artifact-lstat') {
+        writeFileSync(artifactPath, changes % 2 === 0 ? 'version-b' : 'version-a')
+        changes += 1
+      }
+    }
+
+    assertErrorCode(
+      () =>
+        validateRecordsResolved(root, {
+          hooks: {
+            canonicalScan: () => {
+              scans += 1
+            },
+          },
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(scans, 3)
+    assert.equal(changes, 3)
+  })
+
+  test('does not begin another canonical scan at the exact retry deadline', () => {
+    const root = createRoot()
+    const id = 'retry-deadline-boundary'
+    writeCanonicalRecord(root, { id, subject: 'retry.deadline-boundary' })
+    const path = join(root, 'encephalon', 'decision', `${id}.json`)
+    const counts = { canonicalScans: 0, graphValidations: 0 }
+    const clock = [0, 60_000]
+    const hooks = {
+      canonicalScan: () => {
+        counts.canonicalScans += 1
+      },
+      graphValidation: () => {
+        counts.graphValidations += 1
+        if (counts.graphValidations === 1) {
+          writeFileSync(path, `${readFileSync(path, 'utf8')} `)
+        }
+      },
+      now: () => clock.shift() ?? 60_000,
+    } as RecordReadHooks & { now: () => number }
+
+    assertErrorCode(() => readRecordsResolved(root, hooks), 'REPOSITORY_CHANGED')
+    assert.deepEqual(counts, { canonicalScans: 1, graphValidations: 1 })
+  })
+
+  test('uses one non-resetting deadline while accepting a slow first attempt and a 59,999ms retry', () => {
+    const slowRoot = createRoot()
+    writeCanonicalRecord(slowRoot, {
+      id: 'slow-first-attempt',
+      subject: 'retry.slow-first-attempt',
+    })
+    let slowNow = 0
+    let slowNowCalls = 0
+    const slowResult = validateRecordsResolved(slowRoot, {
+      hooks: {
+        graphValidation: () => {
+          slowNow = 60_000
+        },
+        now: () => {
+          slowNowCalls += 1
+          return slowNow
+        },
+      },
+    })
+    assert.equal(slowResult.valid, true)
+    assert.equal(slowNowCalls, 1)
+
+    const permittedRoot = createRoot()
+    const permittedId = 'retry-before-deadline'
+    const permittedPath = join(permittedRoot, 'encephalon', 'decision', `${permittedId}.json`)
+    writeCanonicalRecord(permittedRoot, { id: permittedId, subject: 'retry.before-deadline' })
+    const permittedClock = [0, 59_999]
+    let permittedScans = 0
+    const permittedResult = validateRecordsResolved(permittedRoot, {
+      hooks: {
+        canonicalScan: () => {
+          permittedScans += 1
+        },
+        graphValidation: () => {
+          if (permittedScans === 1) {
+            writeFileSync(permittedPath, `${readFileSync(permittedPath, 'utf8')} `)
+          }
+        },
+        now: () => permittedClock.shift() ?? 59_999,
+      },
+    })
+    assert.equal(permittedResult.valid, true)
+    assert.equal(permittedScans, 2)
+
+    const nonResetRoot = createRoot()
+    const nonResetId = 'retry-non-resetting-deadline'
+    const nonResetPath = join(nonResetRoot, 'encephalon', 'decision', `${nonResetId}.json`)
+    writeCanonicalRecord(nonResetRoot, { id: nonResetId, subject: 'retry.non-resetting-deadline' })
+    const nonResetClock = [0, 59_999, 60_000]
+    let nonResetScans = 0
+    assertErrorCode(
+      () =>
+        validateRecordsResolved(nonResetRoot, {
+          hooks: {
+            canonicalScan: () => {
+              nonResetScans += 1
+            },
+            graphValidation: () => {
+              writeFileSync(nonResetPath, `${readFileSync(nonResetPath, 'utf8')} `)
+            },
+            now: () => nonResetClock.shift() ?? 60_000,
+          },
+        }),
+      'REPOSITORY_CHANGED',
+    )
+    assert.equal(nonResetScans, 2)
+  })
+
+  test('record descriptor open cannot block when the observed file becomes a FIFO', {
+    skip: process.platform === 'win32' ? 'Windows runners do not provide mkfifo.' : false,
+  }, () => {
+    const root = createRoot()
+    const id = 'record-fifo-replacement'
+    writeCanonicalRecord(root, { id, subject: 'record.fifo-replacement' })
+    const path = join(root, 'encephalon', 'decision', `${id}.json`)
+    const script = `
+      import { spawnSync } from 'node:child_process'
+      import { rmSync } from 'node:fs'
+      import { validateRecordsResolved } from ${JSON.stringify(new URL('../src/records.ts', import.meta.url).href)}
+      let replaced = false
+      const result = validateRecordsResolved(process.argv[1], {
+        hooks: {
+          fault: (point, path) => {
+            if (point === 'after-record-lstat' && !replaced) {
+              replaced = true
+              rmSync(path)
+              const created = spawnSync('mkfifo', [path])
+              if (created.status !== 0) throw created.error ?? new Error('mkfifo failed')
+            }
+          },
+        },
+      })
+      process.exitCode = replaced && !result.valid && result.errors.some(error => error.code === 'INVALID_RECORD_LAYOUT') ? 0 : 3
+    `
+    const child = spawnSync(process.execPath, ['--input-type=module', '--eval', script, root, path], { timeout: 2000 })
+
+    assert.equal(child.error, undefined)
+    assert.equal(child.status, 0, child.stderr.toString())
   })
 
   test('stable canonical snapshot preserves ordinary validation for a stable malformed record', () => {
