@@ -189,6 +189,7 @@ describe('package contract', () => {
     assert.match(contract, /## Operation Budgets/)
     assert.match(contract, /## Unicode Literal Search/)
     assert.match(contract, /## Canonical Storage/)
+    assert.match(contract, /## Stable Canonical Read Snapshots/)
     assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
     assert.match(contract, /## Bounded Disposable Cache Validation/)
@@ -207,7 +208,11 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-25 for code and behavioural-test snapshot `ac365f666d2031421706bea8190d3d6202ec4b90`\./,
+      /Last reviewed: 2026-08-26 for code and behavioural-test snapshot `422c3a20e1ee13e69dcf87ea219a8a0dab4ff071`\./,
+    )
+    assert.match(
+      contract,
+      /MAR-2575 stable canonical read and validation snapshots with one bounded operation-scoped retry ledger: `422c3a20e1ee13e69dcf87ea219a8a0dab4ff071`\./,
     )
     assert.match(
       contract,
