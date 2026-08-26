@@ -384,16 +384,38 @@ test('writes validated mutation snapshots equivalently and falls back after iden
       }
     }
 
-    api.addRecord({
-      id: `snapshot-addition-${entry.kind}`,
-      kind: 'decision',
-      payload: { summary: 'Validated snapshot addition' },
-      root,
-      searchText: 'new searchable snapshot addition',
-      source: 'test',
-      subject: `cache.snapshot.${entry.kind}`,
-      supersedes: [seedId],
-    })
+    const additionId = `snapshot-addition-${entry.kind}`
+    const add = () =>
+      api.addRecord({
+        id: additionId,
+        kind: 'decision',
+        payload: { summary: 'Validated snapshot addition' },
+        root,
+        searchText: 'new searchable snapshot addition',
+        source: 'test',
+        subject: `cache.snapshot.${entry.kind}`,
+        supersedes: [seedId],
+      })
+
+    if (entry.kind === 'stable' || entry.kind === 'corrupt') {
+      add()
+    } else {
+      assert.throws(add, error => {
+        assert.ok(error instanceof api.EncephalonError)
+        assert.equal(error.code, 'REPOSITORY_CHANGED')
+        assert.deepEqual(error.details, {
+          canonicalCommitted: true,
+          committedRecordIds: [additionId],
+          path: `encephalon/decision/${additionId}.json`,
+          postCommitPhase: 'publicationVerification',
+          recordId: additionId,
+          recoveryAction:
+            'Inspect the canonical directory generation before retrying; the linked record may have been displaced by a concurrent replacement.',
+          repositoryChanged: true,
+        })
+        return true
+      })
+    }
 
     assert.equal(
       diskCacheValidations,
