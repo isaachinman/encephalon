@@ -1,10 +1,69 @@
 import assert from 'node:assert/strict'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import {
+  appendFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve, sep } from 'node:path'
 import { describe, test } from 'node:test'
+import { spawnNpmCommand } from '../scripts/npm-command.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
+const forbiddenRuntimeDependencyValues = {
+  bundleDependencies: ['runtime-package'],
+  bundledDependencies: ['runtime-package'],
+  dependencies: { 'runtime-package': '1.0.0' },
+  optionalDependencies: { 'runtime-package': '1.0.0' },
+  peerDependencies: { 'runtime-package': '1.0.0' },
+  peerDependenciesMeta: { 'runtime-package': { optional: true } },
+} as const
+
+const packageFixturePaths = [
+  'package.json',
+  'scripts/check-package.ts',
+  'scripts/npm-command.ts',
+  'scripts/package-version.ts',
+  'src',
+  'dist',
+  'skills/encephalon/SKILL.md',
+  'assets/encephalon.png',
+  'docs/performance.md',
+  'docs/performance-baseline.json',
+  'docs/performance-budgets.json',
+  'README.md',
+  'LICENSE',
+] as const
+
+const createPackageCheckFixture = (prefix: string) => {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), prefix))
+  const fixtureRoot = resolve(temporaryRoot, 'repository')
+  for (const path of packageFixturePaths) {
+    const destination = resolve(fixtureRoot, path)
+    mkdirSync(dirname(destination), { recursive: true })
+    cpSync(resolve(root, path), destination, { recursive: true })
+  }
+  symlinkSync(resolve(root, 'node_modules'), resolve(fixtureRoot, 'node_modules'), 'junction')
+  const initialise = spawnSync('git', ['init', '--quiet'], { cwd: fixtureRoot, encoding: 'utf8' })
+  assert.equal(initialise.status, 0, `${initialise.stdout}${initialise.stderr}`)
+  const stage = spawnSync(
+    'git',
+    ['add', '--', 'package.json', 'src', 'skills', 'assets', 'docs', 'README.md', 'LICENSE'],
+    { cwd: fixtureRoot, encoding: 'utf8' },
+  )
+  assert.equal(stage.status, 0, `${stage.stdout}${stage.stderr}`)
+  return { fixtureRoot, temporaryRoot }
+}
 
 describe('package contract', () => {
   test('declares a zero-runtime-dependency Node ESM package', () => {
@@ -15,8 +74,9 @@ describe('package contract', () => {
     assert.equal(packageJson.type, 'module')
     assert.deepEqual(packageJson.engines, { node: '>=24.15.0' })
     assert.deepEqual(packageJson.bin, { encephalon: 'dist/cli.mjs' })
-    assert.equal(packageJson.dependencies, undefined)
-    assert.equal((packageJson.files as readonly unknown[]).includes('scripts'), false)
+    for (const field of Object.keys(forbiddenRuntimeDependencyValues)) {
+      assert.equal(packageJson[field], undefined, field)
+    }
 
     const scripts = packageJson.scripts as Record<string, unknown> | undefined
     assert.equal(scripts?.install, undefined)
@@ -25,19 +85,49 @@ describe('package contract', () => {
     assert.equal(scripts?.prepare, undefined)
   })
 
+  test('rejects every runtime dependency manifest field', () => {
+    const failures = Object.entries(forbiddenRuntimeDependencyValues).map(([field, value]) => {
+      const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-dependency-')
+      try {
+        const packageJson = JSON.parse(readFileSync(resolve(fixtureRoot, 'package.json'), 'utf8')) as Record<
+          string,
+          unknown
+        >
+        writeFileSync(resolve(fixtureRoot, 'package.json'), `${JSON.stringify({ ...packageJson, [field]: value })}\n`)
+        return {
+          field,
+          result: spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+            cwd: fixtureRoot,
+            encoding: 'utf8',
+            timeout: 30_000,
+          }),
+        }
+      } finally {
+        rmSync(temporaryRoot, { force: true, recursive: true })
+      }
+    })
+
+    for (const { field, result } of failures) {
+      assert.notEqual(result.status, 0, field)
+      assert.equal(result.stdout, '', field)
+      assert.match(result.stderr, /zero-runtime-dependency contract is invalid/u, field)
+    }
+  })
+
   test('keeps workflow tooling development-only and scripts-scoped', () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
       devDependencies?: Readonly<Record<string, unknown>>
+      files?: readonly unknown[]
     }
-    const configFiles = readdirSync(root)
+    const configs = readdirSync(root)
       .filter(file => file.startsWith('tsconfig.') && file.endsWith('.json'))
       .toSorted()
-    const configs = configFiles.map(file => ({
-      file,
-      value: JSON.parse(readFileSync(resolve(root, file), 'utf8')) as {
-        compilerOptions?: Readonly<{ skipLibCheck?: unknown; types?: unknown }>
-      },
-    }))
+      .map(file => ({
+        file,
+        value: JSON.parse(readFileSync(resolve(root, file), 'utf8')) as {
+          compilerOptions?: Readonly<{ skipLibCheck?: unknown; types?: unknown }>
+        },
+      }))
     const bunTypedProjects = configs
       .filter(({ value }) => Array.isArray(value.compilerOptions?.types) && value.compilerOptions.types.includes('bun'))
       .map(({ file }) => file)
@@ -47,6 +137,7 @@ describe('package contract', () => {
 
     assert.equal(packageJson.devDependencies?.['@types/bun'], '1.3.1')
     assert.equal(packageJson.devDependencies?.yaml, '2.9.0')
+    assert.equal(packageJson.files?.includes('scripts'), false)
     assert.deepEqual(bunTypedProjects, ['tsconfig.scripts.json'])
     assert.deepEqual(skippedLibraryCheckProjects, ['tsconfig.scripts.json'])
     assert.equal(existsSync(resolve(root, 'scripts', 'bun-runtime.d.ts')), false)
@@ -127,6 +218,7 @@ describe('package contract', () => {
     assert.match(contract, /## Operation Budgets/)
     assert.match(contract, /## Unicode Literal Search/)
     assert.match(contract, /## Canonical Storage/)
+    assert.match(contract, /## Stable Canonical Read Snapshots/)
     assert.match(contract, /## Partial Initialisation Progress/)
     assert.match(contract, /## Cache Compatibility/)
     assert.match(contract, /## Bounded Disposable Cache Validation/)
@@ -134,6 +226,7 @@ describe('package contract', () => {
     assert.match(contract, /Cache schema compatibility requires the exact owned ordinary-table semantics/)
     assert.match(contract, /## Package and Release Gates/)
     assert.match(contract, /## Historical Plan Divergence Checklist/)
+    assert.doesNotMatch(contract, /MAR-2640 required current-Node.*`[0-9a-f]{40}`/u)
     assert.match(
       contract,
       /Stable response-budget names are `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes`\./,
@@ -144,7 +237,19 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /Last reviewed: 2026-08-24 for code and behavioural-test snapshot `7666139ad3d1f4853cfee8710ddc841dc3978aec`\./,
+      /Last reviewed: 2026-08-26 for code and behavioural-test snapshot `c17834e5d4f4129c8f8374713be224c54ab4a39f`\./,
+    )
+    assert.match(
+      contract,
+      /MAR-2575 stable canonical read and validation snapshots with one bounded operation-scoped retry ledger: `c17834e5d4f4129c8f8374713be224c54ab4a39f`\./,
+    )
+    assert.match(
+      contract,
+      /MAR-2641 negative-zero confidence normalisation across validation, canonical storage, mutation-cache hydration, public reads, and CLI output: `b6de02d1c5c6eab7d98e7d4525b8dee41035f1ab`\./,
+    )
+    assert.match(
+      contract,
+      /MAR-2576 bounded payload property inspection, allocation-order enforcement, canonical-output compatibility, and packed API coverage: `58ba821f4b655fad1b1e79be9df57600e7409381`\./,
     )
     assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
     assert.match(
@@ -245,161 +350,128 @@ describe('package contract', () => {
     assert.doesNotMatch(skill, /node \.\/node_modules\/encephalon\/dist\/cli\.mjs/)
   })
 
-  // This bootstrap assertion executes independently so disabling the workflow security suite cannot disable its CI gate.
-  test('runs pull-request and current-Node package checks with a trusted release gate', () => {
-    const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
-    const readme = readFileSync(resolve(root, 'README.md'), 'utf8')
-    const publishCheck = readFileSync(resolve(root, 'scripts', 'check-publish.ts'), 'utf8')
-    const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
-      scripts?: Record<string, unknown>
+  test('retains the exact package tarball exercised by the package checker', { timeout: 75_000 }, () => {
+    const artifactParentName = join('test', `.package-artifacts-test-${randomUUID()}`)
+    const artifactDirectoryName = join(artifactParentName, 'nested')
+    const artifactParent = resolve(root, artifactParentName)
+    const artifactDirectory = resolve(root, artifactDirectoryName)
+    const referenceDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-reference-'))
+    try {
+      const result = spawnSync(
+        process.execPath,
+        ['./scripts/check-package.ts', '--retain-tarball', artifactDirectoryName],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          timeout: 60_000,
+        },
+      )
+      assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+      const retainedFilename = `encephalon-${PACKAGE_VERSION}.tgz`
+      assert.equal(result.stdout, `${artifactDirectoryName.split(sep).join('/')}/${retainedFilename}\n`)
+      assert.deepEqual(readdirSync(artifactDirectory), [retainedFilename])
+
+      const referenceResult = spawnNpmCommand(
+        ['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', referenceDirectory],
+        { cwd: root },
+      )
+      assert.equal(referenceResult.status, 0, `${referenceResult.stdout}${referenceResult.stderr}`)
+      const [referencePack] = JSON.parse(referenceResult.stdout) as Array<{ filename?: unknown }>
+      assert.equal(referencePack?.filename, retainedFilename)
+      assert.deepEqual(
+        readFileSync(resolve(artifactDirectory, retainedFilename)),
+        readFileSync(resolve(referenceDirectory, retainedFilename)),
+      )
+    } finally {
+      rmSync(artifactParent, { force: true, recursive: true })
+      rmSync(referenceDirectory, { force: true, recursive: true })
     }
-    const publishScript = String(packageJson.scripts?.['check:publish'])
-    const workflowCheckScript = String(packageJson.scripts?.['check:workflows'])
-    const eventsStart = workflow.indexOf('\non:\n') + 1
-    const permissionsStart = workflow.indexOf('\npermissions:\n', eventsStart)
-    const jobsStart = workflow.indexOf('\njobs:\n')
-    const releaseStart = workflow.indexOf('\n  release:\n', jobsStart)
-    const workflowConfiguration = workflow.slice(0, jobsStart)
-    const verificationJob = workflow.slice(jobsStart, releaseStart)
-    const releaseJob = workflow.slice(releaseStart)
-    const matrixStart = verificationJob.indexOf('      matrix:\n')
-    const runnerStart = verificationJob.indexOf('    runs-on:', matrixStart)
-    const matrixBlock = verificationJob.slice(matrixStart, runnerStart)
-    const verificationStepsStart = verificationJob.indexOf('    steps:\n')
-    const verificationHeader = verificationJob.slice(0, matrixStart)
-    const verificationRunner = verificationJob.slice(runnerStart, verificationStepsStart)
-    const verificationSteps = verificationJob.slice(verificationStepsStart)
-    const releaseStepsStart = releaseJob.indexOf('    steps:\n')
-    const releaseHeader = releaseJob.slice(0, releaseStepsStart)
-    const releaseSteps = releaseJob.slice(releaseStepsStart)
-    const uploadStart = releaseJob.indexOf('      - name: Upload release-equivalent package artifact\n')
-    const uploadStep = releaseJob.slice(uploadStart)
+  })
 
-    assert.equal(
-      workflow.slice(eventsStart, permissionsStart),
-      `on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
-    types: [opened, reopened, synchronize, edited]
-`,
-    )
-    assert.doesNotMatch(workflow.slice(eventsStart, permissionsStart), /paths|ignore|workflow_dispatch|schedule/)
-    assert.match(workflowConfiguration, /permissions:\n\s+contents: read/)
-    assert.match(
-      workflowConfiguration,
-      /concurrency:\n\s+group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}\n\s+cancel-in-progress: true/,
-    )
+  test('does not retain a tarball when a late packed CLI check fails', { timeout: 30_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-late-failure-')
+    const retainedDirectory = resolve(fixtureRoot, 'late-package-artifact', 'nested')
+    try {
+      appendFileSync(
+        resolve(fixtureRoot, 'dist', 'cli.mjs'),
+        '\nif (process.argv.includes("gather")) process.exitCode = 91\n',
+      )
 
-    assert.equal(
-      verificationHeader,
-      `
-jobs:
-  verify:
-    name: verify (\${{ matrix.context }})
-    strategy:
-      fail-fast: false
-`,
-    )
-    assert.equal(
-      matrixBlock,
-      `      matrix:
-        include:
-          - context: ubuntu-latest
-            os: ubuntu-latest
-            node: 24.15.0
-          - context: macos-latest
-            os: macos-latest
-            node: 24.15.0
-          - context: windows-latest
-            os: windows-latest
-            node: 24.15.0
-          - context: ubuntu-current
-            os: ubuntu-latest
-            node: 26
-`,
-    )
-    assert.match(verificationRunner, /^ {4}runs-on: \$\{\{ matrix\.os \}\}\n$/)
-    assert.doesNotMatch(verificationJob, /^ {4}(?:if|continue-on-error):/m)
-    assert.match(verificationSteps, /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/)
-    assert.match(
-      verificationSteps,
-      /uses: actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version: \$\{\{ matrix\.node \}\}/,
-    )
+      const result = spawnSync(
+        process.execPath,
+        ['./scripts/check-package.ts', '--retain-tarball', 'late-package-artifact/nested'],
+        { cwd: fixtureRoot, encoding: 'utf8', timeout: 30_000 },
+      )
+      assert.notEqual(result.status, 0)
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /failed with exit code 91/)
+      assert.equal(existsSync(retainedDirectory), false)
+      assert.equal(existsSync(dirname(retainedDirectory)), false)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects unreviewed files from packaged source and generated output trees', { timeout: 30_000 }, () => {
+    const results = ['skills/encephalon/unreviewed.txt', 'dist/unreviewed.txt'].map(path => {
+      const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-manifest-')
+      try {
+        writeFileSync(resolve(fixtureRoot, path), 'unreviewed package content\n')
+        return spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+          cwd: fixtureRoot,
+          encoding: 'utf8',
+          timeout: 30_000,
+        })
+      } finally {
+        rmSync(temporaryRoot, { force: true, recursive: true })
+      }
+    })
     assert.deepEqual(
-      [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
-      [
-        'bun install --frozen-lockfile',
-        'bun run check:workflows',
-        'bun run typecheck',
-        'bun run test',
-        'bun run lint',
-        'bun run benchmark:check',
-        'bun run build',
-        'bun run check:package',
-      ],
+      results.map(result => result.status === 0),
+      [false, false],
     )
-    assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 8)
-    assert.doesNotMatch(verificationSteps, /^\s{8}(?:if|continue-on-error):/m)
+    for (const result of results) {
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /reviewed package file manifest/)
+    }
+  })
 
-    assert.equal(
-      releaseHeader,
-      `
-  release:
-    name: Release-equivalent package gate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: verify
-    runs-on: ubuntu-latest
-`,
-    )
-    assert.match(releaseSteps, /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/)
-    assert.match(releaseSteps, /uses: actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version: 24\.15\.0/)
-    assert.deepEqual(
-      [...releaseSteps.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
-      ['bun install --frozen-lockfile', 'bun run check:workflows', 'bun run build', 'bun run check:package'],
-    )
-    assert.equal(releaseSteps.match(/^\s+(?:- )?run:/gm)?.length, 6)
-    assert.doesNotMatch(releaseSteps, /^\s{8}(?:if|continue-on-error):/m)
-    assert.match(
-      releaseJob,
-      /- name: Create release-equivalent package artifact\n\s+shell: bash\n\s+run: \|\n\s+mkdir -p package-artifacts\n\s+npm pack --dry-run=false --ignore-scripts --json --pack-destination package-artifacts > package-artifacts\/npm-pack\.json/,
-    )
-    assert.equal(releaseJob.match(/npm pack --dry-run=false/g)?.length, 1)
-    assert.match(releaseJob, /- name: Check npm publish dry run\n\s+run: bun run check:publish/)
-    assert.equal(releaseJob.match(/bun run check:publish/g)?.length, 1)
-    assert.equal(releaseJob.match(/actions\/upload-artifact/g)?.length, 1)
-    assert.equal(
-      uploadStep
-        .split('\n')
-        .filter(line => !line.includes('uses: actions/upload-artifact@'))
-        .slice(1)
-        .join('\n'),
-      `        with:
-          name: encephalon-npm-package
-          path: package-artifacts/*
-          if-no-files-found: error
-          retention-days: 7
-`,
-    )
-    assert.equal(
-      ['bun run build', 'bun run check:package', 'npm pack', 'bun run check:publish', 'actions/upload-artifact']
-        .map(step => releaseJob.indexOf(step))
-        .every(
-          (position, index, positions) =>
-            position >= 0 && (index === 0 || position > (positions[index - 1] ?? Number.POSITIVE_INFINITY)),
-        ),
-      true,
-    )
-    assert.match(readme, /four verification lanes/)
-    assert.match(readme, /trusted pushes to `main`/)
-    assert.match(readme, /release-equivalent package gate/)
-    assert.equal(workflowCheckScript, 'bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts')
-    assert.equal(publishScript, 'bun run scripts/check-publish.ts')
-    assert.equal(publishCheck.includes("'--dry-run'"), true)
-    assert.equal(publishCheck.includes("'--ignore-scripts'"), true)
-    assert.equal(publishCheck.includes('You cannot publish over the previously published versions'), true)
+  test('rejects a missing declaration derived from reviewed TypeScript source', { timeout: 30_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-missing-declaration-')
+    try {
+      rmSync(resolve(fixtureRoot, 'dist', 'api-input.d.ts'))
+
+      const result = spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+        cwd: fixtureRoot,
+        encoding: 'utf8',
+        timeout: 30_000,
+      })
+
+      assert.notEqual(result.status, 0)
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /reviewed package file manifest/)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('accepts newly reviewed skill files in the package manifest', { timeout: 30_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-reviewed-skill-')
+    try {
+      const reviewedSkill = 'skills/encephalon/reviewed.txt'
+      writeFileSync(resolve(fixtureRoot, reviewedSkill), 'reviewed package content\n')
+      const stage = spawnSync('git', ['add', '--', reviewedSkill], { cwd: fixtureRoot, encoding: 'utf8' })
+      assert.equal(stage.status, 0, `${stage.stdout}${stage.stderr}`)
+
+      const result = spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+        cwd: fixtureRoot,
+        encoding: 'utf8',
+        timeout: 30_000,
+      })
+
+      assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
   })
 })

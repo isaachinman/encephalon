@@ -1,10 +1,12 @@
 import { type Dirent, opendirSync } from 'node:fs'
+import { type DirectoryReader, readBoundedDirectoryEntries } from './bounded-directory.ts'
 import {
   captureDirectoryWitness,
   type DirectoryWitness,
   DirectoryWitnessError,
   revalidateDirectoryWitness,
 } from './directory-witness.ts'
+import { sameStableEntryMetadata } from './filesystem-entry.ts'
 import { ordinalStringCompare } from './order.ts'
 
 export const MAX_CANONICAL_BRAIN_ROOT_ENTRIES = 1002
@@ -32,11 +34,6 @@ export const isCanonicalReservedDirectory = (name: string) => CANONICAL_RESERVED
 export const isCanonicalKindDirectoryEntry = (entry: Dirent) =>
   !entry.name.startsWith('_') && entry.isDirectory() && !entry.isSymbolicLink()
 
-type DirectoryReader<Entry> = {
-  closeSync: () => void
-  readSync: () => Entry | null
-}
-
 type OpenDirectory<Entry> = (path: string) => DirectoryReader<Entry>
 
 /** @internal */
@@ -50,20 +47,14 @@ export const collectBoundedDirectoryEntries = <Entry extends { name: string } = 
   let primaryError: unknown
   let result: { entries: Entry[]; overflow: false } | { entries: never[]; overflow: true } | undefined
   try {
-    const entries: Entry[] = []
-    while (entries.length <= maximum) {
-      const entry = reader.readSync()
-      if (entry === null) {
-        result = {
-          entries: entries.sort((first, second) => ordinalStringCompare(first.name, second.name)),
-          overflow: false as const,
-        }
-        break
-      }
-      onEntry?.()
-      entries.push(entry)
-    }
-    result ??= { entries: [], overflow: true as const }
+    const collected = readBoundedDirectoryEntries(reader, maximum + 1, () => onEntry?.())
+    result =
+      collected.entries.length > maximum
+        ? { entries: [], overflow: true as const }
+        : {
+            entries: collected.entries.sort((first, second) => ordinalStringCompare(first.name, second.name)),
+            overflow: false as const,
+          }
   } catch (error) {
     primaryError = error
   }
@@ -93,6 +84,7 @@ export const isCanonicalDirectoryReplacementError = (error: unknown) => {
 
 export type CanonicalDirectorySnapshot = {
   entries: Dirent[]
+  maximum: number
   overflow: boolean
   witness: DirectoryWitness
 }
@@ -109,7 +101,7 @@ export const captureCanonicalDirectory = (
     const collected = collectBoundedDirectoryEntries(witness.canonicalPath, maximum, undefined, onEntry)
     afterEnumeration?.(path)
     revalidateDirectoryWitness(witness)
-    return { ...collected, witness }
+    return { ...collected, maximum, witness }
   } catch (error) {
     if (isCanonicalDirectoryReplacementError(error)) {
       throw new CanonicalDirectoryChangedError(path, { cause: error })
@@ -117,6 +109,39 @@ export const captureCanonicalDirectory = (
     throw error
   }
 }
+
+type CanonicalEntryType = 'directory' | 'file' | 'other' | 'symlink'
+
+const canonicalEntryType = (entry: Dirent): CanonicalEntryType => {
+  if (entry.isSymbolicLink()) {
+    return 'symlink'
+  }
+  if (entry.isDirectory()) {
+    return 'directory'
+  }
+  if (entry.isFile()) {
+    return 'file'
+  }
+  return 'other'
+}
+
+export const sameCanonicalDirectoryGeneration = (
+  first: CanonicalDirectorySnapshot,
+  second: CanonicalDirectorySnapshot,
+) =>
+  first.witness.path === second.witness.path &&
+  first.witness.canonicalPath === second.witness.canonicalPath &&
+  sameStableEntryMetadata(first.witness.pathMetadata, second.witness.pathMetadata) &&
+  sameStableEntryMetadata(first.witness.canonicalMetadata, second.witness.canonicalMetadata) &&
+  first.overflow === second.overflow &&
+  first.entries.length === second.entries.length &&
+  first.entries.every((entry, index) => {
+    const other = second.entries[index]
+    return other !== undefined && entry.name === other.name && canonicalEntryType(entry) === canonicalEntryType(other)
+  })
+
+export const recaptureCanonicalDirectoryGeneration = (snapshot: CanonicalDirectorySnapshot) =>
+  captureCanonicalDirectory(snapshot.witness.path, snapshot.maximum)
 
 export const revalidateCanonicalDirectory = (snapshot: CanonicalDirectorySnapshot) => {
   try {

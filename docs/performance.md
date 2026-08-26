@@ -18,7 +18,7 @@ bun run benchmark:check
 
 The profiles are fixed:
 
-- `ci`: 0 and 100 records, no warmup, one measured sample;
+- `ci`: 0, 100, and 1,000 records, no warmup, one measured sample;
 - `baseline` (the default): 0 and 100 records, one warmup and three measured samples;
 - `full`: 0, 100, and 1,000 records, two warmups and five measured samples.
 
@@ -32,7 +32,7 @@ Every warmup and measured operation runs in a fresh Node child after the parent 
 
 Results are committed in [performance-baseline.json](./performance-baseline.json). CI ceilings live in [performance-budgets.json](./performance-budgets.json), select explicit p95 total-time or maximum cache statistics, and reject incompatible or incomplete budget schemas before creating a benchmark repository.
 
-Correctness tests enforce deterministic output and bounded work counts for canonical scans, supersession graphs, and baseline accumulation. They use per-invocation internal observers and never inspect production source spelling. Wall-clock latency, memory, and cache-size regressions remain the exclusive responsibility of `benchmark:check` and the stable full-profile evidence.
+Correctness tests enforce deterministic output and bounded work counts for canonical scans, supersession graphs, and baseline accumulation. They use per-invocation internal observers and never inspect production source spelling. One isolated test also compares retained heap allocation against descriptor-map controls for payload validation; `benchmark:check` and the stable full-profile evidence own configured product wall-clock and cache-size ceilings, while isolated RSS remains diagnostic unless a budget explicitly selects it.
 
 ## Stable baseline
 
@@ -40,11 +40,13 @@ The committed schema-version 2 baseline was measured on Node.js v26.5.0 on darwi
 
 | Records | Cold hydrate | Unchanged prepare | Stale prepare | Compact search | Full search | Gather | Cache amplification |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 11.2 / 11.5 ms | 4.5 / 4.8 ms | n/a | 5.0 / 5.1 ms | 5.0 / 5.1 ms | 5.5 / 5.6 ms | n/a |
-| 100 | 35.4 / 35.5 ms | 15.7 / 16.2 ms | 56.1 / 56.5 ms | 17.4 / 17.8 ms | 16.7 / 16.9 ms | 308.0 / 310.8 ms | 2.46x |
-| 1,000 | 208.7 / 210.5 ms | 85.0 / 85.9 ms | 377.3 / 380.5 ms | 94.7 / 94.9 ms | 88.5 / 102.0 ms | 3.08 / 3.20 s | 2.32x |
+| 0 | 30.5 / 32.1 ms | 5.3 / 5.4 ms | n/a | 5.9 / 6.0 ms | 5.9 / 5.9 ms | 6.4 / 6.5 ms | n/a |
+| 100 | 103.0 / 104.0 ms | 50.5 / 57.0 ms | 126.2 / 128.4 ms | 54.6 / 55.5 ms | 51.1 / 52.8 ms | 344.1 / 345.4 ms | 2.46x |
+| 1,000 | 666.0 / 673.3 ms | 382.0 / 392.3 ms | 885.4 / 890.1 ms | 417.7 / 519.2 ms | 399.4 / 409.6 ms | 3.37 / 3.38 s | 2.32x |
 
-The CI profile intentionally runs only 0 and 100 records with one measured process and generous ceilings. It catches runaway cache rebuild, automatic preparation, search, gather, and cache-size regressions without treating noisy cross-platform timings as precise performance claims. Stable comparisons should use the full profile and its distributions.
+The CI profile runs 0, 100, and 1,000 records with one measured process and generous ceilings. The product-limit case explicitly budgets the preparation/integrity phase that proves canonical/cache record equivalence, as well as total operation latency and cache size. It catches runaway cache rebuild, automatic preparation, search, gather, equivalence validation, and cache-size regressions without treating noisy cross-platform timings as precise performance claims. Stable comparisons should use the full profile and its distributions.
+
+At 1,000 records, canonical/cache equality validation is included in the measured preparation/integrity phase: median / p95 is 382.0 / 392.3 ms for unchanged preparation and 257.0 / 267.7 ms for list. Across list, show, compact search, full search, and gather, that phase remains below 300 ms p95 in this full profile; unchanged preparation is reported separately above. The committed product-limit budget permits at most 10 seconds for each read preparation/integrity phase, leaving cross-platform headroom while still detecting unbounded or duplicated validation work.
 
 ## Single-pass read comparison
 
@@ -71,6 +73,12 @@ MAR-2560 compares the same 100-record duplicate-heavy workload with and without 
 
 Deterministic behavioural hooks, not wall-clock thresholds, enforce one show read and one search execution per exact distinct key. The identical benchmark workload demonstrates the resulting reduction while retaining all 80 output envelopes and per-occurrence response accounting.
 
+## Stable canonical read snapshots
+
+Stable validation and canonical reads perform one bounded canonical scan, one graph-validation pass, one initial artifact-validation pass, and one closing artifact-record-artifact evidence sandwich. Behavioural work-count tests cover empty, 100-record, and 1,000-record corpora. A detected generation change discards that attempt and adds exactly one complete pipeline; no per-directory or per-record retry resets the shared maximum of three attempts or its non-resetting 60-second deadline.
+
+This change introduces no new latency, memory, cache-size, or amplification threshold. The existing schema-version 2 benchmark remains the release authority for configured public-operation budgets, while deterministic work observers enforce the stable and retry pipeline counts.
+
 ## Validated mutation snapshot comparison
 
 MAR-2565 removes the second canonical JSON parse and graph validation from stable record additions and record-producing initialisation. Three measured fresh Node processes used the same lightweight valid corpus with no warmup at the MAR-2560 base (`15e3b037e5d710fa4743168798d5e3d8f752ee4c`) and the implementation snapshot (`906d6d7710fe511982a81ad0deb9ecff7e36f7d0`). Timings are diagnostic median / nearest-rank p95 milliseconds, not new CI thresholds.
@@ -84,7 +92,7 @@ The deterministic work counts are the regression authority: every measured snaps
 
 ## Scale guidance
 
-The current full-rebuild cache is suitable for repository knowledge bases up to the product limit of 1,000 canonical records. On the baseline machine, cold hydration remained near a quarter second at that limit; unchanged prepare, list, show, and search remained near or below two tenths of a second, stale rebuilding remained below half a second, and the maximum-envelope duplicate-heavy gather remained the expensive path because it still constructs and charges every requested output occurrence.
+The current full-rebuild cache is suitable for repository knowledge bases up to the product limit of 1,000 canonical records. On the baseline machine, cold hydration remained below 0.7 seconds at that limit; unchanged prepare, list, show, and full search remained near 0.4 seconds, stale rebuilding remained below 0.9 seconds, and the maximum-envelope duplicate-heavy gather remained the expensive path because it still constructs and charges every requested output occurrence.
 
 Prefer specific terms, compact search, and targeted `show` calls when exploring larger corpora. Explicit record counts above the product limit remain exploratory and still fail if canonical record or byte budgets are exceeded.
 

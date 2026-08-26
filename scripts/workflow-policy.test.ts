@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import {
   appendFileSync,
+  existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
@@ -2941,7 +2942,52 @@ jobs:
   )
 })
 
-// This suite owns the structural workflow security contract; test/package.test.ts independently guards its CI bootstrap.
+test('direct workflow policy validation bypasses package lifecycle hooks', () => {
+  const staleWorkflow = `name: Fail
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: owner/action@v1
+`
+  const repairedWorkflow = staleWorkflow.replace(
+    'owner/action@v1',
+    'owner/action@0123456789abcdef0123456789abcdef01234567 # v1.0.0',
+  )
+  const root = createFixture({ '.github/workflows/fail.yml': staleWorkflow })
+  const workflowPath = join(root, '.github', 'workflows', 'fail.yml')
+  const repairMarkerPath = join(root, 'repair-ran')
+  writeFileSync(
+    join(root, 'package.json'),
+    `${JSON.stringify({
+      scripts: {
+        'check:workflows': `bun run ${policyPath}`,
+        'precheck:workflows': 'node ./repair-workflow.mjs',
+      },
+      type: 'module',
+    })}\n`,
+  )
+  writeFileSync(
+    join(root, 'repair-workflow.mjs'),
+    `import { writeFileSync } from 'node:fs'\nwriteFileSync(new URL('./.github/workflows/fail.yml', import.meta.url), ${JSON.stringify(repairedWorkflow)})\nwriteFileSync(new URL('./repair-ran', import.meta.url), 'true\\n')\n`,
+  )
+
+  const directResult = spawnSync(process.execPath, ['run', policyPath], { cwd: root, encoding: 'utf8' })
+  assert.equal(directResult.status, 1)
+  assert.match(directResult.stderr, /external-reference-sha/u)
+  assert.equal(readFileSync(workflowPath, 'utf8'), staleWorkflow)
+  assert.equal(existsSync(repairMarkerPath), false)
+
+  const aliasResult = spawnSync(process.execPath, ['run', 'check:workflows'], { cwd: root, encoding: 'utf8' })
+  assert.equal(aliasResult.status, 0, `${aliasResult.stdout}${aliasResult.stderr}`)
+  assert.equal(readFileSync(workflowPath, 'utf8'), repairedWorkflow)
+  assert.equal(readFileSync(repairMarkerPath, 'utf8'), 'true\n')
+})
+
+// This suite owns the structural workflow security contract; test/ci-workflow.test.ts independently guards its CI bootstrap.
 // Mutation caught: mutable actions, hidden local wrappers, unprotected credentials, or write permissions would escape repository policy.
 test('repository workflows obey immutable action and credential boundaries', () => {
   const externalReferences: ExternalReferenceObservation[] = []
@@ -3018,6 +3064,7 @@ test('repository workflows obey immutable action and credential boundaries', () 
     ciWorkflow.jobs.verify.steps.filter(step => step.uses !== undefined).map(step => step.uses),
     [
       'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+      'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
       'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
       'oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6',
     ],

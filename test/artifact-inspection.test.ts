@@ -44,7 +44,11 @@ const filesystemCapabilities = (() => {
         throw error
       }
     }
-    return { caseInsensitiveCanonicalPath, directoryLink, fifo: spawnSync('mkfifo', [fifo]).status === 0 }
+    return {
+      caseInsensitiveCanonicalPath,
+      directoryLink,
+      fifo: spawnSync('mkfifo', [fifo]).status === 0,
+    }
   } finally {
     rmSync(root, { force: true, recursive: true })
   }
@@ -430,6 +434,63 @@ test('rejects an initially invalid artifact that becomes stable during batch ins
           if (!created && point === 'after-artifact-lstat' && currentArtifact === laterArtifact) {
             created = true
             writeFileSync(path, 'newly created evidence')
+          }
+        },
+      }),
+    ArtifactChangedError,
+  )
+})
+
+test('rejects a higher ancestor replacement even when the final artifact keeps the same inode', () => {
+  const { artifact, brainDirectory, root } = createArtifact()
+  const artifactsDirectory = join(brainDirectory, '_artifacts')
+  const decisionDirectory = join(artifactsDirectory, 'decision')
+  const finalParent = join(decisionDirectory, 'artifact-inspection')
+  const displacedDecision = join(root, 'displaced-decision-ancestor')
+  const replacementDecision = join(root, 'replacement-decision-ancestor')
+  mkdirSync(replacementDecision)
+  let ancestorLstats = 0
+
+  assert.throws(
+    () =>
+      inspectArtifactFiles(brainDirectory, [artifact], {
+        fault: point => {
+          if (point === 'before-ancestor-lstat') {
+            ancestorLstats += 1
+            if (ancestorLstats === 4) {
+              renameSync(finalParent, join(replacementDecision, 'artifact-inspection'))
+              renameSync(decisionDirectory, displacedDecision)
+              renameSync(replacementDecision, decisionDirectory)
+            }
+          }
+        },
+      }),
+    ArtifactChangedError,
+  )
+})
+
+test('rejects a higher ancestor replacement for the same stable invalid final path', () => {
+  const { artifact, brainDirectory, path, root } = createArtifact()
+  rmSync(path)
+  const artifactsDirectory = join(brainDirectory, '_artifacts')
+  const decisionDirectory = join(artifactsDirectory, 'decision')
+  const finalParent = join(decisionDirectory, 'artifact-inspection')
+  const displacedDecision = join(root, 'displaced-invalid-decision-ancestor')
+  const replacementDecision = join(root, 'replacement-invalid-decision-ancestor')
+  mkdirSync(replacementDecision)
+  let ancestorLstats = 0
+
+  assert.throws(
+    () =>
+      inspectArtifactFiles(brainDirectory, [artifact], {
+        fault: point => {
+          if (point === 'before-ancestor-lstat') {
+            ancestorLstats += 1
+            if (ancestorLstats === 4) {
+              renameSync(finalParent, join(replacementDecision, 'artifact-inspection'))
+              renameSync(decisionDirectory, displacedDecision)
+              renameSync(replacementDecision, decisionDirectory)
+            }
           }
         },
       }),

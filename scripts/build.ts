@@ -1,6 +1,7 @@
 import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { renderPackageVersionSource } from './package-version.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const outputDirectory = resolve(root, 'dist')
@@ -10,11 +11,7 @@ if (typeof packageJson.version !== 'string') {
 }
 const generatedDirectory = resolve(root, 'src', 'generated')
 mkdirSync(generatedDirectory, { recursive: true })
-writeFileSync(
-  resolve(generatedDirectory, 'version.ts'),
-  `// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = ${JSON.stringify(packageJson.version)}\n`,
-  'utf8',
-)
+writeFileSync(resolve(generatedDirectory, 'version.ts'), renderPackageVersionSource(packageJson.version), 'utf8')
 
 rmSync(outputDirectory, { force: true, recursive: true })
 mkdirSync(outputDirectory, { recursive: true })

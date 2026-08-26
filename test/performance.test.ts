@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
@@ -7,6 +8,7 @@ import { assertRecordGraph, readRecordsResolved, validateRecordsResolved } from 
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
+const payloadValidationWorkFixture = join(import.meta.dirname, 'fixtures', 'payload-validation-work.ts')
 
 const createRoot = () => {
   const root = createTestRepository()
@@ -49,6 +51,39 @@ const writeRecord = (
 }
 
 describe('hot scan performance regressions', () => {
+  test('avoids descriptor-map allocation before payload budgets', () => {
+    const run = (mode: 'bounded' | 'descriptor-map') =>
+      JSON.parse(
+        execFileSync(process.execPath, ['--expose-gc', payloadValidationWorkFixture, mode], {
+          encoding: 'utf8',
+        }),
+      ) as {
+        descriptorMapCalls: number
+        heapGrowthBytes: number
+        mode: string
+        oversizedArrayWork: { descriptors: string[]; ownKeys: number }
+        propertyCount: number
+        retainedDescriptorCount: number
+        work: { descriptors: number; ownKeys: number }
+      }
+
+    const bounded = run('bounded')
+    const descriptorMap = run('descriptor-map')
+
+    assert.equal(bounded.descriptorMapCalls, 0)
+    assert.deepEqual(bounded.work, { descriptors: bounded.propertyCount, ownKeys: 1 })
+    assert.deepEqual(bounded.oversizedArrayWork, { descriptors: ['length'], ownKeys: 0 })
+    assert.equal(descriptorMap.descriptorMapCalls, 2)
+    assert.deepEqual(descriptorMap.work, {
+      descriptors: descriptorMap.propertyCount,
+      ownKeys: 1,
+    })
+    assert.deepEqual(descriptorMap.oversizedArrayWork, { descriptors: ['length'], ownKeys: 1 })
+    assert.equal(bounded.retainedDescriptorCount, 0)
+    assert.equal(descriptorMap.retainedDescriptorCount, descriptorMap.propertyCount)
+    assert.ok(descriptorMap.heapGrowthBytes > bounded.heapGrowthBytes + descriptorMap.propertyCount * 32)
+  })
+
   test('leaves returned baseline results free of instrumentation wrappers', () => {
     const root = createRoot()
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'sample-project' }))
@@ -217,6 +252,93 @@ describe('hot scan performance regressions', () => {
     assert.equal(result.errors[0]?.code, 'DUPLICATE_RECORD_ID')
     assert.equal(work.get('duplicate-issue-read'), 1)
     assert.equal(work.get('duplicate-issue-write'), 1)
+  })
+
+  test('stable canonical snapshot work is one scan and graph pass for 0, 100, and 1,000 records', () => {
+    ;[0, 100, 1000].reduce<undefined>((verified, recordCount) => {
+      const root = createRoot()
+      Array.from({ length: recordCount }, (_, index) =>
+        writeRecord(root, {
+          createdAt: new Date(Date.UTC(2026, 0, 1) + index).toISOString(),
+          id: `stable-work-${index.toString().padStart(4, '0')}`,
+        }),
+      )
+      const work = { canonicalEntries: 0, canonicalScans: 0, graphValidations: 0 }
+
+      const result = validateRecordsResolved(root, {
+        hooks: {
+          canonicalScan: () => {
+            work.canonicalScans += 1
+          },
+          graphValidation: () => {
+            work.graphValidations += 1
+          },
+          onWork: operation => {
+            if (operation === 'canonical-entry') {
+              work.canonicalEntries += 1
+            }
+          },
+        },
+      })
+
+      assert.equal(result.recordsChecked, recordCount)
+      assert.deepEqual(work, {
+        canonicalEntries: recordCount,
+        canonicalScans: 1,
+        graphValidations: 1,
+      })
+      return verified
+    }, undefined)
+  })
+
+  test('canonical snapshot retry work adds one complete scan and graph pass without per-directory retries', () => {
+    ;[0, 100, 1000].reduce<undefined>((verified, recordCount) => {
+      const root = createRoot()
+      Array.from({ length: recordCount }, (_, index) =>
+        writeRecord(root, {
+          createdAt: new Date(Date.UTC(2026, 0, 1) + index).toISOString(),
+          id: `retry-work-${index.toString().padStart(4, '0')}`,
+        }),
+      )
+      const firstRecordPath = join(root, 'encephalon', 'context', 'retry-work-0000.json')
+      const firstRecordMetadata = recordCount === 0 ? undefined : statSync(firstRecordPath)
+      const work = { canonicalEntries: 0, canonicalScans: 0, graphValidations: 0 }
+
+      const result = validateRecordsResolved(root, {
+        hooks: {
+          canonicalScan: () => {
+            work.canonicalScans += 1
+          },
+          graphValidation: () => {
+            work.graphValidations += 1
+            if (work.graphValidations === 1) {
+              if (firstRecordMetadata === undefined) {
+                mkdirSync(join(root, 'encephalon', 'context'), { recursive: true })
+              } else {
+                const original = readFileSync(firstRecordPath, 'utf8')
+                const replacement = original.replace('retry-work-0000', 'retry-work-xxxx')
+                assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(original))
+                writeFileSync(firstRecordPath, replacement)
+                utimesSync(firstRecordPath, firstRecordMetadata.atime, firstRecordMetadata.mtime)
+              }
+            }
+          },
+          onWork: operation => {
+            if (operation === 'canonical-entry') {
+              work.canonicalEntries += 1
+            }
+          },
+        },
+      })
+
+      assert.equal(result.recordsChecked, recordCount)
+      assert.deepEqual(work, {
+        canonicalEntries: recordCount * 2,
+        canonicalScans: 2,
+        graphValidations: 2,
+      })
+      return verified
+    }, undefined)
   })
 
   test('bounds baseline accumulator work while preserving output order', () => {
