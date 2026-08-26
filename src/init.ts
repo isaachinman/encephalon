@@ -7,20 +7,22 @@ import {
   prepareResolvedRepository,
   type ValidatedMutationCacheSnapshot,
 } from './cache.ts'
-import { assertCacheLocation } from './cache-location.ts'
+import { assertCacheLocation, type CacheLocation } from './cache-location.ts'
 import { EncephalonError, fail, wrapIo } from './errors.ts'
 import { applyInstructionChangesOutcome, planInstructionChanges } from './instructions.ts'
 import { withOperationLock } from './lock.ts'
 import { ordinalStringCompare } from './order.ts'
 import {
   assertCanonicalLayoutAdditions,
+  committedCanonicalRecordPrefixError,
   MAX_CANONICAL_RECORD_BYTES,
   nextRecordCreatedAt,
   planRecordAddition,
   publishPlannedRecordOutcome,
   type RecordReadHooks,
   type RecordWriteHooks,
-  readRecordPlanningSnapshotResolved,
+  rethrowCanonicalGenerationChangeAfterCommit,
+  withRecordPlanningSnapshotRetryResolved,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import { createRecordFile, validateAddRecordInput } from './schema.ts'
@@ -51,6 +53,8 @@ type InitProgressDetails = InitProgress & {
   recoveryMode: 'rerun' | 'inspectAndRerun'
   recoveryAction: string
 }
+
+type InitPublicationAuthority = Parameters<typeof publishPlannedRecordOutcome>[2]['authority']
 
 const recoveryActions = {
   cachePreparation: 'Run prepare, run validate, then repeat the same init operation with the same options.',
@@ -181,6 +185,67 @@ const baselineActions = (records: readonly BrainRecord[], baseline: AddRecordInp
     { additions: [], conflicts: [] },
   )
 
+const publishInitRecords = (
+  root: string,
+  plans: readonly ReturnType<typeof planRecordAddition>[],
+  authority: InitPublicationAuthority,
+  progress: InitProgress,
+  hooks: InitHooks,
+) =>
+  plans.reduce<BrainRecord[]>((recordsCreated, plan) => {
+    let publication: ReturnType<typeof publishPlannedRecordOutcome>
+    try {
+      publication = publishPlannedRecordOutcome(root, plan, {
+        authority,
+        ...(hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }),
+      })
+    } catch (error) {
+      return rethrowCanonicalGenerationChangeAfterCommit(error, recordsCreated)
+    }
+    const committedRecords = [...recordsCreated, publication.record]
+    progress.committedRecordIds = [...progress.committedRecordIds, publication.record.id]
+    progress.cacheState = 'disposable'
+    if (publication.committedError !== undefined) {
+      throw committedCanonicalRecordPrefixError(publication.committedError, committedRecords)
+    }
+    return committedRecords
+  }, [])
+
+const prepareInitCache = (
+  root: string,
+  location: CacheLocation,
+  hasAdditions: boolean,
+  cacheSnapshot: ValidatedMutationCacheSnapshot | undefined,
+  authority: InitPublicationAuthority,
+  recordsCreated: readonly BrainRecord[],
+  hooks: InitHooks,
+) => {
+  try {
+    const result = (() => {
+      if (hasAdditions) {
+        return cacheSnapshot === undefined
+          ? hydrateResolvedRepository(root, 'held', location)
+          : hydrateResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
+      }
+      if (cacheSnapshot !== undefined) {
+        return prepareResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
+      }
+      return prepareResolvedRepository(root, 'held', location)
+    })()
+    hooks.hydration?.(result)
+    authority.assertCurrent()
+  } catch (error) {
+    if (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED') {
+      try {
+        authority.assertCurrent()
+      } catch (authorityError) {
+        return rethrowCanonicalGenerationChangeAfterCommit(authorityError, recordsCreated)
+      }
+    }
+    return rethrowCanonicalGenerationChangeAfterCommit(error, recordsCreated)
+  }
+}
+
 const initResolved = (
   input: InitEncephalonInput,
   progress: InitProgress,
@@ -230,110 +295,105 @@ const initResolved = (
             subject: candidate.subject,
           }))
         : undefined
-      const planning = readRecordPlanningSnapshotResolved(root, hooks, location)
-      const { records } = planning
-      assertCacheLocation(location)
-      const { actions, validatedAdditions } = (() => {
-        try {
-          const plannedActions = baselineActions(records, baseline, refresh)
-          return {
-            actions: plannedActions,
-            validatedAdditions: plannedActions.additions.map(addition => validateAddRecordInput({ ...addition, root })),
-          }
-        } catch (error) {
-          planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
-          throw error
-        }
-      })()
-      let recordsCreated: BrainRecord[] = []
-      let cacheSnapshot: ValidatedMutationCacheSnapshot | undefined
-      if (validatedAdditions.length > 0) {
-        const validationPlans = validatedAdditions.map(addition =>
-          planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
-        )
-        const artifacts = (() => {
-          try {
-            return planning.validateFinal(
-              [...records, ...validationPlans.map(plan => plan.record)],
-              'The generated baseline would make canonical records invalid.',
-            )
-          } catch (error) {
-            if (error instanceof EncephalonError && error.code === 'VALIDATION_FAILED') {
-              planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
+      const { actions, recordsCreated } = withRecordPlanningSnapshotRetryResolved(
+        root,
+        planning => {
+          const { records } = planning
+          assertCacheLocation(location)
+          const validateCurrentRecords = () =>
+            planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
+          const { actions: plannedActions, validatedAdditions } = (() => {
+            try {
+              const nextActions = baselineActions(records, baseline, refresh)
+              return {
+                actions: nextActions,
+                validatedAdditions: nextActions.additions.map(addition =>
+                  validateAddRecordInput({ ...addition, root }),
+                ),
+              }
+            } catch (error) {
+              validateCurrentRecords()
+              throw error
             }
-            throw error
-          }
-        })()
-        const { plans } = validatedAdditions.reduce<{
-          cursor: readonly BrainRecord[]
-          plans: readonly ReturnType<typeof planRecordAddition>[]
-        }>(
-          (result, addition) => {
-            const plan = planRecordAddition(root, createRecordFile(addition, nextRecordCreatedAt(result.cursor)))
-            return { cursor: [...result.cursor, plan.record], plans: [...result.plans, plan] }
-          },
-          { cursor: records, plans: [] },
-        )
-        const authority = assertCanonicalLayoutAdditions(
-          plans.map(plan => plan.record.kind),
-          planning.authority(),
-        )
-        const recordWriteOptions = {
-          authority,
-          ...(hooks.recordWriteHooks === undefined ? {} : { hooks: hooks.recordWriteHooks }),
-        }
-        progress.phase = 'recordPublication'
-        for (const plan of plans) {
-          const publication = publishPlannedRecordOutcome(root, plan, recordWriteOptions)
-          recordsCreated = [...recordsCreated, publication.record]
-          progress.committedRecordIds = [...progress.committedRecordIds, publication.record.id]
+          })()
+          let attemptRecordsCreated: BrainRecord[] = []
+          let cacheSnapshot: ValidatedMutationCacheSnapshot | undefined
+          const authority = (() => {
+            if (validatedAdditions.length > 0) {
+              const validationPlans = validatedAdditions.map(addition =>
+                planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
+              )
+              const artifacts = (() => {
+                try {
+                  return planning.validateFinal(
+                    [...records, ...validationPlans.map(plan => plan.record)],
+                    'The generated baseline would make canonical records invalid.',
+                  )
+                } catch (error) {
+                  if (error instanceof EncephalonError && error.code === 'VALIDATION_FAILED') {
+                    validateCurrentRecords()
+                  }
+                  throw error
+                }
+              })()
+              const { plans } = validatedAdditions.reduce<{
+                cursor: readonly BrainRecord[]
+                plans: readonly ReturnType<typeof planRecordAddition>[]
+              }>(
+                (result, addition) => {
+                  const plan = planRecordAddition(root, createRecordFile(addition, nextRecordCreatedAt(result.cursor)))
+                  return { cursor: [...result.cursor, plan.record], plans: [...result.plans, plan] }
+                },
+                { cursor: records, plans: [] },
+              )
+              const publicationAuthority = assertCanonicalLayoutAdditions(
+                plans.map(plan => plan.record.kind),
+                planning.authority(),
+              )
+              progress.phase = 'recordPublication'
+              attemptRecordsCreated = publishInitRecords(root, plans, publicationAuthority, progress, hooks)
+              const mutationBytes =
+                planning.bytes + plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted), 0)
+              if (mutationBytes <= MAX_CANONICAL_RECORD_BYTES) {
+                cacheSnapshot = Object.freeze({
+                  artifacts,
+                  assertCurrent: publicationAuthority.assertCurrent,
+                  records: Object.freeze([...records, ...attemptRecordsCreated]),
+                  repositoryRealpath: location.repository,
+                })
+              }
+              return publicationAuthority
+            }
+            const artifacts = validateCurrentRecords()
+            const settledAuthority = planning.authority()
+            if (!refresh) {
+              cacheSnapshot = Object.freeze({
+                artifacts,
+                assertCurrent: settledAuthority.assertCurrent,
+                records: Object.freeze([...records]),
+                repositoryRealpath: location.repository,
+              })
+            }
+            return settledAuthority
+          })()
+          progress.phase = 'cachePreparation'
           progress.cacheState = 'disposable'
-          if (publication.committedError !== undefined) {
-            throw publication.committedError
-          }
-        }
-        const mutationBytes =
-          planning.bytes + plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted), 0)
-        if (mutationBytes <= MAX_CANONICAL_RECORD_BYTES) {
-          cacheSnapshot = Object.freeze({
-            artifacts,
-            assertCurrent: authority.assertCurrent,
-            records: Object.freeze([...records, ...recordsCreated]),
-            repositoryRealpath: location.repository,
-          })
-        }
-      } else {
-        const artifacts = planning.validateFinal(
-          records,
-          'Canonical records are invalid.',
-          planning.bytes,
-          allowedGeneratedHeads,
-        )
-        const authority = planning.authority()
-        if (!refresh) {
-          cacheSnapshot = Object.freeze({
-            artifacts,
-            assertCurrent: authority.assertCurrent,
-            records: Object.freeze([...records]),
-            repositoryRealpath: location.repository,
-          })
-        }
-      }
-      progress.phase = 'cachePreparation'
-      progress.cacheState = 'disposable'
-      const cacheResult = (() => {
-        if (validatedAdditions.length > 0) {
-          return cacheSnapshot === undefined
-            ? hydrateResolvedRepository(root, 'held', location)
-            : hydrateResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
-        }
-        if (cacheSnapshot !== undefined) {
-          return prepareResolvedMutationSnapshot(root, cacheSnapshot, 'held', location)
-        }
-        return prepareResolvedRepository(root, 'held', location)
-      })()
-      progress.cacheState = 'prepared'
-      hooks.hydration?.(cacheResult)
+          prepareInitCache(
+            root,
+            location,
+            validatedAdditions.length > 0,
+            cacheSnapshot,
+            authority,
+            attemptRecordsCreated,
+            hooks,
+          )
+          progress.cacheState = 'prepared'
+          return { actions: plannedActions, recordsCreated: attemptRecordsCreated }
+        },
+        hooks,
+        location,
+        false,
+      )
       progress.phase = 'instructionApplication'
       const instructionOutcome = applyInstructionChangesOutcome(root, instructionPlans, hooks.instructionWriteHooks)
       progress.committedInstructionFiles = [...instructionOutcome.instructionFiles]
