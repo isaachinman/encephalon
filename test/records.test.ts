@@ -4857,7 +4857,7 @@ describe('canonical records', () => {
         canonicalScan: () => {
           scans += 1
           if (scans === 2 && displaced) {
-            renameSync(displacedKindPath, kindPath)
+            writeCanonicalRecord(root, { id, subject: 'record.parent-disappearance' })
           }
         },
         fault: (point, faultPath) => {
