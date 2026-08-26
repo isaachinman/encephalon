@@ -378,6 +378,51 @@ const committedRecordIds = (records: readonly Pick<BrainRecord, 'id'>[]): string
   return ids
 }
 
+const canonicalRaceRecoveryAction = 'Run validate and reconcile the canonical repository before retrying the operation.'
+
+/** @internal */
+export const rethrowCanonicalGenerationChangeAfterCommit = (
+  error: unknown,
+  records: readonly Pick<BrainRecord, 'id'>[],
+): never => {
+  if (error instanceof CanonicalGenerationChanged && records.length > 0) {
+    const ids = committedRecordIds(records)
+    const noun = ids.length === 1 ? 'record was' : 'records were'
+    throw new EncephalonError(
+      'REPOSITORY_CHANGED',
+      `The canonical repository changed after ${ids.length} ${noun} committed. ${canonicalRaceRecoveryAction}`,
+      {
+        canonicalCommitted: true,
+        committedRecordIds: ids,
+        postCommitPhase: 'publicationVerification',
+        recoveryAction: canonicalRaceRecoveryAction,
+        repositoryChanged: true,
+      },
+      { cause: error },
+    )
+  }
+  throw error
+}
+
+/** @internal */
+export const committedCanonicalRecordPrefixError = (
+  error: EncephalonError,
+  records: readonly Pick<BrainRecord, 'id'>[],
+) => {
+  if (error.code === 'REPOSITORY_CHANGED' && error.details.canonicalCommitted === true) {
+    return new EncephalonError(
+      error.code,
+      error.message,
+      {
+        ...error.details,
+        committedRecordIds: committedRecordIds(records),
+      },
+      { cause: error.cause },
+    )
+  }
+  return error
+}
+
 const publicationVerificationError = (record: BrainRecord, cause: unknown) =>
   new EncephalonError(
     'REPOSITORY_CHANGED',
@@ -2184,11 +2229,13 @@ export const readRecordPlanningSnapshotResolved = (
 ): RecordPlanningSnapshot =>
   recordPlanningSnapshot(root, readStableCanonicalPlanningScan(root, hooks), hooks, cacheLocation)
 
-const withRecordPlanningSnapshotRetryResolved = <Result>(
+/** @internal */
+export const withRecordPlanningSnapshotRetryResolved = <Result>(
   root: string,
   operation: (planning: RecordPlanningSnapshot, repositoryChanged: boolean) => Result,
   hooks: RecordReadHooks = {},
   cacheLocation?: CacheLocation,
+  replanAfterPreparation = true,
 ): Result => {
   const ledger = createCanonicalSnapshotRetryLedger(hooks.now)
   return withCanonicalSnapshotRetry(
@@ -2200,7 +2247,7 @@ const withRecordPlanningSnapshotRetryResolved = <Result>(
           hooks,
           cacheLocation,
           canonicalGenerationChanged,
-          true,
+          replanAfterPreparation,
         ),
         ledger.repositoryChanged,
       ),

@@ -229,6 +229,8 @@ afterEach(() => {
 })
 
 describe('initialisation', () => {
+  const canonicalRaceRecoveryAction =
+    'Run validate and reconcile the canonical repository before retrying the operation.'
   const baselinePublicationOrder = [
     ['context', 'encephalon:init/repository-overview'],
     ['architecture', 'encephalon:init/tooling-layout'],
@@ -627,6 +629,103 @@ describe('initialisation', () => {
           root,
         }),
     )
+  })
+
+  test('rejects a changed generation after the full baseline prefix and before instructions', () => {
+    const root = createRoot()
+    let injected = false
+    let instructionHooks = 0
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            hydration: () => {
+              if (!injected) {
+                injected = true
+                writeRecordFile(root, {
+                  createdAt: '2099-01-01T00:00:00.000Z',
+                  id: 'concurrent-init-cache-preparation',
+                  kind: 'decision',
+                  payload: {},
+                  source: 'test',
+                  subject: 'concurrent.init-cache-preparation',
+                })
+              }
+            },
+            instructionWriteHooks: {
+              fault: () => {
+                instructionHooks += 1
+              },
+            },
+          },
+        ),
+      error => {
+        const actual = error as EncephalonError
+        const committedRecordIds = committedBaselineIds(root)
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(
+          actual.message,
+          `The canonical repository changed after 3 records were committed. ${canonicalRaceRecoveryAction}`,
+        )
+        assert.deepEqual(actual.details.committedRecordIds, committedRecordIds)
+        assert.deepEqual(
+          (actual.details.initProgress as { committedRecordIds?: unknown }).committedRecordIds,
+          committedRecordIds,
+        )
+        return true
+      },
+    )
+
+    assert.equal(injected, true)
+    assert.equal(instructionHooks, 0)
+    assert.equal(committedBaselineIds(root).length, baselinePublicationOrder.length)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('retains the committed prefix when cache and canonical generations both change', () => {
+    const root = createRoot()
+    let initialChange = false
+    cacheReadTestHooks.duringDatabaseInitialisation = mode => {
+      if (mode === 'writer' && !initialChange) {
+        initialChange = true
+        writeRecordFile(root, {
+          createdAt: '2099-01-01T00:00:00.000Z',
+          id: 'concurrent-init-cache-churn',
+          kind: 'decision',
+          payload: {},
+          source: 'test',
+          subject: 'concurrent.init-cache-churn',
+        })
+        throw new EncephalonError('REPOSITORY_CHANGED', 'Injected cache generation change.')
+      }
+    }
+
+    assert.throws(
+      () => api.initEncephalon({ root }),
+      error => {
+        const actual = error as EncephalonError
+        const committedRecordIds = committedBaselineIds(root)
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.equal(
+          actual.message,
+          `The canonical repository changed after 3 records were committed. ${canonicalRaceRecoveryAction}`,
+        )
+        assert.deepEqual(actual.details.committedRecordIds, committedRecordIds)
+        assert.deepEqual(
+          (actual.details.initProgress as { committedRecordIds?: unknown }).committedRecordIds,
+          committedRecordIds,
+        )
+        return true
+      },
+    )
+
+    assert.equal(initialChange, true)
+    assert.equal(committedBaselineIds(root).length, baselinePublicationOrder.length)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
 
   test('init instruction progress retains the first action when the second file fails before commit', () => {
@@ -1302,34 +1401,145 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
 
-  test('rejects a replacement canonical generation before publishing any baseline record', () => {
+  test('replans a changed canonical generation before the first baseline commit', () => {
     const root = createRoot()
-    mkdirSync(join(root, 'encephalon', 'decision'), { recursive: true })
-    const brainDirectory = join(root, 'encephalon')
-    const displaced = join(root, 'displaced-encephalon-before-init')
-    let replaced = false
+    const concurrentCreatedAt = '2099-01-01T00:00:00.000Z'
+    const concurrentId = 'concurrent-init-repository-overview'
+    let publicationAttempts = 0
+    const result = initWithCounts({ root }, point => {
+      if (point === 'before-publication') {
+        publicationAttempts += 1
+        if (publicationAttempts === 1) {
+          writeRecordFile(root, {
+            createdAt: concurrentCreatedAt,
+            id: concurrentId,
+            kind: 'context',
+            payload: { summary: 'Concurrent repository overview' },
+            source: 'test',
+            subject: 'encephalon:init/repository-overview',
+          })
+        }
+      }
+    })
 
-    assertErrorCode(
+    assert.deepEqual(result.counts, {
+      baselineScans: 1,
+      canonicalScans: 2,
+      diskCacheValidations: 0,
+      graphValidations: 2,
+      hydrations: 1,
+    })
+    assert.deepEqual(result.result.skippedConflicts, [
+      {
+        activeRecordIds: [concurrentId],
+        kind: 'context',
+        subject: 'encephalon:init/repository-overview',
+      },
+    ])
+    assert.deepEqual(
+      result.result.recordsCreated.map(record => [record.subject, record.createdAt]),
+      [
+        ['encephalon:init/tooling-layout', '2099-01-01T00:00:00.001Z'],
+        ['encephalon:init/commands-ci', '2099-01-01T00:00:00.002Z'],
+      ],
+    )
+    assert.equal(publicationAttempts, 3)
+    assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('bounds repeated complete init replans before the first baseline commit', () => {
+    const root = createRoot()
+    let publicationAttempts = 0
+
+    assert.throws(
       () =>
         initEncephalonWithHooks(
           { root },
           {
             recordWriteHooks: {
               fault: point => {
-                if (point === 'before-directory-preparation' && !replaced) {
-                  replaced = true
-                  renameSync(brainDirectory, displaced)
-                  mkdirSync(join(brainDirectory, 'decision'), { recursive: true })
+                if (point === 'before-publication') {
+                  publicationAttempts += 1
+                  writeRecordFile(root, {
+                    createdAt: `2099-01-01T00:00:00.00${publicationAttempts}Z`,
+                    id: `concurrent-init-replan-${publicationAttempts}`,
+                    kind: 'decision',
+                    payload: {},
+                    source: 'test',
+                    subject: `concurrent.init-replan-${publicationAttempts}`,
+                  })
                 }
               },
             },
           },
         ),
-      'REPOSITORY_CHANGED',
+      error => {
+        const actual = error as EncephalonError
+        assert.equal(actual.code, 'REPOSITORY_CHANGED')
+        assert.match(actual.message, /changed repeatedly/)
+        assert.deepEqual((actual.details.initProgress as { committedRecordIds?: unknown }).committedRecordIds, [])
+        return true
+      },
     )
-    assert.equal(replaced, true)
-    assert.deepEqual(readdirSync(join(brainDirectory, 'decision')), [])
-    assert.equal(existsSync(join(brainDirectory, '_staging')), false)
+
+    assert.equal(publicationAttempts, 3)
+    assert.deepEqual(committedBaselineIds(root), [])
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+  })
+
+  test('preserves a stable batch-limit failure after a complete replan', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 997 }, (_, value) => value)) {
+      const suffix = String(index).padStart(4, '0')
+      writeRecordFile(root, {
+        createdAt: '2026-01-01T00:00:00.000Z',
+        id: `existing-init-record-${suffix}`,
+        kind: 'decision',
+        payload: {},
+        source: 'test',
+        subject: `existing.init-record-${suffix}`,
+      })
+    }
+    let changed = false
+
+    assert.throws(
+      () =>
+        initEncephalonWithHooks(
+          { root },
+          {
+            recordWriteHooks: {
+              fault: point => {
+                if (point === 'before-publication' && !changed) {
+                  changed = true
+                  writeRecordFile(root, {
+                    createdAt: '2026-01-01T00:00:00.001Z',
+                    id: 'concurrent-init-record-limit',
+                    kind: 'decision',
+                    payload: {},
+                    source: 'test',
+                    subject: 'concurrent.init-record-limit',
+                  })
+                }
+              },
+            },
+          },
+        ),
+      error => {
+        const actual = error as EncephalonError
+        assert.equal(actual.code, 'VALIDATION_FAILED')
+        assert.equal(
+          (actual.details.errors as Array<{ code?: unknown }>).some(issue => issue.code === 'CORPUS_RECORD_LIMIT'),
+          true,
+        )
+        return true
+      },
+    )
+
+    assert.equal(changed, true)
+    assert.deepEqual(committedBaselineIds(root), [])
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
     assert.equal(existsSync(join(root, 'AGENTS.md')), false)
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
@@ -1701,6 +1911,10 @@ describe('initialisation', () => {
 
     const first = initWithCounts({ root })
     assert.equal(first.result.recordsCreated.length, 3)
+    assert.deepEqual(
+      first.result.recordsCreated.map(record => record.id),
+      committedBaselineIds(root),
+    )
     assert.deepEqual(first.counts, {
       baselineScans: 1,
       canonicalScans: 1,
@@ -1978,6 +2192,66 @@ describe('initialisation', () => {
     const records = api.listRecords({ includeSuperseded: true, limit: 20, root })
     assert.equal(records.length, 3)
     assert.deepEqual(new Set(records.map(record => record.subject)).size, 3)
+  })
+
+  test('stops a changed generation at the exact committed prefix and converges on rerun', () => {
+    const root = createRoot()
+    let publicationAttempts = 0
+    let capturedError: unknown
+
+    try {
+      initWithCounts({ root }, point => {
+        if (point === 'before-publication') {
+          publicationAttempts += 1
+          if (publicationAttempts === 2) {
+            writeRecordFile(root, {
+              createdAt: '2099-01-01T00:00:00.000Z',
+              id: 'concurrent-init-mid-batch',
+              kind: 'decision',
+              payload: {},
+              source: 'test',
+              subject: 'concurrent.init-mid-batch',
+            })
+          }
+        }
+      })
+      assert.fail('Expected the changed canonical generation to stop the batch.')
+    } catch (error) {
+      capturedError = error
+    }
+
+    assert.ok(capturedError instanceof EncephalonError)
+    const committedRecordIds = committedBaselineIds(root)
+    assert.equal(publicationAttempts, 2)
+    assert.equal(capturedError.code, 'REPOSITORY_CHANGED')
+    assert.equal(
+      capturedError.message,
+      `The canonical repository changed after 1 record was committed. ${canonicalRaceRecoveryAction}`,
+    )
+    const { initProgress, ...details } = capturedError.details
+    assert.deepEqual(details, {
+      canonicalCommitted: true,
+      committedRecordIds,
+      postCommitPhase: 'publicationVerification',
+      recoveryAction: canonicalRaceRecoveryAction,
+      repositoryChanged: true,
+    })
+    assert.equal(Object.isFrozen(details.committedRecordIds), true)
+    assert.deepEqual((initProgress as { committedRecordIds?: unknown }).committedRecordIds, committedRecordIds)
+    assert.equal(committedRecordIds.length, 1)
+    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
+    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
+    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
+
+    const rerun = initWithCounts({ root })
+    assert.equal(rerun.result.recordsCreated.length, 2)
+    assert.equal(api.validateRecords({ root }).valid, true)
+    const records = api.listRecords({ includeSuperseded: true, limit: 20, root })
+    assert.equal(records.length, 4)
+    assert.deepEqual(new Set(records.map(record => record.subject)).size, 4)
+    for (const [, subject] of baselinePublicationOrder) {
+      assert.equal(records.filter(record => record.subject === subject).length, 1)
+    }
   })
 
   test('stops a baseline batch after a post-link canonical generation replacement', () => {
