@@ -418,11 +418,11 @@ try {
 
   const help = cli(['--help'])
   const helpFragments = [
-    'list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <1..50>]',
-    'search [--kind <kind>] [--include-superseded] [--limit <1..50>] [--] <query>',
-    'search --compact [--kind <kind>] [--include-superseded] [--limit <1..100>] [--] <query>',
+    'list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <1..1000>]',
+    'search [--kind <kind>] [--include-superseded] [--limit <1..1000>] [--] <query>',
+    'search --compact [--kind <kind>] [--include-superseded] [--limit <1..1000>] [--] <query>',
     'gather [--search <query> ...] [--show <id> ...] [--hydrate] [--include-superseded]\n' +
-      '         [--kind <kind>] [--limit <1..100>]',
+      '         [--kind <kind>] [--limit <1..1000>]',
     'Accepts at most 16 searches and 64 shows.',
     'Accepts at most 1,000 supersession targets.',
   ]
@@ -452,16 +452,36 @@ try {
     }
   }
 
-  assertPackedBudgetFailure(['list', '--root', consumer, '--limit=51'], {
-    budget: 'fullResultLimit',
-    field: 'limit',
-    maximum: 50,
-  })
-  assertPackedBudgetFailure(['search', '--root', consumer, '--compact', '--limit=101', 'x'], {
-    budget: 'compactResultLimit',
-    field: 'limit',
-    maximum: 100,
-  })
+  const packedResultLimitCases = [
+    {
+      accepted: ['list', '--root', consumer, '--limit=1000'],
+      budget: 'fullResultLimit',
+      rejected: ['list', '--root', consumer, '--limit=1001'],
+    },
+    {
+      accepted: ['search', '--root', consumer, '--limit=1000', 'x'],
+      budget: 'fullResultLimit',
+      rejected: ['search', '--root', consumer, '--limit=1001', 'x'],
+    },
+    {
+      accepted: ['search', '--root', consumer, '--compact', '--limit=1000', 'x'],
+      budget: 'compactResultLimit',
+      rejected: ['search', '--root', consumer, '--compact', '--limit=1001', 'x'],
+    },
+    {
+      accepted: ['gather', '--root', consumer, '--limit=1000'],
+      budget: 'compactResultLimit',
+      rejected: ['gather', '--root', consumer, '--limit=1001'],
+    },
+  ] as const
+
+  for (const limitCase of packedResultLimitCases) {
+    assertPackedBudgetFailure([...limitCase.rejected], {
+      budget: limitCase.budget,
+      field: 'limit',
+      maximum: 1000,
+    })
+  }
 
   const prepared = cliJson(['--root', consumer, 'prepare']) as { hydrated?: unknown; recordsIndexed?: unknown }
   if (prepared.hydrated !== true || prepared.recordsIndexed !== 0) {
@@ -470,6 +490,9 @@ try {
   const initialised = cliJson(['init', '--root', consumer]) as { recordsCreated?: unknown }
   if (!Array.isArray(initialised.recordsCreated) || initialised.recordsCreated.length !== 3) {
     throw new Error('The packed Node-only CLI init command returned an unexpected result.')
+  }
+  for (const limitCase of packedResultLimitCases) {
+    cliJson([...limitCase.accepted])
   }
   const added = cliJson([
     'add',

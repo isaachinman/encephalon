@@ -4111,7 +4111,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(api.searchRecords({ limit: 1, query: 'large summary marker', root })[0]?.id, added.id)
   })
 
-  test('accepts request budget boundaries and rejects one unit over before cache I/O', () => {
+  test('accepts published result limits and rejects oversized operation inputs before cache I/O', () => {
     const validRoot = createRoot()
     const listRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('listRecords')
     const searchRecords =
@@ -4120,19 +4120,29 @@ describe('SQLite cache and reads', () => {
       functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>[]>('searchCompactRecords')
     const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
 
-    assert.deepEqual(listRecords({ limit: 50, root: validRoot }), [])
-    assert.deepEqual(searchRecords({ limit: 50, query: 'x'.repeat(1024), root: validRoot }), [])
+    const compatibleLimits = [50, 100, 101, 999, 1000] as const
+    for (const limit of compatibleLimits) {
+      assert.deepEqual(listRecords({ limit, root: validRoot }), [])
+      assert.deepEqual(searchRecords({ limit, query: 'x', root: validRoot }), [])
+      assert.deepEqual(searchCompactRecords({ limit, query: 'x', root: validRoot }), [])
+      assert.deepEqual(gatherRecords({ limit, root: validRoot, searches: ['x'] }), {
+        hydrated: null,
+        records: [],
+        searches: [{ kind: null, query: 'x', results: [] }],
+      })
+    }
+
+    assert.deepEqual(searchRecords({ limit: 1000, query: 'x'.repeat(1024), root: validRoot }), [])
     assert.deepEqual(
       searchRecords({
-        limit: 50,
+        limit: 1000,
         query: Array.from({ length: 32 }, () => 'x').join(' '),
         root: validRoot,
       }),
       [],
     )
-    assert.deepEqual(searchCompactRecords({ limit: 100, query: 'x', root: validRoot }), [])
     const gathered = gatherRecords({
-      limit: 100,
+      limit: 1000,
       root: validRoot,
       searches: Array.from({ length: 16 }, () => 'x'),
       shows: Array.from({ length: 64 }, () => 'missing'),
@@ -4154,16 +4164,16 @@ describe('SQLite cache and reads', () => {
       run: (root: string) => void
     }> = [
       {
-        expected: { budget: 'fullResultLimit', field: 'limit', maximum: 50 },
-        run: root => listRecords({ limit: 51, root }),
+        expected: { budget: 'fullResultLimit', field: 'limit', maximum: 1000 },
+        run: root => listRecords({ limit: 1001, root }),
       },
       {
-        expected: { budget: 'fullResultLimit', field: 'limit', maximum: 50 },
-        run: root => searchRecords({ limit: 51, query: 'x', root }),
+        expected: { budget: 'fullResultLimit', field: 'limit', maximum: 1000 },
+        run: root => searchRecords({ limit: 1001, query: 'x', root }),
       },
       {
-        expected: { budget: 'compactResultLimit', field: 'limit', maximum: 100 },
-        run: root => searchCompactRecords({ limit: 101, query: 'x', root }),
+        expected: { budget: 'compactResultLimit', field: 'limit', maximum: 1000 },
+        run: root => searchCompactRecords({ limit: 1001, query: 'x', root }),
       },
       {
         expected: { budget: 'queryBytes', field: 'query', maximum: 1024 },
@@ -4203,8 +4213,8 @@ describe('SQLite cache and reads', () => {
           }),
       },
       {
-        expected: { budget: 'compactResultLimit', field: 'limit', maximum: 100 },
-        run: root => gatherRecords({ limit: 101, root, searches: ['x'] }),
+        expected: { budget: 'compactResultLimit', field: 'limit', maximum: 1000 },
+        run: root => gatherRecords({ limit: 1001, root, searches: ['x'] }),
       },
       {
         expected: { budget: 'queryTerms', field: 'query', maximum: 32 },

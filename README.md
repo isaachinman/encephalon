@@ -92,7 +92,7 @@ Search text is literal rather than raw FTS syntax. Encephalon checks the origina
 
 ### Operation budgets
 
-List and full search accept 1–50 results. Compact search and each gather search accept 1–100 results. A gather request accepts at most 16 searches and 64 shows, while an add request accepts at most 1,000 supersession targets. Search queries are limited to 1,024 UTF-8 bytes and 32 literal terms.
+List, full search, compact search, and each gather search accept 1–1,000 results and default to 20. These result-count limits are independent of response-byte budgets and gather request-array budgets. A gather request accepts at most 16 searches and 64 shows, while an add request accepts at most 1,000 supersession targets. Search queries are limited to 1,024 UTF-8 bytes and 32 literal terms.
 
 Full-record list, show, and search responses use the 4 MiB `fullResponseBytes` budget over cached canonical JSON bytes. Standalone compact search uses the 4 MiB `compactResponseBytes` budget, and one complete gather uses the 4 MiB `gatherResponseBytes` budget across root metadata, request envelopes, shown records or nulls, and compact search results. Compact and gather values count the UTF-8 bytes of every string value and object key, plus eight bytes for every number, boolean, null, array, and object, recursively. Compact rows are lazily iterated, validated, charged, and only then retained. Repeated gather shows and searches are charged on every occurrence. Exact-budget responses succeed; over-budget responses fail without truncation or a partial result.
 

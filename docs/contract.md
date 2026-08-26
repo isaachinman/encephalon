@@ -17,7 +17,7 @@ This document is the concise contract maintainers should update when public beha
 
 ## Operation Budgets
 
-- `list` and full `search` accept result limits from 1 through 50. Compact `search` and each `gather` search accept result limits from 1 through 100. The default remains 20.
+- `list`, full `search`, compact `search`, and each `gather` search accept result limits from 1 through 1,000. The default remains 20. Result-count limits are independent of response-byte budgets and gather request-array budgets.
 - A `gather` input contains at most 16 searches and 64 shows. An add-record input contains at most 1,000 supersession targets.
 - Every search query contains at most 1,024 UTF-8 bytes and 32 literal terms.
 - `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes` each have a fixed 4 MiB maximum and use `field: 'response'`. Full-record list, show, and search responses charge `fullResponseBytes` by exact cached canonical JSON bytes.

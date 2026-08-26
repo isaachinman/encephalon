@@ -365,7 +365,7 @@ describe('package contract', () => {
     try {
       appendFileSync(
         resolve(fixtureRoot, 'dist', 'cli.mjs'),
-        '\nif (process.argv.includes("gather")) process.exitCode = 91\n',
+        '\nif (process.argv.includes("gather") && process.argv.includes("--limit=1000")) process.exitCode = 91\n',
       )
 
       const result = spawnSync(
