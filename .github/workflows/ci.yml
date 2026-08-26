@@ -52,8 +52,8 @@ jobs:
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
-      - run: bun test scripts/workflow-policy.test.ts
-      - run: bun run ./scripts/workflow-policy.ts
+      - run: node --test scripts/workflow-policy.test.ts
+      - run: node ./scripts/workflow-policy.ts
       - run: bun run typecheck
       - run: bun run test
       - run: bun run lint
@@ -82,8 +82,8 @@ jobs:
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
-      - run: bun test scripts/workflow-policy.test.ts
-      - run: bun run ./scripts/workflow-policy.ts
+      - run: node --test scripts/workflow-policy.test.ts
+      - run: node ./scripts/workflow-policy.ts
       - run: bun run build
       - run: git diff --exit-code HEAD
       - name: Check npm publish dry run

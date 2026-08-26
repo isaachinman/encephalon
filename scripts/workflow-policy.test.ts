@@ -3053,7 +3053,7 @@ jobs:
   )
 })
 
-test('direct workflow policy validation bypasses package lifecycle hooks', () => {
+test('direct workflow policy validation bypasses package lifecycle hooks and Bun preloads', () => {
   const staleWorkflow = `name: Fail
 on: workflow_dispatch
 permissions:
@@ -3085,14 +3085,15 @@ jobs:
     join(root, 'repair-workflow.mjs'),
     `import { writeFileSync } from 'node:fs'\nwriteFileSync(new URL('./.github/workflows/fail.yml', import.meta.url), ${JSON.stringify(repairedWorkflow)})\nwriteFileSync(new URL('./repair-ran', import.meta.url), 'true\\n')\n`,
   )
+  writeFileSync(join(root, 'bunfig.toml'), 'preload = ["./repair-workflow.mjs"]\n')
 
-  const directResult = spawnSync(process.execPath, ['run', policyPath], { cwd: root, encoding: 'utf8' })
+  const directResult = spawnSync(process.execPath, [policyPath], { cwd: root, encoding: 'utf8' })
   assert.equal(directResult.status, 1)
   assert.match(directResult.stderr, /external-reference-sha/u)
   assert.equal(readFileSync(workflowPath, 'utf8'), staleWorkflow)
   assert.equal(existsSync(repairMarkerPath), false)
 
-  const aliasResult = spawnSync(process.execPath, ['run', 'check:workflows'], { cwd: root, encoding: 'utf8' })
+  const aliasResult = spawnSync('bun', ['run', 'check:workflows'], { cwd: root, encoding: 'utf8' })
   assert.equal(aliasResult.status, 0, `${aliasResult.stdout}${aliasResult.stderr}`)
   assert.equal(readFileSync(workflowPath, 'utf8'), repairedWorkflow)
   assert.equal(readFileSync(repairMarkerPath, 'utf8'), 'true\n')

@@ -153,8 +153,8 @@ jobs:
     [
       'node ./scripts/check-generated-version.ts',
       'bun install --frozen-lockfile --ignore-scripts',
-      'bun test scripts/workflow-policy.test.ts',
-      'bun run ./scripts/workflow-policy.ts',
+      'node --test scripts/workflow-policy.test.ts',
+      'node ./scripts/workflow-policy.ts',
       'bun run typecheck',
       'bun run test',
       'bun run lint',
@@ -195,8 +195,8 @@ jobs:
     [
       'node ./scripts/check-generated-version.ts',
       'bun install --frozen-lockfile --ignore-scripts',
-      'bun test scripts/workflow-policy.test.ts',
-      'bun run ./scripts/workflow-policy.ts',
+      'node --test scripts/workflow-policy.test.ts',
+      'node ./scripts/workflow-policy.ts',
       'bun run build',
       'git diff --exit-code HEAD',
       'git diff --exit-code HEAD',
@@ -262,6 +262,7 @@ jobs:
   assert.doesNotMatch(workflow, /^\s+- run: bun run \.\/scripts\/check-generated-version\.ts$/m)
   assert.doesNotMatch(workflow, /^\s+- run: bun run check:generated$/m)
   assert.doesNotMatch(workflow, /^\s+- run: bun run check:workflows$/m)
+  assert.doesNotMatch(workflow, /^\s+- run: bun (?:run|test).*workflow-policy/m)
   assert.equal(workflow.match(/^\s+- run: bun install --frozen-lockfile --ignore-scripts$/gmu)?.length, 2)
   assert.doesNotMatch(workflow, /^\s+- run: bun install --frozen-lockfile$/m)
   const pinnedActionReferences = [...workflow.matchAll(/^\s+(?:- )?uses: [^@\s]+@([^\s#]+)/gmu)].map(match => match[1])

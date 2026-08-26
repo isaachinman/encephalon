@@ -274,15 +274,15 @@ updates:
       interval: weekly
 ```
 
-Add `"check:workflows": "bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts"` to `package.json`. In each CI job, run `bun run check:workflows` immediately after frozen installation and before TypeScript/build work. Do not add a new job or status-check name.
+Add `"check:workflows": "bun test scripts/workflow-policy.test.ts && bun run scripts/workflow-policy.ts"` to `package.json` as contributor convenience for trusted local checkouts. In each CI job, install the frozen graph with lifecycle scripts disabled, then invoke the workflow-policy test and checker files directly rather than through this package-script alias so `precheck:workflows` cannot interpose before validation. Keep both direct commands before TypeScript/build work. Do not add a new job or status-check name.
 
 - [x] **Step 6: Run focused tests and policy GREEN**
 
 Run:
 
 ```bash
-bun test scripts/workflow-policy.test.ts
-bun run check:workflows
+node --test scripts/workflow-policy.test.ts
+node ./scripts/workflow-policy.ts
 bun run typecheck
 bun run lint
 ```
