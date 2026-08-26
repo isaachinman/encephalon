@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Work only on `mar-2636-locking-bound-lock-candidate-discovery-and-reclaim-abandoned`, based on exact MAR-2637 head `79bc637164dfa78d4e88fb7b2a7bdc5fee96a118`; do not use worktrees.
+- Work only on `mar-2636-locking-bound-lock-candidate-discovery-and-reclaim-abandoned`, based on exact current main `f0023f5c08cbbec67be8affe8cda9005eb89d5d0`; do not use worktrees.
 - Preserve every public API signature, result shape, `CACHE_BUSY` detail, single 60-second deadline, cache schema, error code, and error precedence.
 - Keep fixed lock/recovery, current-candidate, cache-location, and gate invariants fail-closed; suppress only unrelated candidate-local maintenance failures.
 - Visit at most 64 raw entries, inspect at most 16 candidates, attempt at most 4 reclamations, and retain at most 8 identity-bound cursors.
@@ -133,5 +133,5 @@ node dist/cli.mjs validate
 git diff --check
 ```
 
-- [x] **Step 5: Request independent security, correctness, data-consistency/race, test-coverage, maintainability, and UX/API-regression reviews against exact MAR-2637 head.** Fix every high- or medium-confidence issue and repeat affected verification.
-- [ ] **Step 6: Commit the documentation as `[MAR-2636] Document lock candidate maintenance`, push with explicit `origin mar-2636-locking-bound-lock-candidate-discovery-and-reclaim-abandoned:mar-2636-locking-bound-lock-candidate-discovery-and-reclaim-abandoned`, open a draft stacked PR based on MAR-2637, link it to Linear, and request exact-head bot review. Do not merge until the full ticket sequence is complete.
+- [x] **Step 5: Request independent security, correctness, data-consistency/race, test-coverage, maintainability, and UX/API-regression reviews against the exact implementation head.** Fix every high- or medium-confidence issue and repeat affected verification.
+- [ ] **Step 6: Complete the fresh two-round local review on current main, force-push the reviewed restack with explicit `origin mar-2636-locking-bound-lock-candidate-discovery-and-reclaim-abandoned:mar-2636-locking-bound-lock-candidate-discovery-and-reclaim-abandoned`, make PR #74 non-draft, and require exact-head CI and Pullfrog before merge.**

@@ -926,6 +926,55 @@ describe('lock candidate maintenance', () => {
     assert.equal(existsSync(path), false)
   })
 
+  test('converges after a Windows-style candidate quarantine sharing violation', () => {
+    const root = createRoot()
+    const token = tokenFor(0x5_01)
+    const path = candidatePath(root, token)
+    const ownerPath = join(path, 'owner.json')
+    mkdirSync(path, { recursive: true })
+    writeFileSync(ownerPath, '{transient quarantine sharing owner')
+    age(ownerPath)
+    age(path)
+    const originalIdentity = identityOf(ownerPath)
+    const originalBytes = readFileSync(ownerPath)
+    let quarantineAttempts = 0
+    cacheLocationTestHooks.beforeQuarantineRename = current => {
+      if (basename(current) === `operation.lock.${token}`) {
+        quarantineAttempts += 1
+        if (quarantineAttempts === 1) {
+          throw Object.assign(new Error('transient candidate quarantine sharing failure'), { code: 'EPERM' })
+        }
+      }
+    }
+    const hooks = {
+      openCandidateDirectory: () => {
+        let read = false
+        return {
+          closeSync: () => undefined,
+          readSync: () => {
+            const entry = read ? null : entryFor(token)
+            read = true
+            return entry
+          },
+        }
+      },
+    }
+
+    assert.equal(
+      withOperationLock(root, () => 'first', hooks),
+      'first',
+    )
+    assert.equal(quarantineAttempts, 1)
+    assert.deepEqual(identityOf(ownerPath), originalIdentity)
+    assert.deepEqual(readFileSync(ownerPath), originalBytes)
+    assert.equal(
+      withOperationLock(root, () => 'second', hooks),
+      'second',
+    )
+    assert.equal(quarantineAttempts, 2)
+    assert.equal(existsSync(path), false)
+  })
+
   test('preserves candidate symlinks and their external targets', () => {
     const root = createRoot()
     const outside = createRoot()
