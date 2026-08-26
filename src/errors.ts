@@ -40,7 +40,8 @@ const containsAbsolutePath = (value: string) =>
   /(^|[\s("'=:;,])file:\/\//i.test(value) ||
   /^[a-z][a-z0-9+.-]*:\//i.test(value)
 
-const isRecognizedFilesystemError = (error: unknown) => {
+/** @internal */
+export const isRecognizedFilesystemError = (error: unknown) => {
   if (!isRecord(error)) {
     return false
   }

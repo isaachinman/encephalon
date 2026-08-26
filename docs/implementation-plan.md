@@ -961,7 +961,7 @@ Persistable facts:
 
 - Safe top-level file and directory names, excluding secret-prone hidden paths.
 - Recognised root manifest, lockfile, and configuration filenames.
-- Root `package.json` package name, valid `packageManager` declaration, workspace presence, and discovery-only script keys, accepted only from a verified, no-follow regular file no larger than 1 MiB. Missing package metadata is normal; invalid, oversized, unreadable, or replaced metadata contributes no package facts or source attribution.
+- Root `package.json` package name, valid `packageManager` declaration, workspace presence, and discovery-only script keys, accepted only from a verified, no-follow regular file no larger than 1 MiB. Missing package metadata is normal; invalid, oversized, or stably unreadable metadata contributes no package facts or source attribution. Replacement discards the complete baseline attempt and retries from a later stable observation.
 - Package-manager evidence is recorded as `unknown`, `declared`, `lockfile-derived`, `declared-and-lockfile`, or `conflicted`; `packageManager` is present only when declaration and lockfile evidence identify one unambiguous manager.
 - Derived package script invocations as structured `{ executable, arguments, scriptKey }` argv data; never shell command strings or the script body. These invocations are omitted when the package manager is unknown or conflicted. Script keys beginning with `-` remain discoverable in `scriptKeys` but do not produce runnable invocations.
 - CI workflow filenames under `.github/workflows`; never YAML content, triggers, jobs, steps, secrets, or environment values.

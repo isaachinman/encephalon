@@ -1,7 +1,7 @@
 import { lstatSync } from 'node:fs'
 import { extname, resolve } from 'node:path'
 import {
-  type CanonicalDirectorySnapshot,
+  CanonicalDirectoryChangedError,
   captureCanonicalDirectory,
   collectBoundedDirectoryEntries,
   revalidateCanonicalDirectory,
@@ -12,9 +12,18 @@ import {
   DirectoryWitnessError,
   revalidateDirectoryWitness,
 } from './directory-witness.ts'
+import { fail, isRecognizedFilesystemError } from './errors.ts'
+import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import { ordinalStringCompare } from './order.ts'
 import type { AddRecordInput, JsonValue } from './types.ts'
-import { decodeVerifiedUtf8, readVerifiedRegularFile } from './verified-file.ts'
+import {
+  decodeVerifiedUtf8,
+  readObservedVerifiedRegularFile,
+  revalidateObservedVerifiedRegularFile,
+  VerifiedFileError,
+  type VerifiedRegularFileEvidence,
+  type VerifiedRegularFileObservation,
+} from './verified-file.ts'
 import { observedArray, observedMap, observeWork, rethrowWorkObserverError } from './work-observer.ts'
 
 const MAX_SCANNED_FILES = 100_000
@@ -174,6 +183,7 @@ type BaselineScanHooks = {
   beforeWorkflowDirectoryCapture?: (() => void) | undefined
   maximumScannedDirectories?: number | undefined
   maximumScannedFiles?: number | undefined
+  now?: (() => number) | undefined
   onLanguageDirectoryScheduled?: (() => void) | undefined
   onWork?: ((operation: BaselineWork) => void) | undefined
 }
@@ -188,6 +198,162 @@ type BaselineReason =
   | 'unreadable-directory'
   | 'workflow-entry-limit'
   | 'workflow-enumeration-error'
+
+type BaselineExpectedFailureClassification = 'directory-witness' | `filesystem:${string}` | 'verified-file'
+
+class BaselineGenerationChanged extends Error {
+  constructor() {
+    super('The baseline source generation changed during observation.')
+    this.name = 'BaselineGenerationChanged'
+  }
+}
+
+class PackageMetadataValidationError extends Error {
+  constructor() {
+    super('Package metadata must contain a JSON object.')
+    this.name = 'PackageMetadataValidationError'
+  }
+}
+
+class BaselineHookError extends Error {}
+
+const baselineGenerationChanged = (): never => {
+  throw new BaselineGenerationChanged()
+}
+
+const isObservedSourceReplacement = (error: unknown) => {
+  const code = (error as NodeJS.ErrnoException | null | undefined)?.code
+  return (
+    error instanceof CanonicalDirectoryChangedError ||
+    error instanceof DirectoryWitnessError ||
+    code === 'ELOOP' ||
+    code === 'ENOENT' ||
+    code === 'ENOTDIR'
+  )
+}
+
+const expectedFailureClassification = (error: unknown): BaselineExpectedFailureClassification | undefined => {
+  if (error instanceof DirectoryWitnessError) {
+    return 'directory-witness'
+  }
+  if (error instanceof VerifiedFileError) {
+    return 'verified-file'
+  }
+  if (isRecognizedFilesystemError(error)) {
+    return `filesystem:${(error as NodeJS.ErrnoException).code as string}`
+  }
+}
+
+const invokeBaselineHook = (hook: (() => void) | undefined) => {
+  if (hook !== undefined) {
+    try {
+      hook()
+    } catch (error) {
+      throw new BaselineHookError('An internal baseline hook failed.', { cause: error })
+    }
+  }
+}
+
+const invokeBaselinePathHook = (hook: ((path: string) => void) | undefined, path: string) => {
+  if (hook !== undefined) {
+    try {
+      hook(path)
+    } catch (error) {
+      throw new BaselineHookError('An internal baseline hook failed.', { cause: error })
+    }
+  }
+}
+
+const rethrowBaselineHookError = (error: unknown) => {
+  if (error instanceof BaselineHookError) {
+    throw error.cause
+  }
+}
+
+type BaselineExpectedFailureObservation = Readonly<{
+  classification: BaselineExpectedFailureClassification
+  probe: () => void
+}>
+
+class BaselineObservationAuthority {
+  private readonly directories: DirectoryWitness[] = []
+  private readonly expectedFailures: BaselineExpectedFailureObservation[] = []
+  private packageObservation: VerifiedRegularFileEvidence | undefined
+
+  readonly observeDirectory = (witness: DirectoryWitness) => {
+    this.directories.push(witness)
+  }
+
+  readonly observePackage = (observation: VerifiedRegularFileObservation) => {
+    this.packageObservation = Object.freeze({
+      digest: observation.digest,
+      metadata: observation.metadata,
+      path: observation.path,
+    })
+  }
+
+  readonly observeExpectedFailure = (error: unknown, probe: () => void) => {
+    const classification = expectedFailureClassification(error)
+    if (classification === undefined) {
+      throw error
+    }
+    this.expectedFailures.push(Object.freeze({ classification, probe }))
+  }
+
+  readonly proveCurrent = () => {
+    for (const witness of this.directories) {
+      try {
+        revalidateDirectoryWitness(witness)
+      } catch (error) {
+        if (isObservedSourceReplacement(error) || isRecognizedFilesystemError(error)) {
+          baselineGenerationChanged()
+        }
+        throw error
+      }
+    }
+    if (this.packageObservation !== undefined) {
+      try {
+        revalidateObservedVerifiedRegularFile(this.packageObservation)
+      } catch (error) {
+        if (
+          error instanceof VerifiedFileError ||
+          isObservedSourceReplacement(error) ||
+          isRecognizedFilesystemError(error)
+        ) {
+          return baselineGenerationChanged()
+        }
+        throw error
+      }
+    }
+    for (const observation of this.expectedFailures) {
+      let failed = false
+      let currentFailure: unknown
+      try {
+        observation.probe()
+      } catch (error) {
+        failed = true
+        currentFailure = error
+      }
+      if (failed) {
+        if (
+          currentFailure instanceof BaselineGenerationChanged ||
+          currentFailure instanceof CanonicalDirectoryChangedError
+        ) {
+          baselineGenerationChanged()
+        }
+        const currentClassification = expectedFailureClassification(currentFailure)
+        if (currentClassification === undefined) {
+          throw currentFailure
+        }
+        if (currentClassification !== observation.classification) {
+          baselineGenerationChanged()
+        }
+      } else {
+        baselineGenerationChanged()
+      }
+    }
+  }
+}
 
 type ScanState = {
   filesSeen: number
@@ -270,93 +436,118 @@ const safeWorkspacePattern = (value: unknown): value is string =>
 
 const emptyPackageFacts = (): PackageFacts => ({ scriptKeys: [], workspacePatterns: [] })
 
+const packageMetadataError = (sourceName: string, manifestObserved: boolean): SourceResult<PackageSource> => ({
+  reasons: ['package-metadata-error'],
+  value: {
+    facts: emptyPackageFacts(),
+    ...(manifestObserved ? { manifestSource: sourceName } : {}),
+  },
+})
+
+const parsePackageMetadata = (bytes: Buffer) => {
+  const parsed: unknown = JSON.parse(decodeVerifiedUtf8(bytes))
+  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return parsed as {
+      name?: unknown
+      packageManager?: unknown
+      scripts?: unknown
+      workspaces?: unknown
+    }
+  }
+  throw new PackageMetadataValidationError()
+}
+
 const readPackageFacts = (
   root: string,
   hooks: BaselineScanHooks,
   sourceName: string,
   expected: boolean,
+  authority: BaselineObservationAuthority,
 ): SourceResult<PackageSource> => {
   const path = resolve(root, 'package.json')
-  let result: SourceResult<PackageSource> = {
-    reasons: [],
-    value: { facts: emptyPackageFacts() },
-  }
   let manifestObserved = false
+  let observation: VerifiedRegularFileObservation | undefined
   try {
-    hooks.beforePackageMetadataRead?.()
-    const bytes = readVerifiedRegularFile(path, MAX_PACKAGE_BYTES, {
+    invokeBaselineHook(hooks.beforePackageMetadataRead)
+    observation = readObservedVerifiedRegularFile(path, MAX_PACKAGE_BYTES, {
       fault: point => {
         if (point === 'after-lstat') {
           manifestObserved = true
-          hooks.afterPackageMetadataLstat?.()
+          invokeBaselineHook(hooks.afterPackageMetadataLstat)
         }
       },
     })
-    if (bytes === undefined && expected) {
-      throw new DirectoryWitnessError()
+  } catch (error) {
+    rethrowBaselineHookError(error)
+    if (error instanceof VerifiedFileError || isRecognizedFilesystemError(error)) {
+      authority.observeExpectedFailure(error, () => {
+        readObservedVerifiedRegularFile(path, MAX_PACKAGE_BYTES)
+      })
+      return packageMetadataError(sourceName, expected || manifestObserved)
     }
-    if (bytes !== undefined) {
-      const parsed: unknown = JSON.parse(decodeVerifiedUtf8(bytes))
-      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        const value = parsed as {
-          name?: unknown
-          packageManager?: unknown
-          scripts?: unknown
-          workspaces?: unknown
-        }
-        let workspaceValue: unknown = []
-        if (Array.isArray(value.workspaces)) {
-          workspaceValue = value.workspaces
-        } else if (
-          value.workspaces !== null &&
-          typeof value.workspaces === 'object' &&
-          'packages' in value.workspaces
-        ) {
-          workspaceValue = (value.workspaces as { packages?: unknown }).packages
-        }
-        const packageManager = declaredPackageManager(value.packageManager)
-        result = {
-          reasons: [],
-          value: {
-            facts: {
-              ...(typeof value.name === 'string' && safeName(value.name) ? { name: value.name } : {}),
-              ...(packageManager === undefined ? {} : { packageManager }),
-              scriptKeys:
-                value.scripts !== null && typeof value.scripts === 'object' && !Array.isArray(value.scripts)
-                  ? Object.keys(value.scripts).filter(safeName).sort(ordinalStringCompare)
-                  : [],
-              workspacePatterns: Array.isArray(workspaceValue)
-                ? workspaceValue.filter(safeWorkspacePattern).sort(ordinalStringCompare)
-                : [],
-            },
-            manifestSource: sourceName,
-            source: sourceName,
-          },
-        }
-      } else {
-        throw new TypeError('Package metadata must be an object.')
-      }
+    throw error
+  }
+  if (observation === undefined) {
+    if (expected) {
+      return baselineGenerationChanged()
     }
-  } catch {
-    result = {
-      reasons: ['package-metadata-error'],
-      value: {
-        facts: emptyPackageFacts(),
-        ...(expected || manifestObserved ? { manifestSource: sourceName } : {}),
-      },
+    return {
+      reasons: [],
+      value: { facts: emptyPackageFacts() },
     }
   }
-  return result
+  authority.observePackage(observation)
+
+  let value: ReturnType<typeof parsePackageMetadata>
+  try {
+    value = parsePackageMetadata(observation.bytes)
+  } catch (error) {
+    if (
+      error instanceof PackageMetadataValidationError ||
+      error instanceof SyntaxError ||
+      error instanceof VerifiedFileError
+    ) {
+      return packageMetadataError(sourceName, true)
+    }
+    throw error
+  }
+
+  let workspaceValue: unknown = []
+  if (Array.isArray(value.workspaces)) {
+    workspaceValue = value.workspaces
+  } else if (value.workspaces !== null && typeof value.workspaces === 'object' && 'packages' in value.workspaces) {
+    workspaceValue = (value.workspaces as { packages?: unknown }).packages
+  }
+  const packageManager = declaredPackageManager(value.packageManager)
+  return {
+    reasons: [],
+    value: {
+      facts: {
+        ...(typeof value.name === 'string' && safeName(value.name) ? { name: value.name } : {}),
+        ...(packageManager === undefined ? {} : { packageManager }),
+        scriptKeys:
+          value.scripts !== null && typeof value.scripts === 'object' && !Array.isArray(value.scripts)
+            ? Object.keys(value.scripts).filter(safeName).sort(ordinalStringCompare)
+            : [],
+        workspacePatterns: Array.isArray(workspaceValue)
+          ? workspaceValue.filter(safeWorkspacePattern).sort(ordinalStringCompare)
+          : [],
+      },
+      manifestSource: sourceName,
+      source: sourceName,
+    },
+  }
 }
 
 const readBoundedDirectoryEntries = (
   directory: string,
   hooks: BaselineScanHooks,
-  parent?: CanonicalDirectorySnapshot,
+  authority: BaselineObservationAuthority,
+  parent?: DirectoryWitness,
 ) => {
-  hooks.beforeLanguageDirectoryCapture?.(directory)
+  invokeBaselinePathHook(hooks.beforeLanguageDirectoryCapture, directory)
   if (parent !== undefined) {
-    revalidateCanonicalDirectory(parent)
+    revalidateDirectoryWitness(parent)
   }
   const snapshot = captureCanonicalDirectory(
     directory,
@@ -364,10 +555,11 @@ const readBoundedDirectoryEntries = (
     undefined,
     observeWork(hooks.onWork, 'language-entry'),
   )
-  hooks.afterLanguageDirectoryCapture?.(directory)
+  invokeBaselinePathHook(hooks.afterLanguageDirectoryCapture, directory)
   if (parent !== undefined) {
-    revalidateCanonicalDirectory(parent)
+    revalidateDirectoryWitness(parent)
   }
+  authority.observeDirectory(snapshot.witness)
   return {
     entries: snapshot.entries.filter(entry => {
       const excludedDirectory = entry.isDirectory() && EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())
@@ -378,11 +570,12 @@ const readBoundedDirectoryEntries = (
         !excludedDirectory
       )
     }),
-    snapshot,
+    overflow: snapshot.overflow,
+    witness: snapshot.witness,
   }
 }
 
-const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
+const scanLanguages = (root: string, hooks: BaselineScanHooks, authority: BaselineObservationAuthority) => {
   const state: ScanState = {
     filesSeen: 0,
     languageCounts: observedMap(observeWork(hooks.onWork, 'language-count-write')),
@@ -390,18 +583,16 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
   }
   const maximumDirectories = hooks.maximumScannedDirectories ?? MAX_SCANNED_DIRECTORIES
   const maximumFiles = hooks.maximumScannedFiles ?? MAX_SCANNED_FILES
-  const queue: { depth: number; directory: string; parent?: CanonicalDirectorySnapshot }[] = [
-    { depth: 0, directory: root },
-  ]
+  const queue: { depth: number; directory: string; parent?: DirectoryWitness }[] = [{ depth: 0, directory: root }]
   let directoriesScheduled = 1
-  hooks.onLanguageDirectoryScheduled?.()
+  invokeBaselineHook(hooks.onLanguageDirectoryScheduled)
   scanDirectories: for (const { depth, directory, parent } of queue) {
     try {
-      const { entries, snapshot } = readBoundedDirectoryEntries(directory, hooks, parent)
-      if (snapshot.overflow) {
+      const { entries, overflow, witness } = readBoundedDirectoryEntries(directory, hooks, authority, parent)
+      if (overflow) {
         state.truncationReasons.add('directory-entry-limit')
       } else {
-        revalidateCanonicalDirectory(snapshot)
+        revalidateDirectoryWitness(witness)
         for (const entry of entries) {
           const path = resolve(directory, entry.name)
           if (entry.isDirectory()) {
@@ -410,9 +601,9 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
             } else if (directoriesScheduled >= maximumDirectories) {
               state.truncationReasons.add('directory-limit')
             } else {
-              queue.push({ depth: depth + 1, directory: path, parent: snapshot })
+              queue.push({ depth: depth + 1, directory: path, parent: witness })
               directoriesScheduled += 1
-              hooks.onLanguageDirectoryScheduled?.()
+              invokeBaselineHook(hooks.onLanguageDirectoryScheduled)
             }
           } else if (entry.isFile()) {
             if (state.filesSeen >= maximumFiles) {
@@ -429,7 +620,21 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
       }
     } catch (error) {
       rethrowWorkObserverError(error)
-      state.truncationReasons.add('unreadable-directory')
+      rethrowBaselineHookError(error)
+      if (error instanceof BaselineGenerationChanged) {
+        throw error
+      }
+      if (isObservedSourceReplacement(error)) {
+        return baselineGenerationChanged()
+      }
+      if (isRecognizedFilesystemError(error)) {
+        authority.observeExpectedFailure(error, () => {
+          captureCanonicalDirectory(directory, MAX_LANGUAGE_DIRECTORY_ENTRIES)
+        })
+        state.truncationReasons.add('unreadable-directory')
+      } else {
+        throw error
+      }
     }
   }
   return state
@@ -438,38 +643,72 @@ const scanLanguages = (root: string, hooks: BaselineScanHooks) => {
 const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
 
 const captureOptionalDirectory = (path: string, hooks: BaselineScanHooks, expected = false) => {
+  let metadata: ReturnType<typeof lstatSync>
   try {
-    lstatSync(path, { bigint: true })
+    metadata = lstatSync(path, { bigint: true })
   } catch (error) {
-    if (isMissing(error) && !expected) {
-      return
+    if (isMissing(error)) {
+      if (expected) {
+        return baselineGenerationChanged()
+      }
+      return { kind: 'absent' as const }
     }
     throw error
   }
-  hooks.afterOptionalDirectoryLstat?.(path)
-  return captureDirectoryWitness(path, { allowLink: false })
+  if (!(metadata.isDirectory() && !metadata.isSymbolicLink())) {
+    if (expected) {
+      return baselineGenerationChanged()
+    }
+    return { kind: 'invalid' as const }
+  }
+  invokeBaselinePathHook(hooks.afterOptionalDirectoryLstat, path)
+  return { kind: 'observed' as const, witness: captureDirectoryWitness(path, { allowLink: false }) }
 }
 
-const workflowFiles = (root: string, hooks: BaselineScanHooks, expectedGithub: boolean): SourceResult<string[]> => {
+const probeWorkflowSource = (root: string, expectedGithub: boolean) => {
+  const github = captureOptionalDirectory(resolve(root, '.github'), {}, expectedGithub)
+  if (github.kind === 'observed') {
+    const workflows = captureOptionalDirectory(resolve(github.witness.canonicalPath, 'workflows'), {})
+    if (workflows.kind === 'observed') {
+      collectBoundedDirectoryEntries(workflows.witness.canonicalPath, MAX_WORKFLOW_ENTRIES)
+      revalidateDirectoryWitness(workflows.witness)
+    }
+    revalidateDirectoryWitness(github.witness)
+  }
+}
+
+const workflowFiles = (
+  root: string,
+  hooks: BaselineScanHooks,
+  expectedGithub: boolean,
+  authority: BaselineObservationAuthority,
+): SourceResult<string[]> => {
   let result: SourceResult<string[]> = { reasons: [], value: [] }
   try {
-    hooks.beforeWorkflowDirectoryCapture?.()
-    const githubWitness = captureOptionalDirectory(resolve(root, '.github'), hooks, expectedGithub)
-    if (githubWitness !== undefined) {
-      const workflowsPath = resolve(githubWitness.canonicalPath, 'workflows')
-      const workflowsWitness = captureOptionalDirectory(workflowsPath, hooks)
-      if (workflowsWitness === undefined) {
-        revalidateDirectoryWitness(githubWitness)
+    invokeBaselineHook(hooks.beforeWorkflowDirectoryCapture)
+    const github = captureOptionalDirectory(resolve(root, '.github'), hooks, expectedGithub)
+    if (github.kind === 'invalid') {
+      result = { reasons: ['workflow-enumeration-error'], value: [] }
+    } else if (github.kind === 'observed') {
+      authority.observeDirectory(github.witness)
+      const workflowsPath = resolve(github.witness.canonicalPath, 'workflows')
+      const workflows = captureOptionalDirectory(workflowsPath, hooks)
+      if (workflows.kind === 'absent') {
+        revalidateDirectoryWitness(github.witness)
+      } else if (workflows.kind === 'invalid') {
+        revalidateDirectoryWitness(github.witness)
+        result = { reasons: ['workflow-enumeration-error'], value: [] }
       } else {
+        authority.observeDirectory(workflows.witness)
         const collected = collectBoundedDirectoryEntries(
-          workflowsWitness.canonicalPath,
+          workflows.witness.canonicalPath,
           MAX_WORKFLOW_ENTRIES,
           undefined,
           observeWork(hooks.onWork, 'workflow-entry'),
         )
-        hooks.afterWorkflowEnumeration?.()
-        revalidateDirectoryWitness(workflowsWitness)
-        revalidateDirectoryWitness(githubWitness)
+        invokeBaselineHook(hooks.afterWorkflowEnumeration)
+        revalidateDirectoryWitness(workflows.witness)
+        revalidateDirectoryWitness(github.witness)
         if (collected.overflow) {
           result = { reasons: ['workflow-entry-limit'], value: [] }
         } else {
@@ -487,7 +726,21 @@ const workflowFiles = (root: string, hooks: BaselineScanHooks, expectedGithub: b
     }
   } catch (error) {
     rethrowWorkObserverError(error)
-    result = { reasons: ['workflow-enumeration-error'], value: [] }
+    rethrowBaselineHookError(error)
+    if (error instanceof BaselineGenerationChanged) {
+      throw error
+    }
+    if (isObservedSourceReplacement(error)) {
+      return baselineGenerationChanged()
+    }
+    if (isRecognizedFilesystemError(error)) {
+      authority.observeExpectedFailure(error, () => {
+        probeWorkflowSource(root, expectedGithub)
+      })
+      result = { reasons: ['workflow-enumeration-error'], value: [] }
+    } else {
+      throw error
+    }
   }
   return result
 }
@@ -497,7 +750,7 @@ const emptyTopLevelFacts = (hooks?: BaselineScanHooks) => ({
   recognisedFiles: observedArray<string>(undefined, observeWork(hooks?.onWork, 'top-level-fact-write')),
 })
 
-const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
+const topLevelFacts = (root: string, hooks: BaselineScanHooks, authority: BaselineObservationAuthority) => {
   let result: SourceResult<ReturnType<typeof emptyTopLevelFacts>> = {
     reasons: [],
     value: emptyTopLevelFacts(),
@@ -509,6 +762,7 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
       undefined,
       observeWork(hooks.onWork, 'top-level-entry'),
     )
+    authority.observeDirectory(snapshot.witness)
     if (snapshot.overflow) {
       result = { reasons: ['top-level-entry-limit'], value: emptyTopLevelFacts() }
     } else {
@@ -522,13 +776,27 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks) => {
           }
           return candidate
         }, emptyTopLevelFacts(hooks))
-      hooks.beforeTopLevelRevalidation?.()
+      invokeBaselineHook(hooks.beforeTopLevelRevalidation)
       revalidateCanonicalDirectory(snapshot)
       result = { reasons: [], value: facts }
     }
   } catch (error) {
     rethrowWorkObserverError(error)
-    result = { reasons: ['unreadable-directory'], value: emptyTopLevelFacts() }
+    rethrowBaselineHookError(error)
+    if (error instanceof BaselineGenerationChanged) {
+      throw error
+    }
+    if (isObservedSourceReplacement(error)) {
+      return baselineGenerationChanged()
+    }
+    if (isRecognizedFilesystemError(error)) {
+      authority.observeExpectedFailure(error, () => {
+        captureCanonicalDirectory(root, MAX_TOP_LEVEL_ENTRIES)
+      })
+      result = { reasons: ['unreadable-directory'], value: emptyTopLevelFacts() }
+    } else {
+      throw error
+    }
   }
   return result
 }
@@ -558,51 +826,39 @@ type CollectedBaselineSources = {
   workflowResult: SourceResult<string[]>
 }
 
-const rootAuthorityFailure = (error: unknown) => {
-  const { code } = error as NodeJS.ErrnoException
-  return error instanceof DirectoryWitnessError || (typeof code === 'string' && /^E[A-Z0-9]+$/.test(code))
-}
-
-const emptyCollectedBaselineSources = (
-  globalReasons: readonly BaselineReason[],
-  observed: Omit<CollectedBaselineSources, 'globalReasons'> = {
-    layoutResult: { reasons: [], value: emptyTopLevelFacts() },
-    packageResult: { reasons: [], value: { facts: emptyPackageFacts() } },
-    scan: emptyScanState(),
-    workflowResult: { reasons: [], value: [] },
-  },
-): CollectedBaselineSources => ({
+const emptyCollectedBaselineSources = (globalReasons: readonly BaselineReason[]): CollectedBaselineSources => ({
   globalReasons,
   layoutResult: {
-    reasons: observed.layoutResult.reasons,
+    reasons: [],
     value: emptyTopLevelFacts(),
   },
   packageResult: {
-    reasons: observed.packageResult.reasons,
+    reasons: [],
     value: { facts: emptyPackageFacts() },
   },
-  scan: {
-    ...emptyScanState(),
-    truncationReasons: new Set(observed.scan.truncationReasons),
-  },
+  scan: emptyScanState(),
   workflowResult: {
-    reasons: observed.workflowResult.reasons,
+    reasons: [],
     value: [],
   },
 })
 
-const collectBaselineSources = (root: string, hooks: BaselineScanHooks) => {
+const collectBaselineSources = (root: string, hooks: BaselineScanHooks, authority: BaselineObservationAuthority) => {
   let rootWitness: DirectoryWitness
   try {
     rootWitness = captureDirectoryWitness(root, { allowLink: false })
   } catch (error) {
-    if (rootAuthorityFailure(error)) {
+    if (error instanceof DirectoryWitnessError || isRecognizedFilesystemError(error)) {
+      authority.observeExpectedFailure(error, () => {
+        captureDirectoryWitness(root, { allowLink: false })
+      })
       return emptyCollectedBaselineSources(['unreadable-directory'])
     }
     throw error
   }
+  authority.observeDirectory(rootWitness)
 
-  const layoutResult = topLevelFacts(root, hooks)
+  const layoutResult = topLevelFacts(root, hooks, authority)
   const packageSource =
     layoutResult.value.recognisedFiles.find(file => file === 'package.json') ??
     layoutResult.value.recognisedFiles.find(file => file.toLowerCase() === 'package.json') ??
@@ -612,25 +868,20 @@ const collectBaselineSources = (root: string, hooks: BaselineScanHooks) => {
     hooks,
     packageSource,
     layoutResult.value.recognisedFiles.includes('package.json'),
+    authority,
   )
-  const scan = scanLanguages(root, hooks)
-  const workflowResult = workflowFiles(root, hooks, layoutResult.value.directories.includes('.github'))
-  const observed = { layoutResult, packageResult, scan, workflowResult }
-  hooks.afterBaselineSources?.()
-  try {
-    revalidateDirectoryWitness(rootWitness)
-  } catch (error) {
-    if (rootAuthorityFailure(error)) {
-      return emptyCollectedBaselineSources(['unreadable-directory'], observed)
-    }
-    throw error
-  }
-  return { globalReasons: [], ...observed }
+  const scan = scanLanguages(root, hooks, authority)
+  const workflowResult = workflowFiles(root, hooks, layoutResult.value.directories.includes('.github'), authority)
+  return { globalReasons: [], layoutResult, packageResult, scan, workflowResult }
 }
 
-/** @internal */
-export const scanBaselineWithHooks = (root: string, hooks: BaselineScanHooks): AddRecordInput[] => {
-  const { globalReasons, layoutResult, packageResult, scan, workflowResult } = collectBaselineSources(root, hooks)
+const buildBaselineRecords = ({
+  globalReasons,
+  layoutResult,
+  packageResult,
+  scan,
+  workflowResult,
+}: CollectedBaselineSources): AddRecordInput[] => {
   const layout = layoutResult.value
   const packageFacts = packageResult.value.facts
   const packageEvidence = packageManagerEvidence(packageFacts.packageManager, lockfileEvidence(layout.recognisedFiles))
@@ -709,6 +960,58 @@ export const scanBaselineWithHooks = (root: string, hooks: BaselineScanHooks): A
     },
   ]
 }
+
+type BaselineObservationRetryLedger = {
+  attempt: number
+  deadline: number
+  maximumAttempts: number
+  now: () => number
+}
+
+const baselineObservationRetryExhausted = (): never =>
+  fail('REPOSITORY_CHANGED', 'The canonical repository changed repeatedly during the operation.')
+
+const createBaselineObservationRetryLedger = (now: () => number = Date.now): BaselineObservationRetryLedger => ({
+  attempt: 0,
+  deadline: now() + OPERATION_BUDGETS.baselineObservationRetryMilliseconds.maximum,
+  maximumAttempts: OPERATION_BUDGETS.baselineObservationAttempts.maximum,
+  now,
+})
+
+const withBaselineObservationRetry = <Result>(
+  operation: () => Result,
+  ledger: BaselineObservationRetryLedger = createBaselineObservationRetryLedger(),
+): Result => {
+  if (ledger.attempt >= ledger.maximumAttempts || (ledger.attempt > 0 && ledger.now() >= ledger.deadline)) {
+    return baselineObservationRetryExhausted()
+  }
+  ledger.attempt += 1
+  try {
+    return operation()
+  } catch (error) {
+    rethrowBaselineHookError(error)
+    if (error instanceof BaselineGenerationChanged) {
+      if (ledger.attempt < ledger.maximumAttempts) {
+        return withBaselineObservationRetry(operation, ledger)
+      }
+      return baselineObservationRetryExhausted()
+    }
+    throw error
+  }
+}
+
+const scanBaselineAttempt = (root: string, hooks: BaselineScanHooks) => {
+  const authority = new BaselineObservationAuthority()
+  const collected = collectBaselineSources(root, hooks, authority)
+  const provisional = buildBaselineRecords(collected)
+  invokeBaselineHook(hooks.afterBaselineSources)
+  authority.proveCurrent()
+  return provisional
+}
+
+/** @internal */
+export const scanBaselineWithHooks = (root: string, hooks: BaselineScanHooks): AddRecordInput[] =>
+  withBaselineObservationRetry(() => scanBaselineAttempt(root, hooks), createBaselineObservationRetryLedger(hooks.now))
 
 export const scanBaseline = (root: string): AddRecordInput[] => scanBaselineWithHooks(root, {})
 

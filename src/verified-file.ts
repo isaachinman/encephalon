@@ -1,7 +1,13 @@
+import { createHash } from 'node:crypto'
 import type { BigIntStats } from 'node:fs'
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs'
 import { TextDecoder } from 'node:util'
-import { sameEntryIdentity, sameStableEntryMetadata } from './filesystem-entry.ts'
+import {
+  type EntryMetadata,
+  entryMetadataFrom,
+  sameEntryIdentity,
+  sameStableEntryMetadata,
+} from './filesystem-entry.ts'
 
 type VerifiedFileFault = 'after-fstat' | 'after-lstat' | 'before-allocation' | 'before-final-path-lstat'
 
@@ -9,8 +15,20 @@ type VerifiedFileOptions = {
   fault?: (point: VerifiedFileFault) => void
 }
 
+/** @internal */
+export type VerifiedRegularFileObservation = Readonly<{
+  bytes: Buffer
+  digest: string
+  metadata: EntryMetadata
+  path: string
+}>
+
+/** @internal */
+export type VerifiedRegularFileEvidence = Readonly<Omit<VerifiedRegularFileObservation, 'bytes'>>
+
 const noFollowFlag = constants.O_NOFOLLOW ?? 0
 const decoder = new TextDecoder('utf-8', { fatal: true })
+const digestBytes = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
 
 const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
 
@@ -79,14 +97,15 @@ const readVerifiedDescriptor = (
   ) {
     return changed()
   }
-  return bytes
+  return { bytes, metadata: entryMetadataFrom(finalPathMetadata) }
 }
 
-export const readVerifiedRegularFile = (
+/** @internal */
+export const readObservedVerifiedRegularFile = (
   path: string,
   maximumBytes: number,
   options: VerifiedFileOptions = {},
-): Buffer | undefined => {
+): VerifiedRegularFileObservation | undefined => {
   let pathMetadata: BigIntStats
   try {
     pathMetadata = lstatSync(path, { bigint: true })
@@ -111,10 +130,10 @@ export const readVerifiedRegularFile = (
     throw error
   }
 
-  let bytes: Buffer | undefined
+  let verified: ReturnType<typeof readVerifiedDescriptor> | undefined
   let primaryError: unknown
   try {
-    bytes = readVerifiedDescriptor(descriptor, path, pathMetadata, maximumBytes, options)
+    verified = readVerifiedDescriptor(descriptor, path, pathMetadata, maximumBytes, options)
   } catch (error) {
     primaryError = error
   }
@@ -130,8 +149,33 @@ export const readVerifiedRegularFile = (
   if (closeError !== undefined) {
     throw closeError
   }
-  return bytes
+  if (verified !== undefined) {
+    return Object.freeze({
+      bytes: verified.bytes,
+      digest: digestBytes(verified.bytes),
+      metadata: Object.freeze(verified.metadata),
+      path,
+    })
+  }
 }
+
+/** @internal */
+export const revalidateObservedVerifiedRegularFile = (observation: VerifiedRegularFileEvidence) => {
+  const current = readObservedVerifiedRegularFile(observation.path, Number(observation.metadata.size))
+  if (
+    current === undefined ||
+    !sameStableEntryMetadata(observation.metadata, current.metadata) ||
+    observation.digest !== current.digest
+  ) {
+    return changed()
+  }
+}
+
+export const readVerifiedRegularFile = (
+  path: string,
+  maximumBytes: number,
+  options: VerifiedFileOptions = {},
+): Buffer | undefined => readObservedVerifiedRegularFile(path, maximumBytes, options)?.bytes
 
 export const decodeVerifiedUtf8 = (bytes: Buffer) => {
   try {
