@@ -71,6 +71,12 @@ MAR-2560 compares the same 100-record duplicate-heavy workload with and without 
 
 Deterministic behavioural hooks, not wall-clock thresholds, enforce one show read and one search execution per exact distinct key. The identical benchmark workload demonstrates the resulting reduction while retaining all 80 output envelopes and per-occurrence response accounting.
 
+## Stable canonical read snapshots
+
+Stable validation and canonical reads perform one bounded canonical scan, one graph-validation pass, one initial artifact-validation pass, and one closing artifact-record-artifact evidence sandwich. Behavioural work-count tests cover empty, 100-record, and 1,000-record corpora. A detected generation change discards that attempt and adds exactly one complete pipeline; no per-directory or per-record retry resets the shared maximum of three attempts or its non-resetting 60-second deadline.
+
+This change introduces no new latency, memory, cache-size, or amplification threshold. The existing schema-version 2 benchmark remains the release authority for configured public-operation budgets, while deterministic work observers enforce the stable and retry pipeline counts.
+
 ## Validated mutation snapshot comparison
 
 MAR-2565 removes the second canonical JSON parse and graph validation from stable record additions and record-producing initialisation. Three measured fresh Node processes used the same lightweight valid corpus with no warmup at the MAR-2560 base (`15e3b037e5d710fa4743168798d5e3d8f752ee4c`) and the implementation snapshot (`906d6d7710fe511982a81ad0deb9ecff7e36f7d0`). Timings are diagnostic median / nearest-rank p95 milliseconds, not new CI thresholds.

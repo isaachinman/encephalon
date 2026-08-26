@@ -1,0 +1,22 @@
+{
+  "createdAt": "2026-08-26T03:23:52.360Z",
+  "id": "fe3abe5d-a9d6-46dd-87e4-71861b2294e5",
+  "kind": "architecture",
+  "payload": {
+    "summary": "Canonical reads and validation accept only one proven-stable corpus generation.",
+    "attempts": 3,
+    "deadlineMilliseconds": 60000,
+    "invariants": [
+      "Accept complete bounded root and kind entry generations only.",
+      "Bind accepted and rejected records plus artifact evidence to the same attempt.",
+      "Discard the entire attempt on detected churn."
+    ],
+    "compatibility": [
+      "Preserve successful public result shapes and canonical JSON.",
+      "Keep mutation publication and cache-equivalence semantics in their owning tickets."
+    ]
+  },
+  "searchText": "stable canonical snapshot read validation generation retry ledger",
+  "source": "agent",
+  "subject": "canonical.stable-read-snapshot"
+}
