@@ -212,7 +212,7 @@ describe('package contract', () => {
     )
     assert.match(
       contract,
-      /MAR-2575 stable canonical read and validation snapshots with one bounded operation-scoped retry ledger: `422c3a20e1ee13e69dcf87ea219a8a0dab4ff071`\./,
+      /MAR-2575 stable canonical read and validation snapshots with one bounded operation-scoped retry ledger: `78ca415858eb3a3b7ad1c2a97ee4da38560e4937`\./,
     )
     assert.match(
       contract,
