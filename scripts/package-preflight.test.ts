@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { test } from 'node:test'
 import { spawnNpmCommand } from './npm-command.ts'
+import * as packagePreflightAuthority from './package-preflight.ts'
 import { preflightExactPackageArtifact } from './package-preflight.ts'
 
 const sourceRoot = resolve(import.meta.dirname, '..')
@@ -22,6 +23,20 @@ const fixturePaths = [
   'README.md',
   'LICENSE',
 ] as const
+
+test('keeps archive modes strict while accepting the two npm CLI modes on Windows', () => {
+  const authority = packagePreflightAuthority as typeof packagePreflightAuthority & {
+    reviewedPackageArchiveMode?: (path: string, mode: number, platform: NodeJS.Platform) => boolean
+  }
+  assert.equal(typeof authority.reviewedPackageArchiveMode, 'function')
+  assert.equal(authority.reviewedPackageArchiveMode?.('dist/cli.mjs', 0o755, 'linux'), true)
+  assert.equal(authority.reviewedPackageArchiveMode?.('dist/cli.mjs', 0o644, 'linux'), false)
+  assert.equal(authority.reviewedPackageArchiveMode?.('dist/cli.mjs', 0o755, 'win32'), true)
+  assert.equal(authority.reviewedPackageArchiveMode?.('dist/cli.mjs', 0o644, 'win32'), true)
+  assert.equal(authority.reviewedPackageArchiveMode?.('dist/cli.mjs', 0o600, 'win32'), false)
+  assert.equal(authority.reviewedPackageArchiveMode?.('README.md', 0o644, 'win32'), true)
+  assert.equal(authority.reviewedPackageArchiveMode?.('README.md', 0o755, 'win32'), false)
+})
 
 const runGit = (root: string, arguments_: readonly string[]) => {
   const result = spawnSync('git', arguments_, { cwd: root, encoding: 'utf8' })

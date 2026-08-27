@@ -140,6 +140,15 @@ const readmeReferences = (content: string) => {
 
 const decodeUtf8 = (bytes: Buffer) => new TextDecoder('utf-8', { fatal: true }).decode(bytes)
 
+export const reviewedPackageArchiveMode = (
+  path: string,
+  mode: number,
+  platform: NodeJS.Platform = process.platform,
+) => {
+  const expectedMode = path === 'dist/cli.mjs' ? 0o755 : 0o644
+  return mode === expectedMode || (platform === 'win32' && path === 'dist/cli.mjs' && mode === 0o644)
+}
+
 const packageIdentity = (root: string) => {
   const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as PackageManifest
   const packageVersion = assertReviewedManifest(packageJson)
@@ -212,8 +221,7 @@ export const validateReviewedPackageSnapshot = (root: string, snapshot: PackageT
 
   const contentMismatch = packedEntries.find(entry => {
     const expectedContent = readFileSync(resolve(root, entry.path))
-    const expectedMode = entry.path === 'dist/cli.mjs' ? 0o755 : 0o644
-    return entry.mode !== expectedMode || !entry.content.equals(expectedContent)
+    return !(reviewedPackageArchiveMode(entry.path, entry.mode) && entry.content.equals(expectedContent))
   })
   if (contentMismatch !== undefined) {
     throw new Error(`The reviewed package bytes or mode differ for ${contentMismatch.path}.`)

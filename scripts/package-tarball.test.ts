@@ -203,7 +203,9 @@ describe('package tarball authority', () => {
               writeFileSync(source, 'replacement bytes')
             },
           }),
-        /ancestor|changed while|unchanged regular file/u,
+        process.platform === 'win32'
+          ? /EPERM|ancestor|changed while|unchanged regular file/u
+          : /ancestor|changed while|unchanged regular file/u,
       )
     } finally {
       rmSync(fixtureDirectory, { force: true, recursive: true })

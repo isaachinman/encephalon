@@ -568,6 +568,17 @@ const assertPackageArtifact = (artifact: VerifiedPackageArtifact) => {
 
 const installedPackageWitnesses = new Map<string, DurableSnapshot>()
 
+export const installedPackageEntryMatches = (
+  expected: Readonly<{ content: Buffer; mode: number; path: string }>,
+  actual: Readonly<{ bytes?: Buffer; canonicalPath: string; mode: number }> | undefined,
+  installedPackageCanonicalPath: string,
+  platform: NodeJS.Platform = process.platform,
+) =>
+  actual?.bytes !== undefined &&
+  (platform === 'win32' || actual.mode === expected.mode) &&
+  actual.bytes.equals(expected.content) &&
+  actual.canonicalPath === resolve(installedPackageCanonicalPath, expected.path)
+
 const assertInstalledTreeMatchesArtifact = (
   artifact: VerifiedPackageArtifact,
   installedPackage: string,
@@ -578,16 +589,12 @@ const assertInstalledTreeMatchesArtifact = (
   )
   const actualFiles = snapshot.filter(entry => entry.type === 'file')
   const actualByPath = new Map(actualFiles.map(entry => [entry.path, entry]))
+  const installedPackageCanonicalPath = realpathSync.native(installedPackage)
   const differs =
     actualFiles.length !== expectedFiles.length ||
     expectedFiles.some(expected => {
       const actual = actualByPath.get(expected.path)
-      return (
-        actual?.bytes === undefined ||
-        actual.mode !== expected.mode ||
-        !actual.bytes.equals(expected.content) ||
-        actual.canonicalPath !== resolve(realpathSync.native(installedPackage), expected.path)
-      )
+      return !installedPackageEntryMatches(expected, actual, installedPackageCanonicalPath)
     })
   if (differs) {
     throw new Error('The fresh installed compatibility package tree differs from its verified tarball.')

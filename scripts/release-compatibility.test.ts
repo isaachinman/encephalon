@@ -23,6 +23,7 @@ import { pathToFileURL } from 'node:url'
 import { captureIsolatedRoot, disposeIsolatedRoot } from './isolated-root.ts'
 import { spawnNpmCommand } from './npm-command.ts'
 import { packageTarballDigests } from './package-tarball.ts'
+import * as releaseCompatibilityAuthority from './release-compatibility.ts'
 import {
   assertDurableSnapshotsEqual,
   assertStablePublicSurface,
@@ -39,6 +40,37 @@ import {
 
 const compatibilityIntegrationTimeout = process.platform === 'win32' ? 300_000 : 120_000
 const compatibilityRegressionTimeout = process.platform === 'win32' ? 360_000 : 180_000
+
+test('keeps installed package bytes authoritative when Windows cannot preserve archive modes', () => {
+  const authority = releaseCompatibilityAuthority as typeof releaseCompatibilityAuthority & {
+    installedPackageEntryMatches?: (
+      expected: Readonly<{ content: Buffer; mode: number; path: string }>,
+      actual: Readonly<{ bytes?: Buffer; canonicalPath: string; mode: number }> | undefined,
+      installedPackage: string,
+      platform: NodeJS.Platform,
+    ) => boolean
+  }
+  const installedPackage = resolve('fixture', 'node_modules', 'encephalon')
+  const expected = { content: Buffer.from('reviewed bytes'), mode: 0o755, path: 'dist/cli.mjs' }
+  const actual = {
+    bytes: Buffer.from('reviewed bytes'),
+    canonicalPath: resolve(installedPackage, 'dist/cli.mjs'),
+    mode: 0o666,
+  }
+
+  assert.equal(typeof authority.installedPackageEntryMatches, 'function')
+  assert.equal(authority.installedPackageEntryMatches?.(expected, actual, installedPackage, 'win32'), true)
+  assert.equal(authority.installedPackageEntryMatches?.(expected, actual, installedPackage, 'linux'), false)
+  assert.equal(
+    authority.installedPackageEntryMatches?.(
+      expected,
+      { ...actual, bytes: Buffer.from('changed bytes') },
+      installedPackage,
+      'win32',
+    ),
+    false,
+  )
+})
 
 const createDurableFixture = () => {
   const root = mkdtempSync(resolve(tmpdir(), 'encephalon-release-durable-'))
