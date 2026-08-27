@@ -621,9 +621,15 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-const [root] = process.argv.slice(2)
+const [root, packagePhase] = process.argv.slice(2)
 const api = await import('encephalon')
 const cli = resolve(root, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
+const sanitizedChildEnvironment = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => {
+    const normalized = key.toLowerCase()
+    return normalized !== 'node_options' && normalized !== 'node_path'
+  }),
+)
 const MAX_CANONICAL_BYTES = 8 * 1024 * 1024
 const MAX_RECORD_BYTES = 1024 * 1024
 const fail = stage => { throw Object.assign(new Error(stage), { stage }) }
@@ -639,14 +645,16 @@ const apiObservation = action => {
     return { error: errorValue(error), status: 'rejected' }
   }
 }
-const cliObservation = arguments_ => {
-  const result = spawnSync(process.execPath, [cli, '--root', root, ...arguments_], {
+const cliResult = arguments_ =>
+  spawnSync(process.execPath, [cli, '--root', root, ...arguments_], {
     cwd: root,
     encoding: 'utf8',
-    env: process.env,
+    env: sanitizedChildEnvironment,
     maxBuffer: 16 * 1024 * 1024,
     shell: false,
   })
+const cliObservation = arguments_ => {
+  const result = cliResult(arguments_)
   if (result.error === undefined && result.status === 0) {
     try {
       JSON.parse(result.stdout)
@@ -671,12 +679,39 @@ const boundary = (withinLimit, overLimit) => ({
   overLimit: overLimit(),
   withinLimit: withinLimit(),
 })
+const validationObservation = value => {
+  if (!Array.isArray(value?.errors) || typeof value?.truncated !== 'boolean' || typeof value?.valid !== 'boolean') {
+    fail('budget-validation-shape')
+  }
+  const validation = {
+    errors: value.errors.map(error => ({ code: error?.code, message: error?.message })),
+    truncated: value.truncated,
+    valid: value.valid,
+  }
+  return validation.valid && validation.errors.length === 0 && !validation.truncated
+    ? { status: 'accepted' }
+    : { status: 'rejected', validation }
+}
+const apiValidationObservation = () => validationObservation(api.validateRecords({ root }))
+const cliValidationObservation = () => {
+  const result = cliResult(['validate'])
+  if (result.error !== undefined || result.stderr !== '') fail('budget-cli-validation-process')
+  let value
+  try {
+    value = JSON.parse(result.stdout)
+  } catch {
+    fail('budget-cli-validation-json')
+  }
+  if (result.status !== (value?.valid === true ? 0 : 2)) fail('budget-cli-validation-status')
+  return validationObservation(value)
+}
 const canonicalFiles = () => {
   const brain = resolve(root, 'encephalon')
   return readdirSync(brain, { withFileTypes: true })
     .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith('_'))
     .flatMap(entry => readdirSync(resolve(brain, entry.name)).filter(name => name.endsWith('.json')).map(name => resolve(brain, entry.name, name)))
 }
+const canonicalRecords = () => canonicalFiles().map(path => JSON.parse(readFileSync(path, 'utf8')))
 const recordValue = (kind, id, index, payload = {}, searchText) => ({
   createdAt: new Date(Date.UTC(2000, 0, 1) + index).toISOString(),
   id,
@@ -740,9 +775,25 @@ const apiReport = {
     () => apiObservation(() => api.searchRecords({ query: queryBytesWithin, root })),
     () => apiObservation(() => api.searchRecords({ query: queryBytesOver, root })),
   ),
+  compactQueryBytes: boundary(
+    () => apiObservation(() => api.searchCompactRecords({ query: queryBytesWithin, root })),
+    () => apiObservation(() => api.searchCompactRecords({ query: queryBytesOver, root })),
+  ),
+  gatherQueryBytes: boundary(
+    () => apiObservation(() => api.gatherRecords({ root, searches: [queryBytesWithin] })),
+    () => apiObservation(() => api.gatherRecords({ root, searches: [queryBytesOver] })),
+  ),
   queryTerms: boundary(
     () => apiObservation(() => api.searchRecords({ query: queryTermsWithin, root })),
     () => apiObservation(() => api.searchRecords({ query: queryTermsOver, root })),
+  ),
+  compactQueryTerms: boundary(
+    () => apiObservation(() => api.searchCompactRecords({ query: queryTermsWithin, root })),
+    () => apiObservation(() => api.searchCompactRecords({ query: queryTermsOver, root })),
+  ),
+  gatherQueryTerms: boundary(
+    () => apiObservation(() => api.gatherRecords({ root, searches: [queryTermsWithin] })),
+    () => apiObservation(() => api.gatherRecords({ root, searches: [queryTermsOver] })),
   ),
   gatherSearches: boundary(
     () => apiObservation(() => api.gatherRecords({ root, searches: searchesWithin })),
@@ -771,9 +822,25 @@ const cliReport = {
     () => cliObservation(['search', '--', queryBytesWithin]),
     () => cliObservation(['search', '--', queryBytesOver]),
   ),
+  compactQueryBytes: boundary(
+    () => cliObservation(['search', '--compact', '--', queryBytesWithin]),
+    () => cliObservation(['search', '--compact', '--', queryBytesOver]),
+  ),
+  gatherQueryBytes: boundary(
+    () => cliObservation(['gather', '--search', queryBytesWithin]),
+    () => cliObservation(['gather', '--search', queryBytesOver]),
+  ),
   queryTerms: boundary(
     () => cliObservation(['search', '--', queryTermsWithin]),
     () => cliObservation(['search', '--', queryTermsOver]),
+  ),
+  compactQueryTerms: boundary(
+    () => cliObservation(['search', '--compact', '--', queryTermsWithin]),
+    () => cliObservation(['search', '--compact', '--', queryTermsOver]),
+  ),
+  gatherQueryTerms: boundary(
+    () => cliObservation(['gather', '--search', queryTermsWithin]),
+    () => cliObservation(['gather', '--search', queryTermsOver]),
   ),
   gatherSearches: boundary(
     () => cliObservation(['gather', ...searchesWithin.flatMap(query => ['--search', query])]),
@@ -795,6 +862,84 @@ const cliReport = {
     temporaryCliAdd('compatibility-cli-payload-depth-within', nestedPayload(64)),
     temporaryCliAdd('compatibility-cli-payload-depth-over', nestedPayload(65)),
   ),
+}
+
+const fixtureWitness = api.__releaseCompatibilityWitness
+const captureApiError = action => {
+  let failure
+  try {
+    action()
+  } catch (error) {
+    failure = error
+  }
+  if (failure === undefined) fail('allocation-api-error-missing')
+  return errorValue(failure)
+}
+const captureAllocationWork = () => {
+  const propertyCount = 100000
+  const target = {}
+  for (let index = 0; index < propertyCount; index += 1) {
+    target['key-' + index] = index
+  }
+  const work = { descriptors: 0, ownKeys: 0 }
+  const payload = new Proxy(target, {
+    getOwnPropertyDescriptor: (object, key) => {
+      work.descriptors += 1
+      return Reflect.getOwnPropertyDescriptor(object, key)
+    },
+    ownKeys: object => {
+      work.ownKeys += 1
+      return Reflect.ownKeys(object)
+    },
+  })
+  const oversizedArrayWork = { descriptors: [], ownKeys: 0 }
+  const oversizedArray = new Proxy(new Array(2 ** 32 - 1), {
+    getOwnPropertyDescriptor: (array, key) => {
+      oversizedArrayWork.descriptors.push(String(key))
+      return Reflect.getOwnPropertyDescriptor(array, key)
+    },
+    ownKeys: array => {
+      oversizedArrayWork.ownKeys += 1
+      return Reflect.ownKeys(array)
+    },
+  })
+  const originalGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
+  const retainedDescriptorMaps = []
+  let descriptorMapCalls = 0
+  Object.getOwnPropertyDescriptors = value => {
+    descriptorMapCalls += 1
+    const descriptors = originalGetOwnPropertyDescriptors(value)
+    retainedDescriptorMaps.push(descriptors)
+    return descriptors
+  }
+  const addPayload = value => api.addRecord({
+    id: 'compatibility-allocation-work',
+    kind: 'decision',
+    payload: value,
+    root: resolve(root, '.release-compatibility', 'unused-allocation-root'),
+    source: 'release-compatibility',
+    subject: 'release.compatibility.allocation-work',
+  })
+  let wideObjectError
+  let oversizedArrayError
+  try {
+    wideObjectError = captureApiError(() => addPayload(payload))
+    oversizedArrayError = captureApiError(() => addPayload(oversizedArray))
+  } finally {
+    Object.getOwnPropertyDescriptors = originalGetOwnPropertyDescriptors
+  }
+  return {
+    descriptorMapCalls,
+    oversizedArray: { error: oversizedArrayError, work: oversizedArrayWork },
+    retainedDescriptorCount: retainedDescriptorMaps.reduce(
+      (count, descriptors) => count + Reflect.ownKeys(descriptors).length,
+      0,
+    ),
+    wideObject: { error: wideObjectError, propertyCount, work },
+  }
+}
+if (packagePhase === 'candidate') {
+  apiReport.allocationWork = fixtureWitness?.allocationWork ?? captureAllocationWork()
 }
 
 const existingCount = canonicalFiles().length
@@ -841,6 +986,125 @@ const byteEvidence = withRecords(byteKind, byteRecords, () => ({
 }))
 apiReport.corpusBytes = byteEvidence.api
 cliReport.corpusBytes = byteEvidence.cli
+
+const aggregateSupersessionEvidence = (() => {
+  if (fixtureWitness?.corpusSupersessionEdges !== undefined) {
+    return {
+      api: fixtureWitness.corpusSupersessionEdges,
+      cli: fixtureWitness.corpusSupersessionEdges,
+    }
+  }
+  const existingRecords = canonicalRecords()
+  const remainingEdges = 1000 - existingRecords.reduce(
+    (count, record) => count + (record.supersedes?.length ?? 0),
+    0,
+  )
+  const kind = 'compatibilitybudgetsupersession'
+  const recordCount = Math.ceil((remainingEdges + 4) / 2)
+  if (remainingEdges < 1 || recordCount > 1000 - existingRecords.length) {
+    fail('budget-corpus-supersession-fixture')
+  }
+  const records = Array.from({ length: recordCount }, (_, index) => ({
+    ...recordValue(kind, 'compatibility-supersession-' + String(index).padStart(4, '0'), index),
+    subject: 'release.compatibility.aggregate-supersession',
+    ...(index === 0 ? {} : { supersedes: ['compatibility-supersession-' + String(index - 1).padStart(4, '0')] }),
+  }))
+  const last = records.at(-1)
+  if (last === undefined) fail('budget-corpus-supersession-last')
+  const chainEdges = records.length - 1
+  const additionalEdges = remainingEdges - chainEdges
+  if (additionalEdges < 0 || additionalEdges > records.length - 3) {
+    fail('budget-corpus-supersession-capacity')
+  }
+  const withinLast = {
+    ...last,
+    supersedes: [
+      ...(last.supersedes ?? []),
+      ...records.slice(0, additionalEdges).map(record => record.id),
+    ],
+  }
+  const withinRecords = [...records.slice(0, -1), withinLast]
+  const overTarget = records[additionalEdges]
+  if (overTarget === undefined || withinLast.supersedes.includes(overTarget.id)) {
+    fail('budget-corpus-supersession-over-target')
+  }
+  return withRecords(kind, withinRecords, () => {
+    const apiWithin = apiValidationObservation()
+    const cliWithin = cliValidationObservation()
+    writeFileSync(
+      resolve(root, 'encephalon', kind, withinLast.id + '.json'),
+      formatted({ ...withinLast, supersedes: [...withinLast.supersedes, overTarget.id] }),
+    )
+    return {
+      api: { overLimit: apiValidationObservation(), withinLimit: apiWithin },
+      cli: { overLimit: cliValidationObservation(), withinLimit: cliWithin },
+    }
+  })
+})()
+apiReport.corpusSupersessionEdges = aggregateSupersessionEvidence.api
+cliReport.corpusSupersessionEdges = aggregateSupersessionEvidence.cli
+
+const aggregateArtifactEvidence = (() => {
+  if (fixtureWitness?.corpusArtifactReferences !== undefined) {
+    return {
+      api: fixtureWitness.corpusArtifactReferences,
+      cli: fixtureWitness.corpusArtifactReferences,
+    }
+  }
+  const existingArtifactCount = canonicalRecords().reduce(
+    (count, record) => count + (record.artifacts?.length ?? 0),
+    0,
+  )
+  const remainingArtifacts = 1000 - existingArtifactCount
+  const kind = 'compatibilitybudgetartifacts'
+  const artifactsPerRecord = 250
+  const recordCount = Math.ceil(remainingArtifacts / artifactsPerRecord)
+  if (remainingArtifacts < 1 || recordCount < 1) fail('budget-corpus-artifact-fixture')
+  const records = Array.from({ length: recordCount }, (_, recordIndex) => {
+    const id = 'compatibility-artifacts-' + String(recordIndex).padStart(2, '0')
+    const count = Math.min(artifactsPerRecord, remainingArtifacts - recordIndex * artifactsPerRecord)
+    return {
+      ...recordValue(kind, id, recordIndex),
+      artifacts: Array.from(
+        { length: count },
+        (_, artifactIndex) =>
+          '_artifacts/' + kind + '/' + id + '/evidence-' + String(artifactIndex).padStart(3, '0') + '.txt',
+      ),
+    }
+  })
+  const recordDirectory = resolve(root, 'encephalon', kind)
+  const artifactDirectory = resolve(root, 'encephalon', '_artifacts', kind)
+  mkdirSync(recordDirectory)
+  mkdirSync(artifactDirectory, { recursive: true })
+  try {
+    records.map(record => {
+      writeFileSync(resolve(recordDirectory, record.id + '.json'), formatted(record))
+      record.artifacts.map(path => {
+        const directory = resolve(root, 'encephalon', '_artifacts', kind, record.id)
+        mkdirSync(directory, { recursive: true })
+        writeFileSync(resolve(root, 'encephalon', path), '')
+      })
+    })
+    const apiWithin = apiValidationObservation()
+    const cliWithin = cliValidationObservation()
+    const last = records.at(-1)
+    if (last === undefined) fail('budget-corpus-artifact-last')
+    const overPath = '_artifacts/' + kind + '/' + last.id + '/over-limit.txt'
+    writeFileSync(
+      resolve(recordDirectory, last.id + '.json'),
+      formatted({ ...last, artifacts: [...last.artifacts, overPath] }),
+    )
+    return {
+      api: { overLimit: apiValidationObservation(), withinLimit: apiWithin },
+      cli: { overLimit: cliValidationObservation(), withinLimit: cliWithin },
+    }
+  } finally {
+    rmSync(recordDirectory, { force: true, recursive: true })
+    rmSync(artifactDirectory, { force: true, recursive: true })
+  }
+})()
+apiReport.corpusArtifactReferences = aggregateArtifactEvidence.api
+cliReport.corpusArtifactReferences = aggregateArtifactEvidence.cli
 
 const responseKind = 'compatibilitybudgetresponse'
 const responseRecords = Array.from({ length: 5 }, (_, index) =>
@@ -1126,6 +1390,14 @@ type BudgetObservation = Readonly<
       }>
       status: 'rejected'
     }
+  | {
+      status: 'rejected'
+      validation: Readonly<{
+        errors: readonly Readonly<{ code: string; message: string }>[]
+        truncated: boolean
+        valid: boolean
+      }>
+    }
 >
 
 type BudgetBoundary = Readonly<{
@@ -1133,15 +1405,34 @@ type BudgetBoundary = Readonly<{
   withinLimit: BudgetObservation
 }>
 
-type IndependentBudgetChannel = Readonly<Record<string, BudgetBoundary>>
+type AllocationWorkEvidence = Readonly<{
+  descriptorMapCalls: number
+  oversizedArray: Readonly<{
+    error: Readonly<{ code: string; details: Readonly<Record<string, unknown>>; message: string }>
+    work: Readonly<{ descriptors: readonly string[]; ownKeys: number }>
+  }>
+  retainedDescriptorCount: number
+  wideObject: Readonly<{
+    error: Readonly<{ code: string; details: Readonly<Record<string, unknown>>; message: string }>
+    propertyCount: number
+    work: Readonly<{ descriptors: number; ownKeys: number }>
+  }>
+}>
+
+type IndependentBudgetChannel = Readonly<Record<string, AllocationWorkEvidence | BudgetBoundary>>
 
 type IndependentBudgetReport = Readonly<{
   api: IndependentBudgetChannel
   cli: IndependentBudgetChannel
 }>
 
-const runBudgetProbe = (probe: string, fixtureRoot: string, redactions: readonly Buffer[]) => {
-  const result = runCompatibilityCommand(process.execPath, [probe, fixtureRoot], {
+const runBudgetProbe = (
+  probe: string,
+  fixtureRoot: string,
+  packagePhase: 'candidate' | 'oracle',
+  redactions: readonly Buffer[],
+) => {
+  const result = runCompatibilityCommand(process.execPath, [probe, fixtureRoot, packagePhase], {
     cwd: fixtureRoot,
     label: 'The independent public budget probe',
     redactions,
@@ -1169,8 +1460,23 @@ const validationFailure = (code: string, message: string) =>
   rejectedBudgetObservation('VALIDATION_FAILED', 'The new record would make canonical records invalid.', {
     errors: [{ code, message }],
   })
+const validationBoundaryFailure = (code: string, message: string): BudgetObservation =>
+  Object.freeze({
+    status: 'rejected',
+    validation: Object.freeze({
+      errors: Object.freeze([Object.freeze({ code, message })]),
+      truncated: false,
+      valid: false,
+    }),
+  })
 
 const commonCandidateBudgetEvidence = Object.freeze({
+  compactQueryBytes: budgetBoundary(
+    budgetFailure('queryBytes', 'query', 1024, 'query must contain at most 1024 UTF-8 bytes.'),
+  ),
+  compactQueryTerms: budgetBoundary(
+    budgetFailure('queryTerms', 'query', 32, 'query may contain at most 32 literal terms.'),
+  ),
   compactResponseBytes: budgetBoundary(
     budgetFailure('compactResponseBytes', 'response', 4 * 1024 * 1024, 'response may contain at most 4194304 bytes.'),
   ),
@@ -1187,6 +1493,12 @@ const commonCandidateBudgetEvidence = Object.freeze({
       4 * 1024 * 1024,
       'full-record responses may contain at most 4194304 UTF-8 bytes.',
     ),
+  ),
+  gatherQueryBytes: budgetBoundary(
+    budgetFailure('queryBytes', 'query', 1024, 'query must contain at most 1024 UTF-8 bytes.'),
+  ),
+  gatherQueryTerms: budgetBoundary(
+    budgetFailure('queryTerms', 'query', 32, 'query may contain at most 32 literal terms.'),
   ),
   gatherResponseBytes: budgetBoundary(
     budgetFailure('gatherResponseBytes', 'response', 4 * 1024 * 1024, 'response may contain at most 4194304 bytes.'),
@@ -1208,6 +1520,39 @@ const commonCandidateBudgetEvidence = Object.freeze({
 const candidateBudgetEvidence = Object.freeze({
   api: Object.freeze({
     ...commonCandidateBudgetEvidence,
+    allocationWork: Object.freeze({
+      descriptorMapCalls: 0,
+      oversizedArray: Object.freeze({
+        error: Object.freeze({
+          code: 'INVALID_ARGUMENT',
+          details: Object.freeze({ field: 'payload' }),
+          message: 'payload may contain at most 10000 JSON nodes.',
+        }),
+        work: Object.freeze({ descriptors: Object.freeze(['length']), ownKeys: 0 }),
+      }),
+      retainedDescriptorCount: 0,
+      wideObject: Object.freeze({
+        error: Object.freeze({
+          code: 'INVALID_ARGUMENT',
+          details: Object.freeze({ field: 'payload' }),
+          message: 'payload may contain at most 10000 JSON nodes.',
+        }),
+        propertyCount: 100_000,
+        work: Object.freeze({ descriptors: 100_000, ownKeys: 1 }),
+      }),
+    }),
+    corpusArtifactReferences: budgetBoundary(
+      validationBoundaryFailure(
+        'CORPUS_ARTIFACT_LIMIT',
+        'Canonical corpus may contain at most 1000 artifact references.',
+      ),
+    ),
+    corpusSupersessionEdges: budgetBoundary(
+      validationBoundaryFailure(
+        'CORPUS_SUPERSEDES_LIMIT',
+        'Canonical corpus may contain at most 1000 supersession edges.',
+      ),
+    ),
     supersessionEdges: budgetBoundary(
       budgetFailure('supersessionEdges', 'supersedes', 1000, 'supersedes may contain at most 1000 record ids.'),
       fieldFailure('supersedes must be a non-empty array of unique strings.', 'supersedes'),
@@ -1215,6 +1560,18 @@ const candidateBudgetEvidence = Object.freeze({
   }),
   cli: Object.freeze({
     ...commonCandidateBudgetEvidence,
+    corpusArtifactReferences: budgetBoundary(
+      validationBoundaryFailure(
+        'CORPUS_ARTIFACT_LIMIT',
+        'Canonical corpus may contain at most 1000 artifact references.',
+      ),
+    ),
+    corpusSupersessionEdges: budgetBoundary(
+      validationBoundaryFailure(
+        'CORPUS_SUPERSEDES_LIMIT',
+        'Canonical corpus may contain at most 1000 supersession edges.',
+      ),
+    ),
     supersessionEdges: budgetBoundary(
       budgetFailure('supersessionEdges', 'supersedes', 1000, '--supersedes may be supplied at most 1000 times.'),
       fieldFailure('supersedes must be a non-empty array of unique strings.', 'supersedes'),
@@ -1479,7 +1836,7 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     }
     const oracleCliSurface = captureCliSurface(fixtureRoot, initial.version, predecessorRedactions)
     const oracleCliLimits = assertCliResultLimits(fixtureRoot, oracleResultLimitMaximums, predecessorRedactions)
-    const oracleIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, predecessorRedactions)
+    const oracleIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, 'oracle', predecessorRedactions)
     const oraclePublicSurface = publicSurfaceDigests(initial.surface, oracleCliSurface)
     const durable = captureDurableSnapshot(fixtureRoot)
     const redactions = durableRedactions(durable)
@@ -1490,7 +1847,7 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     const upgradeApi = runApiProbe(probes.apiProbe, 'upgrade', fixtureRoot, redactions)
     assertLimitReport(upgradeApi.limits, candidateResultLimitMaximums, 'The candidate API phase')
     const upgradeCli = runCandidateCliSurface(fixtureRoot, candidateImport.version, redactions)
-    const upgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, redactions)
+    const upgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, 'candidate', redactions)
     assertStablePublicSurface(initial.surface, upgradeApi.surface, 'The candidate API')
     assertCandidateCliSurface(oracleCliSurface, upgradeCli.surface)
     assertCandidateIndependentBudgets(upgradeIndependentBudgets)
@@ -1504,7 +1861,7 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     const downgradeApi = runApiProbe(probes.apiProbe, 'downgrade', fixtureRoot, redactions)
     assertLimitReport(downgradeApi.limits, oracleResultLimitMaximums, 'The downgraded oracle API phase')
     const downgradeCli = runDowngradeCliSurface(fixtureRoot, downgradeImport.version, redactions)
-    const downgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, redactions)
+    const downgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, 'oracle', redactions)
     assertStablePublicSurface(initial.surface, downgradeApi.surface, 'The downgraded oracle API')
     assertStablePublicSurface(oracleCliSurface, downgradeCli.surface, 'The downgraded oracle CLI')
     assertStablePublicSurface(

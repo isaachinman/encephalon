@@ -40,6 +40,62 @@ const createDurableFixture = () => {
 const standInIndex = (version: string, schemaVersion: string) => {
   const fullMaximum = version.startsWith('0.2.0') ? 50 : 1000
   const compactMaximum = version.startsWith('0.2.0') ? 100 : 1000
+  const payloadBudgetError = {
+    code: 'INVALID_ARGUMENT',
+    details: { field: 'payload' },
+    message: 'payload may contain at most 10000 JSON nodes.',
+  }
+  const fixtureWitness = {
+    allocationWork: {
+      descriptorMapCalls: version.includes('coverage-drift') ? 1 : 0,
+      oversizedArray: {
+        error: payloadBudgetError,
+        work: { descriptors: ['length'], ownKeys: 0 },
+      },
+      retainedDescriptorCount: version.includes('coverage-drift') ? 100_000 : 0,
+      wideObject: {
+        error: payloadBudgetError,
+        propertyCount: 100_000,
+        work: { descriptors: 100_000, ownKeys: 1 },
+      },
+    },
+    corpusArtifactReferences: {
+      overLimit: version.includes('coverage-drift')
+        ? { status: 'accepted' }
+        : {
+            status: 'rejected',
+            validation: {
+              errors: [
+                {
+                  code: 'CORPUS_ARTIFACT_LIMIT',
+                  message: 'Canonical corpus may contain at most 1000 artifact references.',
+                },
+              ],
+              truncated: false,
+              valid: false,
+            },
+          },
+      withinLimit: { status: 'accepted' },
+    },
+    corpusSupersessionEdges: {
+      overLimit: version.includes('coverage-drift')
+        ? { status: 'accepted' }
+        : {
+            status: 'rejected',
+            validation: {
+              errors: [
+                {
+                  code: 'CORPUS_SUPERSEDES_LIMIT',
+                  message: 'Canonical corpus may contain at most 1000 supersession edges.',
+                },
+              ],
+              truncated: false,
+              valid: false,
+            },
+          },
+      withinLimit: { status: 'accepted' },
+    },
+  }
   return `
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -51,6 +107,12 @@ if (${String(version.includes('environment-witness'))} && Object.keys(process.en
 }
 
 export const packageWitness = ${JSON.stringify(version)}
+export const __releaseCompatibilityWitness = ${JSON.stringify(fixtureWitness)}
+
+if (${String(version.includes('environment-mutation'))}) {
+  process.env.NODE_OPTIONS = '--require=' + resolve(import.meta.dirname, 'environment-preload.cjs')
+  process.env.NODE_PATH = resolve(import.meta.dirname, 'environment-node-path')
+}
 
 export class EncephalonError extends Error {
   constructor(code, message, details = {}) {
@@ -82,11 +144,12 @@ const budgetError = (budget, field, maximum, message) => {
 const validationError = (code, message) => {
   throw new EncephalonError('VALIDATION_FAILED', 'The new record would make canonical records invalid.', { errors: [{ code, message }] })
 }
-const assertQuery = query => {
-  const byteMaximum = ${version.includes('budget-drift') ? 2048 : 1024}
+const assertQuery = (query, compact = false) => {
+  const byteMaximum = ${version.includes('budget-drift') ? 2048 : 1024} + (compact && ${String(version.includes('coverage-drift'))} ? 1024 : 0)
   if (Buffer.byteLength(query, 'utf8') > byteMaximum) budgetError('queryBytes', 'query', byteMaximum, 'query must contain at most ' + byteMaximum + ' UTF-8 bytes.')
   const terms = query.match(/[A-Za-z0-9]+/g) ?? []
-  if (terms.length > 32) budgetError('queryTerms', 'query', 32, 'query may contain at most 32 literal terms.')
+  const termMaximum = compact && ${String(version.includes('coverage-drift'))} ? 64 : 32
+  if (terms.length > termMaximum) budgetError('queryTerms', 'query', termMaximum, 'query may contain at most ' + termMaximum + ' literal terms.')
 }
 const assertPayload = payload => {
   const work = [{ depth: 0, path: 'payload', value: payload }]
@@ -228,7 +291,7 @@ export const searchRecords = input => {
   )
 }
 export const searchCompactRecords = input => {
-  assertQuery(input.query)
+  assertQuery(input.query, true)
   return assertResponse(
     readRecords(repositoryRoot(input))
       .filter(record => JSON.stringify(record).includes(input.query))
@@ -387,6 +450,10 @@ const buildStandInTarball = (root: string, version: string, schemaVersion: strin
   )
   writeFileSync(resolve(packageRoot, 'dist', 'index.mjs'), standInIndex(version, schemaVersion))
   writeFileSync(resolve(packageRoot, 'dist', 'cli.mjs'), standInCli(version), { mode: 0o755 })
+  writeFileSync(
+    resolve(packageRoot, 'dist', 'environment-preload.cjs'),
+    "throw new Error('compatibility nested preload executed')\n",
+  )
   writeFileSync(resolve(packageRoot, 'dist', 'index.d.ts'), standInDeclarations)
   const packed = spawnNpmCommand(
     ['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', tarballDirectory],
@@ -720,10 +787,16 @@ describe('release compatibility process fixture', () => {
       assert.deepEqual(report.downgrade.resultLimits.api, expectedOracleLimits)
       assert.deepEqual(report.downgrade.resultLimits.cli, expectedOracleLimits)
       const independentBudgetNames = [
+        'compactQueryBytes',
+        'compactQueryTerms',
         'compactResponseBytes',
+        'corpusArtifactReferences',
         'corpusBytes',
         'corpusRecords',
+        'corpusSupersessionEdges',
         'fullResponseBytes',
+        'gatherQueryBytes',
+        'gatherQueryTerms',
         'gatherResponseBytes',
         'gatherSearches',
         'gatherShows',
@@ -733,7 +806,10 @@ describe('release compatibility process fixture', () => {
         'queryTerms',
         'supersessionEdges',
       ]
-      assert.deepEqual(Object.keys(report.upgrade.independentBudgets.api).sort(), independentBudgetNames)
+      assert.deepEqual(
+        Object.keys(report.upgrade.independentBudgets.api).sort(),
+        ['allocationWork', ...independentBudgetNames].sort(),
+      )
       assert.deepEqual(Object.keys(report.upgrade.independentBudgets.cli).sort(), independentBudgetNames)
       assert.deepEqual(report.upgrade.independentBudgets.api.queryBytes, {
         overLimit: {
@@ -746,15 +822,86 @@ describe('release compatibility process fixture', () => {
         },
         withinLimit: { status: 'accepted' },
       })
+      assert.deepEqual(
+        report.upgrade.independentBudgets.api.compactQueryBytes,
+        report.upgrade.independentBudgets.api.queryBytes,
+      )
+      assert.deepEqual(
+        report.upgrade.independentBudgets.api.gatherQueryBytes,
+        report.upgrade.independentBudgets.api.queryBytes,
+      )
+      assert.deepEqual(report.upgrade.independentBudgets.api.allocationWork, {
+        descriptorMapCalls: 0,
+        oversizedArray: {
+          error: {
+            code: 'INVALID_ARGUMENT',
+            details: { field: 'payload' },
+            message: 'payload may contain at most 10000 JSON nodes.',
+          },
+          work: { descriptors: ['length'], ownKeys: 0 },
+        },
+        retainedDescriptorCount: 0,
+        wideObject: {
+          error: {
+            code: 'INVALID_ARGUMENT',
+            details: { field: 'payload' },
+            message: 'payload may contain at most 10000 JSON nodes.',
+          },
+          propertyCount: 100_000,
+          work: { descriptors: 100_000, ownKeys: 1 },
+        },
+      })
+      assert.deepEqual(report.upgrade.independentBudgets.api.corpusSupersessionEdges, {
+        overLimit: {
+          status: 'rejected',
+          validation: {
+            errors: [
+              {
+                code: 'CORPUS_SUPERSEDES_LIMIT',
+                message: 'Canonical corpus may contain at most 1000 supersession edges.',
+              },
+            ],
+            truncated: false,
+            valid: false,
+          },
+        },
+        withinLimit: { status: 'accepted' },
+      })
+      assert.deepEqual(report.upgrade.independentBudgets.api.corpusArtifactReferences, {
+        overLimit: {
+          status: 'rejected',
+          validation: {
+            errors: [
+              {
+                code: 'CORPUS_ARTIFACT_LIMIT',
+                message: 'Canonical corpus may contain at most 1000 artifact references.',
+              },
+            ],
+            truncated: false,
+            valid: false,
+          },
+        },
+        withinLimit: { status: 'accepted' },
+      })
       const cliSupersessionEvidence = report.upgrade.independentBudgets.cli.supersessionEdges
       assert.ok(cliSupersessionEvidence)
-      assert.deepEqual(cliSupersessionEvidence.overLimit, {
-        error: {
-          code: 'INVALID_ARGUMENT',
-          details: { budget: 'supersessionEdges', field: 'supersedes', maximum: 1000 },
-          message: '--supersedes may be supplied at most 1000 times.',
+      assert.deepEqual(cliSupersessionEvidence, {
+        overLimit: {
+          error: {
+            code: 'INVALID_ARGUMENT',
+            details: { budget: 'supersessionEdges', field: 'supersedes', maximum: 1000 },
+            message: '--supersedes may be supplied at most 1000 times.',
+          },
+          status: 'rejected',
         },
-        status: 'rejected',
+        withinLimit: {
+          error: {
+            code: 'INVALID_ARGUMENT',
+            details: { field: 'supersedes' },
+            message: 'supersedes must be a non-empty array of unique strings.',
+          },
+          status: 'rejected',
+        },
       })
       assert.deepEqual(report.oracle.independentBudgets, report.downgrade.independentBudgets)
       assert.equal(JSON.stringify(report).includes(temporaryRoot), false)
@@ -880,7 +1027,39 @@ describe('release compatibility process fixture', () => {
               tarball: oracle.tarball,
             },
           }),
-        /does not enforce the approved independent public budget boundaries exactly \(api\.queryBytes\.overLimit\.error, api\.queryBytes\.overLimit\.status, cli\.queryBytes\.overLimit\.error, cli\.queryBytes\.overLimit\.status\)\./,
+        /does not enforce the approved independent public budget boundaries exactly \(api\.compactQueryBytes\.overLimit\.error, .*api\.queryBytes\.overLimit\.status, cli\.compactQueryBytes\.overLimit\.error, .*cli\.queryBytes\.overLimit\.status\)\./,
+      )
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects compact/gather query, allocation-work, and aggregate-corpus drift', {
+    timeout: 120_000,
+  }, () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-coverage-drift-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    try {
+      mkdirSync(fixtureRoot)
+      const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-coverage-drift', '2')
+      const oracleDigests = packageTarballDigests(oracle.tarball)
+
+      assert.throws(
+        () =>
+          runReleaseCompatibility({
+            candidateTarball: candidate.tarball,
+            fixtureRoot,
+            oracle: {
+              identity: {
+                integrity: oracleDigests.integrity,
+                shasum: oracleDigests.sha1,
+                specifier: 'local-encephalon@0.2.0',
+              },
+              tarball: oracle.tarball,
+            },
+          }),
+        /does not enforce the approved independent public budget boundaries exactly/,
       )
     } finally {
       rmSync(temporaryRoot, { force: true, recursive: true })
@@ -931,6 +1110,36 @@ describe('release compatibility process fixture', () => {
       } else {
         process.env.NODE_PATH = originalNodePath
       }
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('removes preload variables added by an imported package before spawning nested CLI processes', {
+    timeout: 120_000,
+  }, () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-import-environment-mutation-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    try {
+      mkdirSync(fixtureRoot)
+      const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-environment-mutation', '2')
+      const oracleDigests = packageTarballDigests(oracle.tarball)
+
+      assert.doesNotThrow(() =>
+        runReleaseCompatibility({
+          candidateTarball: candidate.tarball,
+          fixtureRoot,
+          oracle: {
+            identity: {
+              integrity: oracleDigests.integrity,
+              shasum: oracleDigests.sha1,
+              specifier: 'local-encephalon@0.2.0',
+            },
+            tarball: oracle.tarball,
+          },
+        }),
+      )
+    } finally {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
