@@ -22,6 +22,39 @@ import { spawnNpmCommand } from '../scripts/npm-command.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
+const releaseVersion = '0.3.0'
+const published020ChangelogSection = `## [0.2.0] - 2026-08-09
+
+### Added
+
+- Added bounded baseline scanning with deterministic directory ordering and symlink-safe traversal.
+- Added package-manager evidence to baseline records instead of inferring npm from incomplete repository metadata.
+- Added explicit request, response, corpus, cache, and performance budgets.
+- Added package and publish-contract checks to CI, including inspection of the packed package.
+- Added a replacement CLI parser and aligned generated TypeScript declarations with the supported Node.js runtime.
+
+### Changed
+
+- Made canonical record staging, publication, instruction-file writes, and post-commit recovery safer across filesystem failures.
+- Made cache hydration and gather reads transactional, snapshot-consistent, and resilient to malformed disposable state.
+- Made compact search avoid materialising full record JSON and removed persistent-style copying from hot scans.
+- Centralised the package version and separated cache schema compatibility from diagnostic package metadata.
+- Improved validation of record graphs, kind directories, artifact paths, Windows filename portability, and locale-independent ordering.
+
+### Fixed
+
+- Classified expected filesystem and SQLite environment failures separately from internal defects.
+- Made committed add failures report the affected post-commit recovery phase explicitly.
+- Made generated baseline refreshes converge on one canonical snapshot.
+- Deflaked instruction replacement identity checks across supported platforms.
+
+### Documentation
+
+- Corrected README privacy and packaged-asset claims.
+- Resolved implementation-plan drift and removed obsolete documentation surface.
+- Added performance baselines and CI budgets for prepare, hydrate, search, and cache-size behaviour.
+
+`
 const forbiddenRuntimeDependencyValues = {
   bundleDependencies: ['runtime-package'],
   bundledDependencies: ['runtime-package'],
@@ -110,6 +143,49 @@ const runPublishCheckFixture = (temporaryRoot: string, arguments_: readonly stri
     },
   })
 
+const changelogSection = (changelog: string, version: string, followingVersion: string): string => {
+  const start = changelog.indexOf(`## [${version}]`)
+  const end = changelog.indexOf(`## [${followingVersion}]`, start)
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  return changelog.slice(start, end)
+}
+
+const assertInstalledVersionSurfaces = (consumer: string) => {
+  const apiProbe = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '--eval',
+      `import { DatabaseSync } from 'node:sqlite'
+const api = await import('encephalon')
+api.prepare({ root: process.cwd() })
+const database = new DatabaseSync('node_modules/.cache/encephalon/brain.sqlite', { readOnly: true })
+try {
+  const row = database.prepare("SELECT value FROM metadata WHERE key = 'packageVersion'").get()
+  process.stdout.write(String(row?.value ?? ''))
+} finally {
+  database.close()
+}`,
+    ],
+    { cwd: consumer, encoding: 'utf8', timeout: 30_000 },
+  )
+  assert.equal(apiProbe.status, 0, `${apiProbe.stdout}${apiProbe.stderr}`)
+  assert.equal(apiProbe.stdout, releaseVersion)
+
+  const cli = spawnSync(
+    process.execPath,
+    [resolve(consumer, 'node_modules', 'encephalon', 'dist', 'cli.mjs'), '--version'],
+    {
+      cwd: consumer,
+      encoding: 'utf8',
+      timeout: 30_000,
+    },
+  )
+  assert.equal(cli.status, 0, `${cli.stdout}${cli.stderr}`)
+  assert.equal(cli.stdout, `${releaseVersion}\n`)
+}
+
 describe('package contract', () => {
   test('declares a zero-runtime-dependency Node ESM package', () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as Record<string, unknown>
@@ -176,6 +252,89 @@ describe('package contract', () => {
 
     assert.equal(PACKAGE_VERSION, packageJson.version)
     assert.equal(generated.includes(`PACKAGE_VERSION = ${JSON.stringify(PACKAGE_VERSION)}`), true)
+  })
+
+  test('reports the 0.3.0 release version from source, built, and packed API and CLI surfaces', {
+    timeout: 75_000,
+  }, () => {
+    const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
+      version?: unknown
+    }
+    const generated = readFileSync(resolve(root, 'src', 'generated', 'version.ts'), 'utf8')
+    assert.equal(packageJson.version, releaseVersion)
+    assert.equal(PACKAGE_VERSION, releaseVersion)
+    assert.equal(
+      generated,
+      `// Generated from package.json by scripts/build.ts.\nexport const PACKAGE_VERSION = "${releaseVersion}"\n`,
+    )
+
+    const builtConsumer = mkdtempSync(join(tmpdir(), 'encephalon-built-version-'))
+    const packedConsumer = mkdtempSync(join(tmpdir(), 'encephalon-packed-version-'))
+    const packageDirectory = mkdtempSync(join(tmpdir(), 'encephalon-release-package-'))
+    try {
+      for (const consumer of [builtConsumer, packedConsumer]) {
+        mkdirSync(resolve(consumer, '.git'))
+        writeFileSync(resolve(consumer, 'package.json'), '{"name":"version-probe","private":true,"type":"module"}\n')
+      }
+      mkdirSync(resolve(builtConsumer, 'node_modules'))
+      symlinkSync(root, resolve(builtConsumer, 'node_modules', 'encephalon'), 'junction')
+      assertInstalledVersionSurfaces(builtConsumer)
+
+      const packed = spawnNpmCommand(
+        ['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', packageDirectory],
+        { cwd: root },
+      )
+      assert.equal(packed.status, 0, `${packed.stdout}${packed.stderr}`)
+      const [result] = JSON.parse(packed.stdout) as Array<{ filename?: unknown }>
+      assert.equal(typeof result?.filename, 'string')
+      const tarball = resolve(packageDirectory, String(result?.filename))
+      const installed = spawnNpmCommand(
+        ['install', '--dry-run=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-dev', tarball],
+        { cwd: packedConsumer },
+      )
+      assert.equal(installed.status, 0, `${installed.stdout}${installed.stderr}`)
+      assertInstalledVersionSurfaces(packedConsumer)
+    } finally {
+      rmSync(builtConsumer, { force: true, recursive: true })
+      rmSync(packedConsumer, { force: true, recursive: true })
+      rmSync(packageDirectory, { force: true, recursive: true })
+    }
+  })
+
+  test('preserves the complete published 0.2.0 changelog section', () => {
+    const changelog = readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8')
+    const section = changelogSection(changelog, '0.2.0', '0.1.0')
+
+    assert.equal(section, published020ChangelogSection)
+    const leakedClaims = [
+      'Isolated every benchmark operation sample',
+      'Assigned record creation timestamps under the repository operation lock',
+      'Validated disposable SQLite table, constraint, index, and FTS5 semantics',
+      'Normalised negative-zero confidence',
+      'Applied payload node budgets before avoidable descriptor and output allocation',
+      'Rejected multiply linked mutable SQLite primaries',
+    ].filter(postPublicationClaim => section.includes(postPublicationClaim))
+    assert.deepEqual(leakedClaims, [])
+  })
+
+  test('documents the dated 0.3.0 compatibility and exact-artifact release above 0.2.0', () => {
+    const changelog = readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8')
+    const releaseStart = changelog.indexOf('## [0.3.0] - 2026-08-27')
+    const publishedStart = changelog.indexOf('## [0.2.0] - 2026-08-09')
+    assert.notEqual(releaseStart, -1)
+    assert.equal(releaseStart < publishedStart, true)
+    const section = changelog.slice(releaseStart, publishedStart)
+
+    const missingClaims = [
+      /published 0\.2\.0.*compatibility/isu,
+      /1,000.*result limit/isu,
+      /exact.*candidate.*tarball/isu,
+      /schema 1.*schema 2.*schema 1/isu,
+      /stable canonical.*snapshot/isu,
+      /negative-zero/isu,
+      /bounded.*recovery/isu,
+    ].filter(requiredClaim => !requiredClaim.test(section))
+    assert.deepEqual(missingClaims, [])
   })
 
   test('ships the generic repository-memory skill', () => {

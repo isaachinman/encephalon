@@ -15,7 +15,7 @@ Encephalon is general-purpose. It does not include hosted services, accounts, te
 
 Bun is used to build and test Encephalon itself. Installed projects run the bundled ESM distribution with Node and do not need Bun. The package has zero runtime dependencies and no installation lifecycle scripts.
 
-Yarn Plug'n'Play is not supported in v0.2.0.
+Yarn Plug'n'Play is not supported in v0.3.0.
 
 ## Install
 

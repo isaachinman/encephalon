@@ -186,6 +186,7 @@ MAR-2565 validated mutation cache construction, deterministic disk fallback, and
 
 ## Package and Release Gates
 
+- The current release candidate is Encephalon 0.3.0. Historical 0.2.0 references below identify the immutable published compatibility oracle and remain version-pinned.
 - Runtime consumers require Node.js 24.15.0 or newer and do not require Bun.
 - The npm package has no runtime dependencies and no install, preinstall, postinstall, or prepare lifecycle scripts. The package gate rejects `dependencies`, `optionalDependencies`, `peerDependencies`, `peerDependenciesMeta`, `bundledDependencies`, and `bundleDependencies` when present, while development dependencies remain permitted.
 - `bun run check:generated` is contributor convenience for trusted local checkouts. Its target generated-version checker is non-mutating, but package lifecycle hooks and Bun preloads mean the alias is not an authority for untrusted changes. Every source-building CI job must instead run the exact direct command `node ./scripts/check-generated-version.ts` immediately after Node setup and before Bun setup or installation so those hooks and preloads cannot run first. The check compares the complete committed package-version source; stale or missing source receives deterministic build-and-commit guidance, while unrelated I/O failures remain unchanged.
