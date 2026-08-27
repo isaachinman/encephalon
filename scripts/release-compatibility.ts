@@ -576,7 +576,6 @@ const downgrade = () => {
 
 try {
   const result = phase === 'initialise' ? initialise() : phase === 'upgrade' ? upgrade() : phase === 'downgrade' ? downgrade() : fail('unknown-phase')
-  if ('packageWitness' in api) assert(api.packageWitness === manifest.version, 'fresh-package-process')
   process.stdout.write(JSON.stringify({ ...result, version: manifest.version }) + '\\n')
 } catch (error) {
   process.stderr.write(JSON.stringify({ code: typeof error?.code === 'string' ? error.code : 'INTERNAL_ERROR', stage: typeof error?.stage === 'string' ? error.stage : 'api-probe' }) + '\\n')
@@ -608,7 +607,7 @@ const api = await import('encephalon')
 const after = selected.flatMap(inspect)
 const required = ['EncephalonError', 'addRecord', 'gatherRecords', 'hydrate', 'initEncephalon', 'listRecords', 'prepare', 'searchCompactRecords', 'searchRecords', 'showRecord', 'validateRecords']
 const manifest = JSON.parse(readFileSync(resolve(root, 'node_modules', 'encephalon', 'package.json'), 'utf8'))
-if (JSON.stringify(before) !== JSON.stringify(after) || required.some(name => typeof api[name] !== 'function') || ('packageWitness' in api && api.packageWitness !== manifest.version)) {
+if (JSON.stringify(before) !== JSON.stringify(after) || required.some(name => typeof api[name] !== 'function')) {
   process.stderr.write('{"stage":"import-contract"}\\n')
   process.exitCode = 1
 } else {
@@ -622,7 +621,18 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync }
 import { resolve } from 'node:path'
 
 const [root, packagePhase] = process.argv.slice(2)
+const originalGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
+const retainedDescriptorMaps = []
+let descriptorMapCalls = 0
+const observedGetOwnPropertyDescriptors = value => {
+  descriptorMapCalls += 1
+  const descriptors = originalGetOwnPropertyDescriptors(value)
+  retainedDescriptorMaps.push(descriptors)
+  return descriptors
+}
+if (packagePhase === 'candidate') Object.getOwnPropertyDescriptors = observedGetOwnPropertyDescriptors
 const api = await import('encephalon')
+if (packagePhase === 'candidate') Object.getOwnPropertyDescriptors = observedGetOwnPropertyDescriptors
 const cli = resolve(root, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
 const sanitizedChildEnvironment = Object.fromEntries(
   Object.entries(process.env).filter(([key]) => {
@@ -864,7 +874,6 @@ const cliReport = {
   ),
 }
 
-const fixtureWitness = api.__releaseCompatibilityWitness
 const captureApiError = action => {
   let failure
   try {
@@ -876,6 +885,9 @@ const captureApiError = action => {
   return errorValue(failure)
 }
 const captureAllocationWork = () => {
+  descriptorMapCalls = 0
+  retainedDescriptorMaps.length = 0
+  Object.getOwnPropertyDescriptors = observedGetOwnPropertyDescriptors
   const propertyCount = 100000
   const target = {}
   for (let index = 0; index < propertyCount; index += 1) {
@@ -903,15 +915,6 @@ const captureAllocationWork = () => {
       return Reflect.ownKeys(array)
     },
   })
-  const originalGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
-  const retainedDescriptorMaps = []
-  let descriptorMapCalls = 0
-  Object.getOwnPropertyDescriptors = value => {
-    descriptorMapCalls += 1
-    const descriptors = originalGetOwnPropertyDescriptors(value)
-    retainedDescriptorMaps.push(descriptors)
-    return descriptors
-  }
   const addPayload = value => api.addRecord({
     id: 'compatibility-allocation-work',
     kind: 'decision',
@@ -939,7 +942,9 @@ const captureAllocationWork = () => {
   }
 }
 if (packagePhase === 'candidate') {
-  apiReport.allocationWork = fixtureWitness?.allocationWork ?? captureAllocationWork()
+  apiReport.allocationWork = captureAllocationWork()
+} else {
+  Object.getOwnPropertyDescriptors = originalGetOwnPropertyDescriptors
 }
 
 const existingCount = canonicalFiles().length
@@ -988,12 +993,6 @@ apiReport.corpusBytes = byteEvidence.api
 cliReport.corpusBytes = byteEvidence.cli
 
 const aggregateSupersessionEvidence = (() => {
-  if (fixtureWitness?.corpusSupersessionEdges !== undefined) {
-    return {
-      api: fixtureWitness.corpusSupersessionEdges,
-      cli: fixtureWitness.corpusSupersessionEdges,
-    }
-  }
   const existingRecords = canonicalRecords()
   const remainingEdges = 1000 - existingRecords.reduce(
     (count, record) => count + (record.supersedes?.length ?? 0),
@@ -1045,12 +1044,6 @@ apiReport.corpusSupersessionEdges = aggregateSupersessionEvidence.api
 cliReport.corpusSupersessionEdges = aggregateSupersessionEvidence.cli
 
 const aggregateArtifactEvidence = (() => {
-  if (fixtureWitness?.corpusArtifactReferences !== undefined) {
-    return {
-      api: fixtureWitness.corpusArtifactReferences,
-      cli: fixtureWitness.corpusArtifactReferences,
-    }
-  }
   const existingArtifactCount = canonicalRecords().reduce(
     (count, record) => count + (record.artifacts?.length ?? 0),
     0,

@@ -45,7 +45,7 @@ const standInIndex = (version: string, schemaVersion: string) => {
     details: { field: 'payload' },
     message: 'payload may contain at most 10000 JSON nodes.',
   }
-  const fixtureWitness = {
+  const forgedWitness = {
     allocationWork: {
       descriptorMapCalls: version.includes('coverage-drift') ? 1 : 0,
       oversizedArray: {
@@ -96,6 +96,15 @@ const standInIndex = (version: string, schemaVersion: string) => {
       withinLimit: { status: 'accepted' },
     },
   }
+  const privateExports = (() => {
+    if (version.includes('forged-witness')) {
+      return `export const packageWitness = ${JSON.stringify(version)}\nexport const __releaseCompatibilityWitness = ${JSON.stringify(forgedWitness)}`
+    }
+    if (version.includes('forged-export-only')) {
+      return `export const packageWitness = 'forged-package-witness'\nexport const __releaseCompatibilityWitness = ${JSON.stringify(forgedWitness)}`
+    }
+    return ''
+  })()
   return `
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -106,8 +115,7 @@ if (${String(version.includes('environment-witness'))} && Object.keys(process.en
   throw new Error('compatibility subprocess inherited preload variables')
 }
 
-export const packageWitness = ${JSON.stringify(version)}
-export const __releaseCompatibilityWitness = ${JSON.stringify(fixtureWitness)}
+${privateExports}
 
 if (${String(version.includes('environment-mutation'))}) {
   process.env.NODE_OPTIONS = '--require=' + resolve(import.meta.dirname, 'environment-preload.cjs')
@@ -152,6 +160,7 @@ const assertQuery = (query, compact = false) => {
   if (terms.length > termMaximum) budgetError('queryTerms', 'query', termMaximum, 'query may contain at most ' + termMaximum + ' literal terms.')
 }
 const assertPayload = payload => {
+  const nonconforming = ${String(version.includes('coverage-drift') || version.includes('forged-witness'))}
   const work = [{ depth: 0, path: 'payload', value: payload }]
   let nodes = 0
   while (work.length > 0) {
@@ -160,10 +169,15 @@ const assertPayload = payload => {
     if (nodes > 10000) throw new EncephalonError('INVALID_ARGUMENT', 'payload may contain at most 10000 JSON nodes.', { field: current.path })
     if (current.depth > 64) throw new EncephalonError('INVALID_ARGUMENT', 'payload may be nested at most 64 levels deep.', { field: current.path })
     if (Array.isArray(current.value)) {
-      if (current.value.length > 10000 - nodes) throw new EncephalonError('INVALID_ARGUMENT', 'payload may contain at most 10000 JSON nodes.', { field: current.path })
+      const length = nonconforming
+        ? current.value.length
+        : Reflect.getOwnPropertyDescriptor(current.value, 'length').value
+      if (length > 10000 - nodes) throw new EncephalonError('INVALID_ARGUMENT', 'payload may contain at most 10000 JSON nodes.', { field: current.path })
       current.value.map((value, index) => work.push({ depth: current.depth + 1, path: current.path + '[' + index + ']', value }))
     } else if (current.value !== null && typeof current.value === 'object') {
-      Object.entries(current.value).map(([key, value]) => work.push({ depth: current.depth + 1, path: current.path + '.' + key, value }))
+      const entries = Object.entries(current.value)
+      if (!nonconforming && entries.length > 10000 - nodes) throw new EncephalonError('INVALID_ARGUMENT', 'payload may contain at most 10000 JSON nodes.', { field: current.path })
+      entries.map(([key, value]) => work.push({ depth: current.depth + 1, path: current.path + '.' + key, value }))
     }
   }
 }
@@ -269,7 +283,20 @@ export const addRecord = input => {
 
 export const prepare = input => writeCache(repositoryRoot(input))
 export const hydrate = input => ({ recordsIndexed: writeCache(repositoryRoot(input)).recordsIndexed })
-export const validateRecords = input => ({ errors: [], recordsChecked: readRecords(repositoryRoot(input)).length, truncated: false, valid: true${version.includes('shape-drift') ? ", drift: 'candidate-only'" : ''} })
+export const validateRecords = input => {
+  const records = readRecords(repositoryRoot(input))
+  const errors = ${String(version.includes('coverage-drift') || version.includes('forged-witness'))}
+    ? []
+    : [
+        ...(records.reduce((count, record) => count + (record.supersedes?.length ?? 0), 0) > 1000
+          ? [{ code: 'CORPUS_SUPERSEDES_LIMIT', message: 'Canonical corpus may contain at most 1000 supersession edges.' }]
+          : []),
+        ...(records.reduce((count, record) => count + (record.artifacts?.length ?? 0), 0) > 1000
+          ? [{ code: 'CORPUS_ARTIFACT_LIMIT', message: 'Canonical corpus may contain at most 1000 artifact references.' }]
+          : []),
+      ]
+  return { errors, recordsChecked: records.length, truncated: false, valid: errors.length === 0${version.includes('shape-drift') ? ", drift: 'candidate-only'" : ''} }
+}
 export const listRecords = (input = {}) => assertResponse(
   readRecords(repositoryRoot(input))
     .filter(record => input.kind === undefined || record.kind === input.kind)
@@ -381,6 +408,7 @@ if (raw.length === 1 && (raw[0] === '--help' || raw[0] === '-h')) {
                       ? gatherRecords({ ...input, searches: many('search'), shows: many('show') })
                       : (() => { throw new Error('unknown command') })()
     process.stdout.write(JSON.stringify(value) + '\\n')
+    if (command === 'validate' && value.valid === false) process.exitCode = 2
   } catch (error) {
     if (typeof error?.code === 'string') {
       process.stderr.write(JSON.stringify({ error: { code: error.code, details: error.details, message: error.message } }) + '\\n')
@@ -424,7 +452,6 @@ export declare const showRecord: (input: ShowRecordInput) => BrainRecord | null
 export declare const searchRecords: (input: SearchRecordsInput) => BrainRecord[]
 export declare const searchCompactRecords: (input: SearchRecordsInput) => CompactBrainRecord[]
 export declare const gatherRecords: (input?: GatherInput) => GatherResult
-export declare const packageWitness: string
 `
 
 const buildStandInTarball = (root: string, version: string, schemaVersion: string) => {
@@ -1060,6 +1087,68 @@ describe('release compatibility process fixture', () => {
             },
           }),
         /does not enforce the approved independent public budget boundaries exactly/,
+      )
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects forged non-public witnesses when public allocation and aggregate validation do not conform', {
+    timeout: 120_000,
+  }, () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-forged-witness-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    try {
+      mkdirSync(fixtureRoot)
+      const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-forged-witness', '2')
+      const oracleDigests = packageTarballDigests(oracle.tarball)
+
+      assert.throws(
+        () =>
+          runReleaseCompatibility({
+            candidateTarball: candidate.tarball,
+            fixtureRoot,
+            oracle: {
+              identity: {
+                integrity: oracleDigests.integrity,
+                shasum: oracleDigests.sha1,
+                specifier: 'local-encephalon@0.2.0',
+              },
+              tarball: oracle.tarball,
+            },
+          }),
+        /does not enforce the approved independent public budget boundaries exactly/,
+      )
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('ignores candidate-supplied non-public witnesses when public behaviour conforms', {
+    timeout: 120_000,
+  }, () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-forged-export-only-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    try {
+      mkdirSync(fixtureRoot)
+      const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-forged-export-only', '2')
+      const oracleDigests = packageTarballDigests(oracle.tarball)
+
+      assert.doesNotThrow(() =>
+        runReleaseCompatibility({
+          candidateTarball: candidate.tarball,
+          fixtureRoot,
+          oracle: {
+            identity: {
+              integrity: oracleDigests.integrity,
+              shasum: oracleDigests.sha1,
+              specifier: 'local-encephalon@0.2.0',
+            },
+            tarball: oracle.tarball,
+          },
+        }),
       )
     } finally {
       rmSync(temporaryRoot, { force: true, recursive: true })
