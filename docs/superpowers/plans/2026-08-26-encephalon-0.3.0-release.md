@@ -43,7 +43,7 @@
 - Consumes: existing `OPERATION_BUDGETS`, API input parsers, cache defence-in-depth validation, CLI parsing/help, and packed CLI smoke helpers.
 - Produces: unchanged budget keys `fullResultLimit` and `compactResultLimit`, each with `{ default: 20, field: 'limit', maximum: 1000, minimum: 1 }`.
 
-- [ ] **Step 1: Replace the focused API expectations with the published boundary matrix**
+- [x] **Step 1: Replace the focused API expectations with the published boundary matrix**
 
 Use literal cases in `test/api-input.test.ts` for `parseListRecordsInput`, `parseFullSearchRecordsInput`, `parseCompactSearchRecordsInput`, and `parseGatherInput`:
 
@@ -61,13 +61,13 @@ assertEncephalonError(() => parse(1001), 'INVALID_ARGUMENT', {
 
 Keep existing minimum, integer, accessor, sparse-input, gather-array, and allocation-order cases.
 
-- [ ] **Step 2: Run the API test and verify RED**
+- [x] **Step 2: Run the API test and verify RED**
 
 Run: `node --test --test-name-pattern='operation-specific result limits' test/api-input.test.ts`
 
 Expected: FAIL because 101 or 999 is rejected with maximum 50/100.
 
-- [ ] **Step 3: Add matching CLI, public cache, and packed-package RED cases**
+- [x] **Step 3: Add matching CLI, public cache, and packed-package RED cases**
 
 In `test/cli.test.ts`, run list, full search, compact search, and gather with 50/100/101/999/1,000 against a bounded repository and assert exit 0. Run 1,001 and assert exit 2, empty stdout, `INVALID_ARGUMENT`, and literal `{ field: 'limit', budget, maximum: 1000 }`.
 
@@ -75,13 +75,13 @@ In `test/cache.test.ts`, replace the 51/101 rejection table with acceptance thro
 
 In `scripts/check-package.ts`, change packed help fragments to `<1..1000>` and exercise 1,000 success plus 1,001 failure for each mode. Update `test/package.test.ts` only where it asserts those observable packed behaviours.
 
-- [ ] **Step 4: Run the focused CLI/cache/package tests and verify RED**
+- [x] **Step 4: Run the focused CLI/cache/package tests and verify RED**
 
 Run: `node --test --test-name-pattern='operation-specific result limits|rejects oversized operation inputs|packed' test/cli.test.ts test/cache.test.ts test/package.test.ts`
 
 Expected: FAIL on the current 50/100 authorities; gather-array and response-byte tests remain green.
 
-- [ ] **Step 5: Restore both result-count maxima with the smallest implementation**
+- [x] **Step 5: Restore both result-count maxima with the smallest implementation**
 
 Change only the two result authorities:
 
@@ -92,11 +92,11 @@ fullResultLimit: Object.freeze({ default: 20, field: 'limit', maximum: 1000, min
 
 Do not change `compactResponseBytes`, `fullResponseBytes`, `gatherResponseBytes`, `gatherSearches`, `gatherShows`, `queryBytes`, `queryTerms`, `supersessionEdges`, or canonical budgets.
 
-- [ ] **Step 6: Update maintained public documentation**
+- [x] **Step 6: Update maintained public documentation**
 
 State in `README.md` and `docs/contract.md` that every applicable result limit accepts 1–1,000 and defaults to 20, independently of response-byte and request-array budgets. Do not rewrite the historical 2026-08-13 design record.
 
-- [ ] **Step 7: Verify GREEN and commit**
+- [x] **Step 7: Verify GREEN and commit**
 
 Run:
 
@@ -126,7 +126,7 @@ Commit: `[MAR-2679] Restore published result limits`
 - Consumes: current reviewed-manifest, installed API/declaration, packed CLI, retained-copy, npm command, and publish-conflict authorities.
 - Produces: `parsePackageCheckArguments(args: readonly string[])`, `readPackageTarEntries(path: string)`, and `packageTarballDigests(path: string)` in `scripts/package-tarball.ts`; `check-package.ts --tarball <repository-relative-path>`; `check-publish.ts <repository-relative-tarball>`.
 
-- [ ] **Step 1: Write parser, containment, tar-entry, and digest RED tests**
+- [x] **Step 1: Write parser, containment, tar-entry, and digest RED tests**
 
 In `scripts/package-tarball.test.ts`, cover:
 
@@ -138,13 +138,13 @@ In `scripts/package-tarball.test.ts`, cover:
 
 The expected digests are hard-coded values calculated outside the production helper.
 
-- [ ] **Step 2: Run the helper tests and verify RED**
+- [x] **Step 2: Run the helper tests and verify RED**
 
 Run: `node --test scripts/package-tarball.test.ts`
 
 Expected: FAIL because `scripts/package-tarball.ts` does not exist.
 
-- [ ] **Step 3: Implement the dependency-free tarball authority**
+- [x] **Step 3: Implement the dependency-free tarball authority**
 
 Use only Node standard library. Return immutable values with these shapes:
 
@@ -171,7 +171,7 @@ type PackageTarballDigests = Readonly<{
 
 Keep descriptor/path validation bounded to the one named file and its repository-relative ancestors. Parse the existing gzip/tar format once; replace `packedMode()` with the shared entry reader.
 
-- [ ] **Step 4: Write process-level RED tests for supplied package and publish paths**
+- [x] **Step 4: Write process-level RED tests for supplied package and publish paths**
 
 Extend `test/package.test.ts` to prove:
 
@@ -182,13 +182,13 @@ Extend `test/package.test.ts` to prove:
 - no argument, source directory, extra argument, traversal, symlink, or missing tarball is rejected;
 - an already-published-version response is accepted only by the existing conflict authority.
 
-- [ ] **Step 5: Run process-level tests and verify RED**
+- [x] **Step 5: Run process-level tests and verify RED**
 
 Run: `node --test test/package.test.ts`
 
 Expected: FAIL because neither script accepts a supplied tarball.
 
-- [ ] **Step 6: Refactor `check-package.ts` around one validated tarball path**
+- [x] **Step 6: Refactor `check-package.ts` around one validated tarball path**
 
 Preserve all current source, manifest, API, declaration, CLI, lifecycle, and retained-copy checks. The only branch is tarball acquisition:
 
@@ -201,7 +201,7 @@ validateInstalledPackage(tarball)
 
 Supplied mode must not call `npm pack`. Retained mode must copy only after every check passes. Print the retained path exactly as today; additionally print digest JSON to stderr or a named metadata file without contaminating the stdout path contract.
 
-- [ ] **Step 7: Make the publish checker tarball-only**
+- [x] **Step 7: Make the publish checker tarball-only**
 
 Require exactly one validated repository-relative `.tgz` path and pass it as the first publish target:
 
@@ -211,7 +211,7 @@ const npmArguments = ['publish', tarball, '--dry-run', '--ignore-scripts', '--ac
 
 Never use `root` as the publish target. Preserve signal handling and published-version-conflict classification.
 
-- [ ] **Step 8: Update scripts, contract, verify GREEN, and commit**
+- [x] **Step 8: Update scripts, contract, verify GREEN, and commit**
 
 Keep `check:package` as contributor tarball creation/validation. Change `check:publish` documentation to require a tarball argument; CI supplies it. Run:
 
@@ -239,7 +239,7 @@ Commit: `[MAR-2679] Validate one exact package tarball`
 - Consumes: supplied candidate tarball validation/digests from Task 2, npm command resolution, the pinned 0.2.0 oracle, public API/CLI, canonical storage, managed instructions, and cache schemas.
 - Produces: `check-release-compatibility.ts <repository-relative-candidate.tgz>` and a deterministic JSON success report containing oracle/candidate digests plus upgrade/downgrade results.
 
-- [ ] **Step 1: Write pure oracle, snapshot, and subprocess RED tests**
+- [x] **Step 1: Write pure oracle, snapshot, and subprocess RED tests**
 
 In `scripts/release-compatibility.test.ts`, first name the production breaks:
 
@@ -251,13 +251,13 @@ In `scripts/release-compatibility.test.ts`, first name the production breaks:
 
 Use local literal tarball and repository fixtures for unit tests; do not contact npm from the ordinary Node test suite.
 
-- [ ] **Step 2: Run unit tests and verify RED**
+- [x] **Step 2: Run unit tests and verify RED**
 
 Run: `node --test scripts/release-compatibility.test.ts`
 
 Expected: FAIL because the release compatibility module does not exist.
 
-- [ ] **Step 3: Implement the compatibility orchestration authority**
+- [x] **Step 3: Implement the compatibility orchestration authority**
 
 Use Node standard library and `spawnNpmCommand`. Pin these exact oracle values in one immutable object:
 
@@ -275,11 +275,11 @@ Create one temporary Git repository. Under oracle 0.2.0, write controlled predec
 
 After candidate installation, run declarations, every API export, every CLI command, the result-limit table, validation, reads, and preparation. Assert schema 2 and unchanged durable bytes. After oracle reinstall, run representative reads/validation/preparation, assert schema 1, and compare the same durable snapshot.
 
-- [ ] **Step 4: Add a process-level integration test using a local oracle stand-in**
+- [x] **Step 4: Add a process-level integration test using a local oracle stand-in**
 
 Build two small local package tarballs with the published public surface and cache transition witnesses. Prove the complete orchestrator sequence uses the supplied tarball bytes, swaps packages, starts fresh processes, checks limits, and reports both transitions. Keep the real npm oracle run in the release check, not the default unit suite.
 
-- [ ] **Step 5: Run GREEN, add the script, and commit**
+- [x] **Step 5: Run GREEN, add the script, and commit**
 
 Add `check:compatibility` as `node ./scripts/check-release-compatibility.ts`. Run:
 
@@ -308,7 +308,7 @@ Commit: `[MAR-2679] Prove package upgrade and downgrade compatibility`
 - Consumes: exact package and compatibility CLIs from Tasks 2–3 plus the existing four source-verification lanes.
 - Produces: one uploaded `encephalon-npm-package` candidate artifact, candidate runtime lanes for Node 24.15.0 and Node 26, and a tarball-only release-equivalent publish dry run.
 
-- [ ] **Step 1: Rewrite the workflow contract test first**
+- [x] **Step 1: Rewrite the workflow contract test first**
 
 Require this dependency graph:
 
@@ -331,23 +331,23 @@ Assert that:
 - all jobs keep `contents: read` and checkout credential persistence disabled;
 - clean-tree checks surround build/package work.
 
-- [ ] **Step 2: Run the workflow test and verify RED**
+- [x] **Step 2: Run the workflow test and verify RED**
 
 Run: `node --test test/ci-workflow.test.ts`
 
 Expected: FAIL because current CI dry-runs source before it creates a tarball and does not expose candidate runtime lanes.
 
-- [ ] **Step 3: Implement the smallest workflow graph**
+- [x] **Step 3: Implement the smallest workflow graph**
 
 Keep the existing `verify` matrix. Add a package job that retains the tarball under `package-artifacts`, records its digest, and uploads exactly that `.tgz`. Candidate jobs download the artifact to the same repository-relative directory and run `check-package.ts --tarball` plus packed/API/CLI compatibility on Node 24.15.0 and Node 26. The final release-equivalent job downloads the same artifact, reruns the supplied-tarball package check, runs the real oracle compatibility check once, and invokes `check-publish.ts <tarball>`.
 
 Use GitHub outputs only for a validated relative filename. Never interpolate untrusted package metadata into a shell command. Prefer fixed `package-artifacts/encephalon-0.3.0.tgz` once Task 5 sets the version.
 
-- [ ] **Step 4: Update maintained release documentation**
+- [x] **Step 4: Update maintained release documentation**
 
 Describe the job graph, oracle network requirement, exact-artifact digest, PR artifact retention, trusted-main byte comparison, and manual tarball-only publish handoff. Remove the claim that PR tarballs remain runner-local.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 Run:
 
@@ -376,7 +376,7 @@ Commit: `[MAR-2679] Gate CI on the exact release candidate`
 - Consumes: package-version generator/checker, published git head `54050ff63d07cd2ad051ea4375e31d07b4dd337c`, and completed MAR-2679 implementation.
 - Produces: one coherent 0.3.0 version surface and an immutable historical 0.2.0 changelog section.
 
-- [ ] **Step 1: Add release metadata RED tests**
+- [x] **Step 1: Add release metadata RED tests**
 
 In `test/package.test.ts`, assert:
 
@@ -385,25 +385,25 @@ In `test/package.test.ts`, assert:
 - a dated 0.3.0 section exists above 0.2.0 and includes compatibility, result-limit, exact-artifact, cache upgrade/downgrade, and material post-0.2 work;
 - 0.2.0 text contains none of the post-publication additions currently misplaced there.
 
-- [ ] **Step 2: Run package tests and verify RED**
+- [x] **Step 2: Run package tests and verify RED**
 
 Run: `node --test test/package.test.ts`
 
 Expected: FAIL because version surfaces remain 0.2.0 and the changelog has no 0.3.0 section.
 
-- [ ] **Step 3: Bump and regenerate through the existing authority**
+- [x] **Step 3: Bump and regenerate through the existing authority**
 
 Set `package.json` to 0.3.0, then run `bun run build`. Do not hand-edit generated version text beyond accepting the generator output. Run `node ./scripts/check-generated-version.ts` immediately afterwards.
 
-- [ ] **Step 4: Restore and extend the changelog**
+- [x] **Step 4: Restore and extend the changelog**
 
 Copy the complete 0.2.0 section byte-for-byte from `git show 54050ff63d07cd2ad051ea4375e31d07b4dd337c:CHANGELOG.md`. Add a 0.3.0 section dated on the release-preparation day. Move and consolidate every material post-publication change under Added/Changed/Fixed/Documentation without duplicating 0.2.0 claims.
 
-- [ ] **Step 5: Update versioned user documentation**
+- [x] **Step 5: Update versioned user documentation**
 
 Change references that describe the current release as 0.2.0 where they mean the candidate version. Preserve historical references and the 0.2.0 oracle discussion.
 
-- [ ] **Step 6: Verify GREEN and commit**
+- [x] **Step 6: Verify GREEN and commit**
 
 Run:
 
@@ -432,7 +432,7 @@ Commit: `[MAR-2679] Prepare Encephalon 0.3.0 metadata`
 - Consumes: all prior task commits and their focused test evidence.
 - Produces: a ticket-pure, reviewed, exact-head-ready MAR-2679 branch and one exact local candidate tarball/digest.
 
-- [ ] **Step 1: Search active Encephalon knowledge before recording**
+- [x] **Step 1: Search active Encephalon knowledge before recording**
 
 Run:
 
@@ -442,20 +442,22 @@ node dist/cli.mjs search --compact "npm release exact tarball compatibility upgr
 
 If an active workflow head exists for the same subject, supersede it. Otherwise add one concise `workflow` record with subject `release.npm-exact-artifact`, source `agent`, the oracle identity, required gates, and manual tarball-only publish rule. Do not record transient CI URLs or credentials.
 
-- [ ] **Step 2: Run the complete local verification matrix**
+- [x] **Step 2: Run the complete local verification matrix**
 
 Run in this order:
 
 ```bash
-bun install --frozen-lockfile
 node ./scripts/check-generated-version.ts
+bun install --frozen-lockfile --ignore-scripts
 bun run typecheck
 bun run test
 bun run lint
 bun run benchmark:check
 bun run build
 git diff --exit-code HEAD
+# `package-artifacts` must be absent; move any previous disposable directory to a private backup first.
 node ./scripts/check-package.ts --retain-tarball package-artifacts
+node ./scripts/check-package-metadata.ts
 node ./scripts/check-package.ts --tarball package-artifacts/encephalon-0.3.0.tgz
 node ./scripts/check-release-compatibility.ts package-artifacts/encephalon-0.3.0.tgz
 node ./scripts/check-publish.ts package-artifacts/encephalon-0.3.0.tgz
@@ -466,11 +468,11 @@ git status --short
 
 Use an isolated npm cache under `/private/tmp` if the user npm cache is not writable. The expected publish dry run must not upload.
 
-- [ ] **Step 3: Commit final maintained evidence**
+- [x] **Step 3: Commit final maintained evidence**
 
 Commit any required contract or Encephalon record change as `[MAR-2679] Record exact release verification`.
 
-- [ ] **Step 4: Run two complete Luna local review rounds**
+- [x] **Step 4: Run two complete Luna local review rounds**
 
 For each round, dispatch parallel Luna reviewers for security, correctness/bugs, data consistency/races, test coverage, maintainability, and UX/API regression. Review the branch against `origin/main`. Fix every valid high- or medium-confidence finding and rerun affected tests. Round 2 must review the amended exact head. Do not start a third local round.
 

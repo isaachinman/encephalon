@@ -7,6 +7,7 @@ import {
   opendirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -14,7 +15,8 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
-import { spawnNpmCommand } from './npm-command.ts'
+import { captureIsolatedRoot, disposeIsolatedRoot } from './isolated-root.ts'
+import { npmCommand } from './npm-command.ts'
 import {
   type PackageTarballDigests,
   packageTarballDigests,
@@ -23,6 +25,7 @@ import {
 } from './package-tarball.ts'
 import {
   assertDurableSnapshotsEqual,
+  assertDurableSnapshotsEqualExcept,
   captureDurableSnapshot,
   captureImportSnapshot,
   type DurableSnapshot,
@@ -33,6 +36,7 @@ import {
   DECLARATION_CONSUMER_SOURCE,
   IMPORT_PROBE_SOURCE,
 } from './release-compatibility-probes.ts'
+import { normalisePublicValue, RESULT_LIMIT_CASES, RESULT_LIMIT_OPERATIONS } from './release-contracts.ts'
 
 export {
   assertDurableSnapshotsEqual,
@@ -48,13 +52,42 @@ export const ORACLE = Object.freeze({
 
 export const MAX_COMPATIBILITY_DIAGNOSTIC_BYTES = 8192
 const MAX_COMPATIBILITY_SUBPROCESS_OUTPUT_BYTES = 16 * 1024 * 1024
+const compatibilityScriptsDirectory = dirname(fileURLToPath(import.meta.url))
+const boundedProcessSupervisor = resolve(compatibilityScriptsDirectory, 'bounded-process-supervisor.mjs')
+const projectRoot = resolve(compatibilityScriptsDirectory, '..')
+
+const compatibilityEnvironmentKeys = new Set(
+  [
+    'APPDATA',
+    'CI',
+    'COMSPEC',
+    'FORCE_COLOR',
+    'HOME',
+    'HOMEDRIVE',
+    'HOMEPATH',
+    'LANG',
+    'LC_ALL',
+    'LOCALAPPDATA',
+    'NO_COLOR',
+    'PATH',
+    'PATHEXT',
+    'SYSTEMROOT',
+    'TEMP',
+    'TMP',
+    'TMPDIR',
+    'TZ',
+    'USERPROFILE',
+    'WINDIR',
+    'npm_config_cache',
+  ].map(key => key.toLowerCase()),
+)
 
 export const sanitizedCompatibilityEnvironment = (environment: NodeJS.ProcessEnv = process.env) =>
   Object.fromEntries(
-    Object.entries(environment).filter(([key]) => {
-      const normalized = key.toLowerCase()
-      return normalized !== 'node_options' && normalized !== 'node_path'
-    }),
+    Object.entries(environment).filter(
+      (entry): entry is [string, string] =>
+        typeof entry[1] === 'string' && compatibilityEnvironmentKeys.has(entry[0].toLowerCase()),
+    ),
   )
 
 export type OracleIdentity = Readonly<{
@@ -69,6 +102,7 @@ type CompatibilityCommandOptions = Readonly<{
   label: string
   redactions?: readonly Buffer[]
   timeoutMilliseconds?: number
+  windowsVerbatimArguments?: boolean
 }>
 
 export type CompatibilityCommandResult = Readonly<{
@@ -203,30 +237,78 @@ export const runCompatibilityCommand = (
   arguments_: readonly string[],
   options: CompatibilityCommandOptions,
 ): CompatibilityCommandResult => {
-  const result = spawnSync(executable, arguments_, {
+  const timeoutMilliseconds = options.timeoutMilliseconds ?? 120_000
+  const request = Buffer.from(
+    JSON.stringify({
+      arguments: arguments_,
+      cwd: options.cwd,
+      environment: sanitizedCompatibilityEnvironment(options.environment ?? process.env),
+      executable,
+      maximumOutputBytes: MAX_COMPATIBILITY_SUBPROCESS_OUTPUT_BYTES,
+      timeoutMilliseconds,
+      windowsVerbatimArguments: options.windowsVerbatimArguments === true,
+    }),
+  ).toString('base64url')
+  const supervised = spawnSync(process.execPath, [boundedProcessSupervisor, request], {
     cwd: options.cwd,
     encoding: 'utf8',
-    env: options.environment ?? sanitizedCompatibilityEnvironment(),
+    env: sanitizedCompatibilityEnvironment(),
     killSignal: 'SIGKILL',
-    maxBuffer: MAX_COMPATIBILITY_SUBPROCESS_OUTPUT_BYTES,
+    maxBuffer: MAX_COMPATIBILITY_SUBPROCESS_OUTPUT_BYTES * 3,
     shell: false,
-    timeout: options.timeoutMilliseconds ?? 120_000,
+    timeout: timeoutMilliseconds + 10_000,
   })
-  if (result.error === undefined && result.status === 0) {
-    return Object.freeze({ stderr: result.stderr ?? '', stdout: result.stdout ?? '' })
+  type SupervisedResult = Readonly<{
+    error?: Readonly<{ code?: string; message?: string }>
+    overflow: boolean
+    signal: NodeJS.Signals | null
+    status: number | null
+    stderr: string
+    stdout: string
+    timedOut: boolean
+  }>
+  let result: SupervisedResult | undefined
+  if (supervised.error === undefined && supervised.status === 0 && supervised.stderr === '') {
+    try {
+      result = JSON.parse(supervised.stdout) as SupervisedResult
+    } catch {}
+  }
+  if (
+    result !== undefined &&
+    result.error === undefined &&
+    !result.overflow &&
+    !result.timedOut &&
+    result.status === 0
+  ) {
+    return Object.freeze({
+      stderr: Buffer.from(result.stderr, 'base64').toString('utf8'),
+      stdout: Buffer.from(result.stdout, 'base64').toString('utf8'),
+    })
   }
   const redactions = options.redactions ?? []
-  const stdout = boundDiagnostic(redactDiagnostic(result.stdout ?? '', redactions))
-  const stderr = boundDiagnostic(redactDiagnostic(result.stderr ?? '', redactions))
+  const stdout = boundDiagnostic(
+    redactDiagnostic(
+      result === undefined ? (supervised.stdout ?? '') : Buffer.from(result.stdout, 'base64').toString('utf8'),
+      redactions,
+    ),
+  )
+  const stderr = boundDiagnostic(
+    redactDiagnostic(
+      result === undefined ? (supervised.stderr ?? '') : Buffer.from(result.stderr, 'base64').toString('utf8'),
+      redactions,
+    ),
+  )
   throw new CompatibilityCommandError(
     options.label,
     {
-      exitCode: result.status ?? 1,
-      signal: result.signal,
+      exitCode: result?.status ?? supervised.status ?? 1,
+      signal: result?.signal ?? supervised.signal,
       stderr,
       stdout,
     },
-    result.error === undefined ? undefined : { cause: result.error },
+    supervised.error === undefined && result?.error === undefined
+      ? undefined
+      : { cause: supervised.error ?? result?.error },
   )
 }
 
@@ -238,9 +320,6 @@ export const verifyOracleTarball = (path: string, identity: OracleIdentity = ORA
   throw new Error('The published compatibility oracle does not match its pinned SHA-1 and SHA-512 identities.')
 }
 
-const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const resultLimitCases = Object.freeze([50, 100, 101, 999, 1000, 1001] as const)
-const resultLimitOperations = Object.freeze(['list', 'search', 'searchCompact', 'gather'] as const)
 const candidateResultLimitMaximums = Object.freeze({ compact: 1000, full: 1000 })
 const oracleResultLimitMaximums = Object.freeze({ compact: 100, full: 50 })
 
@@ -252,6 +331,7 @@ type SuppliedOracle = Readonly<{
 export type ReleaseCompatibilityOptions = Readonly<{
   candidateTarball: string
   fixtureRoot?: string
+  hooks?: Readonly<{ beforeOracleDowngrade?: (oracleSnapshot: string) => void }>
   oracle?: SuppliedOracle
 }>
 
@@ -260,7 +340,7 @@ type ResultLimitOutcome = Readonly<{
   rejected: readonly number[]
 }>
 
-type ResultLimitReport = Readonly<Record<(typeof resultLimitOperations)[number], ResultLimitOutcome>>
+type ResultLimitReport = Readonly<Record<(typeof RESULT_LIMIT_OPERATIONS)[number]['name'], ResultLimitOutcome>>
 
 type ResultLimitMaximums = Readonly<{
   compact: number
@@ -316,8 +396,8 @@ const publicSurfaceDigests = (api: unknown, cli: unknown) =>
 
 const resultLimitOutcome = (maximum: number): ResultLimitOutcome =>
   Object.freeze({
-    accepted: Object.freeze(resultLimitCases.filter(limit => limit <= maximum)),
-    rejected: Object.freeze(resultLimitCases.filter(limit => limit > maximum)),
+    accepted: Object.freeze(RESULT_LIMIT_CASES.filter(limit => limit <= maximum)),
+    rejected: Object.freeze(RESULT_LIMIT_CASES.filter(limit => limit > maximum)),
   })
 
 const resultLimitReport = (maximums: ResultLimitMaximums): ResultLimitReport =>
@@ -333,23 +413,20 @@ const safeNpmResult = (
   cwd: string,
   label: string,
   redactions: readonly Buffer[] = [],
+  requestedEnvironment: NodeJS.ProcessEnv = sanitizedCompatibilityEnvironment(),
 ) => {
-  const result = spawnNpmCommand(arguments_, {
+  const environment = sanitizedCompatibilityEnvironment(requestedEnvironment)
+  const command = npmCommand(arguments_, { environment })
+  return runCompatibilityCommand(command.executable, command.arguments, {
     cwd,
-    environment: sanitizedCompatibilityEnvironment(),
-    maxBuffer: MAX_COMPATIBILITY_SUBPROCESS_OUTPUT_BYTES,
-    timeoutMilliseconds: 120_000,
-  })
-  if (result.error === undefined && result.status === 0) {
-    return { stderr: result.stderr ?? '', stdout: result.stdout ?? '' }
-  }
-  const stdout = boundDiagnostic(redactDiagnostic(result.stdout ?? '', redactions))
-  const stderr = boundDiagnostic(redactDiagnostic(result.stderr ?? '', redactions))
-  throw new CompatibilityCommandError(
+    environment: command.environment ?? environment,
     label,
-    { exitCode: result.status ?? 1, signal: result.signal, stderr, stdout },
-    result.error === undefined ? undefined : { cause: result.error },
-  )
+    redactions,
+    timeoutMilliseconds: 120_000,
+    ...(command.windowsVerbatimArguments === undefined
+      ? {}
+      : { windowsVerbatimArguments: command.windowsVerbatimArguments }),
+  })
 }
 
 const parseJson = <Value>(value: string, label: string): Value => {
@@ -357,6 +434,27 @@ const parseJson = <Value>(value: string, label: string): Value => {
     return JSON.parse(value) as Value
   } catch (error) {
     throw new Error(`${label} did not return one JSON value.`, { cause: error })
+  }
+}
+
+const runFixturePhase = <Value>(fixtureRoot: string, action: () => Value, allowedPrefixes: readonly string[] = []) => {
+  const before = captureImportSnapshot(fixtureRoot)
+  try {
+    return action()
+  } finally {
+    const after = captureImportSnapshot(fixtureRoot)
+    const cachePrefixes = ['node_modules/.cache']
+    const allowed = [...cachePrefixes, ...allowedPrefixes]
+    assertDurableSnapshotsEqualExcept(
+      before,
+      after,
+      change =>
+        (change.path === 'node_modules' && change.kind === 'links') ||
+        (allowedPrefixes.length > 0 &&
+          change.kind === 'links' &&
+          (change.path === '.' || change.path === '@witness:.')) ||
+        allowed.some(prefix => change.path === prefix || change.path.startsWith(`${prefix}/`)),
+    )
   }
 }
 
@@ -379,31 +477,33 @@ const safeDownloadedTarball = (directory: string, stdout: string) => {
   throw new Error('npm did not return one safe published compatibility oracle tarball.')
 }
 
-const acquireOracle = (temporaryDirectory: string, supplied?: SuppliedOracle) => {
+const acquireOracle = (
+  downloadDirectory: string,
+  snapshotDirectory: string,
+  environment: NodeJS.ProcessEnv,
+  supplied?: SuppliedOracle,
+) => {
   const identity = supplied === undefined ? ORACLE : supplied.identity
   const sourcePath = (() => {
     if (supplied !== undefined) {
       return supplied.tarball
     }
-    const downloadDirectory = resolve(temporaryDirectory, 'oracle-download')
-    mkdirSync(downloadDirectory)
     const packed = safeNpmResult(
       ['pack', ORACLE.specifier, '--ignore-scripts', '--json', '--pack-destination', downloadDirectory],
       projectRoot,
       'The published compatibility oracle download',
+      [],
+      environment,
     )
     return safeDownloadedTarball(downloadDirectory, packed.stdout)
   })()
-  const snapshotDirectory = resolve(temporaryDirectory, 'oracle-snapshot')
-  mkdirSync(snapshotDirectory)
   const snapshot = snapshotPackageTarball(sourcePath, snapshotDirectory)
   const digests = verifyOracleTarball(snapshot.path, identity)
-  return { digests, identity, path: snapshot.path }
+  const witness = captureImportSnapshot(snapshotDirectory)
+  return { digests, identity, path: snapshot.path, witness }
 }
 
-const acquireCandidate = (temporaryDirectory: string, sourcePath: string) => {
-  const snapshotDirectory = resolve(temporaryDirectory, 'candidate-snapshot')
-  mkdirSync(snapshotDirectory)
+const acquireCandidate = (snapshotDirectory: string, sourcePath: string) => {
   const snapshot = snapshotPackageTarball(sourcePath, snapshotDirectory)
   const manifestEntry = readPackageTarEntries(snapshot.path).find(entry => entry.path === 'package/package.json')
   const manifest =
@@ -416,7 +516,11 @@ const acquireCandidate = (temporaryDirectory: string, sourcePath: string) => {
     typeof sourceManifest.version === 'string' &&
     manifest.version === sourceManifest.version
   ) {
-    return Object.freeze({ ...snapshot, version: manifest.version })
+    return Object.freeze({
+      ...snapshot,
+      version: manifest.version,
+      witness: captureImportSnapshot(snapshotDirectory),
+    })
   }
   throw new Error('The candidate package version does not equal the reviewed source release version.')
 }
@@ -449,14 +553,111 @@ const initialiseFixtureRepository = (fixtureRoot: string) => {
   })
 }
 
-const installPackage = (fixtureRoot: string, tarball: string, label: string, redactions: readonly Buffer[] = []) => {
-  rmSync(resolve(fixtureRoot, 'node_modules', 'encephalon'), { force: true, recursive: true })
+type VerifiedPackageArtifact = Readonly<{
+  digests: PackageTarballDigests
+  path: string
+  witness: DurableSnapshot
+}>
+
+const assertPackageArtifact = (artifact: VerifiedPackageArtifact) => {
+  assertDurableSnapshotsEqual(artifact.witness, captureImportSnapshot(dirname(artifact.path)))
+  if (!isDeepStrictEqual(artifact.digests, packageTarballDigests(artifact.path))) {
+    throw new Error('A verified compatibility package artifact changed between phases.')
+  }
+}
+
+const installedPackageWitnesses = new Map<string, DurableSnapshot>()
+
+const assertInstalledTreeMatchesArtifact = (
+  artifact: VerifiedPackageArtifact,
+  installedPackage: string,
+  snapshot: DurableSnapshot,
+) => {
+  const expectedFiles = readPackageTarEntries(artifact.path).map(entry =>
+    Object.freeze({ ...entry, path: entry.path.replace(/^package\//u, '') }),
+  )
+  const actualFiles = snapshot.filter(entry => entry.type === 'file')
+  const actualByPath = new Map(actualFiles.map(entry => [entry.path, entry]))
+  const differs =
+    actualFiles.length !== expectedFiles.length ||
+    expectedFiles.some(expected => {
+      const actual = actualByPath.get(expected.path)
+      return (
+        actual?.bytes === undefined ||
+        actual.mode !== expected.mode ||
+        !actual.bytes.equals(expected.content) ||
+        actual.canonicalPath !== resolve(realpathSync.native(installedPackage), expected.path)
+      )
+    })
+  if (differs) {
+    throw new Error('The fresh installed compatibility package tree differs from its verified tarball.')
+  }
+}
+
+const assertInstalledPackage = (fixtureRoot: string) => {
+  const witness = installedPackageWitnesses.get(fixtureRoot)
+  if (witness !== undefined) {
+    assertDurableSnapshotsEqualExcept(
+      witness,
+      captureImportSnapshot(resolve(fixtureRoot, 'node_modules', 'encephalon')),
+      change => change.kind === 'links' && change.path === '@witness:..',
+    )
+    return witness
+  }
+  throw new Error('The installed compatibility package has no immutable witness.')
+}
+
+const installPackage = (
+  fixtureRoot: string,
+  artifact: VerifiedPackageArtifact,
+  installRoot: string,
+  sequence: number,
+  label: string,
+  redactions: readonly Buffer[] = [],
+  environment: NodeJS.ProcessEnv = sanitizedCompatibilityEnvironment(),
+) => {
+  assertPackageArtifact(artifact)
+  writeFileSync(
+    resolve(installRoot, 'package.json'),
+    '{"name":"encephalon-release-install-stage","private":true,"type":"module"}\n',
+  )
   safeNpmResult(
-    ['install', tarball, '--ignore-scripts', '--no-audit', '--no-fund', '--no-save', '--package-lock=false'],
-    fixtureRoot,
+    ['install', artifact.path, '--ignore-scripts', '--no-audit', '--no-fund', '--no-save', '--package-lock=false'],
+    installRoot,
     label,
     redactions,
+    environment,
   )
+  assertPackageArtifact(artifact)
+  const stagedPackage = resolve(installRoot, 'node_modules', 'encephalon')
+  const stagedWitness = captureImportSnapshot(stagedPackage)
+  const fixtureModules = resolve(fixtureRoot, 'node_modules')
+  const fixtureModulesEntry = lstatSync(fixtureModules, { throwIfNoEntry: false })
+  if (fixtureModulesEntry === undefined) {
+    mkdirSync(fixtureModules, { mode: 0o700 })
+  } else if (!fixtureModulesEntry.isDirectory() || fixtureModulesEntry.isSymbolicLink()) {
+    throw new Error('The compatibility fixture node_modules path is not one ordinary directory.')
+  }
+  const installedPackage = resolve(fixtureModules, 'encephalon')
+  const existingPackage = lstatSync(installedPackage, { throwIfNoEntry: false })
+  if (existingPackage !== undefined) {
+    assertInstalledPackage(fixtureRoot)
+    const retiredPackage = resolve(fixtureModules, `.encephalon-retired-${sequence}`)
+    if (lstatSync(retiredPackage, { throwIfNoEntry: false }) !== undefined) {
+      throw new Error('A fixed retired compatibility package path already exists.')
+    }
+    renameSync(installedPackage, retiredPackage)
+  }
+  assertDurableSnapshotsEqual(stagedWitness, captureImportSnapshot(stagedPackage))
+  const stagedRootEntry = lstatSync(stagedPackage, { bigint: true })
+  renameSync(stagedPackage, installedPackage)
+  const installedRootEntry = lstatSync(installedPackage, { bigint: true })
+  if (stagedRootEntry.dev !== installedRootEntry.dev || stagedRootEntry.ino !== installedRootEntry.ino) {
+    throw new Error('The fresh installed compatibility package identity changed during atomic placement.')
+  }
+  const installedWitness = captureImportSnapshot(installedPackage)
+  assertInstalledTreeMatchesArtifact(artifact, installedPackage, installedWitness)
+  installedPackageWitnesses.set(fixtureRoot, installedWitness)
 }
 
 type TrustedProbeWitness = Readonly<{
@@ -506,7 +707,12 @@ const captureTrustedProbeWitness = (directory: string): TrustedProbeWitness => {
 }
 
 const writeProbeFiles = (probeDirectory: string, fixtureRoot: string) => {
-  mkdirSync(probeDirectory)
+  const probeEntry = lstatSync(probeDirectory, { throwIfNoEntry: false })
+  if (probeEntry === undefined) {
+    mkdirSync(probeDirectory, { mode: 0o700 })
+  } else if (!probeEntry.isDirectory() || probeEntry.isSymbolicLink()) {
+    throw new Error('The trusted compatibility probe root must be one ordinary directory.')
+  }
   const apiProbe = resolve(probeDirectory, 'api-probe.mjs')
   const budgetProbe = resolve(probeDirectory, 'budget-probe.mjs')
   const importProbe = resolve(probeDirectory, 'import-probe.mjs')
@@ -560,9 +766,13 @@ const assertTrustedProbe = (path: string) => {
 
 const runTrustedProbe = (probe: string, arguments_: readonly string[], options: CompatibilityCommandOptions) => {
   assertTrustedProbe(probe)
-  const result = runCompatibilityCommand(process.execPath, [probe, ...arguments_], options)
-  assertTrustedProbe(probe)
-  return result
+  assertInstalledPackage(options.cwd)
+  try {
+    return runCompatibilityCommand(process.execPath, [probe, ...arguments_], options)
+  } finally {
+    assertInstalledPackage(options.cwd)
+    assertTrustedProbe(probe)
+  }
 }
 
 const installedPackageEntry = (fixtureRoot: string) =>
@@ -582,11 +792,17 @@ const runApiProbe = (
   fixtureRoot: string,
   redactions: readonly Buffer[],
 ) => {
-  const result = runTrustedProbe(probe, [phase, fixtureRoot, installedPackageEntry(fixtureRoot)], {
-    cwd: fixtureRoot,
-    label: `The ${phase} API compatibility probe`,
-    redactions,
-  })
+  const allowed = phase === 'initialise' ? ['AGENTS.md', 'CLAUDE.md', 'encephalon'] : []
+  const result = runFixturePhase(
+    fixtureRoot,
+    () =>
+      runTrustedProbe(probe, [phase, fixtureRoot, installedPackageEntry(fixtureRoot)], {
+        cwd: fixtureRoot,
+        label: `The ${phase} API compatibility probe`,
+        redactions,
+      }),
+    allowed,
+  )
   if (result.stderr !== '') {
     throw new Error(`The ${phase} API compatibility probe wrote unexpected stderr.`)
   }
@@ -660,11 +876,13 @@ const runBudgetProbe = (
   packagePhase: 'candidate' | 'oracle',
   redactions: readonly Buffer[],
 ) => {
-  const result = runTrustedProbe(probe, [fixtureRoot, packagePhase, installedPackageEntry(fixtureRoot)], {
-    cwd: fixtureRoot,
-    label: 'The independent public budget probe',
-    redactions,
-  })
+  const result = runFixturePhase(fixtureRoot, () =>
+    runTrustedProbe(probe, [fixtureRoot, packagePhase, installedPackageEntry(fixtureRoot)], {
+      cwd: fixtureRoot,
+      label: 'The independent public budget probe',
+      redactions,
+    }),
+  )
   if (result.stderr !== '') {
     throw new Error('The independent public budget probe wrote unexpected stderr.')
   }
@@ -828,29 +1046,41 @@ const assertCandidateIndependentBudgets = (actual: IndependentBudgetReport) => {
 const runDeclarationProbe = (configuration: string, fixtureRoot: string, redactions: readonly Buffer[]) => {
   const compiler = resolve(projectRoot, 'node_modules', 'typescript', 'bin', 'tsc')
   assertTrustedProbe(configuration)
-  const result = runCompatibilityCommand(process.execPath, [compiler, '--project', configuration], {
-    cwd: fixtureRoot,
-    label: 'The consumer declaration compatibility probe',
-    redactions,
-  })
-  assertTrustedProbe(configuration)
-  if (result.stderr !== '') {
-    throw new Error('The consumer declaration compatibility probe wrote unexpected stderr.')
+  assertInstalledPackage(fixtureRoot)
+  try {
+    const result = runFixturePhase(fixtureRoot, () =>
+      runCompatibilityCommand(process.execPath, [compiler, '--project', configuration], {
+        cwd: fixtureRoot,
+        label: 'The consumer declaration compatibility probe',
+        redactions,
+      }),
+    )
+    if (result.stderr !== '') {
+      throw new Error('The consumer declaration compatibility probe wrote unexpected stderr.')
+    }
+  } finally {
+    assertInstalledPackage(fixtureRoot)
+    assertTrustedProbe(configuration)
   }
 }
 
 const installedCli = (fixtureRoot: string) => resolve(fixtureRoot, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
 
 const cliSuccess = (fixtureRoot: string, arguments_: readonly string[], redactions: readonly Buffer[]) => {
-  const result = runCompatibilityCommand(process.execPath, [installedCli(fixtureRoot), ...arguments_], {
-    cwd: fixtureRoot,
-    label: `The ${arguments_[0] ?? 'unknown'} CLI compatibility probe`,
-    redactions,
-  })
-  if (result.stderr === '') {
-    return result.stdout
+  assertInstalledPackage(fixtureRoot)
+  try {
+    const result = runCompatibilityCommand(process.execPath, [installedCli(fixtureRoot), ...arguments_], {
+      cwd: fixtureRoot,
+      label: `The ${arguments_[0] ?? 'unknown'} CLI compatibility probe`,
+      redactions,
+    })
+    if (result.stderr === '') {
+      return result.stdout
+    }
+    throw new Error(`The ${arguments_[0] ?? 'unknown'} CLI compatibility probe wrote unexpected stderr.`)
+  } finally {
+    assertInstalledPackage(fixtureRoot)
   }
-  throw new Error(`The ${arguments_[0] ?? 'unknown'} CLI compatibility probe wrote unexpected stderr.`)
 }
 
 const cliFailure = (fixtureRoot: string, arguments_: readonly string[], redactions: readonly Buffer[]) => {
@@ -867,24 +1097,6 @@ const cliFailure = (fixtureRoot: string, arguments_: readonly string[], redactio
 
 const assertCliJson = (fixtureRoot: string, arguments_: readonly string[], redactions: readonly Buffer[]) =>
   parseJson<unknown>(cliSuccess(fixtureRoot, arguments_, redactions), `The ${arguments_[0] ?? 'unknown'} CLI probe`)
-
-const normalisePublicValue = (value: unknown, fixtureRoot: string, key?: string): unknown => {
-  if (key === 'createdAt' && typeof value === 'string') {
-    return '<timestamp>'
-  }
-  if (typeof value === 'string') {
-    return value.replaceAll(fixtureRoot, '<fixture-root>')
-  }
-  if (Array.isArray(value)) {
-    return value.map(item => normalisePublicValue(item, fixtureRoot))
-  }
-  if (value !== null && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value).map(([name, item]) => [name, normalisePublicValue(item, fixtureRoot, name)]),
-    )
-  }
-  return value
-}
 
 const captureCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) => {
   const help = cliSuccess(fixtureRoot, ['--help'], redactions)
@@ -985,7 +1197,11 @@ const captureCliSurface = (fixtureRoot: string, version: string, redactions: rea
   )
 }
 
-const cliLimitArguments = (operation: (typeof resultLimitOperations)[number], fixtureRoot: string, limit: number) => {
+const cliLimitArguments = (
+  operation: (typeof RESULT_LIMIT_OPERATIONS)[number]['name'],
+  fixtureRoot: string,
+  limit: number,
+) => {
   const prefixes = {
     gather: ['gather', '--root', fixtureRoot, '--search', 'compatibility-marker'],
     list: ['list', '--root', fixtureRoot],
@@ -997,29 +1213,28 @@ const cliLimitArguments = (operation: (typeof resultLimitOperations)[number], fi
 }
 
 const assertCliResultLimits = (fixtureRoot: string, maximums: ResultLimitMaximums, redactions: readonly Buffer[]) => {
-  const cases = resultLimitOperations.flatMap(operation => resultLimitCases.map(limit => ({ limit, operation })))
+  const cases = RESULT_LIMIT_OPERATIONS.flatMap(operation => RESULT_LIMIT_CASES.map(limit => ({ limit, operation })))
   const executed = cases.reduce((count, { limit, operation }) => {
-    const maximum = operation === 'list' || operation === 'search' ? maximums.full : maximums.compact
+    const maximum = maximums[operation.kind]
     if (limit <= maximum) {
-      assertCliJson(fixtureRoot, cliLimitArguments(operation, fixtureRoot, limit), redactions)
+      assertCliJson(fixtureRoot, cliLimitArguments(operation.name, fixtureRoot, limit), redactions)
       return count + 1
     }
-    const failure = cliFailure(fixtureRoot, cliLimitArguments(operation, fixtureRoot, limit), redactions)
+    const failure = cliFailure(fixtureRoot, cliLimitArguments(operation.name, fixtureRoot, limit), redactions)
     const body = parseJson<{ error?: { code?: unknown; details?: Record<string, unknown> } }>(
       failure.stderr,
       'The rejected CLI result-limit probe',
     )
-    const budget = operation === 'list' || operation === 'search' ? 'fullResultLimit' : 'compactResultLimit'
     const hasExpectedEnvelope =
       failure.exitCode === 2 && failure.stdout === '' && body.error?.code === 'INVALID_ARGUMENT'
     const isOracleParserRejection = maximums.full === 50 && maximums.compact === 100 && limit === 1001
     const hasExpectedDetails = isOracleParserRejection
       ? true
-      : body.error?.details?.budget === budget &&
+      : body.error?.details?.budget === operation.budget &&
         body.error.details.field === 'limit' &&
         body.error.details.maximum === maximum
     if (!(hasExpectedEnvelope && hasExpectedDetails)) {
-      throw new Error(`The rejected ${operation} CLI result-limit contract did not match the published oracle.`)
+      throw new Error(`The rejected ${operation.name} CLI result-limit contract did not match the published oracle.`)
     }
     return count + 1
   }, 0)
@@ -1029,17 +1244,19 @@ const assertCliResultLimits = (fixtureRoot: string, maximums: ResultLimitMaximum
   return resultLimitReport(maximums)
 }
 
-const runCandidateCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) => {
-  const surface = captureCliSurface(fixtureRoot, version, redactions)
-  const limits = assertCliResultLimits(fixtureRoot, candidateResultLimitMaximums, redactions)
-  return { limits, surface }
-}
+const runCandidateCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) =>
+  runFixturePhase(fixtureRoot, () => {
+    const surface = captureCliSurface(fixtureRoot, version, redactions)
+    const limits = assertCliResultLimits(fixtureRoot, candidateResultLimitMaximums, redactions)
+    return { limits, surface }
+  })
 
-const runDowngradeCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) => {
-  const surface = captureCliSurface(fixtureRoot, version, redactions)
-  const limits = assertCliResultLimits(fixtureRoot, oracleResultLimitMaximums, redactions)
-  return { limits, surface }
-}
+const runDowngradeCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) =>
+  runFixturePhase(fixtureRoot, () => {
+    const surface = captureCliSurface(fixtureRoot, version, redactions)
+    const limits = assertCliResultLimits(fixtureRoot, oracleResultLimitMaximums, redactions)
+    return { limits, surface }
+  })
 
 const assertLimitReport = (actual: ResultLimitReport, maximums: ResultLimitMaximums, label: string) => {
   const expected = resultLimitReport(maximums)
@@ -1052,22 +1269,51 @@ const durableRedactions = (snapshot: DurableSnapshot) =>
   snapshot.flatMap(entry => (entry.bytes === undefined ? [] : [entry.bytes]))
 
 export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): ReleaseCompatibilityReport => {
-  const temporaryDirectory = mkdtempSync(resolve(tmpdir(), 'encephalon-release-compatibility-'))
+  const trustedRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-trusted-'))
+  const trustedDirectories = Object.freeze({
+    candidate: resolve(trustedRoot, 'candidate'),
+    installCandidate: resolve(trustedRoot, 'install-candidate'),
+    installDowngrade: resolve(trustedRoot, 'install-downgrade'),
+    installOracle: resolve(trustedRoot, 'install-oracle'),
+    npmCache: resolve(trustedRoot, 'npm-cache'),
+    oracleDownload: resolve(trustedRoot, 'oracle-download'),
+    oracleSnapshot: resolve(trustedRoot, 'oracle-snapshot'),
+    probes: resolve(trustedRoot, 'probes'),
+  })
+  for (const path of Object.values(trustedDirectories)) {
+    mkdirSync(path, { mode: 0o700 })
+  }
+  const trustedRootWitness = captureIsolatedRoot(trustedRoot)
+  const fixtureRoot = options.fixtureRoot ?? mkdtempSync(resolve(tmpdir(), 'encephalon-release-fixture-'))
+  const fixtureWitness = options.fixtureRoot === undefined ? captureIsolatedRoot(fixtureRoot) : undefined
+  const environment = Object.freeze({
+    ...sanitizedCompatibilityEnvironment(),
+    npm_config_cache: trustedDirectories.npmCache,
+  })
   try {
-    const candidate = acquireCandidate(temporaryDirectory, options.candidateTarball)
-    const oracle = acquireOracle(temporaryDirectory, options.oracle)
-    const fixtureRoot = options.fixtureRoot ?? resolve(temporaryDirectory, 'repository')
-    if (options.fixtureRoot === undefined) {
-      mkdirSync(fixtureRoot)
-    }
+    const candidate = acquireCandidate(trustedDirectories.candidate, options.candidateTarball)
+    const oracle = acquireOracle(
+      trustedDirectories.oracleDownload,
+      trustedDirectories.oracleSnapshot,
+      environment,
+      options.oracle,
+    )
     initialiseFixtureRepository(fixtureRoot)
-    const probes = writeProbeFiles(resolve(temporaryDirectory, 'trusted-probes'), fixtureRoot)
+    const probes = writeProbeFiles(trustedDirectories.probes, fixtureRoot)
     const predecessorRedactions = [
       Buffer.from('oracle agents predecessor\n'),
       Buffer.from('oracle claude predecessor\n'),
     ]
 
-    installPackage(fixtureRoot, oracle.path, 'The verified published oracle installation', predecessorRedactions)
+    installPackage(
+      fixtureRoot,
+      oracle,
+      trustedDirectories.installOracle,
+      1,
+      'The verified published oracle installation',
+      predecessorRedactions,
+      environment,
+    )
     const initialImport = runImportProbe(probes.importProbe, fixtureRoot, predecessorRedactions)
     runDeclarationProbe(probes.declarationConfiguration, fixtureRoot, predecessorRedactions)
     const initial = runApiProbe(probes.apiProbe, 'initialise', fixtureRoot, predecessorRedactions)
@@ -1075,14 +1321,26 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     if (initial.schemaAfter !== '1') {
       throw new Error('The published compatibility oracle did not prepare cache schema 1.')
     }
-    const oracleCliSurface = captureCliSurface(fixtureRoot, initial.version, predecessorRedactions)
-    const oracleCliLimits = assertCliResultLimits(fixtureRoot, oracleResultLimitMaximums, predecessorRedactions)
+    const initialCli = runFixturePhase(fixtureRoot, () => ({
+      limits: assertCliResultLimits(fixtureRoot, oracleResultLimitMaximums, predecessorRedactions),
+      surface: captureCliSurface(fixtureRoot, initial.version, predecessorRedactions),
+    }))
+    const oracleCliSurface = initialCli.surface
+    const oracleCliLimits = initialCli.limits
     const oracleIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, 'oracle', predecessorRedactions)
     const oraclePublicSurface = publicSurfaceDigests(initial.surface, oracleCliSurface)
     const durable = captureDurableSnapshot(fixtureRoot)
     const redactions = durableRedactions(durable)
 
-    installPackage(fixtureRoot, candidate.path, 'The exact candidate package installation', redactions)
+    installPackage(
+      fixtureRoot,
+      candidate,
+      trustedDirectories.installCandidate,
+      2,
+      'The exact candidate package installation',
+      redactions,
+      environment,
+    )
     const candidateImport = runImportProbe(probes.importProbe, fixtureRoot, redactions)
     if (candidateImport.version !== candidate.version) {
       throw new Error('The installed candidate process version does not match the reviewed candidate manifest.')
@@ -1100,7 +1358,16 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       throw new Error('The candidate package did not rebuild cache schema 1 as schema 2.')
     }
 
-    installPackage(fixtureRoot, oracle.path, 'The verified published oracle reinstallation', redactions)
+    options.hooks?.beforeOracleDowngrade?.(oracle.path)
+    installPackage(
+      fixtureRoot,
+      oracle,
+      trustedDirectories.installDowngrade,
+      3,
+      'The verified published oracle reinstallation',
+      redactions,
+      environment,
+    )
     const downgradeImport = runImportProbe(probes.importProbe, fixtureRoot, redactions)
     const downgradeApi = runApiProbe(probes.apiProbe, 'downgrade', fixtureRoot, redactions)
     assertLimitReport(downgradeApi.limits, oracleResultLimitMaximums, 'The downgraded oracle API phase')
@@ -1151,6 +1418,10 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       }),
     })
   } finally {
-    rmSync(temporaryDirectory, { force: true, recursive: true })
+    installedPackageWitnesses.delete(fixtureRoot)
+    if (fixtureWitness !== undefined) {
+      disposeIsolatedRoot(fixtureWitness)
+    }
+    disposeIsolatedRoot(trustedRootWitness)
   }
 }

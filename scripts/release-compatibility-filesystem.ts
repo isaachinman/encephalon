@@ -13,15 +13,30 @@ import { relative, resolve, sep } from 'node:path'
 
 export type DurableSnapshotEntry = Readonly<{
   bytes?: Buffer
+  canonicalPath: string
+  device: bigint
+  inode: bigint
+  links: bigint
   mode: number
   path: string
   type: 'directory' | 'file'
 }>
 
-export type DurableSnapshot = readonly DurableSnapshotEntry[]
+export type DurableSnapshotWitness = Readonly<{
+  canonicalPath: string
+  device: bigint
+  inode: bigint
+  links: bigint
+  mode: number
+  path: '.' | '..'
+  type: 'directory'
+}>
+
+export type DurableSnapshot = readonly DurableSnapshotEntry[] &
+  Readonly<{ witnesses: readonly DurableSnapshotWitness[] }>
 
 export type DurableSnapshotChange = Readonly<{
-  kind: 'added' | 'bytes' | 'mode' | 'removed' | 'type'
+  kind: 'added' | 'bytes' | 'canonical' | 'device' | 'identity' | 'links' | 'mode' | 'removed' | 'type'
   path: string
 }>
 
@@ -85,6 +100,7 @@ const sameStableDirectory = (left: BigIntStats, right: BigIntStats) =>
   left.dev === right.dev &&
   left.ino === right.ino &&
   left.mode === right.mode &&
+  left.nlink === right.nlink &&
   left.mtimeNs === right.mtimeNs &&
   left.ctimeNs === right.ctimeNs
 
@@ -97,12 +113,12 @@ const readBoundedRegularFile = (path: string, hooks: SnapshotHooks) => {
     if (
       !(before.isFile() && namedBefore.isFile()) ||
       namedBefore.isSymbolicLink() ||
-      before.nlink !== 1n ||
-      namedBefore.nlink !== 1n ||
+      before.nlink < 1n ||
+      namedBefore.nlink < 1n ||
       !sameStableFile(before, namedBefore) ||
       before.size > BigInt(maximumFileBytes)
     ) {
-      throw new Error(`Durable compatibility file is not one stable bounded regular file without a hard link: ${path}`)
+      throw new Error(`Durable compatibility file is not one stable bounded regular file: ${path}`)
     }
     hooks.afterFileOpen?.(path)
     const bytes = Buffer.alloc(Math.min(Number(before.size) + 1, maximumFileBytes + 1))
@@ -146,6 +162,10 @@ const captureEntry = (
   }
   const path = relativePath === '.' ? root : resolve(root, relativePath)
   const containedPath = relative(root, path)
+  const metadata = lstatSync(path, { bigint: true })
+  if (metadata.isSymbolicLink()) {
+    throw new Error(`Durable compatibility entry is a symbolic link: ${relativePath}`)
+  }
   const expectedCanonicalPath =
     relativePath === '.' ? realpathSync.native(root) : resolve(realpathSync.native(root), relativePath)
   if (
@@ -155,7 +175,7 @@ const captureEntry = (
   ) {
     throw new Error(`Durable compatibility entry escaped or redirected its snapshot root: ${relativePath}`)
   }
-  const metadata = lstatSync(path, { bigint: true })
+  const canonicalPath = realpathSync.native(path)
   const mode = Number(metadata.mode & 0o7777n)
   state.entries += 1
   if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
@@ -166,7 +186,18 @@ const captureEntry = (
     })
     const after = lstatSync(path, { bigint: true, throwIfNoEntry: false })
     if (after !== undefined && sameStableDirectory(metadata, after)) {
-      return [Object.freeze({ mode, path: relativePath, type: 'directory' as const }), ...descendants]
+      return [
+        Object.freeze({
+          canonicalPath,
+          device: metadata.dev,
+          inode: metadata.ino,
+          links: metadata.nlink,
+          mode,
+          path: relativePath,
+          type: 'directory' as const,
+        }),
+        ...descendants,
+      ]
     }
     throw new Error(`Durable compatibility directory changed while its generation was being captured: ${relativePath}`)
   }
@@ -174,7 +205,18 @@ const captureEntry = (
     const bytes = readBoundedRegularFile(path, hooks)
     state.aggregateBytes += bytes.length
     if (state.aggregateBytes <= maximumAggregateBytes) {
-      return [Object.freeze({ bytes, mode, path: relativePath, type: 'file' as const })]
+      return [
+        Object.freeze({
+          bytes,
+          canonicalPath,
+          device: metadata.dev,
+          inode: metadata.ino,
+          links: metadata.nlink,
+          mode,
+          path: relativePath,
+          type: 'file' as const,
+        }),
+      ]
     }
     throw new Error('Durable compatibility snapshot exceeded its aggregate byte limit.')
   }
@@ -188,13 +230,36 @@ const captureRoots = (
   excluded: (relativePath: string) => boolean,
 ) => {
   const state: SnapshotState = { aggregateBytes: 0, entries: 0 }
-  return Object.freeze(
-    roots.flatMap(relativePath =>
-      lstatSync(resolve(root, relativePath), { throwIfNoEntry: false }) === undefined
-        ? []
-        : captureEntry(root, relativePath, 0, state, hooks, excluded),
-    ),
+  const entries = roots.flatMap(relativePath =>
+    lstatSync(resolve(root, relativePath), { throwIfNoEntry: false }) === undefined
+      ? []
+      : captureEntry(root, relativePath, 0, state, hooks, excluded),
   )
+  const witnesses = Object.freeze(
+    (
+      [
+        ['.', root],
+        ['..', resolve(root, '..')],
+      ] as const
+    ).map(([path, absolutePath]) => {
+      const metadata = lstatSync(absolutePath, { bigint: true })
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        throw new Error(`Durable compatibility ${path} witness is not one ordinary directory.`)
+      }
+      return Object.freeze({
+        canonicalPath: realpathSync.native(absolutePath),
+        device: metadata.dev,
+        inode: metadata.ino,
+        links: metadata.nlink,
+        mode: Number(metadata.mode & 0o7777n),
+        path,
+        type: 'directory' as const,
+      })
+    }),
+  )
+  const snapshot = [...entries] as DurableSnapshotEntry[] & { witnesses: readonly DurableSnapshotWitness[] }
+  Object.defineProperty(snapshot, 'witnesses', { enumerable: true, value: witnesses })
+  return Object.freeze(snapshot) as DurableSnapshot
 }
 
 export const captureDurableSnapshot = (root: string, hooks: SnapshotHooks = {}): DurableSnapshot =>
@@ -220,6 +285,14 @@ const snapshotEntryChanges = (
     expected.type === actual.type ? [] : [{ kind: 'type', path: expected.path }]
   const modeChanges: DurableSnapshotChange[] =
     expected.mode === actual.mode ? [] : [{ kind: 'mode', path: expected.path }]
+  const canonicalChanges: DurableSnapshotChange[] =
+    expected.canonicalPath === actual.canonicalPath ? [] : [{ kind: 'canonical', path: expected.path }]
+  const deviceChanges: DurableSnapshotChange[] =
+    expected.device === actual.device ? [] : [{ kind: 'device', path: expected.path }]
+  const identityChanges: DurableSnapshotChange[] =
+    expected.inode === actual.inode ? [] : [{ kind: 'identity', path: expected.path }]
+  const linkChanges: DurableSnapshotChange[] =
+    expected.links === actual.links ? [] : [{ kind: 'links', path: expected.path }]
   const byteChanges: DurableSnapshotChange[] =
     expected.type === 'file' &&
     actual.type === 'file' &&
@@ -228,10 +301,30 @@ const snapshotEntryChanges = (
     Buffer.compare(expected.bytes, actual.bytes) !== 0
       ? [{ kind: 'bytes', path: expected.path }]
       : []
-  return [...typeChanges, ...modeChanges, ...byteChanges]
+  return [
+    ...typeChanges,
+    ...modeChanges,
+    ...canonicalChanges,
+    ...deviceChanges,
+    ...identityChanges,
+    ...linkChanges,
+    ...byteChanges,
+  ]
 }
 
-export const assertDurableSnapshotsEqual = (expected: DurableSnapshot, actual: DurableSnapshot) => {
+const witnessChanges = (expected: DurableSnapshot, actual: DurableSnapshot) =>
+  expected.witnesses.flatMap(witness => {
+    const current = actual.witnesses.find(candidate => candidate.path === witness.path)
+    if (current === undefined) {
+      return [{ kind: 'removed' as const, path: `@witness:${witness.path}` }]
+    }
+    return snapshotEntryChanges(
+      { ...witness, path: `@witness:${witness.path}` },
+      { ...current, path: `@witness:${current.path}` },
+    ).filter(change => !(witness.path === '..' && change.kind === 'links'))
+  })
+
+const durableSnapshotChanges = (expected: DurableSnapshot, actual: DurableSnapshot) => {
   const expectedByPath = new Map(expected.map(entry => [entry.path, entry]))
   const actualByPath = new Map(actual.map(entry => [entry.path, entry]))
   const removed = expected
@@ -244,10 +337,21 @@ export const assertDurableSnapshotsEqual = (expected: DurableSnapshot, actual: D
     const current = actualByPath.get(entry.path)
     return current === undefined ? [] : snapshotEntryChanges(entry, current)
   })
-  const changes = [...removed, ...added, ...changed].sort((left, right) =>
+  return [...removed, ...added, ...changed, ...witnessChanges(expected, actual)].sort((left, right) =>
     ordinalCompare(`${left.path}:${left.kind}`, `${right.path}:${right.kind}`),
   )
+}
+
+export const assertDurableSnapshotsEqualExcept = (
+  expected: DurableSnapshot,
+  actual: DurableSnapshot,
+  allowed: (change: DurableSnapshotChange) => boolean,
+) => {
+  const changes = durableSnapshotChanges(expected, actual).filter(change => !allowed(change))
   if (changes.length > 0) {
     throw new DurableSnapshotMismatch(changes)
   }
 }
+
+export const assertDurableSnapshotsEqual = (expected: DurableSnapshot, actual: DurableSnapshot) =>
+  assertDurableSnapshotsEqualExcept(expected, actual, () => false)

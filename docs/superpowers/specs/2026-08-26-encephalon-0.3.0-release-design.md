@@ -23,9 +23,9 @@ The compatibility check downloads the exact version, verifies SHA-512 and SHA-1 
 
 ## Public result-count contract
 
-Published 0.2.0 accepts `limit` values from 1 through 1,000 for list, full search, compact search, and gather searches. The default is 20. This is the intended backwards-compatible public contract.
+Erratum (2026-08-27): the documented and intended 0.2.0 contract accepts `limit` values from 1 through 1,000 for list, full search, compact search, and gather searches, with a default of 20. Direct execution of the immutable dual-hash published 0.2.0 oracle instead observes runtime maxima of 50 for list/full search and 100 for compact search/gather. The earlier design text incorrectly described that published runtime as already accepting the documented range.
 
-Current `main` incorrectly narrows full-result limits to 50 and compact/gather-result limits to 100. Encephalon 0.3.0 restores both result-limit authorities to:
+Encephalon 0.3.0 restores both maintained result-limit authorities to the intended 1–1,000 contract. This is a strict widening of the observed immutable runtime, so no input accepted by published 0.2.0 is rejected:
 
 ```ts
 { default: 20, field: 'limit', maximum: 1000, minimum: 1 }
@@ -91,6 +91,8 @@ No fixture expectation may be computed with candidate implementation helpers. Ex
 ## Exact candidate artifact
 
 One deterministic tarball is created once for each exact source tree. It receives a repository-relative path plus recorded size, SHA-256, SHA-512, npm integrity, package version, and source commit.
+
+Exact retention is one absent-directory transaction. `package-artifacts` must not exist before generation; a previous disposable directory must be moved aside before rerunning the gate. The complete tarball and sidecar are staged in one random private sibling under the stable reviewed repository root, installed by one directory rename, and revalidated as a pair. Callers never replace or merge a prior artifact directory.
 
 The existing package checker remains the single authority for manifest, generated-version, API import, declaration, packed CLI, and install-with-scripts-disabled validation. It gains a supplied-tarball mode rather than duplicating that logic elsewhere.
 

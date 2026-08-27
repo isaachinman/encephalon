@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import {
   chmodSync,
   existsSync,
@@ -7,9 +8,11 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -17,6 +20,7 @@ import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
+import { captureIsolatedRoot, disposeIsolatedRoot } from './isolated-root.ts'
 import { spawnNpmCommand } from './npm-command.ts'
 import { packageTarballDigests } from './package-tarball.ts'
 import {
@@ -52,7 +56,7 @@ const createDurableFixture = () => {
   return { artifact, cache, record, root }
 }
 
-const standInIndex = (version: string, schemaVersion: string, behaviour = version) => {
+const standInIndex = (version: string, schemaVersion: string, behaviour = version, mutationTarget?: string) => {
   const fullMaximum = version.startsWith('0.2.0') ? 50 : 1000
   const compactMaximum = version.startsWith('0.2.0') ? 100 : 1000
   const payloadBudgetError = {
@@ -140,6 +144,10 @@ if (${String(behaviour.includes('environment-mutation'))}) {
 if (${String(behaviour.includes('success-stderr'))}) process.stderr.write('candidate success diagnostic\\n')
 if (${String(behaviour.includes('import-sentinel'))}) writeFileSync(resolve(process.cwd(), 'candidate-import-sentinel'), 'unexpected import side effect\\n')
 if (${String(behaviour.includes('probe-tamper'))}) writeFileSync(process.argv[1], 'candidate replaced trusted probe\\n')
+if (${String(behaviour.includes('candidate-self-rewrite'))}) writeFileSync(new URL(import.meta.url), 'candidate rewrote itself\\n')
+if (${String(behaviour.includes('api-phase-side-effect'))} && process.argv[1]?.endsWith('api-probe.mjs')) writeFileSync(resolve(process.cwd(), 'candidate-api-phase-sentinel'), 'unexpected API phase side effect\\n')
+if (${String(behaviour.includes('budget-phase-side-effect'))} && process.argv[1]?.endsWith('budget-probe.mjs')) writeFileSync(resolve(process.cwd(), 'candidate-budget-phase-sentinel'), 'unexpected budget phase side effect\\n')
+if (${String(behaviour.includes('oracle-replacement'))} && ${JSON.stringify(mutationTarget)} !== undefined) writeFileSync(${JSON.stringify(mutationTarget)}, 'candidate replaced oracle snapshot\\n')
 
 export class EncephalonError extends Error {
   constructor(code, message, details = {}) {
@@ -256,6 +264,9 @@ export const initEncephalon = (input = {}) => {
     const path = resolve(root, name)
     const predecessor = existsSync(path) ? readFileSync(path, 'utf8') : ''
     if (!predecessor.includes('encephalon:managed-instructions:start')) {
+      if (${String(version.startsWith('0.2.0'))}) {
+        writeFileSync(resolve(root, '.' + name + '.' + process.pid + '.' + randomUUID() + '.backup'), predecessor)
+      }
       writeFileSync(path, predecessor + managedBlock)
     }
   })
@@ -361,6 +372,8 @@ export const gatherRecords = (input = {}) => {
 }
 
 const standInCli = (version: string, behaviour = version) => `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import {
   addRecord,
   EncephalonError,
@@ -376,6 +389,7 @@ import {
 } from './index.mjs'
 
 const raw = process.argv.slice(2)
+if (${String(behaviour.includes('cli-phase-side-effect'))}) writeFileSync(resolve(process.cwd(), 'candidate-cli-phase-sentinel'), 'unexpected CLI phase side effect\\n')
 if (raw.length === 1 && (raw[0] === '--help' || raw[0] === '-h')) {
   process.stdout.write('Usage: encephalon <command>\\nCommands: init add prepare hydrate validate list show search gather${behaviour.includes('shape-drift') ? ' candidate-only' : ''}\\n')
 } else if (raw.length === 1 && (raw[0] === '--version' || raw[0] === '-v')) {
@@ -473,7 +487,7 @@ export declare const searchCompactRecords: (input: SearchRecordsInput) => Compac
 export declare const gatherRecords: (input?: GatherInput) => GatherResult
 `
 
-const buildStandInTarball = (root: string, version: string, schemaVersion: string) => {
+const buildStandInTarball = (root: string, version: string, schemaVersion: string, mutationTarget?: string) => {
   const packageVersion = version.startsWith('0.3.0-') ? '0.3.0' : version
   const packageRoot = resolve(root, `package-${version}`)
   const tarballDirectory = resolve(root, 'tarballs')
@@ -495,7 +509,10 @@ const buildStandInTarball = (root: string, version: string, schemaVersion: strin
       2,
     )}\n`,
   )
-  writeFileSync(resolve(packageRoot, 'dist', 'index.mjs'), standInIndex(packageVersion, schemaVersion, version))
+  writeFileSync(
+    resolve(packageRoot, 'dist', 'index.mjs'),
+    standInIndex(packageVersion, schemaVersion, version, mutationTarget),
+  )
   writeFileSync(resolve(packageRoot, 'dist', 'cli.mjs'), standInCli(packageVersion, version), { mode: 0o755 })
   writeFileSync(
     resolve(packageRoot, 'dist', 'environment-preload.cjs'),
@@ -625,26 +642,95 @@ describe('release compatibility authorities', () => {
 
   test('ignores changes only beneath the disposable Encephalon cache', () => {
     const fixture = createDurableFixture()
+    const unrelatedParentSibling = resolve(fixture.root, '..', `encephalon-unrelated-${randomUUID()}`)
     try {
       const expected = captureDurableSnapshot(fixture.root)
+      mkdirSync(unrelatedParentSibling)
       writeFileSync(fixture.cache, 'disposable-cache-two')
       writeFileSync(resolve(fixture.cache, '..', 'brain.sqlite-wal'), 'disposable sidecar')
 
       assert.doesNotThrow(() => assertDurableSnapshotsEqual(expected, captureDurableSnapshot(fixture.root)))
     } finally {
+      rmSync(unrelatedParentSibling, { force: true, recursive: true })
       rmSync(fixture.root, { force: true, recursive: true })
     }
   })
 
-  test('rejects multiply linked, oversized, growing, and replaced durable files', () => {
-    const hardLinked = createDurableFixture()
+  test('persists same-byte replacement and hard-link identity changes across durable snapshots', () => {
+    const replaced = createDurableFixture()
+    const moved = `${replaced.record}.moved`
     try {
-      linkSync(hardLinked.record, resolve(hardLinked.record, '..', 'hard-link.json'))
-      assert.throws(() => captureDurableSnapshot(hardLinked.root), /hard link|stable bounded regular file/u)
+      const expected = captureDurableSnapshot(replaced.root)
+      const bytes = readFileSync(replaced.record)
+      const mode = lstatSync(replaced.record).mode & 0o7777
+      renameSync(replaced.record, moved)
+      writeFileSync(replaced.record, bytes, { mode })
+      rmSync(moved)
+
+      assert.throws(
+        () => assertDurableSnapshotsEqual(expected, captureDurableSnapshot(replaced.root)),
+        error =>
+          error instanceof Error &&
+          'changes' in error &&
+          Array.isArray(error.changes) &&
+          error.changes.some(change => change.kind === 'identity' && change.path.endsWith('compatibility.json')),
+      )
+    } finally {
+      rmSync(replaced.root, { force: true, recursive: true })
+    }
+
+    const hardLinked = createDurableFixture()
+    const hardLink = resolve(hardLinked.record, '..', 'hard-link.json')
+    try {
+      const singleLink = captureDurableSnapshot(hardLinked.root)
+      linkSync(hardLinked.record, hardLink)
+      const doubleLink = captureDurableSnapshot(hardLinked.root)
+      assert.throws(
+        () => assertDurableSnapshotsEqual(singleLink, doubleLink),
+        error => error instanceof Error && error.message.includes('links:'),
+      )
+      rmSync(hardLink)
+      assert.throws(
+        () => assertDurableSnapshotsEqual(doubleLink, captureDurableSnapshot(hardLinked.root)),
+        error => error instanceof Error && error.message.includes('links:'),
+      )
     } finally {
       rmSync(hardLinked.root, { force: true, recursive: true })
     }
+  })
 
+  test('bounded isolated cleanup never follows outside symlinks or a replaced ancestor generation', () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-cleanup-'))
+    const outside = resolve(temporaryRoot, 'outside')
+    const outsideSentinel = resolve(outside, 'sentinel')
+    try {
+      mkdirSync(outside)
+      writeFileSync(outsideSentinel, 'outside sentinel')
+
+      const isolated = resolve(temporaryRoot, 'isolated')
+      mkdirSync(isolated)
+      writeFileSync(resolve(isolated, 'inside'), 'inside')
+      symlinkSync(outside, resolve(isolated, 'outside-link'), 'junction')
+      disposeIsolatedRoot(captureIsolatedRoot(isolated))
+      assert.equal(existsSync(isolated), false)
+      assert.equal(readFileSync(outsideSentinel, 'utf8'), 'outside sentinel')
+
+      const generation = resolve(temporaryRoot, 'generation')
+      const generationMoved = resolve(temporaryRoot, 'generation-moved')
+      const generationRoot = resolve(generation, 'isolated')
+      mkdirSync(generationRoot, { recursive: true })
+      const witness = captureIsolatedRoot(generationRoot)
+      renameSync(generation, generationMoved)
+      mkdirSync(generation)
+      symlinkSync(outside, generationRoot, 'junction')
+      assert.throws(() => disposeIsolatedRoot(witness), /root or parent identity changed|ordinary directory/u)
+      assert.equal(readFileSync(outsideSentinel, 'utf8'), 'outside sentinel')
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects oversized, growing, and concurrently replaced durable files', () => {
     const oversized = createDurableFixture()
     try {
       writeFileSync(oversized.artifact, Buffer.alloc(16 * 1024 * 1024 + 1))
@@ -790,6 +876,46 @@ try {
       assert.equal(result.status, 0, `${result.stdout}${result.stderr}${String(result.error ?? '')}`)
       assert.equal(result.stdout, 'bounded timeout\n')
       assert.equal(result.stderr, '')
+    } finally {
+      rmSync(directory, { force: true, recursive: true })
+    }
+  })
+
+  test('terminates forked descendants before they can mutate after a timeout', () => {
+    const directory = mkdtempSync(resolve(tmpdir(), 'encephalon-release-process-tree-'))
+    const descendant = resolve(directory, 'descendant.mjs')
+    const parent = resolve(directory, 'parent.mjs')
+    const sentinel = resolve(directory, 'late-descendant-mutation')
+    try {
+      writeFileSync(
+        descendant,
+        `import { writeFileSync } from 'node:fs'\nsetTimeout(() => writeFileSync(${JSON.stringify(sentinel)}, 'late mutation'), 250)\n`,
+      )
+      writeFileSync(
+        parent,
+        `import { spawn } from 'node:child_process'\nspawn(process.execPath, [${JSON.stringify(descendant)}], { stdio: 'ignore' })\nsetInterval(() => {}, 1000)\n`,
+      )
+
+      assert.throws(
+        () =>
+          runCompatibilityCommand(process.execPath, [parent], {
+            cwd: directory,
+            label: 'forking timeout witness',
+            timeoutMilliseconds: 50,
+          }),
+        CompatibilityCommandError,
+      )
+      const waited = spawnSync(
+        process.execPath,
+        ['--input-type=module', '--eval', 'await new Promise(resolve => setTimeout(resolve, 400))'],
+        {
+          cwd: directory,
+          encoding: 'utf8',
+          timeout: 1000,
+        },
+      )
+      assert.equal(waited.status, 0, `${waited.stdout}${waited.stderr}`)
+      assert.equal(existsSync(sentinel), false)
     } finally {
       rmSync(directory, { force: true, recursive: true })
     }
@@ -1073,6 +1199,12 @@ describe('release compatibility process fixture', () => {
         readFileSync(resolve(fixtureRoot, 'CLAUDE.md'), 'utf8').startsWith('oracle claude predecessor\n'),
         true,
       )
+      assert.deepEqual(
+        readdirSync(fixtureRoot).filter(name =>
+          /^[.](?:AGENTS[.]md|CLAUDE[.]md)[.][0-9]+[.][0-9a-f-]+[.]backup$/u.test(name),
+        ),
+        [],
+      )
       assert.equal(
         readFileSync(
           resolve(fixtureRoot, 'encephalon', '_artifacts', 'decision', 'compatibility-base', 'evidence.txt'),
@@ -1130,6 +1262,45 @@ describe('release compatibility process fixture', () => {
     }
   })
 
+  test('revalidates durable oracle identity immediately before downgrade installation', {
+    timeout: compatibilityIntegrationTimeout,
+  }, () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-oracle-replacement-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    try {
+      mkdirSync(fixtureRoot)
+      const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0', '2')
+      const oracleDigests = packageTarballDigests(oracle.tarball)
+
+      assert.throws(
+        () =>
+          runReleaseCompatibility({
+            candidateTarball: candidate.tarball,
+            fixtureRoot,
+            hooks: {
+              beforeOracleDowngrade: oracleSnapshot => {
+                const bytes = readFileSync(oracleSnapshot)
+                renameSync(oracleSnapshot, `${oracleSnapshot}.replaced`)
+                writeFileSync(oracleSnapshot, bytes)
+              },
+            },
+            oracle: {
+              identity: {
+                integrity: oracleDigests.integrity,
+                shasum: oracleDigests.sha1,
+                specifier: 'local-encephalon@0.2.0',
+              },
+              tarball: oracle.tarball,
+            },
+          }),
+        /artifact changed|snapshot|identity|Durable compatibility state changed/iu,
+      )
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
   test('requires the candidate manifest version to equal the source release version', {
     timeout: compatibilityRegressionTimeout,
   }, () => {
@@ -1162,10 +1333,18 @@ describe('release compatibility process fixture', () => {
     }
   })
 
-  test('rejects unrelated import side effects and successful probe diagnostics', {
+  test('rejects package self-rewrite, probe tamper, and unrelated per-phase side effects', {
     timeout: compatibilityRegressionTimeout,
   }, () => {
-    for (const behaviour of ['0.3.0-import-sentinel', '0.3.0-probe-tamper', '0.3.0-success-stderr']) {
+    for (const behaviour of [
+      '0.3.0-import-sentinel',
+      '0.3.0-probe-tamper',
+      '0.3.0-success-stderr',
+      '0.3.0-candidate-self-rewrite',
+      '0.3.0-api-phase-side-effect',
+      '0.3.0-cli-phase-side-effect',
+      '0.3.0-budget-phase-side-effect',
+    ]) {
       const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-import-contract-'))
       const fixtureRoot = resolve(temporaryRoot, 'repository')
       try {

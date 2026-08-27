@@ -9,7 +9,20 @@ import { assertCleanReleaseWorktree } from './worktree-clean.ts'
 test('rejects untracked output and permits only the exact ignored artifact pair at the retention phase', () => {
   const root = mkdtempSync(resolve(tmpdir(), 'encephalon-worktree-clean-'))
   try {
-    writeFileSync(resolve(root, '.gitignore'), '*.tgz\n*.tgz.metadata.json\n')
+    writeFileSync(
+      resolve(root, '.gitignore'),
+      [
+        '/node_modules/',
+        '/dist/',
+        '/.superpowers/',
+        '/.vscode/',
+        '*.tgz',
+        '*.tgz.metadata.json',
+        '/coverage/',
+        '/encephalon/_staging/',
+        '',
+      ].join('\n'),
+    )
     writeFileSync(resolve(root, 'tracked.txt'), 'tracked\n')
     const initialise = spawnSync('git', ['init', '--quiet'], { cwd: root, encoding: 'utf8' })
     assert.equal(initialise.status, 0, `${initialise.stdout}${initialise.stderr}`)
@@ -35,6 +48,17 @@ test('rejects untracked output and permits only the exact ignored artifact pair 
     assert.equal(commit.status, 0, `${commit.stdout}${commit.stderr}`)
     assert.doesNotThrow(() => assertCleanReleaseWorktree(root, false))
 
+    for (const path of [
+      'node_modules/package/index.js',
+      'dist/index.mjs',
+      '.superpowers/evidence.md',
+      '.vscode/settings.json',
+    ]) {
+      mkdirSync(resolve(root, path, '..'), { recursive: true })
+      writeFileSync(resolve(root, path), 'intentional ignored output\n')
+    }
+    assert.doesNotThrow(() => assertCleanReleaseWorktree(root, false))
+
     writeFileSync(resolve(root, 'untracked.txt'), 'unexpected\n')
     assert.throws(() => assertCleanReleaseWorktree(root, false), /tracked or untracked/u)
     rmSync(resolve(root, 'untracked.txt'))
@@ -48,6 +72,19 @@ test('rejects untracked output and permits only the exact ignored artifact pair 
 
     writeFileSync(resolve(artifacts, 'unexpected.txt'), 'unexpected\n')
     assert.throws(() => assertCleanReleaseWorktree(root, true), /tracked or untracked|unexpected/u)
+    rmSync(resolve(artifacts, 'unexpected.txt'))
+
+    for (const path of [
+      'rogue.tgz',
+      'rogue.tgz.metadata.json',
+      'coverage/report.json',
+      'encephalon/_staging/leftover',
+    ]) {
+      mkdirSync(resolve(root, path, '..'), { recursive: true })
+      writeFileSync(resolve(root, path), 'rogue ignored output\n')
+      assert.throws(() => assertCleanReleaseWorktree(root, true), /ignored output/u, path)
+      rmSync(resolve(root, path))
+    }
   } finally {
     rmSync(root, { force: true, recursive: true })
   }

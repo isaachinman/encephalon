@@ -15,6 +15,16 @@ const createPublishCheckFixture = () => {
   cpSync(resolve(root, 'scripts', 'check-publish.ts'), resolve(scriptsDirectory, 'check-publish.ts'))
   cpSync(resolve(root, 'scripts', 'npm-publish-conflict.ts'), resolve(scriptsDirectory, 'npm-publish-conflict.ts'))
   cpSync(resolve(root, 'scripts', 'package-tarball.ts'), resolve(scriptsDirectory, 'package-tarball.ts'))
+  writeFileSync(
+    resolve(scriptsDirectory, 'package-preflight.ts'),
+    `import { snapshotPackageTarball, verifyPackageArtifactMetadata } from './package-tarball.ts'
+export const preflightExactPackageArtifact = ({ snapshotDirectory, tarballPath }) => {
+  const metadata = verifyPackageArtifactMetadata(tarballPath)
+  const snapshot = snapshotPackageTarball(tarballPath, snapshotDirectory)
+  return { metadata, snapshot }
+}
+`,
+  )
   writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module"}\n')
   writeFileSync(resolve(temporaryRoot, 'candidate.tgz'), 'candidate tarball')
   writeFileSync(

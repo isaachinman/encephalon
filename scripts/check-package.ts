@@ -1,28 +1,20 @@
 import { spawnSync } from 'node:child_process'
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs'
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import { spawnNpmCommand } from './npm-command.ts'
 import { PACKAGE_DECLARATION_CONSUMER_SOURCE } from './package-declaration-consumer.ts'
+import { assertReviewedManifest, type PackageManifest, validateReviewedPackageSnapshot } from './package-preflight.ts'
 import {
   parsePackageCheckArguments,
-  readPackageTarEntries,
   retainPackageArtifact,
   snapshotPackageTarball,
   verifyPackageArtifactMetadata,
 } from './package-tarball.ts'
 import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
+import { RESULT_LIMIT_CASES, RESULT_LIMIT_OPERATIONS } from './release-contracts.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const options = parsePackageCheckArguments(process.argv.slice(2))
@@ -125,85 +117,6 @@ const collectFiles = (directory: string): string[] =>
     return entry.isDirectory() ? collectFiles(path) : [path]
   })
 
-const readmeReferences = (content: string) => {
-  const pattern = /(?:!?\[[^\]]*]\(([^)]+)\)|<img\b[^>]*\bsrc=["']([^"']+)["'])/gi
-  return [...content.matchAll(pattern)]
-    .map(match => match[1] ?? match[2] ?? '')
-    .map(reference => reference.trim())
-    .filter(
-      reference =>
-        reference.length > 0 &&
-        !reference.startsWith('#') &&
-        !reference.startsWith('/') &&
-        !/^[a-z][a-z0-9+.-]*:/i.test(reference),
-    )
-    .map(reference => {
-      const [path = ''] = reference.split(/[?#]/u, 1)
-      return path.startsWith('./') ? path.slice(2) : path
-    })
-}
-
-type PackageManifest = Readonly<{
-  name?: unknown
-  version?: unknown
-  license?: unknown
-  type?: unknown
-  engines?: unknown
-  bin?: unknown
-  exports?: unknown
-  files?: unknown
-  bundleDependencies?: unknown
-  bundledDependencies?: unknown
-  dependencies?: unknown
-  optionalDependencies?: unknown
-  peerDependencies?: unknown
-  peerDependenciesMeta?: unknown
-  scripts?: Record<string, unknown>
-}>
-
-const assertReviewedManifest = (packageJson: PackageManifest) => {
-  if (typeof packageJson.version !== 'string') {
-    throw new Error('Package version must be a string.')
-  }
-  if (
-    packageJson.name !== 'encephalon' ||
-    packageJson.license !== 'MIT' ||
-    packageJson.type !== 'module' ||
-    JSON.stringify(packageJson.engines) !== JSON.stringify({ node: '>=24.15.0' }) ||
-    JSON.stringify(packageJson.bin) !== JSON.stringify({ encephalon: 'dist/cli.mjs' }) ||
-    JSON.stringify(packageJson.exports) !==
-      JSON.stringify({
-        '.': { import: './dist/index.mjs', types: './dist/index.d.ts' },
-      }) ||
-    JSON.stringify(packageJson.files) !==
-      JSON.stringify([
-        'dist',
-        'skills',
-        'assets/encephalon.png',
-        'docs/performance.md',
-        'docs/performance-baseline.json',
-        'docs/performance-budgets.json',
-        'README.md',
-        'LICENSE',
-      ]) ||
-    packageJson.bundleDependencies !== undefined ||
-    packageJson.bundledDependencies !== undefined ||
-    packageJson.dependencies !== undefined ||
-    packageJson.optionalDependencies !== undefined ||
-    packageJson.peerDependencies !== undefined ||
-    packageJson.peerDependenciesMeta !== undefined
-  ) {
-    throw new Error('Package identity, exports, engine, files, or zero-runtime-dependency contract is invalid.')
-  }
-  const forbiddenLifecycleScripts = ['install', 'preinstall', 'postinstall', 'prepare']
-  if (forbiddenLifecycleScripts.some(name => packageJson.scripts?.[name] !== undefined)) {
-    throw new Error('The package contains a forbidden installation lifecycle script.')
-  }
-  return packageJson.version
-}
-
-const decodeUtf8 = (bytes: Buffer) => new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-
 try {
   const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as PackageManifest
   if (typeof packageJson.version !== 'string') {
@@ -213,23 +126,6 @@ try {
   assertPackageVersionSource(packageJson.version, generatedVersionSource)
   const packageVersion = assertReviewedManifest(packageJson)
 
-  const requiredFiles = [
-    'dist/cli.mjs',
-    'dist/index.mjs',
-    'dist/index.d.ts',
-    'skills/encephalon/SKILL.md',
-    'assets/encephalon.png',
-    'docs/performance.md',
-    'docs/performance-baseline.json',
-    'docs/performance-budgets.json',
-    'README.md',
-    'LICENSE',
-  ]
-  for (const path of requiredFiles) {
-    if (!existsSync(resolve(root, path))) {
-      throw new Error(`Required package file ${path} is missing.`)
-    }
-  }
   const cliPath = resolve(root, 'dist', 'cli.mjs')
   const lacksNodeShebang = !readFileSync(cliPath, 'utf8').startsWith('#!/usr/bin/env node\n')
   const lacksExecutableMode = process.platform !== 'win32' && (lstatSync(cliPath).mode & 0o111) === 0
@@ -250,11 +146,6 @@ try {
   if (/from\s+["'][^"']+\.ts["']/.test(declarations)) {
     throw new Error('The declarations contain unresolved TypeScript source imports.')
   }
-  const cliVersion = runClean([process.execPath, resolve(root, 'dist', 'cli.mjs'), '--version'])
-  if (cliVersion !== `${packageVersion}\n`) {
-    throw new Error('The built CLI reports a stale package version.')
-  }
-
   const createdTarball = options.suppliedTarball === undefined ? createNpmTarball() : undefined
   const sourceTarball = options.suppliedTarball ?? createdTarball?.path
   if (sourceTarball === undefined) {
@@ -279,74 +170,7 @@ try {
     throw new Error('The supplied package bytes changed after metadata verification.')
   }
   const tarball = snapshot.path
-  const entries = readPackageTarEntries(tarball)
-  const allowedFiles = new Set([
-    'LICENSE',
-    'README.md',
-    'assets/encephalon.png',
-    'docs/performance.md',
-    'docs/performance-baseline.json',
-    'docs/performance-budgets.json',
-    'package.json',
-  ])
-  const reviewedInputs = run(['git', 'ls-files', '--cached', '-z', '--'])
-    .split('\0')
-    .filter(path => path.length > 0)
-  const expectedPackagePaths = new Set([
-    ...reviewedInputs.filter(path => allowedFiles.has(path) || path.startsWith('skills/')),
-    ...reviewedInputs
-      .filter(path => path.startsWith('src/') && path.endsWith('.ts') && !path.endsWith('.d.ts'))
-      .map(path => `dist/${path.slice('src/'.length, -'.ts'.length)}.d.ts`),
-    'dist/cli.mjs',
-    'dist/index.mjs',
-  ])
-  const packedEntries = entries.map(entry => {
-    if (entry.path.startsWith('package/') && entry.path.length > 'package/'.length) {
-      return { ...entry, path: entry.path.slice('package/'.length) }
-    }
-    throw new Error('The tarball differs from the reviewed package file manifest.')
-  })
-  const packedPaths = new Set(packedEntries.map(entry => entry.path))
-  const differsFromReviewedManifest =
-    packedEntries.length !== packedPaths.size ||
-    packedEntries.some(entry => !expectedPackagePaths.has(entry.path)) ||
-    [...expectedPackagePaths].some(path => !packedPaths.has(path))
-  if (differsFromReviewedManifest) {
-    throw new Error('The tarball differs from the reviewed package file manifest.')
-  }
-  const packedManifest = packedEntries.find(entry => entry.path === 'package.json')
-  if (packedManifest === undefined) {
-    throw new Error('The packed package manifest is missing from the reviewed package contents.')
-  }
-  try {
-    const packedPackageJson = JSON.parse(decodeUtf8(packedManifest.content)) as PackageManifest
-    const packedVersion = assertReviewedManifest(packedPackageJson)
-    if (packedVersion !== packageVersion) {
-      throw new Error('The packed package version differs from the reviewed source version.')
-    }
-  } catch (error) {
-    throw new Error('The packed package manifest differs from the reviewed package manifest.', { cause: error })
-  }
-  const contentMismatch = packedEntries.find(entry => {
-    const expectedContent = readFileSync(resolve(root, entry.path))
-    const expectedMode = entry.path === 'dist/cli.mjs' ? 0o755 : 0o644
-    return entry.mode !== expectedMode || !entry.content.equals(expectedContent)
-  })
-  if (contentMismatch !== undefined) {
-    throw new Error(`The reviewed package bytes or mode differ for ${contentMismatch.path}.`)
-  }
-  const missingReadmeReferences = readmeReferences(readFileSync(resolve(root, 'README.md'), 'utf8')).filter(
-    path => !packedPaths.has(path),
-  )
-  if (missingReadmeReferences.length > 0) {
-    throw new Error(`The packed README references missing files: ${missingReadmeReferences.join(', ')}`)
-  }
-  const packedCli = packedEntries.find(entry => entry.path === 'dist/cli.mjs')
-  const lacksPackedExecutableMode =
-    process.platform !== 'win32' && (packedCli === undefined || (packedCli.mode & 0o111) === 0)
-  if (packedCli === undefined || lacksPackedExecutableMode) {
-    throw new Error('The packed CLI is missing or not executable.')
-  }
+  validateReviewedPackageSnapshot(root, snapshot)
 
   const consumer = resolve(temporaryDirectory, 'consumer')
   mkdirSync(resolve(consumer, '.git'), { recursive: true })
@@ -379,8 +203,9 @@ try {
     "try { api.prepare(input) } catch (error) { inputRejected = error instanceof api.EncephalonError && error.code === 'INVALID_ARGUMENT' }",
     "if (!inputRejected || getterCalls !== 0) throw new Error('The packed Node API input descriptor contract failed.')",
     'api.prepare({ root: apiRoot })',
-    "const resultCases = [{ name: 'list', budget: 'fullResultLimit', invoke: limit => api.listRecords({ root: apiRoot, limit }) }, { name: 'search', budget: 'fullResultLimit', invoke: limit => api.searchRecords({ root: apiRoot, query: 'x', limit }) }, { name: 'searchCompact', budget: 'compactResultLimit', invoke: limit => api.searchCompactRecords({ root: apiRoot, query: 'x', limit }) }, { name: 'gather', budget: 'compactResultLimit', invoke: limit => api.gatherRecords({ root: apiRoot, limit }) }]",
-    'const acceptedLimits = [50, 100, 101, 999, 1000]',
+    "const resultOperations = { list: limit => api.listRecords({ root: apiRoot, limit }), search: limit => api.searchRecords({ root: apiRoot, query: 'x', limit }), searchCompact: limit => api.searchCompactRecords({ root: apiRoot, query: 'x', limit }), gather: limit => api.gatherRecords({ root: apiRoot, limit }) }",
+    `const resultCases = ${JSON.stringify(RESULT_LIMIT_OPERATIONS)}.map(operation => ({ ...operation, invoke: resultOperations[operation.name] }))`,
+    `const acceptedLimits = ${JSON.stringify(RESULT_LIMIT_CASES.filter(limit => limit <= 1000))}`,
     "for (const resultCase of resultCases) { for (const limit of acceptedLimits) { const result = resultCase.invoke(limit); if (resultCase.name === 'gather' ? !Array.isArray(result.records) : !Array.isArray(result)) throw new Error('The packed API ' + resultCase.name + ' result-limit ' + limit + ' contract failed.') } let exactRejection = false; try { resultCase.invoke(1001) } catch (error) { exactRejection = error instanceof api.EncephalonError && error.code === 'INVALID_ARGUMENT' && error.message === 'limit must be an integer between 1 and 1000.' && JSON.stringify(error.details) === JSON.stringify({ budget: resultCase.budget, field: 'limit', maximum: 1000 }) } if (!exactRejection) throw new Error('The packed API ' + resultCase.name + ' result-limit 1001 contract failed.') }",
   ].join('\n')
   runClean([process.execPath, '--input-type=module', '--eval', packedApiContract], packedApiRoot)
@@ -461,28 +286,23 @@ try {
     }
   }
 
-  const packedResultLimitCases = [
-    {
-      accepted: (limit: number) => ['list', '--root', consumer, `--limit=${limit}`],
-      budget: 'fullResultLimit',
-      rejected: ['list', '--root', consumer, '--limit=1001'],
-    },
-    {
-      accepted: (limit: number) => ['search', '--root', consumer, `--limit=${limit}`, 'x'],
-      budget: 'fullResultLimit',
-      rejected: ['search', '--root', consumer, '--limit=1001', 'x'],
-    },
-    {
-      accepted: (limit: number) => ['search', '--root', consumer, '--compact', `--limit=${limit}`, 'x'],
-      budget: 'compactResultLimit',
-      rejected: ['search', '--root', consumer, '--compact', '--limit=1001', 'x'],
-    },
-    {
-      accepted: (limit: number) => ['gather', '--root', consumer, `--limit=${limit}`],
-      budget: 'compactResultLimit',
-      rejected: ['gather', '--root', consumer, '--limit=1001'],
-    },
-  ] as const
+  const packedCliLimitArguments = Object.freeze({
+    gather: (limit: number) => ['gather', '--root', consumer, `--limit=${limit}`],
+    list: (limit: number) => ['list', '--root', consumer, `--limit=${limit}`],
+    search: (limit: number) => ['search', '--root', consumer, `--limit=${limit}`, 'x'],
+    searchCompact: (limit: number) => ['search', '--root', consumer, '--compact', `--limit=${limit}`, 'x'],
+  })
+  const rejectedResultLimit = RESULT_LIMIT_CASES.find(limit => limit > 1000)
+  if (rejectedResultLimit === undefined) {
+    throw new Error('The release result-limit matrix lacks its rejected boundary.')
+  }
+  const packedResultLimitCases = RESULT_LIMIT_OPERATIONS.map(operation =>
+    Object.freeze({
+      accepted: packedCliLimitArguments[operation.name],
+      budget: operation.budget,
+      rejected: packedCliLimitArguments[operation.name](rejectedResultLimit),
+    }),
+  )
 
   for (const limitCase of packedResultLimitCases) {
     assertPackedBudgetFailure([...limitCase.rejected], {
@@ -500,7 +320,7 @@ try {
   if (!Array.isArray(initialised.recordsCreated) || initialised.recordsCreated.length !== 3) {
     throw new Error('The packed Node-only CLI init command returned an unexpected result.')
   }
-  const acceptedResultLimits = [50, 100, 101, 999, 1000] as const
+  const acceptedResultLimits = RESULT_LIMIT_CASES.filter(limit => limit <= 1000)
   const acceptedLimitResults = packedResultLimitCases.flatMap(limitCase =>
     acceptedResultLimits.map(limit => cliJson(limitCase.accepted(limit))),
   )

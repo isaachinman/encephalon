@@ -249,8 +249,9 @@ jobs:
   )
   assert.match(
     candidateJob,
-    /bun run build[\s\S]+node \.\/scripts\/check-package-metadata\.ts[\s\S]+node \.\/scripts\/check-package\.ts --tarball/u,
+    /bun run build\n\s+- run: node \.\/scripts\/check-worktree-clean\.ts[\s\S]+node \.\/scripts\/check-package-metadata\.ts[\s\S]+node \.\/scripts\/check-package\.ts --tarball/u,
   )
+  assert.equal(candidateJob.match(/node \.\/scripts\/check-worktree-clean\.ts/g)?.length, 1)
   assert.doesNotMatch(candidateJob, /tar --extract|--retain-tarball|npm pack|npm install/u)
 
   assert.match(
@@ -267,8 +268,9 @@ jobs:
   )
   assert.match(
     releaseJob,
-    /bun run build[\s\S]+node \.\/scripts\/check-package-metadata\.ts[\s\S]+node \.\/scripts\/check-package\.ts --tarball/u,
+    /bun run build\n\s+- run: node \.\/scripts\/check-worktree-clean\.ts[\s\S]+node \.\/scripts\/check-package-metadata\.ts[\s\S]+node \.\/scripts\/check-package\.ts --tarball/u,
   )
+  assert.equal(releaseJob.match(/node \.\/scripts\/check-worktree-clean\.ts/g)?.length, 1)
   assert.equal(releaseJob.match(/node \.\/scripts\/check-release-compatibility\.ts/g)?.length, 1)
   assert.equal(releaseJob.match(/node \.\/scripts\/check-publish\.ts/g)?.length, 1)
   assert.doesNotMatch(releaseJob, /tar --extract|--retain-tarball|npm pack|npm install/u)
@@ -279,6 +281,7 @@ jobs:
   assert.equal(workflow.match(/actions\/download-artifact/g)?.length, 2)
   assert.equal(workflow.match(/node \.\/scripts\/check-generated-version\.ts/g)?.length, 4)
   assert.equal(workflow.match(/node \.\/scripts\/check-package-metadata\.ts/g)?.length, 3)
+  assert.equal(workflow.match(/node \.\/scripts\/check-worktree-clean\.ts/g)?.length, 6)
   assert.equal(workflow.match(/actions\/checkout/g)?.length, 4)
   assert.equal(workflow.match(/persist-credentials: false/g)?.length, 4)
   assert.doesNotMatch(workflow, /^ {4}permissions:/m)

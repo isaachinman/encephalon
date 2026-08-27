@@ -5,7 +5,6 @@ import {
   constants,
   fstatSync,
   fsyncSync,
-  linkSync,
   lstatSync,
   mkdirSync,
   opendirSync,
@@ -13,11 +12,12 @@ import {
   readSync,
   realpathSync,
   renameSync,
-  rmSync,
+  rmdirSync,
   statSync,
+  unlinkSync,
   writeSync,
 } from 'node:fs'
-import { dirname, isAbsolute, parse, posix, relative, resolve, sep, win32 } from 'node:path'
+import { basename, dirname, isAbsolute, parse, posix, relative, resolve, sep, win32 } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gunzipSync } from 'node:zlib'
 
@@ -265,15 +265,6 @@ const sameStableFile = (left: BigIntStats, right: BigIntStats) =>
   left.size === right.size &&
   left.mtimeNs === right.mtimeNs &&
   left.ctimeNs === right.ctimeNs &&
-  left.birthtimeNs === right.birthtimeNs
-
-const sameQuarantinedFile = (left: BigIntStats, right: BigIntStats) =>
-  left.dev === right.dev &&
-  left.ino === right.ino &&
-  left.mode === right.mode &&
-  left.nlink === right.nlink &&
-  left.size === right.size &&
-  left.mtimeNs === right.mtimeNs &&
   left.birthtimeNs === right.birthtimeNs
 
 const readFixedMaximumPlusOne = (descriptor: number, expectedBytes: number, maximumBytes: number) => {
@@ -597,13 +588,19 @@ const fileIdentity = (path: string) => {
   throw new Error('Retained package entries must be regular files with one hard link.')
 }
 
-const removeIfIdentityMatches = (path: string, identity: BigIntStats | undefined) => {
-  if (identity !== undefined) {
-    const current = lstatSync(path, { bigint: true, throwIfNoEntry: false })
-    if (current !== undefined && current.dev === identity.dev && current.ino === identity.ino) {
-      rmSync(path, { force: true })
-    }
+const sameEntryIdentity = (left: BigIntStats, right: BigIntStats) =>
+  left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.nlink === right.nlink
+
+const sameDirectoryIdentity = (left: BigIntStats, right: BigIntStats) =>
+  left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
+
+const removeFileIfIdentityMatches = (path: string, identity: BigIntStats | undefined) => {
+  const current = lstatSync(path, { bigint: true, throwIfNoEntry: false })
+  if (identity !== undefined && current !== undefined && sameEntryIdentity(identity, current) && current.isFile()) {
+    unlinkSync(path)
+    return true
   }
+  return current === undefined
 }
 
 export const retainPackageArtifact = (
@@ -625,15 +622,13 @@ export const retainPackageArtifact = (
   ) {
     throw new Error('Retained package artifact identity is invalid.')
   }
-  mkdirSync(retainedDirectory, { mode: 0o700, recursive: true })
+  if (lstatSync(retainedDirectory, { throwIfNoEntry: false }) !== undefined) {
+    throw new Error('The retained package artifact directory must be absent before retention.')
+  }
   const destination = resolve(retainedDirectory, filename)
   const metadataDestination = packageArtifactMetadataPath(destination)
   const expectedEntries = new Set([filename, `${filename}.metadata.json`])
-  const entries = readBoundedDirectoryNames(retainedDirectory, expectedEntries.size)
-  if (entries.length > expectedEntries.size || entries.some(entry => !expectedEntries.has(entry))) {
-    throw new Error('Retained package directory contains unexpected entries.')
-  }
-  const directoryAncestors = captureAncestorChain(resolve(retainedDirectory, '.artifact-install'))
+  const directoryAncestors = captureAncestorChain(retainedDirectory)
   assertRepositoryDestinationChain(directoryAncestors)
   const snapshotBytes = readVerifiedRegularFile(snapshot.path, maximumTarballBytes)
   const snapshotDigests = packageDigests(snapshotBytes)
@@ -647,38 +642,26 @@ export const retainPackageArtifact = (
     repositoryRelativePath(destination),
   )
   const nonce = randomUUID()
-  const privateTarball = resolve(retainedDirectory, `.${filename}.${nonce}.private`)
-  const privateMetadata = resolve(retainedDirectory, `.${filename}.${nonce}.metadata.private`)
-  const staleTarball = resolve(retainedDirectory, `.${filename}.${nonce}.stale`)
-  const staleMetadata = resolve(retainedDirectory, `.${filename}.${nonce}.metadata.stale`)
-  writePrivateFile(privateTarball, snapshotBytes)
-  writePrivateFile(privateMetadata, Buffer.from(serialiseMetadata(metadata), 'utf8'))
-  const privateTarballIdentity = fileIdentity(privateTarball)
-  const privateMetadataIdentity = fileIdentity(privateMetadata)
-  const originalTarballIdentity = lstatSync(destination, { bigint: true, throwIfNoEntry: false })
-  const originalMetadataIdentity = lstatSync(metadataDestination, { bigint: true, throwIfNoEntry: false })
-  if (originalTarballIdentity !== undefined) {
-    fileIdentity(destination)
-  }
-  if (originalMetadataIdentity !== undefined) {
-    fileIdentity(metadataDestination)
-  }
-  let tarballInstalled = false
-  let metadataInstalled = false
-  let tarballQuarantined = false
-  let metadataQuarantined = false
+  const privateDirectory = resolve(dirname(retainedDirectory), `.${basename(retainedDirectory)}.${nonce}.private`)
+  const privateTarball = resolve(privateDirectory, filename)
+  const privateMetadata = resolve(privateDirectory, `${filename}.metadata.json`)
+  let privateDirectoryIdentity: BigIntStats | undefined
+  let privateTarballIdentity: BigIntStats | undefined
+  let privateMetadataIdentity: BigIntStats | undefined
+  let installed = false
 
   const rollback = () => {
-    if (sameAncestorChain(directoryAncestors)) {
-      removeIfIdentityMatches(destination, tarballInstalled ? privateTarballIdentity : undefined)
-      removeIfIdentityMatches(metadataDestination, metadataInstalled ? privateMetadataIdentity : undefined)
-      removeIfIdentityMatches(privateTarball, privateTarballIdentity)
-      removeIfIdentityMatches(privateMetadata, privateMetadataIdentity)
-      if (tarballQuarantined && lstatSync(destination, { throwIfNoEntry: false }) === undefined) {
-        renameSync(staleTarball, destination)
-      }
-      if (metadataQuarantined && lstatSync(metadataDestination, { throwIfNoEntry: false }) === undefined) {
-        renameSync(staleMetadata, metadataDestination)
+    if (!installed && sameAncestorChain(directoryAncestors) && privateDirectoryIdentity !== undefined) {
+      const currentDirectory = lstatSync(privateDirectory, { bigint: true, throwIfNoEntry: false })
+      if (
+        currentDirectory?.isDirectory() &&
+        !currentDirectory.isSymbolicLink() &&
+        sameDirectoryIdentity(privateDirectoryIdentity, currentDirectory) &&
+        removeFileIfIdentityMatches(privateTarball, privateTarballIdentity) &&
+        removeFileIfIdentityMatches(privateMetadata, privateMetadataIdentity) &&
+        readBoundedDirectoryNames(privateDirectory, 0).length === 0
+      ) {
+        rmdirSync(privateDirectory)
       }
     }
   }
@@ -700,33 +683,65 @@ export const retainPackageArtifact = (
     process.on(signal, handler)
   })
   try {
+    mkdirSync(privateDirectory, { mode: 0o700 })
+    const createdPrivateDirectory = lstatSync(privateDirectory, { bigint: true })
+    if (
+      !createdPrivateDirectory.isDirectory() ||
+      createdPrivateDirectory.isSymbolicLink() ||
+      realpathSync.native(privateDirectory) !== privateDirectory
+    ) {
+      throw new Error('The private package artifact directory is not one canonical directory.')
+    }
+    privateDirectoryIdentity = createdPrivateDirectory
+    writePrivateFile(privateTarball, snapshotBytes)
+    privateTarballIdentity = fileIdentity(privateTarball)
+    writePrivateFile(privateMetadata, Buffer.from(serialiseMetadata(metadata), 'utf8'))
+    privateMetadataIdentity = fileIdentity(privateMetadata)
+    privateDirectoryIdentity = lstatSync(privateDirectory, { bigint: true })
+    const privateEntries = readBoundedDirectoryNames(privateDirectory, expectedEntries.size)
+    if (privateEntries.length !== expectedEntries.size || privateEntries.some(entry => !expectedEntries.has(entry))) {
+      throw new Error('The private package artifact directory contains unexpected entries.')
+    }
+    const privateVerifiedMetadata = verifyPackageArtifactMetadata(privateTarball, {
+      packageVersion,
+      sourceCommit,
+      tarball: metadata.tarball,
+    })
+    if (!sameDigests(privateVerifiedMetadata, snapshotDigests)) {
+      throw new Error('The private package artifact differs from the reviewed snapshot.')
+    }
     hooks.beforeInstall?.()
     assertAncestorChain(directoryAncestors, 'Retained package destination')
     assertRepositoryDestinationChain(directoryAncestors)
-    if (originalTarballIdentity !== undefined) {
-      renameSync(destination, staleTarball)
-      if (!sameQuarantinedFile(originalTarballIdentity, lstatSync(staleTarball, { bigint: true }))) {
-        throw new Error('Retained package tarball changed before quarantine.')
-      }
-      tarballQuarantined = true
+    if (lstatSync(retainedDirectory, { throwIfNoEntry: false }) !== undefined) {
+      throw new Error('The retained package destination came into existence before its atomic directory rename.')
     }
-    if (originalMetadataIdentity !== undefined) {
-      renameSync(metadataDestination, staleMetadata)
-      if (!sameQuarantinedFile(originalMetadataIdentity, lstatSync(staleMetadata, { bigint: true }))) {
-        throw new Error('Retained package metadata changed before quarantine.')
-      }
-      metadataQuarantined = true
-    }
+    renameSync(privateDirectory, retainedDirectory)
+    installed = true
     assertAncestorChain(directoryAncestors, 'Retained package destination')
     assertRepositoryDestinationChain(directoryAncestors)
-    linkSync(privateMetadata, metadataDestination)
-    rmSync(privateMetadata)
-    metadataInstalled = true
-    linkSync(privateTarball, destination)
-    rmSync(privateTarball)
-    tarballInstalled = true
-    assertAncestorChain(directoryAncestors, 'Retained package destination')
-    assertRepositoryDestinationChain(directoryAncestors)
+    const retainedDirectoryIdentity = lstatSync(retainedDirectory, { bigint: true, throwIfNoEntry: false })
+    const retainedTarballIdentity = lstatSync(destination, { bigint: true, throwIfNoEntry: false })
+    const retainedMetadataIdentity = lstatSync(metadataDestination, { bigint: true, throwIfNoEntry: false })
+    const retainedEntries = readBoundedDirectoryNames(retainedDirectory, expectedEntries.size)
+    if (
+      retainedDirectoryIdentity === undefined ||
+      !retainedDirectoryIdentity.isDirectory() ||
+      retainedDirectoryIdentity.isSymbolicLink() ||
+      privateDirectoryIdentity === undefined ||
+      !sameEntryIdentity(privateDirectoryIdentity, retainedDirectoryIdentity) ||
+      retainedTarballIdentity === undefined ||
+      privateTarballIdentity === undefined ||
+      !sameStableFile(privateTarballIdentity, retainedTarballIdentity) ||
+      retainedMetadataIdentity === undefined ||
+      privateMetadataIdentity === undefined ||
+      !sameStableFile(privateMetadataIdentity, retainedMetadataIdentity) ||
+      retainedEntries.length !== expectedEntries.size ||
+      retainedEntries.some(entry => !expectedEntries.has(entry)) ||
+      realpathSync.native(retainedDirectory) !== retainedDirectory
+    ) {
+      throw new Error('The retained package directory or file identities changed during installation.')
+    }
     const retainedMetadata = verifyPackageArtifactMetadata(destination, {
       packageVersion,
       sourceCommit,
@@ -734,14 +749,6 @@ export const retainPackageArtifact = (
     })
     if (!sameDigests(retainedMetadata, snapshotDigests)) {
       throw new Error('Retained package artifact differs from the reviewed snapshot.')
-    }
-    if (tarballQuarantined) {
-      rmSync(staleTarball)
-      tarballQuarantined = false
-    }
-    if (metadataQuarantined) {
-      rmSync(staleMetadata)
-      metadataQuarantined = false
     }
     return Object.freeze({ metadata: retainedMetadata, metadataPath: metadataDestination, path: destination })
   } catch (error) {

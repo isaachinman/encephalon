@@ -132,8 +132,10 @@ const packageFixturePaths = [
   'scripts/check-package.ts',
   'scripts/package-declaration-consumer.ts',
   'scripts/npm-command.ts',
+  'scripts/package-preflight.ts',
   'scripts/package-tarball.ts',
   'scripts/package-version.ts',
+  'scripts/release-contracts.ts',
   'src',
   'dist',
   'skills/encephalon/SKILL.md',
@@ -192,6 +194,16 @@ const createPublishCheckFixture = () => {
   cpSync(resolve(root, 'scripts', 'check-publish.ts'), resolve(scriptsDirectory, 'check-publish.ts'))
   cpSync(resolve(root, 'scripts', 'npm-publish-conflict.ts'), resolve(scriptsDirectory, 'npm-publish-conflict.ts'))
   cpSync(resolve(root, 'scripts', 'package-tarball.ts'), resolve(scriptsDirectory, 'package-tarball.ts'))
+  writeFileSync(
+    resolve(scriptsDirectory, 'package-preflight.ts'),
+    `import { snapshotPackageTarball, verifyPackageArtifactMetadata } from './package-tarball.ts'
+export const preflightExactPackageArtifact = ({ snapshotDirectory, tarballPath }) => {
+  const metadata = verifyPackageArtifactMetadata(tarballPath)
+  const snapshot = snapshotPackageTarball(tarballPath, snapshotDirectory)
+  return { metadata, snapshot }
+}
+`,
+  )
   writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module"}\n')
   writeFileSync(tarball, 'candidate tarball')
   writeFileSync(
@@ -632,6 +644,7 @@ describe('package contract', () => {
     const artifactDirectory = resolve(root, artifactDirectoryName)
     const referenceDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-reference-'))
     try {
+      mkdirSync(artifactParent)
       const result = spawnSync(
         process.execPath,
         ['./scripts/check-package.ts', '--retain-tarball', artifactDirectoryName],
@@ -748,6 +761,45 @@ export const spawnNpmCommand = (arguments_, options) => {
     }
   })
 
+  test('rejects a mismatched supplied archive before executing the repository CLI', { timeout: 75_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-source-cli-')
+    const packageDirectory = resolve(fixtureRoot, 'package-artifacts')
+    const sentinel = resolve(temporaryRoot, 'source-cli-executed')
+    try {
+      mkdirSync(packageDirectory)
+      const packed = spawnNpmCommand(
+        ['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', packageDirectory],
+        { cwd: fixtureRoot },
+      )
+      assert.equal(packed.status, 0, `${packed.stdout}${packed.stderr}`)
+      const [pack] = JSON.parse(packed.stdout ?? '') as Array<{ filename?: unknown }>
+      const suppliedTarball = resolve(packageDirectory, String(pack?.filename))
+      writeArtifactMetadata(suppliedTarball, fixtureRoot)
+
+      const cliPath = resolve(fixtureRoot, 'dist', 'cli.mjs')
+      const cliSource = readFileSync(cliPath, 'utf8')
+      assert.equal(cliSource.startsWith('#!/usr/bin/env node\n'), true)
+      writeFileSync(
+        cliPath,
+        cliSource.replace(
+          '#!/usr/bin/env node\n',
+          `#!/usr/bin/env node\nif (process.argv.includes('--version')) (await import('node:fs')).writeFileSync(${JSON.stringify(sentinel)}, 'executed')\n`,
+        ),
+      )
+
+      const result = spawnSync(
+        process.execPath,
+        ['./scripts/check-package.ts', '--tarball', `package-artifacts/${String(pack?.filename)}`],
+        { cwd: fixtureRoot, encoding: 'utf8', timeout: 60_000 },
+      )
+      assert.notEqual(result.status, 0)
+      assert.equal(existsSync(sentinel), false, `${result.stdout}${result.stderr}`)
+      assert.match(result.stderr, /reviewed package bytes|differ/iu)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
   test('rejects byte-modified and wrong-version supplied package tarballs', { timeout: 120_000 }, () => {
     const artifactParentName = join('test', `.package-invalid-test-${randomUUID()}`)
     const artifactParent = resolve(root, artifactParentName)
@@ -849,22 +901,20 @@ export const spawnNpmCommand = (arguments_, options) => {
     }
   })
 
-  test('exercises every accepted packed API and CLI result-limit boundary', { timeout: 120_000 }, () => {
-    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-limit-matrix-')
+  test('the packed API independently exercises every result-limit boundary', { timeout: 120_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-api-limit-matrix-')
     try {
-      for (const file of ['dist/index.mjs', 'dist/cli.mjs']) {
-        const path = resolve(fixtureRoot, file)
-        const source = readFileSync(path, 'utf8')
-        const marker = 'const limit = value === undefined ? budget.default : value;'
-        assert.equal(source.includes(marker), true, file)
-        writeFileSync(
-          path,
-          source.replace(
-            marker,
-            `${marker}\n  if (limit === 101) return failBudget(budgetKey, 'candidate-only boundary drift');`,
-          ),
-        )
-      }
+      const path = resolve(fixtureRoot, 'dist', 'index.mjs')
+      const source = readFileSync(path, 'utf8')
+      const marker = 'const limit = value === undefined ? budget.default : value;'
+      assert.equal(source.includes(marker), true)
+      writeFileSync(
+        path,
+        source.replace(
+          marker,
+          `${marker}\n  if (limit === 101) return failBudget(budgetKey, 'candidate-only API boundary drift');`,
+        ),
+      )
 
       const result = spawnSync(process.execPath, ['./scripts/check-package.ts'], {
         cwd: fixtureRoot,
@@ -873,7 +923,35 @@ export const spawnNpmCommand = (arguments_, options) => {
       })
       assert.notEqual(result.status, 0)
       assert.equal(result.stdout, '')
-      assert.match(result.stderr, /packed.*(?:API|CLI).*result-limit|failed with exit code/u)
+      assert.match(result.stderr, /packed API.*result-limit|failed with exit code/u)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('the packed CLI independently exercises every result-limit boundary', { timeout: 120_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-cli-limit-matrix-')
+    try {
+      const path = resolve(fixtureRoot, 'dist', 'cli.mjs')
+      const source = readFileSync(path, 'utf8')
+      const marker = 'const limit = value === undefined ? budget.default : value;'
+      assert.equal(source.includes(marker), true)
+      writeFileSync(
+        path,
+        source.replace(
+          marker,
+          `${marker}\n  if (limit === 101) return failBudget(budgetKey, 'candidate-only CLI boundary drift');`,
+        ),
+      )
+
+      const result = spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+        cwd: fixtureRoot,
+        encoding: 'utf8',
+        timeout: 90_000,
+      })
+      assert.notEqual(result.status, 0)
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /packed.*CLI.*result-limit|failed with exit code/u)
     } finally {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
@@ -898,6 +976,38 @@ export const spawnNpmCommand = (arguments_, options) => {
     } finally {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
+  })
+
+  test('declaration consumers independently omit public optional root and record fields', { timeout: 180_000 }, () => {
+    const mutations = [
+      ['root?: string;', 'root: string;'],
+      ['confidence?: number;', 'confidence: number;'],
+    ] as const
+    const results = mutations.map(([from, to], index) => {
+      const fixture = createPackageCheckFixture(`encephalon-package-optional-declaration-${index}-`)
+      try {
+        const declarations = resolve(fixture.fixtureRoot, 'dist', 'types.d.ts')
+        const source = readFileSync(declarations, 'utf8')
+        assert.equal(source.includes(from), true)
+        writeFileSync(declarations, source.replace(from, to))
+        return spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+          cwd: fixture.fixtureRoot,
+          encoding: 'utf8',
+          timeout: 90_000,
+        })
+      } finally {
+        rmSync(fixture.temporaryRoot, { force: true, recursive: true })
+      }
+    })
+
+    assert.deepEqual(
+      results.map(result => result.status === 0),
+      [false, false],
+    )
+    assert.equal(
+      results.every(result => /typescript|tsc|failed with exit code/iu.test(result.stderr)),
+      true,
+    )
   })
 
   test('publishes only an immutable private snapshot of the supplied repository-relative tarball', () => {

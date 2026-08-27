@@ -216,8 +216,8 @@ Without `root`, Encephalon walks upward to the nearest valid Git repository mark
 ## Development
 
 ```bash
-bun install --frozen-lockfile
-bun run check:generated
+node ./scripts/check-generated-version.ts
+bun install --frozen-lockfile --ignore-scripts
 bun run typecheck
 bun run test
 bun run build
@@ -226,6 +226,8 @@ node ./scripts/check-package-metadata.ts
 node ./scripts/check-release-compatibility.ts package-artifacts/encephalon-0.3.0.tgz
 node ./scripts/check-publish.ts package-artifacts/encephalon-0.3.0.tgz
 ```
+
+Exact retention requires `package-artifacts` to be absent. Before regenerating, move any previous disposable artifact directory to a private backup; the package gate then installs the complete tarball-and-sidecar directory as one transaction and never merges with or replaces an existing directory.
 
 Performance benchmarks are separate from correctness tests:
 
@@ -240,7 +242,7 @@ The full profile runs every operation in fresh child processes with two discarde
 
 `bun run check:generated` is contributor convenience for trusted local checkouts. Its target generated-version checker is non-mutating, but package lifecycle hooks and Bun preloads mean the alias is not an authority for untrusted changes. Every source-building CI job runs the exact direct command `node ./scripts/check-generated-version.ts` immediately after Node setup and before Bun setup or installation so those hooks and preloads cannot repair stale or missing committed source before validation. `check:package` rejects packed paths outside reviewed tracked package inputs and the expected generated distribution, installs the tarball with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything. The `bun run check:package` and `bun run check:publish` contributor commands launch those Node scripts, while CI invokes those scripts directly so package lifecycle hooks and Bun preloads cannot interpose.
 
-CI runs four verification lanes: Node 24.15.0 on Ubuntu, macOS, and Windows, plus Node 26 on Ubuntu. After all four succeed, one package job gates the clean source tree around the test suite and explicit build, then checks and retains `package-artifacts/encephalon-0.3.0.tgz` together with its deterministic metadata sidecar. The sidecar records the exact byte size, SHA-1, SHA-256, SHA-512, npm integrity, package version, source commit, and fixed repository-relative tarball path. CI recomputes that authority before uploading both files as `encephalon-npm-package` on pull requests and trusted pushes to `main`.
+CI runs four verification lanes: Node 24.15.0 on Ubuntu, macOS, and Windows, plus Node 26 on Ubuntu. After all four succeed, one package job gates the clean source tree around the test suite and explicit build, requires the artifact directory to be absent, then checks and retains `package-artifacts/encephalon-0.3.0.tgz` together with its deterministic metadata sidecar. The sidecar records the exact byte size, SHA-1, SHA-256, SHA-512, npm integrity, package version, source commit, and fixed repository-relative tarball path. CI recomputes that authority before uploading both files as `encephalon-npm-package` on pull requests and trusted pushes to `main`.
 
 Node 24.15.0 and Node 26 candidate jobs build the reviewed checkout, download those same artifact bytes, verify the metadata sidecar, and invoke `check-package.ts --tarball` against the fixed repository-relative tarball path without extracting or repacking it. The final release-equivalent package gate repeats those checks, runs the compatibility oracle once with that exact path, and passes the same path to the tarball-only publish dry run. The published npm oracle requires network access, but no job receives repository, provider, or npm credentials and no job publishes.
 

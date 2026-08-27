@@ -4,6 +4,7 @@ import {
   appendFileSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -209,13 +210,14 @@ describe('package tarball authority', () => {
     }
   })
 
-  test('rejects destination-ancestor replacement before retained artifact installation', () => {
+  test('rejects destination-ancestor replacement after the race hook recreates the destination path', () => {
     const fixtureDirectory = mkdtempSync(resolve(root, 'scripts', '.package-retention-race-'))
     const source = resolve(fixtureDirectory, 'candidate.tgz')
     const snapshotDirectory = resolve(fixtureDirectory, 'snapshot')
     const retainedParent = resolve(fixtureDirectory, 'retained-parent')
     const retainedDirectory = resolve(retainedParent, 'package-artifacts')
     const movedParent = resolve(fixtureDirectory, 'retained-parent-moved')
+    let hookReached = false
     const { retainPackageArtifact } = packageTarballAuthority as typeof packageTarballAuthority & {
       retainPackageArtifact?: (
         snapshot: ReturnType<typeof snapshotPackageTarball>,
@@ -230,7 +232,7 @@ describe('package tarball authority', () => {
     }
     try {
       mkdirSync(snapshotDirectory)
-      mkdirSync(retainedDirectory, { recursive: true })
+      mkdirSync(retainedParent)
       writeFileSync(source, 'candidate bytes')
       const snapshot = snapshotPackageTarball(source, snapshotDirectory)
 
@@ -247,6 +249,7 @@ describe('package tarball authority', () => {
             },
             {
               beforeInstall: () => {
+                hookReached = true
                 renameSync(retainedParent, movedParent)
                 mkdirSync(retainedDirectory, { recursive: true })
               },
@@ -254,13 +257,15 @@ describe('package tarball authority', () => {
           ),
         /destination|directory changed/u,
       )
+      assert.equal(hookReached, true)
       assert.equal(existsSync(resolve(retainedDirectory, 'encephalon-0.3.0.tgz')), false)
+      assert.equal(existsSync(resolve(movedParent, 'package-artifacts', 'encephalon-0.3.0.tgz')), false)
     } finally {
       rmSync(fixtureDirectory, { force: true, recursive: true })
     }
   })
 
-  test('replaces a stale exact artifact only through the verified retention flow', () => {
+  test('requires the complete retained artifact directory to be absent and preserves its predecessor', () => {
     const fixtureDirectory = mkdtempSync(resolve(root, 'scripts', '.package-retention-replace-'))
     const retainedDirectory = resolve(fixtureDirectory, 'package-artifacts')
     const firstSnapshotDirectory = resolve(fixtureDirectory, 'first-snapshot')
@@ -268,34 +273,84 @@ describe('package tarball authority', () => {
     const firstSource = resolve(fixtureDirectory, 'first.tgz')
     const secondSource = resolve(fixtureDirectory, 'second.tgz')
     try {
-      mkdirSync(retainedDirectory)
       mkdirSync(firstSnapshotDirectory)
       mkdirSync(secondSnapshotDirectory)
       writeFileSync(firstSource, 'stale candidate bytes')
       writeFileSync(secondSource, 'reviewed candidate bytes')
-      packageTarballAuthority.retainPackageArtifact(snapshotPackageTarball(firstSource, firstSnapshotDirectory), {
-        filename: 'encephalon-0.3.0.tgz',
-        packageVersion: '0.3.0',
-        retainedDirectory,
-        sourceCommit: 'a'.repeat(40),
-      })
-
-      const retained = packageTarballAuthority.retainPackageArtifact(
-        snapshotPackageTarball(secondSource, secondSnapshotDirectory),
+      const predecessor = packageTarballAuthority.retainPackageArtifact(
+        snapshotPackageTarball(firstSource, firstSnapshotDirectory),
         {
           filename: 'encephalon-0.3.0.tgz',
           packageVersion: '0.3.0',
           retainedDirectory,
-          sourceCommit: 'b'.repeat(40),
+          sourceCommit: 'a'.repeat(40),
         },
       )
+      const predecessorDirectory = lstatSync(retainedDirectory, { bigint: true })
+      const predecessorTarball = lstatSync(predecessor.path, { bigint: true })
+      const predecessorMetadata = lstatSync(predecessor.metadataPath, { bigint: true })
 
-      assert.equal(readFileSync(retained.path, 'utf8'), 'reviewed candidate bytes')
-      assert.equal(retained.metadata.sourceCommit, 'b'.repeat(40))
+      assert.throws(
+        () =>
+          packageTarballAuthority.retainPackageArtifact(snapshotPackageTarball(secondSource, secondSnapshotDirectory), {
+            filename: 'encephalon-0.3.0.tgz',
+            packageVersion: '0.3.0',
+            retainedDirectory,
+            sourceCommit: 'b'.repeat(40),
+          }),
+        /must be absent/u,
+      )
+
+      assert.equal(readFileSync(predecessor.path, 'utf8'), 'stale candidate bytes')
+      assert.equal(lstatSync(retainedDirectory, { bigint: true }).ino, predecessorDirectory.ino)
+      assert.equal(lstatSync(predecessor.path, { bigint: true }).ino, predecessorTarball.ino)
+      assert.equal(lstatSync(predecessor.metadataPath, { bigint: true }).ino, predecessorMetadata.ino)
       assert.deepEqual(readdirSync(retainedDirectory).sort(), [
         'encephalon-0.3.0.tgz',
         'encephalon-0.3.0.tgz.metadata.json',
       ])
+    } finally {
+      rmSync(fixtureDirectory, { force: true, recursive: true })
+    }
+  })
+
+  test('preserves a successor directory installed immediately before the atomic directory rename', () => {
+    const fixtureDirectory = mkdtempSync(resolve(root, 'scripts', '.package-retention-successor-'))
+    const source = resolve(fixtureDirectory, 'candidate.tgz')
+    const snapshotDirectory = resolve(fixtureDirectory, 'snapshot')
+    const retainedDirectory = resolve(fixtureDirectory, 'package-artifacts')
+    const successorSentinel = resolve(retainedDirectory, 'successor.txt')
+    try {
+      mkdirSync(snapshotDirectory)
+      writeFileSync(source, 'reviewed candidate bytes')
+      const snapshot = snapshotPackageTarball(source, snapshotDirectory)
+
+      assert.throws(
+        () =>
+          packageTarballAuthority.retainPackageArtifact(
+            snapshot,
+            {
+              filename: 'encephalon-0.3.0.tgz',
+              packageVersion: '0.3.0',
+              retainedDirectory,
+              sourceCommit: 'c'.repeat(40),
+            },
+            {
+              beforeInstall: () => {
+                mkdirSync(retainedDirectory)
+                writeFileSync(successorSentinel, 'successor bytes\n')
+              },
+            },
+          ),
+        /exist|rename|destination/u,
+      )
+
+      assert.equal(readFileSync(successorSentinel, 'utf8'), 'successor bytes\n')
+      assert.deepEqual(readdirSync(retainedDirectory), ['successor.txt'])
+      assert.equal(
+        readdirSync(fixtureDirectory).some(name => name.includes('.private')),
+        false,
+      )
     } finally {
       rmSync(fixtureDirectory, { force: true, recursive: true })
     }

@@ -1,15 +1,82 @@
 import { PACKAGE_DECLARATION_CONSUMER_SOURCE } from './package-declaration-consumer.ts'
+import { RELEASE_CONTRACT_PROBE_SOURCE } from './release-contracts.ts'
 
 export const API_PROBE_SOURCE = `
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+${RELEASE_CONTRACT_PROBE_SOURCE}
+
 const [phase, root, packageEntry] = process.argv.slice(2)
+const trustedJsonStringify = JSON.stringify.bind(JSON)
+const trustedStdoutWrite = process.stdout.write.bind(process.stdout)
+const trustedStderrWrite = process.stderr.write.bind(process.stderr)
 const api = await import(packageEntry)
 const manifest = JSON.parse(readFileSync(resolve(root, 'node_modules', 'encephalon', 'package.json'), 'utf8'))
 const fail = stage => { throw Object.assign(new Error(stage), { stage }) }
 const assert = (condition, stage) => { if (!condition) fail(stage) }
+const boundedFixtureRootNames = () => {
+  const directory = opendirSync(root)
+  try {
+    const names = []
+    while (names.length <= 32) {
+      const entry = directory.readSync()
+      if (entry === null) return names
+      names.push(entry.name)
+    }
+    fail('initialise-instruction-backup-root-bound')
+  } finally {
+    directory.closeSync()
+  }
+}
+const sameStableBackup = (expected, actual) =>
+  actual !== undefined &&
+  expected.dev === actual.dev &&
+  expected.ino === actual.ino &&
+  expected.mode === actual.mode &&
+  expected.nlink === actual.nlink &&
+  expected.size === actual.size &&
+  expected.mtimeNs === actual.mtimeNs &&
+  expected.ctimeNs === actual.ctimeNs &&
+  expected.birthtimeNs === actual.birthtimeNs
+const cleanupPublishedOracleInstructionBackups = () => {
+  const expected = new Map([
+    ['AGENTS.md', 'oracle agents predecessor\\n'],
+    ['CLAUDE.md', 'oracle claude predecessor\\n'],
+  ])
+  const backupPattern = /^[.](AGENTS[.]md|CLAUDE[.]md)[.][0-9]+[.][0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}[.]backup$/u
+  const backups = boundedFixtureRootNames().filter(name => backupPattern.test(name))
+  assert(backups.length === expected.size, 'initialise-instruction-backup-count')
+  backups.forEach(name => {
+    const filename = backupPattern.exec(name)?.[1]
+    const expectedBytes = filename === undefined ? undefined : expected.get(filename)
+    const path = resolve(root, name)
+    const before = lstatSync(path, { bigint: true })
+    assert(
+      expectedBytes !== undefined &&
+        before.isFile() &&
+        !before.isSymbolicLink() &&
+        before.nlink === 1n &&
+        before.size === 26n &&
+        realpathSync.native(path) === resolve(realpathSync.native(root), name),
+      'initialise-instruction-backup-identity',
+    )
+    const bytes = readFileSync(path, 'utf8')
+    const after = lstatSync(path, { bigint: true, throwIfNoEntry: false })
+    assert(
+      bytes === expectedBytes && sameStableBackup(before, after),
+      'initialise-instruction-backup-stability',
+    )
+    unlinkSync(path)
+    assert(
+      lstatSync(path, { throwIfNoEntry: false }) === undefined,
+      'initialise-instruction-backup-cleanup',
+    )
+    expected.delete(filename)
+  })
+  assert(expected.size === 0, 'initialise-instruction-backup-completeness')
+}
 const at = (stage, action) => {
   try {
     return action()
@@ -30,15 +97,6 @@ const cacheSchema = () => {
   }
 }
 const assertRecord = (record, id, stage) => assert(record?.id === id, stage)
-const normalisePublicValue = (value, key) => {
-  if (key === 'createdAt' && typeof value === 'string') return '<timestamp>'
-  if (typeof value === 'string') return value.replaceAll(root, '<fixture-root>')
-  if (Array.isArray(value)) return value.map(item => normalisePublicValue(item))
-  if (value !== null && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, normalisePublicValue(item, name)]))
-  }
-  return value
-}
 const errorShape = (error, stage) => {
   assert(error instanceof api.EncephalonError, stage + '-type')
   return normalisePublicValue({
@@ -47,7 +105,7 @@ const errorShape = (error, stage) => {
     message: error.message,
     name: error.name,
     ownKeys: Reflect.ownKeys(error).filter(key => typeof key === 'string').sort(),
-  })
+  }, root)
 }
 const captureError = (action, stage) => {
   let failure
@@ -59,8 +117,6 @@ const captureError = (action, stage) => {
   assert(failure !== undefined, stage + '-missing')
   return errorShape(failure, stage)
 }
-const limits = [50, 100, 101, 999, 1000, 1001]
-const operationNames = ['list', 'search', 'searchCompact', 'gather']
 const operations = {
   gather: limit => api.gatherRecords({ includeSuperseded: true, limit, root, searches: ['compatibility-marker'] }),
   list: limit => api.listRecords({ includeSuperseded: true, limit, root }),
@@ -71,8 +127,9 @@ const resultLimits = () => {
   const maximums = phase === 'upgrade'
     ? { gather: 1000, list: 1000, search: 1000, searchCompact: 1000 }
     : { gather: 100, list: 50, search: 50, searchCompact: 100 }
-  return Object.fromEntries(operationNames.map(name => [name, limits.reduce((outcome, limit) => {
-    const budget = name === 'list' || name === 'search' ? 'fullResultLimit' : 'compactResultLimit'
+  return Object.fromEntries(resultLimitOperations.map(operation => [operation.name, resultLimitCases.reduce((outcome, limit) => {
+    const name = operation.name
+    const budget = operation.budget
     if (limit <= maximums[name]) {
       at('api-limit-accepted-' + name + '-' + limit, () => operations[name](limit))
       return { ...outcome, accepted: [...outcome.accepted, limit] }
@@ -154,10 +211,11 @@ const publicSurface = () => {
     })),
     show: at('surface-show', () => api.showRecord({ id: 'compatibility-base', root })),
     validate: at('surface-validate', () => api.validateRecords({ root })),
-  })
+  }, root)
 }
 const initialise = () => {
   at('initialise-init', () => api.initEncephalon({ root }))
+  cleanupPublishedOracleInstructionBackups()
   const artifact = resolve(root, 'encephalon', '_artifacts', 'decision', 'compatibility-base', 'evidence.txt')
   mkdirSync(resolve(artifact, '..'), { recursive: true })
   writeFileSync(artifact, 'oracle artifact evidence\\n')
@@ -212,9 +270,9 @@ const downgrade = () => {
 
 try {
   const result = phase === 'initialise' ? initialise() : phase === 'upgrade' ? upgrade() : phase === 'downgrade' ? downgrade() : fail('unknown-phase')
-  process.stdout.write(JSON.stringify({ ...result, version: manifest.version }) + '\\n')
+  trustedStdoutWrite(trustedJsonStringify({ ...result, version: manifest.version }) + '\\n')
 } catch (error) {
-  process.stderr.write(JSON.stringify({ code: typeof error?.code === 'string' ? error.code : 'INTERNAL_ERROR', stage: typeof error?.stage === 'string' ? error.stage : 'api-probe' }) + '\\n')
+  trustedStderrWrite(trustedJsonStringify({ code: typeof error?.code === 'string' ? error.code : 'INTERNAL_ERROR', stage: typeof error?.stage === 'string' ? error.stage : 'api-probe' }) + '\\n')
   process.exitCode = 1
 }
 `
@@ -224,14 +282,17 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const [root, packageEntry] = process.argv.slice(2)
+const trustedJsonStringify = JSON.stringify.bind(JSON)
+const trustedStdoutWrite = process.stdout.write.bind(process.stdout)
+const trustedStderrWrite = process.stderr.write.bind(process.stderr)
 const api = await import(packageEntry)
 const required = ['EncephalonError', 'addRecord', 'gatherRecords', 'hydrate', 'initEncephalon', 'listRecords', 'prepare', 'searchCompactRecords', 'searchRecords', 'showRecord', 'validateRecords']
 const manifest = JSON.parse(readFileSync(resolve(root, 'node_modules', 'encephalon', 'package.json'), 'utf8'))
 if (required.some(name => typeof api[name] !== 'function')) {
-  process.stderr.write('{"stage":"import-contract"}\\n')
+  trustedStderrWrite('{"stage":"import-contract"}\\n')
   process.exitCode = 1
 } else {
-  process.stdout.write(JSON.stringify({ exports: required, version: manifest.version }) + '\\n')
+  trustedStdoutWrite(trustedJsonStringify({ exports: required, version: manifest.version }) + '\\n')
 }
 `
 
@@ -241,6 +302,17 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync }
 import { resolve } from 'node:path'
 
 const [root, packagePhase, packageEntry] = process.argv.slice(2)
+const trustedJsonParse = JSON.parse.bind(JSON)
+const trustedJsonStringify = JSON.stringify.bind(JSON)
+const trustedObjectEntries = Object.entries.bind(Object)
+const trustedObjectFromEntries = Object.fromEntries.bind(Object)
+const trustedStdoutWrite = process.stdout.write.bind(process.stdout)
+const sanitizedChildEnvironment = Object.freeze(trustedObjectFromEntries(
+  trustedObjectEntries(process.env).filter(([key]) => {
+    const normalized = key.toLowerCase()
+    return normalized !== 'node_options' && normalized !== 'node_path'
+  }),
+))
 const originalGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors
 const retainedDescriptorMaps = []
 let descriptorMapCalls = 0
@@ -254,12 +326,6 @@ if (packagePhase === 'candidate') Object.getOwnPropertyDescriptors = observedGet
 const api = await import(packageEntry)
 if (packagePhase === 'candidate') Object.getOwnPropertyDescriptors = observedGetOwnPropertyDescriptors
 const cli = resolve(root, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
-const sanitizedChildEnvironment = Object.fromEntries(
-  Object.entries(process.env).filter(([key]) => {
-    const normalized = key.toLowerCase()
-    return normalized !== 'node_options' && normalized !== 'node_path'
-  }),
-)
 const MAX_CANONICAL_BYTES = 8 * 1024 * 1024
 const MAX_RECORD_BYTES = 1024 * 1024
 const fail = stage => { throw Object.assign(new Error(stage), { stage }) }
@@ -289,7 +355,7 @@ const cliObservation = arguments_ => {
   const result = cliResult(arguments_)
   if (result.error === undefined && result.status === 0 && result.stderr === '') {
     try {
-      JSON.parse(result.stdout)
+      trustedJsonParse(result.stdout)
     } catch {
       fail('budget-cli-success-json')
     }
@@ -297,7 +363,7 @@ const cliObservation = arguments_ => {
   }
   if (result.error === undefined && result.status === 2 && result.stdout === '') {
     try {
-      const body = JSON.parse(result.stderr)
+      const body = trustedJsonParse(result.stderr)
       if (body?.error?.code !== undefined && body?.error?.details !== undefined && body?.error?.message !== undefined) {
         return { error: body.error, status: 'rejected' }
       }
@@ -330,7 +396,7 @@ const cliValidationObservation = () => {
   if (result.error !== undefined || result.stderr !== '') fail('budget-cli-validation-process')
   let value
   try {
-    value = JSON.parse(result.stdout)
+    value = trustedJsonParse(result.stdout)
   } catch {
     fail('budget-cli-validation-json')
   }
@@ -343,7 +409,7 @@ const canonicalFiles = () => {
     .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith('_'))
     .flatMap(entry => readdirSync(resolve(brain, entry.name)).filter(name => name.endsWith('.json')).map(name => resolve(brain, entry.name, name)))
 }
-const canonicalRecords = () => canonicalFiles().map(path => JSON.parse(readFileSync(path, 'utf8')))
+const canonicalRecords = () => canonicalFiles().map(path => trustedJsonParse(readFileSync(path, 'utf8')))
 const recordValue = (kind, id, index, payload = {}, searchText) => ({
   createdAt: new Date(Date.UTC(2000, 0, 1) + index).toISOString(),
   id,
@@ -353,7 +419,7 @@ const recordValue = (kind, id, index, payload = {}, searchText) => ({
   subject: 'release.compatibility.' + id,
   ...(searchText === undefined ? {} : { searchText }),
 })
-const formatted = record => JSON.stringify(record, null, 2) + '\\n'
+const formatted = record => trustedJsonStringify(record, null, 2) + '\\n'
 const withRecords = (kind, records, action) => {
   const directory = resolve(root, 'encephalon', kind)
   mkdirSync(directory)
@@ -383,7 +449,7 @@ const temporaryApiAdd = (id, payload, extra = {}) => () => {
 const temporaryCliAdd = (id, payload, extraArguments = []) => () => {
   const path = resolve(root, 'encephalon', 'decision', id + '.json')
   try {
-    return cliObservation(['add', '--id', id, '--kind', 'decision', '--subject', 'release.compatibility.' + id, '--source', 'release-compatibility', '--data', JSON.stringify(payload), ...extraArguments])
+    return cliObservation(['add', '--id', id, '--kind', 'decision', '--subject', 'release.compatibility.' + id, '--source', 'release-compatibility', '--data', trustedJsonStringify(payload), ...extraArguments])
   } finally {
     rmSync(path, { force: true })
   }
@@ -764,7 +830,7 @@ const responseEvidence = withRecords(responseKind, responseRecords, () => ({
 Object.assign(apiReport, responseEvidence.api)
 Object.assign(cliReport, responseEvidence.cli)
 
-process.stdout.write(JSON.stringify({ api: apiReport, cli: cliReport }) + '\\n')
+trustedStdoutWrite(trustedJsonStringify({ api: apiReport, cli: cliReport }) + '\\n')
 `
 
 export const DECLARATION_CONSUMER_SOURCE = PACKAGE_DECLARATION_CONSUMER_SOURCE

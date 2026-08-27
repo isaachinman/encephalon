@@ -94,6 +94,43 @@ const gatherInput: GatherInput = {
   hydrate: true,
 }
 
+const minimalRoot: RootInput = {}
+const minimalFile: BrainRecordFile = {
+  id: 'minimal-record',
+  kind: 'decision',
+  subject: 'declaration.minimal',
+  source: 'package-check',
+  createdAt: '2026-08-27T00:00:00.000Z',
+  payload: null,
+}
+const minimalAdd: AddRecordInput = {
+  kind: minimalFile.kind,
+  subject: minimalFile.subject,
+  source: minimalFile.source,
+  payload: minimalFile.payload,
+}
+const minimalInit: InitEncephalonInput = {}
+const minimalList: ListRecordsInput = {}
+const minimalShow: ShowRecordInput = { id: minimalFile.id }
+const minimalSearch: SearchRecordsInput = { query: minimalFile.subject }
+const minimalGather: GatherInput = {}
+const minimalIssue: ValidationIssue = { code: 'CODE', message: 'message' }
+
+prepare()
+hydrate()
+initEncephalon()
+listRecords()
+validateRecords()
+addRecord(minimalAdd)
+showRecord(minimalShow)
+searchRecords(minimalSearch)
+searchCompactRecords(minimalSearch)
+gatherRecords(minimalGather)
+minimalRoot satisfies RootInput
+minimalInit satisfies InitEncephalonInput
+minimalList satisfies ListRecordsInput
+minimalIssue satisfies ValidationIssue
+
 const prepared: PrepareResult = prepare(root)
 const hydrated: HydrateResult = hydrate(root)
 const added: BrainRecord = addRecord(addInput)

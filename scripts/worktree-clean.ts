@@ -17,6 +17,35 @@ export const assertCleanReleaseWorktree = (root: string, allowPackageArtifacts: 
     throw new Error('The release worktree contains tracked or untracked changes.')
   }
 
+  const ignored = spawnSync(
+    'git',
+    ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '--no-empty-directory', '-z'],
+    {
+      cwd: root,
+      encoding: 'buffer',
+      killSignal: 'SIGKILL',
+      maxBuffer: 1024 * 1024,
+      timeout: 10_000,
+    },
+  )
+  if (ignored.error !== undefined) {
+    throw ignored.error
+  }
+  if (ignored.status !== 0 || ignored.stderr.length > 0) {
+    throw new Error('Unable to enumerate ignored release worktree output.')
+  }
+  const allowedIgnoredEntries = new Set(['.superpowers/', '.vscode/', 'AGENTS.md', 'dist/', 'node_modules/'])
+  const ignoredEntries = ignored.stdout
+    .toString('utf8')
+    .split('\0')
+    .filter(entry => entry.length > 0)
+  const unexpectedIgnoredEntries = ignoredEntries.filter(
+    entry => entry !== 'package-artifacts/' && !allowedIgnoredEntries.has(entry),
+  )
+  if (unexpectedIgnoredEntries.length > 0) {
+    throw new Error('The release worktree contains unexpected ignored output.')
+  }
+
   const artifactDirectory = resolve(root, 'package-artifacts')
   const artifactDirectoryEntry = lstatSync(artifactDirectory, { throwIfNoEntry: false })
   if (allowPackageArtifacts) {
