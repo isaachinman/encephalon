@@ -516,43 +516,36 @@ describe('API input budgets', () => {
   test('applies operation-specific result limits', () => {
     const limitCases = [
       {
-        accept: 50,
         budget: 'fullResultLimit',
-        maximum: 50,
         parse: (limit: number) => parseListRecordsInput({ limit }),
       },
       {
-        accept: 50,
         budget: 'fullResultLimit',
-        maximum: 50,
         parse: (limit: number) => parseFullSearchRecordsInput({ limit, query: 'x' }),
       },
       {
-        accept: 100,
         budget: 'compactResultLimit',
-        maximum: 100,
         parse: (limit: number) => parseCompactSearchRecordsInput({ limit, query: 'x' }),
       },
       {
-        accept: 100,
         budget: 'compactResultLimit',
-        maximum: 100,
         parse: (limit: number) => parseGatherInput({ limit }),
       },
     ] as const satisfies ReadonlyArray<{
-      accept: number
       budget: BudgetName
-      maximum: number
       parse: (limit: number) => { limit?: number }
     }>
 
     for (const limitCase of limitCases) {
       assert.equal(limitCase.parse(1).limit, 1)
-      assert.equal(limitCase.parse(limitCase.accept).limit, limitCase.accept)
-      assertBudget(() => limitCase.parse(limitCase.maximum + 1), {
+      const compatibleLimits = [50, 100, 101, 999, 1000] as const
+      for (const limit of compatibleLimits) {
+        assert.equal(limitCase.parse(limit).limit, limit)
+      }
+      assertBudget(() => limitCase.parse(1001), {
         budget: limitCase.budget,
         field: 'limit',
-        maximum: limitCase.maximum,
+        maximum: 1000,
       })
     }
   })

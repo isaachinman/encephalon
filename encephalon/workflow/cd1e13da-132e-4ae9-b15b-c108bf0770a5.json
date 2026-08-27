@@ -1,0 +1,22 @@
+{
+  "createdAt": "2026-08-27T11:08:19.055Z",
+  "id": "cd1e13da-132e-4ae9-b15b-c108bf0770a5",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Release one exact reviewed npm artifact through ordered local and CI-equivalent gates, then publish only those reviewed tarball bytes after explicit maintainer approval.",
+    "oracle": {
+      "specifier": "encephalon@0.2.0",
+      "shasum": "1db80715ac2028cb8f12ae029577aed3428d52ef",
+      "integrity": "sha512-dgGi7fL43v9KQJ7Rb42fRAT+Z+h6WIOKhbPz9JzNBtnpqSyf4HyN6zBmIy6ftkTazZO6SyGU4MUi1FTVJyBvEw=="
+    },
+    "gates": [
+      "Use a fresh isolated writable npm cache; run frozen install, generated-version check, typecheck, full tests, lint, benchmark check, build, and require a clean source diff before packaging.",
+      "Create one retained candidate tarball; run source packaging once, then supplied-tarball package validation, v0.2 upgrade/downgrade compatibility, publish dry run, and built CLI validation against the same repository-relative tarball path.",
+      "Record byte size, SHA-1, SHA-256, SHA-512, and npm integrity; require reviewed/main CI artifact byte identity before publication."
+    ],
+    "publication": "Publication is a manual tarball-only action: npm publish <reviewed-candidate.tgz>. Never rebuild or publish a directory, and never upload without the maintainer final explicit approval after merge and green main."
+  },
+  "searchText": "npm release exact reviewed tarball compatibility oracle upgrade downgrade isolated cache dry run explicit approval",
+  "source": "agent",
+  "subject": "release.npm-exact-artifact"
+}

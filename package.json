@@ -1,6 +1,6 @@
 {
   "name": "encephalon",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Repository-local, durable knowledge for coding agents",
   "keywords": [
     "agents",
@@ -52,12 +52,13 @@
     "benchmark": "node scripts/benchmark.ts",
     "benchmark:check": "node scripts/benchmark.ts --profile ci --budget docs/performance-budgets.json",
     "build": "bun run scripts/build.ts",
+    "check:compatibility": "node ./scripts/check-release-compatibility.ts",
     "check:generated": "bun run scripts/check-generated-version.ts",
     "check:package": "node ./scripts/check-package.ts",
     "check:publish": "node ./scripts/check-publish.ts",
     "lint": "ultracite check",
     "prepack": "bun run build && bun run check:package",
-    "test": "bun run build && node --test test/*.test.ts",
+    "test": "bun run build && node --test scripts/*.test.ts test/*.test.ts",
     "typecheck": "tsc --project tsconfig.src.json --noEmit && tsc --project tsconfig.scripts.json --noEmit && tsc --project tsconfig.test.json --noEmit && tsc --project tsconfig.runtime-guard.json --noEmit"
   },
   "devDependencies": {

@@ -20,7 +20,10 @@ test('rejects absolute and out-of-repository retained-tarball directories', () =
     })
     assert.notEqual(result.status, 0)
     assert.equal(result.stdout, '')
-    assert.match(result.stderr, /Usage: check-package\.ts \[--retain-tarball <repository-relative-directory>\]/)
+    assert.match(
+      result.stderr,
+      /Usage: check-package\.ts \[--retain-tarball <repository-relative-directory> \| --tarball <repository-relative-tarball>\]/,
+    )
     assert.equal(existsSync(resolve(root, directory)), false)
   }
 })
@@ -42,7 +45,10 @@ test('rejects retained-tarball directories beneath a symlinked parent before inv
     )
     assert.notEqual(result.status, 0)
     assert.equal(result.stdout, '')
-    assert.match(result.stderr, /Usage: check-package\.ts \[--retain-tarball <repository-relative-directory>\]/)
+    assert.match(
+      result.stderr,
+      /Usage: check-package\.ts \[--retain-tarball <repository-relative-directory> \| --tarball <repository-relative-tarball>\]/,
+    )
     assert.equal(existsSync(join(outsideDirectory, 'nested')), false)
   } finally {
     rmSync(symlink, { force: true })

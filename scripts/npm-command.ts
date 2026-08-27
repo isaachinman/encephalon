@@ -20,7 +20,12 @@ export type NpmCommand = {
 
 type NpmSpawnOptions = NpmCommandOptions & {
   cwd: string
+  maxBuffer?: number
+  timeoutMilliseconds?: number
 }
+
+const defaultMaximumOutputBytes = 1024 * 1024
+const defaultTimeoutMilliseconds = 120_000
 
 const NPM_COMMAND_ENVIRONMENT_KEY = 'ENCEPHALON_NPM_COMMAND'
 const npmArgumentEnvironmentKey = (index: number) => `ENCEPHALON_NPM_ARGUMENT_${index}`
@@ -113,8 +118,11 @@ export const spawnNpmCommand = (arguments_: readonly string[], options: NpmSpawn
   return spawnSync(command.executable, command.arguments, {
     cwd: options.cwd,
     encoding: 'utf8',
-    env: command.environment,
+    env: command.environment ?? options.environment,
+    killSignal: 'SIGKILL',
+    maxBuffer: options.maxBuffer ?? defaultMaximumOutputBytes,
     shell: false,
+    timeout: options.timeoutMilliseconds ?? defaultTimeoutMilliseconds,
     windowsVerbatimArguments: command.windowsVerbatimArguments,
   })
 }

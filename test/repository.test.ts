@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import { discoverRepository, repositoryTestHooks, resolveRepository } from '../src/repository.ts'
 import { createTestRepository } from './helpers.ts'
 
@@ -39,7 +40,10 @@ const createIsolatedPackage = () => {
     join(sourceRoot, 'src', 'generated', 'version.ts'),
     join(executingRoot, 'src', 'generated', 'version.ts'),
   )
-  writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","type":"module","version":"0.2.0"}\n')
+  writeFileSync(
+    join(executingRoot, 'package.json'),
+    `${JSON.stringify({ name: 'encephalon', type: 'module', version: PACKAGE_VERSION })}\n`,
+  )
 
   const repositoryRoot = join(testRoot, 'repository')
   mkdirSync(join(repositoryRoot, 'node_modules'), { recursive: true })
@@ -279,7 +283,7 @@ test('rejects an oversized installed manifest after executing identity is cached
 
   writeFileSync(
     join(executingRoot, 'package.json'),
-    JSON.stringify({ name: 'encephalon', padding: 'x'.repeat(1024 * 1024), version: '0.2.0' }),
+    JSON.stringify({ name: 'encephalon', padding: 'x'.repeat(1024 * 1024), version: PACKAGE_VERSION }),
   )
   assert.throws(
     () => repositoryModule.assertRootInstallation(repositoryRoot),
@@ -304,7 +308,10 @@ test('does not memoize executing identity across a package-directory generation 
       replaced = true
       renameSync(executingRoot, capturedRoot)
       mkdirSync(join(executingRoot, 'src'), { recursive: true })
-      writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","version":"0.2.0"}\n')
+      writeFileSync(
+        join(executingRoot, 'package.json'),
+        `${JSON.stringify({ name: 'encephalon', version: PACKAGE_VERSION })}\n`,
+      )
       writeFileSync(join(executingRoot, 'src', 'package.json'), '{"name":"unrelated","type":"module"}\n')
     }
   }
@@ -416,7 +423,10 @@ test('requires the installed root to retain the memoized executing generation be
   const capturedRoot = `${executingRoot}-captured`
   renameSync(executingRoot, capturedRoot)
   mkdirSync(executingRoot)
-  writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","version":"0.2.0"}\n')
+  writeFileSync(
+    join(executingRoot, 'package.json'),
+    `${JSON.stringify({ name: 'encephalon', version: PACKAGE_VERSION })}\n`,
+  )
 
   assert.throws(
     () => repositoryModule.assertRootInstallation(repositoryRoot),
@@ -441,7 +451,10 @@ test('rejects an installed package-directory generation change after its manifes
       replaced = true
       renameSync(executingRoot, capturedRoot)
       mkdirSync(executingRoot)
-      writeFileSync(join(executingRoot, 'package.json'), '{"name":"encephalon","version":"0.2.0"}\n')
+      writeFileSync(
+        join(executingRoot, 'package.json'),
+        `${JSON.stringify({ name: 'encephalon', version: PACKAGE_VERSION })}\n`,
+      )
     }
   }
 
@@ -528,7 +541,7 @@ test('rejects unsafe executing package manifests with a stable internal error', 
           JSON.stringify({
             name: 'encephalon',
             padding: 'x'.repeat(1024 * 1024),
-            version: '0.2.0',
+            version: PACKAGE_VERSION,
           }),
         ),
     },
@@ -536,7 +549,7 @@ test('rejects unsafe executing package manifests with a stable internal error', 
       name: 'symlink',
       write: (path: string) => {
         const target = `${path}.target`
-        writeFileSync(target, '{"name":"encephalon","version":"0.2.0"}\n')
+        writeFileSync(target, `${JSON.stringify({ name: 'encephalon', version: PACKAGE_VERSION })}\n`)
         rmSync(path)
         symlinkSync(target, path, 'file')
       },

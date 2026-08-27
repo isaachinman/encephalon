@@ -15,7 +15,7 @@ Encephalon is general-purpose. It does not include hosted services, accounts, te
 
 Bun is used to build and test Encephalon itself. Installed projects run the bundled ESM distribution with Node and do not need Bun. The package has zero runtime dependencies and no installation lifecycle scripts.
 
-Yarn Plug'n'Play is not supported in v0.2.0.
+Yarn Plug'n'Play is not supported in v0.3.0.
 
 ## Install
 
@@ -92,7 +92,7 @@ Search text is literal rather than raw FTS syntax. Encephalon checks the origina
 
 ### Operation budgets
 
-List and full search accept 1–50 results. Compact search and each gather search accept 1–100 results. A gather request accepts at most 16 searches and 64 shows, while an add request accepts at most 1,000 supersession targets. Search queries are limited to 1,024 UTF-8 bytes and 32 literal terms.
+List, full search, compact search, and each gather search accept 1–1,000 results and default to 20. These result-count limits are independent of response-byte budgets and gather request-array budgets. A gather request accepts at most 16 searches and 64 shows, while an add request accepts at most 1,000 supersession targets. Search queries are limited to 1,024 UTF-8 bytes and 32 literal terms.
 
 Full-record list, show, and search responses use the 4 MiB `fullResponseBytes` budget over cached canonical JSON bytes. Standalone compact search uses the 4 MiB `compactResponseBytes` budget, and one complete gather uses the 4 MiB `gatherResponseBytes` budget across root metadata, request envelopes, shown records or nulls, and compact search results. Compact and gather values count the UTF-8 bytes of every string value and object key, plus eight bytes for every number, boolean, null, array, and object, recursively. Compact rows are lazily iterated, validated, charged, and only then retained. Repeated gather shows and searches are charged on every occurrence. Exact-budget responses succeed; over-budget responses fail without truncation or a partial result.
 
@@ -216,14 +216,18 @@ Without `root`, Encephalon walks upward to the nearest valid Git repository mark
 ## Development
 
 ```bash
-bun install --frozen-lockfile
-bun run check:generated
+node ./scripts/check-generated-version.ts
+bun install --frozen-lockfile --ignore-scripts
 bun run typecheck
 bun run test
 bun run build
-bun run check:package
-bun run check:publish
+node ./scripts/check-package.ts --retain-tarball package-artifacts
+node ./scripts/check-package-metadata.ts
+node ./scripts/check-release-compatibility.ts package-artifacts/encephalon-0.3.0.tgz
+node ./scripts/check-publish.ts package-artifacts/encephalon-0.3.0.tgz
 ```
+
+Exact retention requires `package-artifacts` to be absent. Before regenerating, move any previous disposable artifact directory to a private backup; the package gate then installs the complete tarball-and-sidecar directory as one transaction and never merges with or replaces an existing directory.
 
 Performance benchmarks are separate from correctness tests:
 
@@ -236,9 +240,15 @@ Correctness tests enforce deterministic bounded-work counts without reading prod
 
 The full profile runs every operation in fresh child processes with two discarded warmups and five measured samples at 0, 100, and 1,000 records. `benchmark:check` keeps CI to a single 0/100/1,000 sample with generous schema-version 2 p95 and cache-size ceilings. See [docs/performance.md](./docs/performance.md) for phase semantics, memory sources, profiles, budgets, baseline distributions, and scale guidance.
 
-`bun run check:generated` is contributor convenience for trusted local checkouts. Its target generated-version checker is non-mutating, but package lifecycle hooks and Bun preloads mean the alias is not an authority for untrusted changes. Every CI job must run the exact direct command `node ./scripts/check-generated-version.ts` immediately after Node setup and before Bun setup or installation so those hooks and preloads cannot repair stale or missing committed source before validation. `check:package` rejects packed paths outside reviewed tracked package inputs and the expected generated distribution, installs the tarball with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything. The `bun run check:package` and `bun run check:publish` contributor commands launch those Node scripts, while CI invokes the scripts directly so package lifecycle hooks and Bun preloads cannot interpose. CI runs four verification lanes: Node 24.15.0 on Ubuntu, macOS, and Windows, plus Node 26 on Ubuntu. The release-equivalent package gate waits for all four verification lanes, then checks the publish contract and creates, inspects, and retains one real npm tarball on pull requests and trusted pushes to `main`, without repository, provider, or npm secrets. Every CI build path fails if the build changes tracked files. Pull requests retain the bounded tarball in runner-local storage; on trusted pushes to `main`, the gate uploads the exact tarball exercised by the package checker after a final clean-tree check. Pull-request runs cancel superseded work, while each trusted push has an independent run so a newer push cannot cancel its artifact handoff.
+`bun run check:generated` is contributor convenience for trusted local checkouts. Its target generated-version checker is non-mutating, but package lifecycle hooks and Bun preloads mean the alias is not an authority for untrusted changes. Every source-building CI job runs the exact direct command `node ./scripts/check-generated-version.ts` immediately after Node setup and before Bun setup or installation so those hooks and preloads cannot repair stale or missing committed source before validation. `check:package` rejects packed paths outside reviewed tracked package inputs and the expected generated distribution, installs the tarball with lifecycle scripts disabled, imports the public API, and runs the bundled CLI using Node. `check:publish` exercises npm's publish-time manifest normalisation without uploading anything. The `bun run check:package` and `bun run check:publish` contributor commands launch those Node scripts, while CI invokes those scripts directly so package lifecycle hooks and Bun preloads cannot interpose.
 
-After rollout, branch protection must require exactly `verify (ubuntu-latest)`, `verify (macos-latest)`, `verify (windows-latest)`, `verify (ubuntu-current)`, and `Release-equivalent package gate`. Maintainers can repeat the read-only verification with:
+CI runs four verification lanes: Node 24.15.0 on Ubuntu, macOS, and Windows, plus Node 26 on Ubuntu. After all four succeed, one package job gates the clean source tree around the test suite and explicit build, requires the artifact directory to be absent, then checks and retains `package-artifacts/encephalon-0.3.0.tgz` together with its deterministic metadata sidecar. The sidecar records the exact byte size, SHA-1, SHA-256, SHA-512, npm integrity, package version, source commit, and fixed repository-relative tarball path. CI recomputes that authority before uploading both files as `encephalon-npm-package` on pull requests and trusted pushes to `main`.
+
+Node 24.15.0 and Node 26 candidate jobs build the reviewed checkout, download those same artifact bytes, verify the metadata sidecar, and invoke `check-package.ts --tarball` against the fixed repository-relative tarball path without extracting or repacking it. The final release-equivalent package gate repeats those checks, runs the compatibility oracle once with that exact path, and passes the same path to the tarball-only publish dry run. The published npm oracle requires network access, but no job receives repository, provider, or npm credentials and no job publishes.
+
+Pull requests therefore upload and retain the auditable candidate instead of keeping it only on the runner. Before a manual, explicit-approval, tarball-only publish from trusted `main`, maintainers must compare the trusted-main tarball and metadata sidecar with the reviewed pull-request candidate and require the tarballs to be byte-identical. Pull-request runs cancel superseded work, while each trusted push has an independent run so a newer push cannot cancel its artifact handoff.
+
+After rollout, branch protection must require exactly `verify (ubuntu-latest)`, `verify (macos-latest)`, `verify (windows-latest)`, `verify (ubuntu-current)`, `Build exact package candidate`, `candidate (Node 24.15.0)`, `candidate (Node 26)`, and `Release-equivalent package gate`. Maintainers can repeat the read-only verification with:
 
 ```bash
 gh api repos/isaachinman/encephalon/branches/main/protection/required_status_checks \

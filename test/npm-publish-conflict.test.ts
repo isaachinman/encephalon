@@ -14,13 +14,48 @@ const createPublishCheckFixture = () => {
   mkdirSync(scriptsDirectory)
   cpSync(resolve(root, 'scripts', 'check-publish.ts'), resolve(scriptsDirectory, 'check-publish.ts'))
   cpSync(resolve(root, 'scripts', 'npm-publish-conflict.ts'), resolve(scriptsDirectory, 'npm-publish-conflict.ts'))
+  cpSync(resolve(root, 'scripts', 'package-tarball.ts'), resolve(scriptsDirectory, 'package-tarball.ts'))
+  writeFileSync(
+    resolve(scriptsDirectory, 'package-preflight.ts'),
+    `import { snapshotPackageTarball, verifyPackageArtifactMetadata } from './package-tarball.ts'
+export const preflightExactPackageArtifact = ({ snapshotDirectory, tarballPath }) => {
+  const metadata = verifyPackageArtifactMetadata(tarballPath)
+  const snapshot = snapshotPackageTarball(tarballPath, snapshotDirectory)
+  return { metadata, snapshot }
+}
+`,
+  )
   writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module"}\n')
+  writeFileSync(resolve(temporaryRoot, 'candidate.tgz'), 'candidate tarball')
+  writeFileSync(
+    resolve(temporaryRoot, 'candidate.tgz.metadata.json'),
+    `${JSON.stringify(
+      {
+        bytes: 17,
+        integrity: 'sha512-pTxmTw4D11aGOhLuuuLi7XMdkIwxMD/CLeWekvX9m00fIf2X+zxgZ/yhlV2/ZgbNj9U6a6zJFfMCchSrkKTj8A==',
+        packageVersion: '0.3.0',
+        sha1: '4d85c35b6eaaf3bb12766dd30b7f6d763bd34be8',
+        sha256: '840e0eaa94a08f97f361ebdc32d46cb60b9e94a5f10773d0647b363847605b67',
+        sha512:
+          'a53c664f0e03d756863a12eebae2e2ed731d908c31303fc22de59e92f5fd9b4d1f21fd97fb3c6067fca1955dbf6606cd8fd53a6bacc915f3027214ab90a4e3f0',
+        sourceCommit: 'a'.repeat(40),
+        tarball: 'candidate.tgz',
+      },
+      null,
+      2,
+    )}\n`,
+  )
   writeFileSync(
     resolve(scriptsDirectory, 'npm-command.ts'),
-    `export const spawnNpmCommand = (arguments_, options) => {
-  if (JSON.stringify(arguments_) !== '["publish","--dry-run","--ignore-scripts","--access","public","--json"]') {
+    `import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+export const spawnNpmCommand = (arguments_, options) => {
+  const expectedTail = ['--dry-run', '--ignore-scripts', '--access', 'public', '--json']
+  const source = resolve(options.cwd, 'candidate.tgz')
+  if (arguments_[0] !== 'publish' || arguments_[1] === source || JSON.stringify(arguments_.slice(2)) !== JSON.stringify(expectedTail)) {
     throw new Error('Unexpected npm arguments.')
   }
+  if (readFileSync(arguments_[1], 'utf8') !== 'candidate tarball') throw new Error('Unexpected publish bytes.')
   if (typeof options.cwd !== 'string') throw new Error('Missing npm working directory.')
   return JSON.parse(process.env.ENCEPHALON_TEST_NPM_RESULT ?? '{}')
 }
@@ -30,7 +65,7 @@ const createPublishCheckFixture = () => {
 }
 
 const runPublishCheckFixture = (temporaryRoot: string, result: object) =>
-  spawnSync(process.execPath, ['./scripts/check-publish.ts'], {
+  spawnSync(process.execPath, ['./scripts/check-publish.ts', 'candidate.tgz'], {
     cwd: temporaryRoot,
     encoding: 'utf8',
     env: { ...process.env, ENCEPHALON_TEST_NPM_RESULT: JSON.stringify(result) },

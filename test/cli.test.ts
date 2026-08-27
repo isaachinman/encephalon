@@ -325,16 +325,16 @@ describe('command-line interface', () => {
     assert.equal(help.status, 0)
     assert.match(help.stdout, /^Usage: encephalon/m)
     assert.ok(
-      help.stdout.includes('list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <1..50>]'),
+      help.stdout.includes('list [--kind <kind>] [--subject <subject>] [--include-superseded] [--limit <1..1000>]'),
     )
-    assert.ok(help.stdout.includes('search [--kind <kind>] [--include-superseded] [--limit <1..50>] [--] <query>'))
+    assert.ok(help.stdout.includes('search [--kind <kind>] [--include-superseded] [--limit <1..1000>] [--] <query>'))
     assert.ok(
-      help.stdout.includes('search --compact [--kind <kind>] [--include-superseded] [--limit <1..100>] [--] <query>'),
+      help.stdout.includes('search --compact [--kind <kind>] [--include-superseded] [--limit <1..1000>] [--] <query>'),
     )
     assert.ok(
       help.stdout.includes(
         'gather [--search <query> ...] [--show <id> ...] [--hydrate] [--include-superseded]\n' +
-          '         [--kind <kind>] [--limit <1..100>]',
+          '         [--kind <kind>] [--limit <1..1000>]',
       ),
     )
     assert.ok(help.stdout.includes('Accepts at most 16 searches and 64 shows.'))
@@ -349,47 +349,46 @@ describe('command-line interface', () => {
     assert.equal(errorJson(commandHelp).error.message, 'Unknown option --help.')
   })
 
-  test('enforces operation-specific limit budgets before API invocation', () => {
+  test('applies operation-specific result limits before API invocation', () => {
     const root = createRoot()
     const cases = [
       {
-        accepted: ['list', '--limit=50'],
+        arguments: (limit: number) => ['list', `--limit=${limit}`],
         budget: 'fullResultLimit',
-        maximum: 50,
-        rejected: ['list', '--limit=51'],
       },
       {
-        accepted: ['search', '--limit=50', 'x'],
+        arguments: (limit: number) => ['search', `--limit=${limit}`, 'x'],
         budget: 'fullResultLimit',
-        maximum: 50,
-        rejected: ['search', '--limit=51', 'x'],
       },
       {
-        accepted: ['search', '--compact', '--limit=100', 'x'],
+        arguments: (limit: number) => ['search', '--compact', `--limit=${limit}`, 'x'],
         budget: 'compactResultLimit',
-        maximum: 100,
-        rejected: ['search', '--compact', '--limit=101', 'x'],
       },
       {
-        accepted: ['gather', '--limit=100'],
+        arguments: (limit: number) => ['gather', `--limit=${limit}`],
         budget: 'compactResultLimit',
-        maximum: 100,
-        rejected: ['gather', '--limit=101'],
       },
     ] as const
 
     for (const entry of cases) {
-      const accepted = run(root, [...entry.accepted, '--root', root])
-      assert.equal(accepted.status, 0, entry.accepted.join(' '))
+      const compatibleLimits = [50, 100, 101, 999, 1000] as const
+      for (const limit of compatibleLimits) {
+        const arguments_ = entry.arguments(limit)
+        const accepted = run(root, [...arguments_, '--root', root])
+        assert.equal(accepted.status, 0, arguments_.join(' '))
+      }
 
-      const rejected = run(root, [...entry.rejected, '--root', root])
-      assert.equal(rejected.status, 2, entry.rejected.join(' '))
+      const rejectedArguments = entry.arguments(1001)
+      const rejected = run(root, [...rejectedArguments, '--root', root])
+      assert.equal(rejected.status, 2, rejectedArguments.join(' '))
+      assert.equal(rejected.stdout, '')
+      assert.equal(errorJson(rejected).error.code, 'INVALID_ARGUMENT')
       assert.deepEqual(errorJson(rejected).error.details, {
         budget: entry.budget,
         field: 'limit',
-        maximum: entry.maximum,
+        maximum: 1000,
       })
-      assert.equal(errorJson(rejected).error.message, `--limit must be an integer between 1 and ${entry.maximum}.`)
+      assert.equal(errorJson(rejected).error.message, '--limit must be an integer between 1 and 1000.')
     }
   })
 
@@ -653,7 +652,7 @@ describe('command-line interface', () => {
       },
       {
         arguments_: ['list', '--root', root, '--limit=-1'],
-        message: '--limit must be an integer between 1 and 50.',
+        message: '--limit must be an integer between 1 and 1000.',
       },
       {
         arguments_: ['list', '--root', root, '--limit', '-1'],
