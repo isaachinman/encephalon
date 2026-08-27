@@ -1,7 +1,5 @@
 import { spawnSync } from 'node:child_process'
 import {
-  constants,
-  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -16,13 +14,22 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import { spawnNpmCommand } from './npm-command.ts'
-import { parsePackageCheckArguments, readPackageTarEntries, snapshotPackageTarball } from './package-tarball.ts'
+import { PACKAGE_DECLARATION_CONSUMER_SOURCE } from './package-declaration-consumer.ts'
+import {
+  parsePackageCheckArguments,
+  readPackageTarEntries,
+  retainPackageArtifact,
+  snapshotPackageTarball,
+  verifyPackageArtifactMetadata,
+} from './package-tarball.ts'
 import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const options = parsePackageCheckArguments(process.argv.slice(2))
 const retainedTarballDirectory = options.retainedDirectory
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'encephalon-package-check-'))
+const subprocessTimeoutMilliseconds = 60_000
+const subprocessMaximumOutputBytes = 1024 * 1024
 
 const execute = (command: readonly string[], cwd = root) => {
   const [requestedExecutable, ...arguments_] = command
@@ -30,6 +37,9 @@ const execute = (command: readonly string[], cwd = root) => {
     const result = spawnSync(requestedExecutable, arguments_, {
       cwd,
       encoding: 'utf8',
+      killSignal: 'SIGKILL',
+      maxBuffer: subprocessMaximumOutputBytes,
+      timeout: subprocessTimeoutMilliseconds,
     })
     if (result.error !== undefined) {
       throw result.error
@@ -53,6 +63,16 @@ const run = (command: string[], cwd = root) => {
   throw new Error(`${command[0]} failed with exit code ${result.exitCode}.`)
 }
 
+const runClean = (command: string[], cwd = root) => {
+  const result = execute(command, cwd)
+  if (result.exitCode === 0 && result.stderr === '') {
+    return result.stdout
+  }
+  process.stderr.write(result.stdout)
+  process.stderr.write(result.stderr)
+  throw new Error(`${command[0]} failed with exit code ${result.exitCode} or wrote unexpected stderr.`)
+}
+
 const runExpectedFailure = (command: string[], cwd = root) => {
   const result = execute(command, cwd)
   return {
@@ -63,7 +83,11 @@ const runExpectedFailure = (command: string[], cwd = root) => {
 }
 
 const runNpm = (arguments_: readonly string[], cwd = root) => {
-  const result = spawnNpmCommand(arguments_, { cwd })
+  const result = spawnNpmCommand(arguments_, {
+    cwd,
+    maxBuffer: subprocessMaximumOutputBytes,
+    timeoutMilliseconds: subprocessTimeoutMilliseconds,
+  })
   if (result.error !== undefined) {
     throw result.error
   }
@@ -95,32 +119,6 @@ const createNpmTarball = () => {
   throw new Error('npm pack did not return package metadata.')
 }
 
-const createRetainedTarballParents = (parentDirectory: string) =>
-  relative(root, parentDirectory)
-    .split(sep)
-    .filter(segment => segment.length > 0)
-    .reduce((parent, segment) => {
-      const directory = resolve(parent, segment)
-      const entry = lstatSync(directory, { throwIfNoEntry: false })
-      if (entry === undefined) {
-        mkdirSync(directory, { mode: 0o700 })
-      } else if (!(entry.isDirectory() && !entry.isSymbolicLink())) {
-        throw new Error('The retained tarball destination changed after validation.')
-      }
-      return directory
-    }, root)
-
-const retainTarball = (tarball: string, filename: string) => {
-  if (retainedTarballDirectory !== undefined) {
-    const parentDirectory = dirname(retainedTarballDirectory)
-    createRetainedTarballParents(parentDirectory)
-    mkdirSync(retainedTarballDirectory, { mode: 0o700 })
-    const retainedTarball = resolve(retainedTarballDirectory, filename)
-    copyFileSync(tarball, retainedTarball, constants.COPYFILE_EXCL)
-    return relative(root, retainedTarball).split(sep).join('/')
-  }
-}
-
 const collectFiles = (directory: string): string[] =>
   readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
     const path = resolve(directory, entry.name)
@@ -145,29 +143,28 @@ const readmeReferences = (content: string) => {
     })
 }
 
-try {
-  const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
-    name?: unknown
-    version?: unknown
-    license?: unknown
-    type?: unknown
-    engines?: unknown
-    bin?: unknown
-    exports?: unknown
-    files?: unknown
-    bundleDependencies?: unknown
-    bundledDependencies?: unknown
-    dependencies?: unknown
-    optionalDependencies?: unknown
-    peerDependencies?: unknown
-    peerDependenciesMeta?: unknown
-    scripts?: Record<string, unknown>
-  }
+type PackageManifest = Readonly<{
+  name?: unknown
+  version?: unknown
+  license?: unknown
+  type?: unknown
+  engines?: unknown
+  bin?: unknown
+  exports?: unknown
+  files?: unknown
+  bundleDependencies?: unknown
+  bundledDependencies?: unknown
+  dependencies?: unknown
+  optionalDependencies?: unknown
+  peerDependencies?: unknown
+  peerDependenciesMeta?: unknown
+  scripts?: Record<string, unknown>
+}>
+
+const assertReviewedManifest = (packageJson: PackageManifest) => {
   if (typeof packageJson.version !== 'string') {
     throw new Error('Package version must be a string.')
   }
-  const generatedVersionSource = readPackageVersionSource(resolve(root, 'src', 'generated', 'version.ts'))
-  assertPackageVersionSource(packageJson.version, generatedVersionSource)
   if (
     packageJson.name !== 'encephalon' ||
     packageJson.license !== 'MIT' ||
@@ -202,6 +199,19 @@ try {
   if (forbiddenLifecycleScripts.some(name => packageJson.scripts?.[name] !== undefined)) {
     throw new Error('The package contains a forbidden installation lifecycle script.')
   }
+  return packageJson.version
+}
+
+const decodeUtf8 = (bytes: Buffer) => new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+
+try {
+  const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as PackageManifest
+  if (typeof packageJson.version !== 'string') {
+    throw new Error('Package version must be a string.')
+  }
+  const generatedVersionSource = readPackageVersionSource(resolve(root, 'src', 'generated', 'version.ts'))
+  assertPackageVersionSource(packageJson.version, generatedVersionSource)
+  const packageVersion = assertReviewedManifest(packageJson)
 
   const requiredFiles = [
     'dist/cli.mjs',
@@ -240,8 +250,8 @@ try {
   if (/from\s+["'][^"']+\.ts["']/.test(declarations)) {
     throw new Error('The declarations contain unresolved TypeScript source imports.')
   }
-  const cliVersion = run([process.execPath, resolve(root, 'dist', 'cli.mjs'), '--version'])
-  if (cliVersion !== `${packageJson.version}\n`) {
+  const cliVersion = runClean([process.execPath, resolve(root, 'dist', 'cli.mjs'), '--version'])
+  if (cliVersion !== `${packageVersion}\n`) {
     throw new Error('The built CLI reports a stale package version.')
   }
 
@@ -250,7 +260,24 @@ try {
   if (sourceTarball === undefined) {
     throw new Error('Package tarball acquisition failed.')
   }
+  const sourceCommit = run(['git', 'rev-parse', 'HEAD']).trim()
+  const suppliedMetadata =
+    options.suppliedTarball === undefined
+      ? undefined
+      : verifyPackageArtifactMetadata(options.suppliedTarball, { packageVersion, sourceCommit })
   const snapshot = snapshotPackageTarball(sourceTarball, temporaryDirectory)
+  if (
+    suppliedMetadata !== undefined &&
+    !isDeepStrictEqual(snapshot.digests, {
+      bytes: suppliedMetadata.bytes,
+      integrity: suppliedMetadata.integrity,
+      sha1: suppliedMetadata.sha1,
+      sha256: suppliedMetadata.sha256,
+      sha512: suppliedMetadata.sha512,
+    })
+  ) {
+    throw new Error('The supplied package bytes changed after metadata verification.')
+  }
   const tarball = snapshot.path
   const entries = readPackageTarEntries(tarball)
   const allowedFiles = new Set([
@@ -287,6 +314,27 @@ try {
   if (differsFromReviewedManifest) {
     throw new Error('The tarball differs from the reviewed package file manifest.')
   }
+  const packedManifest = packedEntries.find(entry => entry.path === 'package.json')
+  if (packedManifest === undefined) {
+    throw new Error('The packed package manifest is missing from the reviewed package contents.')
+  }
+  try {
+    const packedPackageJson = JSON.parse(decodeUtf8(packedManifest.content)) as PackageManifest
+    const packedVersion = assertReviewedManifest(packedPackageJson)
+    if (packedVersion !== packageVersion) {
+      throw new Error('The packed package version differs from the reviewed source version.')
+    }
+  } catch (error) {
+    throw new Error('The packed package manifest differs from the reviewed package manifest.', { cause: error })
+  }
+  const contentMismatch = packedEntries.find(entry => {
+    const expectedContent = readFileSync(resolve(root, entry.path))
+    const expectedMode = entry.path === 'dist/cli.mjs' ? 0o755 : 0o644
+    return entry.mode !== expectedMode || !entry.content.equals(expectedContent)
+  })
+  if (contentMismatch !== undefined) {
+    throw new Error(`The reviewed package bytes or mode differ for ${contentMismatch.path}.`)
+  }
   const missingReadmeReferences = readmeReferences(readFileSync(resolve(root, 'README.md'), 'utf8')).filter(
     path => !packedPaths.has(path),
   )
@@ -304,8 +352,19 @@ try {
   mkdirSync(resolve(consumer, '.git'), { recursive: true })
   writeFileSync(resolve(consumer, 'package.json'), '{"name":"encephalon-smoke","private":true,"type":"module"}\n')
   runNpm(['install', '--dry-run=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-dev', tarball], consumer)
+  const packedApiRoot = resolve(temporaryDirectory, 'api-consumer')
+  mkdirSync(resolve(packedApiRoot, '.git'), { recursive: true })
+  writeFileSync(
+    resolve(packedApiRoot, 'package.json'),
+    '{"name":"encephalon-api-smoke","private":true,"type":"module"}\n',
+  )
+  runNpm(
+    ['install', '--dry-run=false', '--ignore-scripts', '--no-audit', '--no-fund', '--save-dev', tarball],
+    packedApiRoot,
+  )
   const packedApiContract = [
     "const api = await import('encephalon')",
+    `const apiRoot = ${JSON.stringify(packedApiRoot)}`,
     "if (typeof api.prepare !== 'function' || typeof api.initEncephalon !== 'function') throw new Error('The packed API is incomplete.')",
     'const descriptors = []',
     'let ownKeys = 0',
@@ -319,19 +378,13 @@ try {
     'let inputRejected = false',
     "try { api.prepare(input) } catch (error) { inputRejected = error instanceof api.EncephalonError && error.code === 'INVALID_ARGUMENT' }",
     "if (!inputRejected || getterCalls !== 0) throw new Error('The packed Node API input descriptor contract failed.')",
+    'api.prepare({ root: apiRoot })',
+    "const resultCases = [{ name: 'list', budget: 'fullResultLimit', invoke: limit => api.listRecords({ root: apiRoot, limit }) }, { name: 'search', budget: 'fullResultLimit', invoke: limit => api.searchRecords({ root: apiRoot, query: 'x', limit }) }, { name: 'searchCompact', budget: 'compactResultLimit', invoke: limit => api.searchCompactRecords({ root: apiRoot, query: 'x', limit }) }, { name: 'gather', budget: 'compactResultLimit', invoke: limit => api.gatherRecords({ root: apiRoot, limit }) }]",
+    'const acceptedLimits = [50, 100, 101, 999, 1000]',
+    "for (const resultCase of resultCases) { for (const limit of acceptedLimits) { const result = resultCase.invoke(limit); if (resultCase.name === 'gather' ? !Array.isArray(result.records) : !Array.isArray(result)) throw new Error('The packed API ' + resultCase.name + ' result-limit ' + limit + ' contract failed.') } let exactRejection = false; try { resultCase.invoke(1001) } catch (error) { exactRejection = error instanceof api.EncephalonError && error.code === 'INVALID_ARGUMENT' && error.message === 'limit must be an integer between 1 and 1000.' && JSON.stringify(error.details) === JSON.stringify({ budget: resultCase.budget, field: 'limit', maximum: 1000 }) } if (!exactRejection) throw new Error('The packed API ' + resultCase.name + ' result-limit 1001 contract failed.') }",
   ].join('\n')
-  run([process.execPath, '--input-type=module', '--eval', packedApiContract], consumer)
-  writeFileSync(
-    resolve(consumer, 'smoke.ts'),
-    [
-      "import { EncephalonError, type BrainRecordFile, type SearchRecordsInput } from 'encephalon'",
-      "const record: BrainRecordFile = { id: 'x', kind: 'context', subject: 'x', source: 'test', createdAt: '2026-08-06T00:00:00.000Z', payload: {} }",
-      'const search: SearchRecordsInput = { query: record.subject }',
-      "const error: EncephalonError = new EncephalonError('INVALID_ARGUMENT', search.query)",
-      "if (error.code !== 'INVALID_ARGUMENT') throw error",
-      '',
-    ].join('\n'),
-  )
+  runClean([process.execPath, '--input-type=module', '--eval', packedApiContract], packedApiRoot)
+  writeFileSync(resolve(consumer, 'smoke.ts'), PACKAGE_DECLARATION_CONSUMER_SOURCE)
   writeFileSync(
     resolve(consumer, 'tsconfig.json'),
     `${JSON.stringify(
@@ -359,10 +412,16 @@ try {
     consumer,
   )
   const installedCli = resolve(consumer, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
-  const cli = (arguments_: string[]) => run([process.execPath, installedCli, ...arguments_], consumer)
+  const cli = (arguments_: string[]) => runClean([process.execPath, installedCli, ...arguments_], consumer)
   const cliFailure = (arguments_: string[]) =>
     runExpectedFailure([process.execPath, installedCli, ...arguments_], consumer)
-  const cliJson = (arguments_: string[]) => JSON.parse(cli(arguments_)) as unknown
+  const cliJson = (arguments_: string[]) => {
+    const stdout = cli(arguments_)
+    if (stdout.endsWith('\n') && /^[[{]/u.test(stdout)) {
+      return JSON.parse(stdout) as unknown
+    }
+    throw new Error('The packed Node-only CLI JSON stdout framing contract failed.')
+  }
 
   const help = cli(['--help'])
   const helpFragments = [
@@ -377,7 +436,7 @@ try {
   if (
     !/^Usage: encephalon/m.test(help) ||
     helpFragments.some(fragment => !help.includes(fragment)) ||
-    cli(['--version']) !== `${packageJson.version}\n`
+    cli(['--version']) !== `${packageVersion}\n`
   ) {
     throw new Error('The packed Node-only CLI help/version contract failed.')
   }
@@ -388,12 +447,14 @@ try {
   ) => {
     const result = cliFailure(arguments_)
     const body = JSON.parse(result.stderr) as {
-      error?: { code?: unknown; details?: unknown }
+      error?: { code?: unknown; details?: unknown; message?: unknown }
     }
     if (
       result.exitCode !== 2 ||
       result.stdout !== '' ||
+      !result.stderr.endsWith('\n') ||
       body.error?.code !== 'INVALID_ARGUMENT' ||
+      body.error.message !== '--limit must be an integer between 1 and 1000.' ||
       !isDeepStrictEqual(body.error.details, expectedDetails)
     ) {
       throw new Error('The packed Node-only CLI operation budget contract failed.')
@@ -402,22 +463,22 @@ try {
 
   const packedResultLimitCases = [
     {
-      accepted: ['list', '--root', consumer, '--limit=1000'],
+      accepted: (limit: number) => ['list', '--root', consumer, `--limit=${limit}`],
       budget: 'fullResultLimit',
       rejected: ['list', '--root', consumer, '--limit=1001'],
     },
     {
-      accepted: ['search', '--root', consumer, '--limit=1000', 'x'],
+      accepted: (limit: number) => ['search', '--root', consumer, `--limit=${limit}`, 'x'],
       budget: 'fullResultLimit',
       rejected: ['search', '--root', consumer, '--limit=1001', 'x'],
     },
     {
-      accepted: ['search', '--root', consumer, '--compact', '--limit=1000', 'x'],
+      accepted: (limit: number) => ['search', '--root', consumer, '--compact', `--limit=${limit}`, 'x'],
       budget: 'compactResultLimit',
       rejected: ['search', '--root', consumer, '--compact', '--limit=1001', 'x'],
     },
     {
-      accepted: ['gather', '--root', consumer, '--limit=1000'],
+      accepted: (limit: number) => ['gather', '--root', consumer, `--limit=${limit}`],
       budget: 'compactResultLimit',
       rejected: ['gather', '--root', consumer, '--limit=1001'],
     },
@@ -439,8 +500,12 @@ try {
   if (!Array.isArray(initialised.recordsCreated) || initialised.recordsCreated.length !== 3) {
     throw new Error('The packed Node-only CLI init command returned an unexpected result.')
   }
-  for (const limitCase of packedResultLimitCases) {
-    cliJson([...limitCase.accepted])
+  const acceptedResultLimits = [50, 100, 101, 999, 1000] as const
+  const acceptedLimitResults = packedResultLimitCases.flatMap(limitCase =>
+    acceptedResultLimits.map(limit => cliJson(limitCase.accepted(limit))),
+  )
+  if (acceptedLimitResults.length !== packedResultLimitCases.length * acceptedResultLimits.length) {
+    throw new Error('The packed CLI accepted result-limit matrix did not execute every case.')
   }
   const added = cliJson([
     'add',
@@ -499,9 +564,14 @@ try {
     throw new Error('The packed Node-only CLI gather command returned an unexpected result.')
   }
   process.stderr.write(`${JSON.stringify(snapshot.digests)}\n`)
-  const retainedTarball = retainTarball(tarball, basename(sourceTarball))
-  if (retainedTarball !== undefined) {
-    process.stdout.write(`${retainedTarball}\n`)
+  if (retainedTarballDirectory !== undefined) {
+    const retained = retainPackageArtifact(snapshot, {
+      filename: basename(sourceTarball),
+      packageVersion,
+      retainedDirectory: retainedTarballDirectory,
+      sourceCommit,
+    })
+    process.stdout.write(`${relative(root, retained.path).split(sep).join('/')}\n`)
   }
 } finally {
   rmSync(temporaryDirectory, { force: true, recursive: true })

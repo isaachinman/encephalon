@@ -1,10 +1,22 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, test } from 'node:test'
+import { pathToFileURL } from 'node:url'
 import { spawnNpmCommand } from './npm-command.ts'
 import { packageTarballDigests } from './package-tarball.ts'
 import {
@@ -20,6 +32,9 @@ import {
   sanitizedCompatibilityEnvironment,
   verifyOracleTarball,
 } from './release-compatibility.ts'
+
+const compatibilityIntegrationTimeout = process.platform === 'win32' ? 300_000 : 120_000
+const compatibilityRegressionTimeout = process.platform === 'win32' ? 360_000 : 180_000
 
 const createDurableFixture = () => {
   const root = mkdtempSync(resolve(tmpdir(), 'encephalon-release-durable-'))
@@ -37,7 +52,7 @@ const createDurableFixture = () => {
   return { artifact, cache, record, root }
 }
 
-const standInIndex = (version: string, schemaVersion: string) => {
+const standInIndex = (version: string, schemaVersion: string, behaviour = version) => {
   const fullMaximum = version.startsWith('0.2.0') ? 50 : 1000
   const compactMaximum = version.startsWith('0.2.0') ? 100 : 1000
   const payloadBudgetError = {
@@ -47,12 +62,12 @@ const standInIndex = (version: string, schemaVersion: string) => {
   }
   const forgedWitness = {
     allocationWork: {
-      descriptorMapCalls: version.includes('coverage-drift') ? 1 : 0,
+      descriptorMapCalls: behaviour.includes('coverage-drift') ? 1 : 0,
       oversizedArray: {
         error: payloadBudgetError,
         work: { descriptors: ['length'], ownKeys: 0 },
       },
-      retainedDescriptorCount: version.includes('coverage-drift') ? 100_000 : 0,
+      retainedDescriptorCount: behaviour.includes('coverage-drift') ? 100_000 : 0,
       wideObject: {
         error: payloadBudgetError,
         propertyCount: 100_000,
@@ -60,7 +75,7 @@ const standInIndex = (version: string, schemaVersion: string) => {
       },
     },
     corpusArtifactReferences: {
-      overLimit: version.includes('coverage-drift')
+      overLimit: behaviour.includes('coverage-drift')
         ? { status: 'accepted' }
         : {
             status: 'rejected',
@@ -78,7 +93,7 @@ const standInIndex = (version: string, schemaVersion: string) => {
       withinLimit: { status: 'accepted' },
     },
     corpusSupersessionEdges: {
-      overLimit: version.includes('coverage-drift')
+      overLimit: behaviour.includes('coverage-drift')
         ? { status: 'accepted' }
         : {
             status: 'rejected',
@@ -97,10 +112,10 @@ const standInIndex = (version: string, schemaVersion: string) => {
     },
   }
   const privateExports = (() => {
-    if (version.includes('forged-witness')) {
-      return `export const packageWitness = ${JSON.stringify(version)}\nexport const __releaseCompatibilityWitness = ${JSON.stringify(forgedWitness)}`
+    if (behaviour.includes('forged-witness')) {
+      return `export const packageWitness = ${JSON.stringify(behaviour)}\nexport const __releaseCompatibilityWitness = ${JSON.stringify(forgedWitness)}`
     }
-    if (version.includes('forged-export-only')) {
+    if (behaviour.includes('forged-export-only')) {
       return `export const packageWitness = 'forged-package-witness'\nexport const __releaseCompatibilityWitness = ${JSON.stringify(forgedWitness)}`
     }
     return ''
@@ -111,16 +126,20 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
-if (${String(version.includes('environment-witness'))} && Object.keys(process.env).some(key => key.toLowerCase() === 'node_options' || key.toLowerCase() === 'node_path')) {
+if (${String(behaviour.includes('environment-witness'))} && Object.keys(process.env).some(key => key.toLowerCase() === 'node_options' || key.toLowerCase() === 'node_path')) {
   throw new Error('compatibility subprocess inherited preload variables')
 }
 
 ${privateExports}
 
-if (${String(version.includes('environment-mutation'))}) {
+if (${String(behaviour.includes('environment-mutation'))}) {
   process.env.NODE_OPTIONS = '--require=' + resolve(import.meta.dirname, 'environment-preload.cjs')
   process.env.NODE_PATH = resolve(import.meta.dirname, 'environment-node-path')
 }
+
+if (${String(behaviour.includes('success-stderr'))}) process.stderr.write('candidate success diagnostic\\n')
+if (${String(behaviour.includes('import-sentinel'))}) writeFileSync(resolve(process.cwd(), 'candidate-import-sentinel'), 'unexpected import side effect\\n')
+if (${String(behaviour.includes('probe-tamper'))}) writeFileSync(process.argv[1], 'candidate replaced trusted probe\\n')
 
 export class EncephalonError extends Error {
   constructor(code, message, details = {}) {
@@ -153,14 +172,14 @@ const validationError = (code, message) => {
   throw new EncephalonError('VALIDATION_FAILED', 'The new record would make canonical records invalid.', { errors: [{ code, message }] })
 }
 const assertQuery = (query, compact = false) => {
-  const byteMaximum = ${version.includes('budget-drift') ? 2048 : 1024} + (compact && ${String(version.includes('coverage-drift'))} ? 1024 : 0)
+  const byteMaximum = ${behaviour.includes('budget-drift') ? 2048 : 1024} + (compact && ${String(behaviour.includes('coverage-drift'))} ? 1024 : 0)
   if (Buffer.byteLength(query, 'utf8') > byteMaximum) budgetError('queryBytes', 'query', byteMaximum, 'query must contain at most ' + byteMaximum + ' UTF-8 bytes.')
   const terms = query.match(/[A-Za-z0-9]+/g) ?? []
-  const termMaximum = compact && ${String(version.includes('coverage-drift'))} ? 64 : 32
+  const termMaximum = compact && ${String(behaviour.includes('coverage-drift'))} ? 64 : 32
   if (terms.length > termMaximum) budgetError('queryTerms', 'query', termMaximum, 'query may contain at most ' + termMaximum + ' literal terms.')
 }
 const assertPayload = payload => {
-  const nonconforming = ${String(version.includes('coverage-drift') || version.includes('forged-witness'))}
+  const nonconforming = ${String(behaviour.includes('coverage-drift') || behaviour.includes('forged-witness'))}
   const work = [{ depth: 0, path: 'payload', value: payload }]
   let nodes = 0
   while (work.length > 0) {
@@ -278,14 +297,14 @@ export const addRecord = input => {
   }
   mkdirSync(recordsDirectory(root), { recursive: true })
   writeFileSync(path, JSON.stringify(record) + '\\n')
-  return record
+  return ${String(behaviour.includes('hostile-added-path'))} ? { ...record, path: 'AGENTS.md' } : record
 }
 
 export const prepare = input => writeCache(repositoryRoot(input))
 export const hydrate = input => ({ recordsIndexed: writeCache(repositoryRoot(input)).recordsIndexed })
 export const validateRecords = input => {
   const records = readRecords(repositoryRoot(input))
-  const errors = ${String(version.includes('coverage-drift') || version.includes('forged-witness'))}
+  const errors = ${String(behaviour.includes('coverage-drift') || behaviour.includes('forged-witness'))}
     ? []
     : [
         ...(records.reduce((count, record) => count + (record.supersedes?.length ?? 0), 0) > 1000
@@ -295,7 +314,7 @@ export const validateRecords = input => {
           ? [{ code: 'CORPUS_ARTIFACT_LIMIT', message: 'Canonical corpus may contain at most 1000 artifact references.' }]
           : []),
       ]
-  return { errors, recordsChecked: records.length, truncated: false, valid: errors.length === 0${version.includes('shape-drift') ? ", drift: 'candidate-only'" : ''} }
+  return { errors, recordsChecked: records.length, truncated: false, valid: errors.length === 0${behaviour.includes('shape-drift') ? ", drift: 'candidate-only'" : ''} }
 }
 export const listRecords = (input = {}) => assertResponse(
   readRecords(repositoryRoot(input))
@@ -341,7 +360,7 @@ export const gatherRecords = (input = {}) => {
 `
 }
 
-const standInCli = (version: string) => `#!/usr/bin/env node
+const standInCli = (version: string, behaviour = version) => `#!/usr/bin/env node
 import {
   addRecord,
   EncephalonError,
@@ -358,7 +377,7 @@ import {
 
 const raw = process.argv.slice(2)
 if (raw.length === 1 && (raw[0] === '--help' || raw[0] === '-h')) {
-  process.stdout.write('Usage: encephalon <command>\\nCommands: init add prepare hydrate validate list show search gather${version.includes('shape-drift') ? ' candidate-only' : ''}\\n')
+  process.stdout.write('Usage: encephalon <command>\\nCommands: init add prepare hydrate validate list show search gather${behaviour.includes('shape-drift') ? ' candidate-only' : ''}\\n')
 } else if (raw.length === 1 && (raw[0] === '--version' || raw[0] === '-v')) {
   process.stdout.write(${JSON.stringify(`${version}\n`)})
 } else {
@@ -440,8 +459,8 @@ export type GatherInput = RootInput & { searches?: string[]; shows?: string[]; k
 export type PrepareResult = { hydrated: boolean; recordsIndexed: number }
 export type HydrateResult = { recordsIndexed: number }
 export type GatherResult = { hydrated: HydrateResult | null; searches: Array<{ query: string; kind: string | null; results: CompactBrainRecord[] }>; records: Array<{ id: string; record: BrainRecord | null }> }
-export type EncephalonErrorCode = 'INVALID_ARGUMENT' | 'RECORD_EXISTS'
-export declare class EncephalonError extends Error { readonly code: EncephalonErrorCode; readonly details: Record<string, JsonValue> }
+export type EncephalonErrorCode = 'UNSUPPORTED_RUNTIME' | 'REPOSITORY_NOT_FOUND' | 'INVALID_REPOSITORY' | 'ROOT_INSTALL_REQUIRED' | 'INVALID_ARGUMENT' | 'VALIDATION_FAILED' | 'RECORD_EXISTS' | 'CACHE_BUSY' | 'CACHE_SCOPE_MISMATCH' | 'REPOSITORY_CHANGED' | 'IO_ERROR' | 'INTERNAL_ERROR'
+export declare class EncephalonError extends Error { constructor(code: EncephalonErrorCode, message: string, details?: Record<string, JsonValue>, options?: ErrorOptions); readonly code: EncephalonErrorCode; readonly details: Record<string, JsonValue> }
 export declare const initEncephalon: (input?: InitEncephalonInput) => InitEncephalonResult
 export declare const addRecord: (input: AddRecordInput) => BrainRecord
 export declare const prepare: (input?: RootInput) => PrepareResult
@@ -455,6 +474,7 @@ export declare const gatherRecords: (input?: GatherInput) => GatherResult
 `
 
 const buildStandInTarball = (root: string, version: string, schemaVersion: string) => {
+  const packageVersion = version.startsWith('0.3.0-') ? '0.3.0' : version
   const packageRoot = resolve(root, `package-${version}`)
   const tarballDirectory = resolve(root, 'tarballs')
   mkdirSync(resolve(packageRoot, 'dist'), { recursive: true })
@@ -469,14 +489,14 @@ const buildStandInTarball = (root: string, version: string, schemaVersion: strin
         name: 'encephalon',
         type: 'module',
         types: './dist/index.d.ts',
-        version,
+        version: packageVersion,
       },
       null,
       2,
     )}\n`,
   )
-  writeFileSync(resolve(packageRoot, 'dist', 'index.mjs'), standInIndex(version, schemaVersion))
-  writeFileSync(resolve(packageRoot, 'dist', 'cli.mjs'), standInCli(version), { mode: 0o755 })
+  writeFileSync(resolve(packageRoot, 'dist', 'index.mjs'), standInIndex(packageVersion, schemaVersion, version))
+  writeFileSync(resolve(packageRoot, 'dist', 'cli.mjs'), standInCli(packageVersion, version), { mode: 0o755 })
   writeFileSync(
     resolve(packageRoot, 'dist', 'environment-preload.cjs'),
     "throw new Error('compatibility nested preload executed')\n",
@@ -577,10 +597,14 @@ describe('release compatibility authorities', () => {
 
   test('preserves and compares special permission bits in durable snapshots', {
     skip: process.platform === 'win32',
-  }, () => {
+  }, testContext => {
     const fixture = createDurableFixture()
     try {
       chmodSync(fixture.record, 0o4755)
+      if ((lstatSync(fixture.record).mode & 0o7777) !== 0o4755) {
+        testContext.skip('The temporary filesystem does not preserve special permission bits.')
+        return
+      }
       const expected = captureDurableSnapshot(fixture.root)
       const record = expected.find(entry => entry.path === 'encephalon/decision/compatibility.json')
       assert.equal(record?.mode, 0o4755)
@@ -612,10 +636,65 @@ describe('release compatibility authorities', () => {
     }
   })
 
+  test('rejects multiply linked, oversized, growing, and replaced durable files', () => {
+    const hardLinked = createDurableFixture()
+    try {
+      linkSync(hardLinked.record, resolve(hardLinked.record, '..', 'hard-link.json'))
+      assert.throws(() => captureDurableSnapshot(hardLinked.root), /hard link|stable bounded regular file/u)
+    } finally {
+      rmSync(hardLinked.root, { force: true, recursive: true })
+    }
+
+    const oversized = createDurableFixture()
+    try {
+      writeFileSync(oversized.artifact, Buffer.alloc(16 * 1024 * 1024 + 1))
+      assert.throws(() => captureDurableSnapshot(oversized.root), /byte limit|bounded regular file/u)
+    } finally {
+      rmSync(oversized.root, { force: true, recursive: true })
+    }
+
+    const growing = createDurableFixture()
+    try {
+      assert.throws(
+        () =>
+          captureDurableSnapshot(growing.root, {
+            afterFileOpen: (path: string) => {
+              if (path === growing.record) {
+                writeFileSync(path, '{"private":"grown-canonical-record-sentinel"}\n')
+              }
+            },
+          }),
+        /changed|stable bounded regular file/u,
+      )
+    } finally {
+      rmSync(growing.root, { force: true, recursive: true })
+    }
+
+    const replaced = createDurableFixture()
+    const moved = `${replaced.record}.moved`
+    try {
+      assert.throws(
+        () =>
+          captureDurableSnapshot(replaced.root, {
+            afterFileOpen: (path: string) => {
+              if (path === replaced.record) {
+                renameSync(path, moved)
+                writeFileSync(path, '{"private":"replacement-canonical-record-sentinel"}\n')
+              }
+            },
+          }),
+        /changed|stable bounded regular file/u,
+      )
+    } finally {
+      rmSync(replaced.root, { force: true, recursive: true })
+    }
+  })
+
   test('runs commands in fresh Node processes and bounds redacted failure diagnostics', () => {
     const directory = mkdtempSync(resolve(tmpdir(), 'encephalon-release-process-'))
     const pidScript = resolve(directory, 'pid.mjs')
     const failureScript = resolve(directory, 'failure.mjs')
+    const multibyteFailureScript = resolve(directory, 'multibyte-failure.mjs')
     const canonicalSecret = 'private-canonical-command-sentinel'
     const instructionSecret = 'private-instruction-command-sentinel'
     try {
@@ -625,6 +704,10 @@ describe('release compatibility authorities', () => {
         `process.stdout.write('${canonicalSecret}' + 'x'.repeat(${MAX_COMPATIBILITY_DIAGNOSTIC_BYTES * 2}))\n` +
           `process.stderr.write('safe diagnostic ${instructionSecret}')\n` +
           'process.exitCode = 7\n',
+      )
+      writeFileSync(
+        multibyteFailureScript,
+        `process.stdout.write('x' + '🙂'.repeat(${MAX_COMPATIBILITY_DIAGNOSTIC_BYTES}))\nprocess.exitCode = 8\n`,
       )
 
       const first = runCompatibilityCommand(process.execPath, [pidScript], {
@@ -657,6 +740,56 @@ describe('release compatibility authorities', () => {
           return true
         },
       )
+
+      assert.throws(
+        () =>
+          runCompatibilityCommand(process.execPath, [multibyteFailureScript], {
+            cwd: directory,
+            label: 'multibyte bounded failure witness',
+          }),
+        error => {
+          assert.equal(error instanceof CompatibilityCommandError, true)
+          const candidate = error as CompatibilityCommandError
+          assert.equal(Buffer.byteLength(candidate.stdout) <= MAX_COMPATIBILITY_DIAGNOSTIC_BYTES, true)
+          assert.equal(candidate.stdout.includes('\uFFFD'), false)
+          return true
+        },
+      )
+    } finally {
+      rmSync(directory, { force: true, recursive: true })
+    }
+  })
+
+  test('terminates a hanging compatibility subprocess within its explicit bound', () => {
+    const directory = mkdtempSync(resolve(tmpdir(), 'encephalon-release-timeout-'))
+    const hang = resolve(directory, 'hang.mjs')
+    const wrapper = resolve(directory, 'wrapper.mjs')
+    try {
+      writeFileSync(hang, 'setInterval(() => {}, 1000)\n')
+      writeFileSync(
+        wrapper,
+        `import { runCompatibilityCommand } from ${JSON.stringify(pathToFileURL(resolve(import.meta.dirname, 'release-compatibility.ts')).href)}
+try {
+  runCompatibilityCommand(process.execPath, [${JSON.stringify(hang)}], {
+    cwd: ${JSON.stringify(directory)},
+    label: 'hanging compatibility witness',
+    timeoutMilliseconds: 50,
+  })
+  process.exitCode = 91
+} catch {
+  process.stdout.write('bounded timeout\\n')
+}
+`,
+      )
+
+      const result = spawnSync(process.execPath, [wrapper], {
+        cwd: directory,
+        encoding: 'utf8',
+        timeout: 2000,
+      })
+      assert.equal(result.status, 0, `${result.stdout}${result.stderr}${String(result.error ?? '')}`)
+      assert.equal(result.stdout, 'bounded timeout\n')
+      assert.equal(result.stderr, '')
     } finally {
       rmSync(directory, { force: true, recursive: true })
     }
@@ -744,7 +877,7 @@ describe('release compatibility process fixture', () => {
   })
 
   test('upgrades and downgrades supplied local package bytes in fresh processes without changing durable state', {
-    timeout: 120_000,
+    timeout: compatibilityIntegrationTimeout,
   }, () => {
     const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-integration-'))
     const fixtureRoot = resolve(temporaryRoot, 'repository')
@@ -997,8 +1130,106 @@ describe('release compatibility process fixture', () => {
     }
   })
 
+  test('requires the candidate manifest version to equal the source release version', {
+    timeout: compatibilityRegressionTimeout,
+  }, () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-version-mismatch-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    try {
+      mkdirSync(fixtureRoot)
+      const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.1', '2')
+      const oracleDigests = packageTarballDigests(oracle.tarball)
+
+      assert.throws(
+        () =>
+          runReleaseCompatibility({
+            candidateTarball: candidate.tarball,
+            fixtureRoot,
+            oracle: {
+              identity: {
+                integrity: oracleDigests.integrity,
+                shasum: oracleDigests.sha1,
+                specifier: 'local-encephalon@0.2.0',
+              },
+              tarball: oracle.tarball,
+            },
+          }),
+        /candidate package version.*source release version/iu,
+      )
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects unrelated import side effects and successful probe diagnostics', {
+    timeout: compatibilityRegressionTimeout,
+  }, () => {
+    for (const behaviour of ['0.3.0-import-sentinel', '0.3.0-probe-tamper', '0.3.0-success-stderr']) {
+      const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-import-contract-'))
+      const fixtureRoot = resolve(temporaryRoot, 'repository')
+      try {
+        mkdirSync(fixtureRoot)
+        const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
+        const candidate = buildStandInTarball(temporaryRoot, behaviour, '2')
+        const oracleDigests = packageTarballDigests(oracle.tarball)
+
+        assert.throws(() =>
+          runReleaseCompatibility({
+            candidateTarball: candidate.tarball,
+            fixtureRoot,
+            oracle: {
+              identity: {
+                integrity: oracleDigests.integrity,
+                shasum: oracleDigests.sha1,
+                specifier: 'local-encephalon@0.2.0',
+              },
+              tarball: oracle.tarball,
+            },
+          }),
+        )
+      } finally {
+        rmSync(temporaryRoot, { force: true, recursive: true })
+      }
+    }
+  })
+
+  test('never deletes a candidate-controlled added path during probe cleanup', {
+    timeout: compatibilityRegressionTimeout,
+  }, () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-hostile-added-path-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    try {
+      mkdirSync(fixtureRoot)
+      const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-hostile-added-path', '2')
+      const oracleDigests = packageTarballDigests(oracle.tarball)
+
+      assert.throws(() =>
+        runReleaseCompatibility({
+          candidateTarball: candidate.tarball,
+          fixtureRoot,
+          oracle: {
+            identity: {
+              integrity: oracleDigests.integrity,
+              shasum: oracleDigests.sha1,
+              specifier: 'local-encephalon@0.2.0',
+            },
+            tarball: oracle.tarball,
+          },
+        }),
+      )
+      assert.equal(
+        readFileSync(resolve(fixtureRoot, 'AGENTS.md'), 'utf8').startsWith('oracle agents predecessor\n'),
+        true,
+      )
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
   test('rejects candidate API and CLI surface drift that loose success checks would accept', {
-    timeout: 120_000,
+    timeout: compatibilityIntegrationTimeout,
   }, () => {
     const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-shape-drift-'))
     const fixtureRoot = resolve(temporaryRoot, 'repository')
@@ -1030,7 +1261,7 @@ describe('release compatibility process fixture', () => {
   })
 
   test('rejects candidate independent-budget drift that result-limit checks cannot observe', {
-    timeout: 120_000,
+    timeout: compatibilityIntegrationTimeout,
   }, () => {
     const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-budget-drift-'))
     const fixtureRoot = resolve(temporaryRoot, 'repository')
@@ -1062,7 +1293,7 @@ describe('release compatibility process fixture', () => {
   })
 
   test('rejects compact/gather query, allocation-work, and aggregate-corpus drift', {
-    timeout: 120_000,
+    timeout: compatibilityIntegrationTimeout,
   }, () => {
     const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-coverage-drift-'))
     const fixtureRoot = resolve(temporaryRoot, 'repository')
@@ -1094,7 +1325,7 @@ describe('release compatibility process fixture', () => {
   })
 
   test('rejects forged non-public witnesses when public allocation and aggregate validation do not conform', {
-    timeout: 120_000,
+    timeout: compatibilityIntegrationTimeout,
   }, () => {
     const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-forged-witness-'))
     const fixtureRoot = resolve(temporaryRoot, 'repository')
@@ -1126,7 +1357,7 @@ describe('release compatibility process fixture', () => {
   })
 
   test('ignores candidate-supplied non-public witnesses when public behaviour conforms', {
-    timeout: 120_000,
+    timeout: compatibilityIntegrationTimeout,
   }, () => {
     const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-forged-export-only-'))
     const fixtureRoot = resolve(temporaryRoot, 'repository')
@@ -1156,7 +1387,7 @@ describe('release compatibility process fixture', () => {
   })
 
   test('removes preload variables from npm and every installed-package child process', {
-    timeout: 120_000,
+    timeout: compatibilityIntegrationTimeout,
   }, () => {
     const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-preload-isolation-'))
     const fixtureRoot = resolve(temporaryRoot, 'repository')
@@ -1204,7 +1435,7 @@ describe('release compatibility process fixture', () => {
   })
 
   test('removes preload variables added by an imported package before spawning nested CLI processes', {
-    timeout: 120_000,
+    timeout: compatibilityIntegrationTimeout,
   }, () => {
     const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-import-environment-mutation-'))
     const fixtureRoot = resolve(temporaryRoot, 'repository')

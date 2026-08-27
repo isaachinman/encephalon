@@ -1,10 +1,28 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { relative, resolve, sep } from 'node:path'
 import { describe, test } from 'node:test'
 import { gzipSync } from 'node:zlib'
-import { packageTarballDigests, parsePackageCheckArguments, readPackageTarEntries } from './package-tarball.ts'
+import * as packageTarballAuthority from './package-tarball.ts'
+import {
+  packageTarballDigests,
+  parsePackageCheckArguments,
+  readPackageTarEntries,
+  snapshotPackageTarball,
+} from './package-tarball.ts'
 
 const root = resolve(import.meta.dirname, '..')
 const repositoryRelative = (path: string) => relative(root, path).split(sep).join('/')
@@ -112,14 +130,172 @@ describe('package tarball authority', () => {
 
       const entries = readPackageTarEntries(tarball)
       assert.deepEqual(entries, [
-        { mode: 0o755, path: 'package/dist/cli.mjs', size: 20 },
-        { mode: 0o644, path: 'package/README.md', size: 8 },
+        {
+          content: Buffer.from('#!/usr/bin/env node\n'),
+          mode: 0o755,
+          path: 'package/dist/cli.mjs',
+          size: 20,
+        },
+        { content: Buffer.from('read me\n'), mode: 0o644, path: 'package/README.md', size: 8 },
       ])
       assert.equal(Object.isFrozen(entries), true)
       assert.equal(
         entries.every(entry => Object.isFrozen(entry)),
         true,
       )
+    } finally {
+      rmSync(fixtureDirectory, { force: true, recursive: true })
+    }
+  })
+
+  test('preserves legitimate trailing spaces in tar entry paths', () => {
+    const fixtureDirectory = mkdtempSync(resolve(root, 'scripts', '.package-tarball-padding-'))
+    const tarball = resolve(fixtureDirectory, 'fixture.tgz')
+    try {
+      writeFileSync(
+        tarball,
+        gzipSync(
+          Buffer.concat([tarEntry('package/trailing-space ', 0o644, Buffer.from('bytes\n')), Buffer.alloc(1024)]),
+        ),
+      )
+
+      assert.deepEqual(readPackageTarEntries(tarball), [
+        {
+          content: Buffer.from('bytes\n'),
+          mode: 0o644,
+          path: 'package/trailing-space ',
+          size: 6,
+        },
+      ])
+    } finally {
+      rmSync(fixtureDirectory, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects source growth and ancestor replacement while snapshotting supplied bytes', () => {
+    const fixtureDirectory = mkdtempSync(resolve(root, 'scripts', '.package-tarball-snapshot-race-'))
+    const sourceDirectory = resolve(fixtureDirectory, 'source')
+    const movedDirectory = resolve(fixtureDirectory, 'source-moved')
+    const snapshotDirectory = resolve(fixtureDirectory, 'snapshot')
+    const source = resolve(sourceDirectory, 'candidate.tgz')
+    try {
+      mkdirSync(sourceDirectory)
+      mkdirSync(snapshotDirectory)
+      writeFileSync(source, 'candidate bytes')
+
+      assert.throws(
+        () =>
+          snapshotPackageTarball(source, snapshotDirectory, {
+            afterSourceOpen: () => appendFileSync(source, '!'),
+          }),
+        /unchanged regular file|changed while/u,
+      )
+
+      rmSync(resolve(snapshotDirectory, 'package.tgz'), { force: true })
+      writeFileSync(source, 'candidate bytes')
+      assert.throws(
+        () =>
+          snapshotPackageTarball(source, snapshotDirectory, {
+            afterSourceOpen: () => {
+              renameSync(sourceDirectory, movedDirectory)
+              mkdirSync(sourceDirectory)
+              writeFileSync(source, 'replacement bytes')
+            },
+          }),
+        /ancestor|changed while|unchanged regular file/u,
+      )
+    } finally {
+      rmSync(fixtureDirectory, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects destination-ancestor replacement before retained artifact installation', () => {
+    const fixtureDirectory = mkdtempSync(resolve(root, 'scripts', '.package-retention-race-'))
+    const source = resolve(fixtureDirectory, 'candidate.tgz')
+    const snapshotDirectory = resolve(fixtureDirectory, 'snapshot')
+    const retainedParent = resolve(fixtureDirectory, 'retained-parent')
+    const retainedDirectory = resolve(retainedParent, 'package-artifacts')
+    const movedParent = resolve(fixtureDirectory, 'retained-parent-moved')
+    const { retainPackageArtifact } = packageTarballAuthority as typeof packageTarballAuthority & {
+      retainPackageArtifact?: (
+        snapshot: ReturnType<typeof snapshotPackageTarball>,
+        options: {
+          filename: string
+          packageVersion: string
+          retainedDirectory: string
+          sourceCommit: string
+        },
+        hooks?: { beforeInstall?: () => void },
+      ) => unknown
+    }
+    try {
+      mkdirSync(snapshotDirectory)
+      mkdirSync(retainedDirectory, { recursive: true })
+      writeFileSync(source, 'candidate bytes')
+      const snapshot = snapshotPackageTarball(source, snapshotDirectory)
+
+      assert.equal(typeof retainPackageArtifact, 'function')
+      assert.throws(
+        () =>
+          retainPackageArtifact?.(
+            snapshot,
+            {
+              filename: 'encephalon-0.3.0.tgz',
+              packageVersion: '0.3.0',
+              retainedDirectory,
+              sourceCommit: 'a'.repeat(40),
+            },
+            {
+              beforeInstall: () => {
+                renameSync(retainedParent, movedParent)
+                mkdirSync(retainedDirectory, { recursive: true })
+              },
+            },
+          ),
+        /destination|directory changed/u,
+      )
+      assert.equal(existsSync(resolve(retainedDirectory, 'encephalon-0.3.0.tgz')), false)
+    } finally {
+      rmSync(fixtureDirectory, { force: true, recursive: true })
+    }
+  })
+
+  test('replaces a stale exact artifact only through the verified retention flow', () => {
+    const fixtureDirectory = mkdtempSync(resolve(root, 'scripts', '.package-retention-replace-'))
+    const retainedDirectory = resolve(fixtureDirectory, 'package-artifacts')
+    const firstSnapshotDirectory = resolve(fixtureDirectory, 'first-snapshot')
+    const secondSnapshotDirectory = resolve(fixtureDirectory, 'second-snapshot')
+    const firstSource = resolve(fixtureDirectory, 'first.tgz')
+    const secondSource = resolve(fixtureDirectory, 'second.tgz')
+    try {
+      mkdirSync(retainedDirectory)
+      mkdirSync(firstSnapshotDirectory)
+      mkdirSync(secondSnapshotDirectory)
+      writeFileSync(firstSource, 'stale candidate bytes')
+      writeFileSync(secondSource, 'reviewed candidate bytes')
+      packageTarballAuthority.retainPackageArtifact(snapshotPackageTarball(firstSource, firstSnapshotDirectory), {
+        filename: 'encephalon-0.3.0.tgz',
+        packageVersion: '0.3.0',
+        retainedDirectory,
+        sourceCommit: 'a'.repeat(40),
+      })
+
+      const retained = packageTarballAuthority.retainPackageArtifact(
+        snapshotPackageTarball(secondSource, secondSnapshotDirectory),
+        {
+          filename: 'encephalon-0.3.0.tgz',
+          packageVersion: '0.3.0',
+          retainedDirectory,
+          sourceCommit: 'b'.repeat(40),
+        },
+      )
+
+      assert.equal(readFileSync(retained.path, 'utf8'), 'reviewed candidate bytes')
+      assert.equal(retained.metadata.sourceCommit, 'b'.repeat(40))
+      assert.deepEqual(readdirSync(retainedDirectory).sort(), [
+        'encephalon-0.3.0.tgz',
+        'encephalon-0.3.0.tgz.metadata.json',
+      ])
     } finally {
       rmSync(fixtureDirectory, { force: true, recursive: true })
     }

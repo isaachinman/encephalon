@@ -18,6 +18,24 @@ const createPublishCheckFixture = () => {
   writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module"}\n')
   writeFileSync(resolve(temporaryRoot, 'candidate.tgz'), 'candidate tarball')
   writeFileSync(
+    resolve(temporaryRoot, 'candidate.tgz.metadata.json'),
+    `${JSON.stringify(
+      {
+        bytes: 17,
+        integrity: 'sha512-pTxmTw4D11aGOhLuuuLi7XMdkIwxMD/CLeWekvX9m00fIf2X+zxgZ/yhlV2/ZgbNj9U6a6zJFfMCchSrkKTj8A==',
+        packageVersion: '0.3.0',
+        sha1: '4d85c35b6eaaf3bb12766dd30b7f6d763bd34be8',
+        sha256: '840e0eaa94a08f97f361ebdc32d46cb60b9e94a5f10773d0647b363847605b67',
+        sha512:
+          'a53c664f0e03d756863a12eebae2e2ed731d908c31303fc22de59e92f5fd9b4d1f21fd97fb3c6067fca1955dbf6606cd8fd53a6bacc915f3027214ab90a4e3f0',
+        sourceCommit: 'a'.repeat(40),
+        tarball: 'candidate.tgz',
+      },
+      null,
+      2,
+    )}\n`,
+  )
+  writeFileSync(
     resolve(scriptsDirectory, 'npm-command.ts'),
     `import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'

@@ -1,0 +1,18 @@
+{
+  "createdAt": "2026-08-27T12:57:52.788Z",
+  "id": "9eae5ef0-50c6-4af1-8c10-bd97d4a22dad",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Prepare releases through one exact reviewed npm tarball and deterministic metadata sidecar before manual publication.",
+    "gates": [
+      "Use a fresh isolated writable npm cache; run the direct generated-version check before frozen script-disabled dependency installation, then typecheck, full tests, lint, benchmark check, deterministic build, and tracked-and-untracked clean-tree gates.",
+      "Create and retain package-artifacts/encephalon-0.3.0.tgz only through the package authority; verify its metadata sidecar, rerun the supplied-tarball package check, the pinned v0.2 upgrade/downgrade compatibility authority, the tarball-only publish dry run, and direct Encephalon validation against the same reviewed bytes.",
+      "Record byte size, SHA-1, SHA-256, SHA-512, npm integrity, package version, source commit, and the fixed repository-relative path; require reviewed pull-request and trusted-main tarball byte identity before publication."
+    ],
+    "publication": "Publication is a manual tarball-only action: npm publish <reviewed-candidate.tgz>. Never rebuild or publish a directory, and never upload without the maintainer final explicit approval after merge and green main."
+  },
+  "searchText": "release preparation exact reviewed npm tarball metadata sidecar compatibility oracle clean tree manual tarball only publication explicit approval",
+  "source": "agent",
+  "subject": "workflow.release-prepare",
+  "supersedes": ["269cceb6-d5e2-47a6-be66-91e309b4e059"]
+}

@@ -23,6 +23,69 @@ import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
 const releaseVersion = '0.3.0'
+const metadataPath = (tarball: string) => `${tarball}.metadata.json`
+
+const gitHead = (repositoryRoot: string) => {
+  const result = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repositoryRoot, encoding: 'utf8' })
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+  return result.stdout.trim()
+}
+
+const writeArtifactMetadata = (tarball: string, repositoryRoot: string, packageVersion = releaseVersion) => {
+  const bytes = readFileSync(tarball)
+  const sha512Hash = createHash('sha512').update(bytes)
+  const metadata = {
+    bytes: bytes.length,
+    integrity: `sha512-${sha512Hash.copy().digest('base64')}`,
+    packageVersion,
+    sha1: createHash('sha1').update(bytes).digest('hex'),
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    sha512: sha512Hash.digest('hex'),
+    sourceCommit: gitHead(repositoryRoot),
+    tarball: relative(repositoryRoot, tarball).split(sep).join('/'),
+  }
+  writeFileSync(metadataPath(tarball), `${JSON.stringify(metadata, null, 2)}\n`)
+  return metadata
+}
+
+const tarField = (header: Buffer, offset: number, length: number) => {
+  const field = header.subarray(offset, offset + length)
+  const nul = field.indexOf(0)
+  return field.subarray(0, nul < 0 ? field.length : nul).toString('utf8')
+}
+
+const mutatePackedFile = (
+  source: string,
+  destination: string,
+  packedPath: string,
+  mutate: (bytes: Buffer) => Buffer,
+) => {
+  const archive = gunzipSync(readFileSync(source))
+  let offset = 0
+  let found = false
+  while (offset + 512 <= archive.length && !found) {
+    const header = archive.subarray(offset, offset + 512)
+    if (header.every(byte => byte === 0)) {
+      offset = archive.length
+    } else {
+      const name = tarField(header, 0, 100)
+      const prefix = tarField(header, 345, 155)
+      const path = prefix.length > 0 ? `${prefix}/${name}` : name
+      const size = Number.parseInt(tarField(header, 124, 12).trim(), 8)
+      const contentOffset = offset + 512
+      if (path === packedPath) {
+        const original = Buffer.from(archive.subarray(contentOffset, contentOffset + size))
+        const replacement = mutate(original)
+        assert.equal(replacement.length, original.length)
+        replacement.copy(archive, contentOffset)
+        found = true
+      }
+      offset = contentOffset + Math.ceil(size / 512) * 512
+    }
+  }
+  assert.equal(found, true, packedPath)
+  writeFileSync(destination, gzipSync(archive))
+}
 const published020ChangelogSection = `## [0.2.0] - 2026-08-09
 
 ### Added
@@ -67,6 +130,7 @@ const forbiddenRuntimeDependencyValues = {
 const packageFixturePaths = [
   'package.json',
   'scripts/check-package.ts',
+  'scripts/package-declaration-consumer.ts',
   'scripts/npm-command.ts',
   'scripts/package-tarball.ts',
   'scripts/package-version.ts',
@@ -98,6 +162,24 @@ const createPackageCheckFixture = (prefix: string) => {
     { cwd: fixtureRoot, encoding: 'utf8' },
   )
   assert.equal(stage.status, 0, `${stage.stdout}${stage.stderr}`)
+  const commit = spawnSync(
+    'git',
+    [
+      '-c',
+      'commit.gpgsign=false',
+      '-c',
+      'user.name=Encephalon Test',
+      '-c',
+      'user.email=encephalon-test@example.invalid',
+      'commit',
+      '--quiet',
+      '--no-verify',
+      '-m',
+      'Package fixture',
+    ],
+    { cwd: fixtureRoot, encoding: 'utf8' },
+  )
+  assert.equal(commit.status, 0, `${commit.stdout}${commit.stderr}`)
   return { fixtureRoot, temporaryRoot }
 }
 
@@ -112,6 +194,24 @@ const createPublishCheckFixture = () => {
   cpSync(resolve(root, 'scripts', 'package-tarball.ts'), resolve(scriptsDirectory, 'package-tarball.ts'))
   writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module"}\n')
   writeFileSync(tarball, 'candidate tarball')
+  writeFileSync(
+    metadataPath(tarball),
+    `${JSON.stringify(
+      {
+        bytes: 17,
+        integrity: 'sha512-pTxmTw4D11aGOhLuuuLi7XMdkIwxMD/CLeWekvX9m00fIf2X+zxgZ/yhlV2/ZgbNj9U6a6zJFfMCchSrkKTj8A==',
+        packageVersion: releaseVersion,
+        sha1: '4d85c35b6eaaf3bb12766dd30b7f6d763bd34be8',
+        sha256: '840e0eaa94a08f97f361ebdc32d46cb60b9e94a5f10773d0647b363847605b67',
+        sha512:
+          'a53c664f0e03d756863a12eebae2e2ed731d908c31303fc22de59e92f5fd9b4d1f21fd97fb3c6067fca1955dbf6606cd8fd53a6bacc915f3027214ab90a4e3f0',
+        sourceCommit: 'a'.repeat(40),
+        tarball: 'candidate.tgz',
+      },
+      null,
+      2,
+    )}\n`,
+  )
   writeFileSync(
     resolve(scriptsDirectory, 'npm-command.ts'),
     `import { readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -544,7 +644,17 @@ describe('package contract', () => {
       assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
       const retainedFilename = `encephalon-${PACKAGE_VERSION}.tgz`
       assert.equal(result.stdout, `${artifactDirectoryName.split(sep).join('/')}/${retainedFilename}\n`)
-      assert.deepEqual(readdirSync(artifactDirectory), [retainedFilename])
+      assert.deepEqual(readdirSync(artifactDirectory).sort(), [retainedFilename, `${retainedFilename}.metadata.json`])
+
+      const retainedMetadata = JSON.parse(
+        readFileSync(resolve(artifactDirectory, `${retainedFilename}.metadata.json`), 'utf8'),
+      ) as Record<string, unknown>
+      assert.deepEqual(retainedMetadata, {
+        ...JSON.parse(result.stderr),
+        packageVersion: releaseVersion,
+        sourceCommit: gitHead(root),
+        tarball: `${artifactDirectoryName.split(sep).join('/')}/${retainedFilename}`,
+      })
 
       const referenceResult = spawnNpmCommand(
         ['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', referenceDirectory],
@@ -591,6 +701,7 @@ describe('package contract', () => {
       const suppliedTarball = resolve(packageDirectory, String(pack?.filename))
       const suppliedBytes = readFileSync(suppliedTarball)
       const expectedSha256 = createHash('sha256').update(suppliedBytes).digest('hex')
+      writeArtifactMetadata(suppliedTarball, fixtureRoot)
       cpSync(resolve(fixtureRoot, 'scripts', 'npm-command.ts'), resolve(fixtureRoot, 'scripts', 'npm-command-real.ts'))
       writeFileSync(
         resolve(fixtureRoot, 'scripts', 'npm-command.ts'),
@@ -654,6 +765,7 @@ export const spawnNpmCommand = (arguments_, options) => {
       const modifiedBytes = Buffer.from(readFileSync(originalTarball))
       modifiedBytes[0] = (modifiedBytes[0] ?? 0) ^ 0xff
       writeFileSync(modifiedTarball, modifiedBytes)
+      writeArtifactMetadata(modifiedTarball, root)
 
       const wrongVersionTarball = resolve(artifactParent, 'wrong-version.tgz')
       const archive = gunzipSync(readFileSync(originalTarball))
@@ -663,6 +775,7 @@ export const spawnNpmCommand = (arguments_, options) => {
       assert.notEqual(versionOffset, -1)
       wrongVersion.copy(archive, versionOffset)
       writeFileSync(wrongVersionTarball, gzipSync(archive))
+      writeArtifactMetadata(wrongVersionTarball, root)
 
       const failures = [modifiedTarball, wrongVersionTarball].map(tarball =>
         spawnSync(process.execPath, ['./scripts/check-package.ts', '--tarball', relative(root, tarball)], {
@@ -685,6 +798,105 @@ export const spawnNpmCommand = (arguments_, options) => {
       )
     } finally {
       rmSync(artifactParent, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects checksum-valid packed manifest and non-manifest byte mutations', { timeout: 120_000 }, () => {
+    const artifactParentName = join('test', `.package-content-mutation-${randomUUID()}`)
+    const artifactParent = resolve(root, artifactParentName)
+    try {
+      mkdirSync(artifactParent)
+      const packed = spawnNpmCommand(
+        ['pack', '--dry-run=false', '--ignore-scripts', '--json', '--pack-destination', artifactParent],
+        { cwd: root },
+      )
+      assert.equal(packed.status, 0, `${packed.stdout}${packed.stderr}`)
+      const [pack] = JSON.parse(packed.stdout) as Array<{ filename?: unknown }>
+      const original = resolve(artifactParent, String(pack?.filename))
+      const manifestMutation = resolve(artifactParent, 'manifest-mutation.tgz')
+      const readmeMutation = resolve(artifactParent, 'readme-mutation.tgz')
+
+      mutatePackedFile(original, manifestMutation, 'package/package.json', bytes => {
+        const source = bytes.toString('utf8')
+        assert.equal(source.includes('"prepack"'), true)
+        return Buffer.from(source.replace('"prepack"', '"install"'))
+      })
+      mutatePackedFile(original, readmeMutation, 'package/README.md', bytes => {
+        const source = bytes.toString('utf8')
+        assert.equal(source.includes('Encephalon'), true)
+        return Buffer.from(source.replace('Encephalon', 'tamperhere'))
+      })
+      writeArtifactMetadata(manifestMutation, root)
+      writeArtifactMetadata(readmeMutation, root)
+
+      const failures = [manifestMutation, readmeMutation].map(tarball =>
+        spawnSync(process.execPath, ['./scripts/check-package.ts', '--tarball', relative(root, tarball)], {
+          cwd: root,
+          encoding: 'utf8',
+          timeout: 60_000,
+        }),
+      )
+      assert.deepEqual(
+        failures.map(result => result.status === 0),
+        [false, false],
+      )
+      assert.equal(
+        failures.every(result => /reviewed package (?:manifest|bytes|contents)/u.test(result.stderr)),
+        true,
+      )
+    } finally {
+      rmSync(artifactParent, { force: true, recursive: true })
+    }
+  })
+
+  test('exercises every accepted packed API and CLI result-limit boundary', { timeout: 120_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-limit-matrix-')
+    try {
+      for (const file of ['dist/index.mjs', 'dist/cli.mjs']) {
+        const path = resolve(fixtureRoot, file)
+        const source = readFileSync(path, 'utf8')
+        const marker = 'const limit = value === undefined ? budget.default : value;'
+        assert.equal(source.includes(marker), true, file)
+        writeFileSync(
+          path,
+          source.replace(
+            marker,
+            `${marker}\n  if (limit === 101) return failBudget(budgetKey, 'candidate-only boundary drift');`,
+          ),
+        )
+      }
+
+      const result = spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+        cwd: fixtureRoot,
+        encoding: 'utf8',
+        timeout: 90_000,
+      })
+      assert.notEqual(result.status, 0)
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /packed.*(?:API|CLI).*result-limit|failed with exit code/u)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('uses every public declaration member and the complete error-code union', { timeout: 120_000 }, () => {
+    const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-declaration-surface-')
+    try {
+      const declarations = resolve(fixtureRoot, 'dist', 'types.d.ts')
+      const source = readFileSync(declarations, 'utf8')
+      assert.equal(source.includes('recordsChecked: number;'), true)
+      writeFileSync(declarations, source.replace('recordsChecked: number;', 'recordCount: number;'))
+
+      const result = spawnSync(process.execPath, ['./scripts/check-package.ts'], {
+        cwd: fixtureRoot,
+        encoding: 'utf8',
+        timeout: 90_000,
+      })
+      assert.notEqual(result.status, 0)
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /typescript|tsc|declaration|failed with exit code/iu)
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
 

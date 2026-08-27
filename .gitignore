@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.tgz
+*.tgz.metadata.json
 coverage/
 /encephalon/_staging/
 .DS_Store
