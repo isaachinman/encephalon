@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
@@ -14,6 +15,15 @@ export const ORACLE = Object.freeze({
 })
 
 export const MAX_COMPATIBILITY_DIAGNOSTIC_BYTES = 8192
+const MAX_COMPATIBILITY_SUBPROCESS_OUTPUT_BYTES = 16 * 1024 * 1024
+
+export const sanitizedCompatibilityEnvironment = (environment: NodeJS.ProcessEnv = process.env) =>
+  Object.fromEntries(
+    Object.entries(environment).filter(([key]) => {
+      const normalized = key.toLowerCase()
+      return normalized !== 'node_options' && normalized !== 'node_path'
+    }),
+  )
 
 export type OracleIdentity = Readonly<{
   integrity: string
@@ -80,6 +90,70 @@ export class CompatibilityCommandError extends Error {
   }
 }
 
+const publicSurfaceDifferencePaths = (expected: unknown, actual: unknown, path = '$'): string[] => {
+  if (isDeepStrictEqual(expected, actual)) {
+    return []
+  }
+  if (Array.isArray(expected) && Array.isArray(actual)) {
+    const length = Math.max(expected.length, actual.length)
+    return Array.from({ length }, (_, index) => index).flatMap(index =>
+      publicSurfaceDifferencePaths(expected[index], actual[index], `${path}[${index}]`),
+    )
+  }
+  if (
+    expected !== null &&
+    actual !== null &&
+    typeof expected === 'object' &&
+    typeof actual === 'object' &&
+    !Array.isArray(expected) &&
+    !Array.isArray(actual)
+  ) {
+    const keys = [...new Set([...Object.keys(expected), ...Object.keys(actual)])].sort(ordinalCompare)
+    return keys.flatMap(key =>
+      publicSurfaceDifferencePaths(
+        (expected as Record<string, unknown>)[key],
+        (actual as Record<string, unknown>)[key],
+        `${path}.${key}`,
+      ),
+    )
+  }
+  return [path]
+}
+
+export const assertStablePublicSurface = (expected: unknown, actual: unknown, label: string) => {
+  if (!isDeepStrictEqual(expected, actual)) {
+    const differences = publicSurfaceDifferencePaths(expected, actual).slice(0, 32)
+    throw new Error(
+      `${label} does not exactly preserve the published public surface. Differences: ${differences.join(', ')}.`,
+    )
+  }
+}
+
+export const expectedCandidateCliHelp = (oracleHelp: string) =>
+  oracleHelp
+    .replace(/^(.*\[--artifact <path> \.\.\.\])$/mu, '$1\n      Accepts at most 1,000 supersession targets.')
+    .replace(/^ {2}search \[--compact\] (.+)$/mu, '  search $1\n  search --compact $1')
+    .replace(/^( {9}.*\[--limit <1\.\.1000>\])$/mu, '$1\n         Accepts at most 16 searches and 64 shows.')
+
+const publicSurfaceWithHelp = (value: unknown, label: string) => {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const { help, ...surface } = value as Record<string, unknown>
+    if (typeof help === 'string') {
+      return { help, surface }
+    }
+  }
+  throw new Error(`${label} did not capture one CLI help surface.`)
+}
+
+const assertCandidateCliSurface = (oracle: unknown, candidate: unknown) => {
+  const expected = publicSurfaceWithHelp(oracle, 'The published oracle')
+  const actual = publicSurfaceWithHelp(candidate, 'The candidate')
+  assertStablePublicSurface(expected.surface, actual.surface, 'The candidate CLI')
+  if (actual.help !== expectedCandidateCliHelp(expected.help)) {
+    throw new Error('The candidate CLI does not exactly preserve the published public surface. Differences: $.help.')
+  }
+}
+
 const ordinalCompare = (left: string, right: string) => {
   if (left < right) {
     return -1
@@ -92,7 +166,7 @@ const ordinalCompare = (left: string, right: string) => {
 
 const durableEntry = (path: string, relativePath: string): DurableSnapshotEntry => {
   const metadata = lstatSync(path)
-  const mode = metadata.mode & 0o777
+  const mode = metadata.mode & 0o7777
   if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
     return Object.freeze({ mode, path: relativePath, type: 'directory' })
   }
@@ -184,8 +258,8 @@ export const runCompatibilityCommand = (
   const result = spawnSync(executable, arguments_, {
     cwd: options.cwd,
     encoding: 'utf8',
-    env: options.environment ?? { ...process.env, NODE_OPTIONS: '', NODE_PATH: '' },
-    maxBuffer: 16 * 1024 * 1024,
+    env: options.environment ?? sanitizedCompatibilityEnvironment(),
+    maxBuffer: MAX_COMPATIBILITY_SUBPROCESS_OUTPUT_BYTES,
     shell: false,
   })
   if (result.error === undefined && result.status === 0) {
@@ -245,6 +319,11 @@ type ResultLimitMaximums = Readonly<{
 
 type PhaseReport = Readonly<{
   durableState: 'identical'
+  independentBudgets: IndependentBudgetReport
+  publicSurface: Readonly<{
+    apiSha256: string
+    cliSha256: string
+  }>
   resultLimits: Readonly<{
     api: ResultLimitReport
     cli: ResultLimitReport
@@ -263,6 +342,15 @@ export type ReleaseCompatibilityReport = Readonly<{
   downgrade: PhaseReport
   oracle: Readonly<{
     digests: PackageTarballDigests
+    independentBudgets: IndependentBudgetReport
+    publicSurface: Readonly<{
+      apiSha256: string
+      cliSha256: string
+    }>
+    resultLimits: Readonly<{
+      api: ResultLimitReport
+      cli: ResultLimitReport
+    }>
     specifier: string
     version: string
   }>
@@ -270,8 +358,14 @@ export type ReleaseCompatibilityReport = Readonly<{
   upgrade: PhaseReport
 }>
 
+const publicSurfaceDigests = (api: unknown, cli: unknown) =>
+  Object.freeze({
+    apiSha256: createHash('sha256').update(JSON.stringify(api)).digest('hex'),
+    cliSha256: createHash('sha256').update(JSON.stringify(cli)).digest('hex'),
+  })
+
 const API_PROBE_SOURCE = `
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
@@ -300,6 +394,35 @@ const cacheSchema = () => {
   }
 }
 const assertRecord = (record, id, stage) => assert(record?.id === id, stage)
+const normalisePublicValue = (value, key) => {
+  if (key === 'createdAt' && typeof value === 'string') return '<timestamp>'
+  if (typeof value === 'string') return value.replaceAll(root, '<fixture-root>')
+  if (Array.isArray(value)) return value.map(item => normalisePublicValue(item))
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, normalisePublicValue(item, name)]))
+  }
+  return value
+}
+const errorShape = (error, stage) => {
+  assert(error instanceof api.EncephalonError, stage + '-type')
+  return normalisePublicValue({
+    code: error.code,
+    details: error.details,
+    message: error.message,
+    name: error.name,
+    ownKeys: Reflect.ownKeys(error).filter(key => typeof key === 'string').sort(),
+  })
+}
+const captureError = (action, stage) => {
+  let failure
+  try {
+    action()
+  } catch (error) {
+    failure = error
+  }
+  assert(failure !== undefined, stage + '-missing')
+  return errorShape(failure, stage)
+}
 const limits = [50, 100, 101, 999, 1000, 1001]
 const operationNames = ['list', 'search', 'searchCompact', 'gather']
 const operations = {
@@ -348,6 +471,55 @@ const readCompatibilityState = () => {
   assert(gathered.records?.[0]?.record?.id === 'compatibility-base', 'api-gather-show')
   assert(gathered.searches?.[0]?.results?.length > 0, 'api-gather-search')
 }
+const publicSurface = () => {
+  const initialised = at('surface-init', () => api.initEncephalon({ root }))
+  const added = at('surface-add', () => api.addRecord({
+    id: 'compatibility-api-surface-add',
+    kind: 'decision',
+    payload: { summary: 'Compatibility API surface add' },
+    root,
+    searchText: 'compatibility-marker api-surface-add',
+    source: 'release-compatibility',
+    subject: 'release.compatibility.api-surface-add',
+  }))
+  rmSync(resolve(root, added.path))
+  const duplicate = captureError(() => api.addRecord({
+    id: 'compatibility-base',
+    kind: 'decision',
+    payload: {},
+    root,
+    source: 'release-compatibility',
+    subject: 'release.compatibility.base',
+  }), 'surface-add-error')
+  const prepared = at('surface-prepare', () => api.prepare({ root }))
+  const hydrated = at('surface-hydrate', () => api.hydrate({ root }))
+  return normalisePublicValue({
+    add: added,
+    addError: duplicate,
+    gather: at('surface-gather', () => api.gatherRecords({
+      includeSuperseded: true,
+      root,
+      searches: ['compatibility-marker'],
+      shows: ['compatibility-base'],
+    })),
+    hydrate: hydrated,
+    init: initialised,
+    list: at('surface-list', () => api.listRecords({ includeSuperseded: true, kind: 'decision', root })),
+    prepare: prepared,
+    search: at('surface-search', () => api.searchRecords({
+      includeSuperseded: true,
+      query: 'compatibility-marker',
+      root,
+    })),
+    searchCompact: at('surface-search-compact', () => api.searchCompactRecords({
+      includeSuperseded: true,
+      query: 'compatibility-marker',
+      root,
+    })),
+    show: at('surface-show', () => api.showRecord({ id: 'compatibility-base', root })),
+    validate: at('surface-validate', () => api.validateRecords({ root })),
+  })
+}
 const initialise = () => {
   at('initialise-init', () => api.initEncephalon({ root }))
   const artifact = resolve(root, 'encephalon', '_artifacts', 'decision', 'compatibility-base', 'evidence.txt')
@@ -374,7 +546,7 @@ const initialise = () => {
     supersedes: ['compatibility-base'],
   }))
   at('initialise-prepare', () => api.prepare({ root }))
-  return { limits: at('initialise-result-limits', resultLimits), schemaAfter: cacheSchema() }
+  return { limits: at('initialise-result-limits', resultLimits), schemaAfter: cacheSchema(), surface: publicSurface() }
 }
 const upgrade = () => {
   const schemaBefore = cacheSchema()
@@ -392,14 +564,14 @@ const upgrade = () => {
   const schemaAfter = cacheSchema()
   const hydrated = api.hydrate({ root })
   assert(typeof hydrated?.recordsIndexed === 'number', 'api-hydrate')
-  return { limits: resultLimits(), schemaAfter, schemaBefore }
+  return { limits: resultLimits(), schemaAfter, schemaBefore, surface: publicSurface() }
 }
 const downgrade = () => {
   const schemaBefore = cacheSchema()
   readCompatibilityState()
   const prepared = api.prepare({ root })
   assert(typeof prepared?.recordsIndexed === 'number', 'api-downgrade-prepare')
-  return { limits: resultLimits(), schemaAfter: cacheSchema(), schemaBefore }
+  return { limits: resultLimits(), schemaAfter: cacheSchema(), schemaBefore, surface: publicSurface() }
 }
 
 try {
@@ -424,10 +596,10 @@ const inspect = relativePath => {
   if (!existsSync(path)) return [{ path: relativePath, type: 'missing' }]
   const metadata = lstatSync(path)
   if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
-    return [{ mode: metadata.mode & 0o777, path: relativePath, type: 'directory' }, ...readdirSync(path).sort().flatMap(name => inspect(relativePath + '/' + name))]
+    return [{ mode: metadata.mode & 0o7777, path: relativePath, type: 'directory' }, ...readdirSync(path).sort().flatMap(name => inspect(relativePath + '/' + name))]
   }
   if (metadata.isFile() && !metadata.isSymbolicLink()) {
-    return [{ digest: createHash('sha256').update(readFileSync(path)).digest('hex'), mode: metadata.mode & 0o777, path: relativePath, type: 'file' }]
+    return [{ digest: createHash('sha256').update(readFileSync(path)).digest('hex'), mode: metadata.mode & 0o7777, path: relativePath, type: 'file' }]
   }
   return [{ path: relativePath, type: 'unsafe' }]
 }
@@ -442,6 +614,278 @@ if (JSON.stringify(before) !== JSON.stringify(after) || required.some(name => ty
 } else {
   process.stdout.write(JSON.stringify({ exports: required, version: manifest.version }) + '\\n')
 }
+`
+
+const BUDGET_PROBE_SOURCE = `
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
+const [root] = process.argv.slice(2)
+const api = await import('encephalon')
+const cli = resolve(root, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
+const MAX_CANONICAL_BYTES = 8 * 1024 * 1024
+const MAX_RECORD_BYTES = 1024 * 1024
+const fail = stage => { throw Object.assign(new Error(stage), { stage }) }
+const errorValue = error => {
+  if (!(error instanceof api.EncephalonError)) fail('budget-api-error-type')
+  return { code: error.code, details: error.details, message: error.message }
+}
+const apiObservation = action => {
+  try {
+    action()
+    return { status: 'accepted' }
+  } catch (error) {
+    return { error: errorValue(error), status: 'rejected' }
+  }
+}
+const cliObservation = arguments_ => {
+  const result = spawnSync(process.execPath, [cli, '--root', root, ...arguments_], {
+    cwd: root,
+    encoding: 'utf8',
+    env: process.env,
+    maxBuffer: 16 * 1024 * 1024,
+    shell: false,
+  })
+  if (result.error === undefined && result.status === 0) {
+    try {
+      JSON.parse(result.stdout)
+    } catch {
+      fail('budget-cli-success-json')
+    }
+    return { status: 'accepted' }
+  }
+  if (result.error === undefined && result.status === 2 && result.stdout === '') {
+    try {
+      const body = JSON.parse(result.stderr)
+      if (body?.error?.code !== undefined && body?.error?.details !== undefined && body?.error?.message !== undefined) {
+        return { error: body.error, status: 'rejected' }
+      }
+    } catch {
+      fail('budget-cli-error-json')
+    }
+  }
+  fail('budget-cli-process')
+}
+const boundary = (withinLimit, overLimit) => ({
+  overLimit: overLimit(),
+  withinLimit: withinLimit(),
+})
+const canonicalFiles = () => {
+  const brain = resolve(root, 'encephalon')
+  return readdirSync(brain, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith('_'))
+    .flatMap(entry => readdirSync(resolve(brain, entry.name)).filter(name => name.endsWith('.json')).map(name => resolve(brain, entry.name, name)))
+}
+const recordValue = (kind, id, index, payload = {}, searchText) => ({
+  createdAt: new Date(Date.UTC(2000, 0, 1) + index).toISOString(),
+  id,
+  kind,
+  payload,
+  source: 'release-compatibility',
+  subject: 'release.compatibility.' + id,
+  ...(searchText === undefined ? {} : { searchText }),
+})
+const formatted = record => JSON.stringify(record, null, 2) + '\\n'
+const withRecords = (kind, records, action) => {
+  const directory = resolve(root, 'encephalon', kind)
+  mkdirSync(directory)
+  try {
+    records.map(record => writeFileSync(resolve(directory, record.id + '.json'), formatted(record)))
+    return action()
+  } finally {
+    rmSync(directory, { force: true, recursive: true })
+  }
+}
+const exactByteRecord = (kind, id, index, targetBytes) => {
+  const empty = recordValue(kind, id, index, { text: '' })
+  const overhead = Buffer.byteLength(formatted(empty))
+  if (targetBytes < overhead || targetBytes > MAX_RECORD_BYTES) fail('budget-byte-fixture')
+  const record = recordValue(kind, id, index, { text: 'x'.repeat(targetBytes - overhead) })
+  if (Buffer.byteLength(formatted(record)) !== targetBytes) fail('budget-byte-fixture-size')
+  return record
+}
+const temporaryApiAdd = (id, payload, extra = {}) => () => {
+  const path = resolve(root, 'encephalon', 'decision', id + '.json')
+  try {
+    api.addRecord({ id, kind: 'decision', payload, root, source: 'release-compatibility', subject: 'release.compatibility.' + id, ...extra })
+  } finally {
+    rmSync(path, { force: true })
+  }
+}
+const temporaryCliAdd = (id, payload, extraArguments = []) => () => {
+  const path = resolve(root, 'encephalon', 'decision', id + '.json')
+  try {
+    return cliObservation(['add', '--id', id, '--kind', 'decision', '--subject', 'release.compatibility.' + id, '--source', 'release-compatibility', '--data', JSON.stringify(payload), ...extraArguments])
+  } finally {
+    rmSync(path, { force: true })
+  }
+}
+const nestedPayload = levels => Array.from({ length: levels }).reduce(value => [value], null)
+const queryBytesWithin = 'q'.repeat(1024)
+const queryBytesOver = queryBytesWithin + 'q'
+const queryTermsWithin = Array.from({ length: 32 }, (_, index) => 'term' + index).join(' ')
+const queryTermsOver = queryTermsWithin + ' term32'
+const searchesWithin = Array.from({ length: 16 }, () => '!')
+const searchesOver = [...searchesWithin, '!']
+const showsWithin = Array.from({ length: 64 }, () => 'compatibility-missing')
+const showsOver = [...showsWithin, 'compatibility-missing']
+const supersedesWithin = Array.from({ length: 1000 }, () => 'compatibility-base')
+const supersedesOver = [...supersedesWithin, 'compatibility-base']
+const payloadNodesWithin = Array.from({ length: 9999 }, () => 0)
+const payloadNodesOver = [...payloadNodesWithin, 0]
+
+const apiReport = {
+  queryBytes: boundary(
+    () => apiObservation(() => api.searchRecords({ query: queryBytesWithin, root })),
+    () => apiObservation(() => api.searchRecords({ query: queryBytesOver, root })),
+  ),
+  queryTerms: boundary(
+    () => apiObservation(() => api.searchRecords({ query: queryTermsWithin, root })),
+    () => apiObservation(() => api.searchRecords({ query: queryTermsOver, root })),
+  ),
+  gatherSearches: boundary(
+    () => apiObservation(() => api.gatherRecords({ root, searches: searchesWithin })),
+    () => apiObservation(() => api.gatherRecords({ root, searches: searchesOver })),
+  ),
+  gatherShows: boundary(
+    () => apiObservation(() => api.gatherRecords({ root, shows: showsWithin })),
+    () => apiObservation(() => api.gatherRecords({ root, shows: showsOver })),
+  ),
+  supersessionEdges: boundary(
+    () => apiObservation(temporaryApiAdd('compatibility-supersedes-within', {}, { supersedes: supersedesWithin })),
+    () => apiObservation(temporaryApiAdd('compatibility-supersedes-over', {}, { supersedes: supersedesOver })),
+  ),
+  payloadNodes: boundary(
+    () => apiObservation(temporaryApiAdd('compatibility-payload-nodes-within', payloadNodesWithin)),
+    () => apiObservation(temporaryApiAdd('compatibility-payload-nodes-over', payloadNodesOver)),
+  ),
+  payloadDepth: boundary(
+    () => apiObservation(temporaryApiAdd('compatibility-payload-depth-within', nestedPayload(64))),
+    () => apiObservation(temporaryApiAdd('compatibility-payload-depth-over', nestedPayload(65))),
+  ),
+}
+
+const cliReport = {
+  queryBytes: boundary(
+    () => cliObservation(['search', '--', queryBytesWithin]),
+    () => cliObservation(['search', '--', queryBytesOver]),
+  ),
+  queryTerms: boundary(
+    () => cliObservation(['search', '--', queryTermsWithin]),
+    () => cliObservation(['search', '--', queryTermsOver]),
+  ),
+  gatherSearches: boundary(
+    () => cliObservation(['gather', ...searchesWithin.flatMap(query => ['--search', query])]),
+    () => cliObservation(['gather', ...searchesOver.flatMap(query => ['--search', query])]),
+  ),
+  gatherShows: boundary(
+    () => cliObservation(['gather', ...showsWithin.flatMap(id => ['--show', id])]),
+    () => cliObservation(['gather', ...showsOver.flatMap(id => ['--show', id])]),
+  ),
+  supersessionEdges: boundary(
+    temporaryCliAdd('compatibility-cli-supersedes-within', {}, supersedesWithin.map(id => '--supersedes=' + id)),
+    temporaryCliAdd('compatibility-cli-supersedes-over', {}, supersedesOver.map(id => '--supersedes=' + id)),
+  ),
+  payloadNodes: boundary(
+    temporaryCliAdd('compatibility-cli-payload-nodes-within', payloadNodesWithin),
+    temporaryCliAdd('compatibility-cli-payload-nodes-over', payloadNodesOver),
+  ),
+  payloadDepth: boundary(
+    temporaryCliAdd('compatibility-cli-payload-depth-within', nestedPayload(64)),
+    temporaryCliAdd('compatibility-cli-payload-depth-over', nestedPayload(65)),
+  ),
+}
+
+const existingCount = canonicalFiles().length
+const countKind = 'compatibilitybudgetcount'
+const countRecords = Array.from({ length: 1000 - existingCount }, (_, index) =>
+  recordValue(countKind, 'compatibility-count-' + String(index).padStart(4, '0'), index),
+)
+const countEvidence = withRecords(countKind, countRecords, () => ({
+  api: boundary(
+    () => apiObservation(() => api.validateRecords({ root })),
+    () => apiObservation(temporaryApiAdd('compatibility-count-over', {})),
+  ),
+  cli: boundary(
+    () => cliObservation(['validate']),
+    temporaryCliAdd('compatibility-cli-count-over', {}),
+  ),
+}))
+apiReport.corpusRecords = countEvidence.api
+cliReport.corpusRecords = countEvidence.cli
+
+const existingBytes = canonicalFiles().reduce((bytes, path) => bytes + statSync(path).size, 0)
+const remainingBytes = MAX_CANONICAL_BYTES - existingBytes
+const byteKind = 'compatibilitybudgetbytes'
+const byteRecordCount = Math.ceil(remainingBytes / (MAX_RECORD_BYTES - 1024))
+const baseByteTarget = Math.floor(remainingBytes / byteRecordCount)
+const extraByteTargets = remainingBytes % byteRecordCount
+const byteRecords = Array.from({ length: byteRecordCount }, (_, index) =>
+  exactByteRecord(
+    byteKind,
+    'compatibility-bytes-' + String(index).padStart(2, '0'),
+    index,
+    baseByteTarget + (index < extraByteTargets ? 1 : 0),
+  ),
+)
+const byteEvidence = withRecords(byteKind, byteRecords, () => ({
+  api: boundary(
+    () => apiObservation(() => api.validateRecords({ root })),
+    () => apiObservation(temporaryApiAdd('compatibility-bytes-over', {})),
+  ),
+  cli: boundary(
+    () => cliObservation(['validate']),
+    temporaryCliAdd('compatibility-cli-bytes-over', {}),
+  ),
+}))
+apiReport.corpusBytes = byteEvidence.api
+cliReport.corpusBytes = byteEvidence.cli
+
+const responseKind = 'compatibilitybudgetresponse'
+const responseRecords = Array.from({ length: 5 }, (_, index) =>
+  recordValue(
+    responseKind,
+    'compatibility-response-' + index,
+    index,
+    { summary: 'x '.repeat(450000) },
+    'compatibility-response-marker',
+  ),
+)
+const responseEvidence = withRecords(responseKind, responseRecords, () => ({
+  api: {
+    fullResponseBytes: boundary(
+      () => apiObservation(() => api.searchRecords({ includeSuperseded: true, limit: 4, query: 'compatibility-response-marker', root })),
+      () => apiObservation(() => api.searchRecords({ includeSuperseded: true, limit: 5, query: 'compatibility-response-marker', root })),
+    ),
+    compactResponseBytes: boundary(
+      () => apiObservation(() => api.searchCompactRecords({ includeSuperseded: true, limit: 4, query: 'compatibility-response-marker', root })),
+      () => apiObservation(() => api.searchCompactRecords({ includeSuperseded: true, limit: 5, query: 'compatibility-response-marker', root })),
+    ),
+    gatherResponseBytes: boundary(
+      () => apiObservation(() => api.gatherRecords({ root, shows: Array.from({ length: 4 }, () => 'compatibility-response-0') })),
+      () => apiObservation(() => api.gatherRecords({ root, shows: Array.from({ length: 5 }, () => 'compatibility-response-0') })),
+    ),
+  },
+  cli: {
+    fullResponseBytes: boundary(
+      () => cliObservation(['search', '--include-superseded', '--limit=4', '--', 'compatibility-response-marker']),
+      () => cliObservation(['search', '--include-superseded', '--limit=5', '--', 'compatibility-response-marker']),
+    ),
+    compactResponseBytes: boundary(
+      () => cliObservation(['search', '--compact', '--include-superseded', '--limit=4', '--', 'compatibility-response-marker']),
+      () => cliObservation(['search', '--compact', '--include-superseded', '--limit=5', '--', 'compatibility-response-marker']),
+    ),
+    gatherResponseBytes: boundary(
+      () => cliObservation(['gather', ...Array.from({ length: 4 }, () => ['--show', 'compatibility-response-0']).flat()]),
+      () => cliObservation(['gather', ...Array.from({ length: 5 }, () => ['--show', 'compatibility-response-0']).flat()]),
+    ),
+  },
+}))
+Object.assign(apiReport, responseEvidence.api)
+Object.assign(cliReport, responseEvidence.cli)
+
+process.stdout.write(JSON.stringify({ api: apiReport, cli: cliReport }) + '\\n')
 `
 
 const DECLARATION_CONSUMER_SOURCE = `
@@ -504,7 +948,11 @@ const safeNpmResult = (
   label: string,
   redactions: readonly Buffer[] = [],
 ) => {
-  const result = spawnNpmCommand(arguments_, { cwd })
+  const result = spawnNpmCommand(arguments_, {
+    cwd,
+    environment: sanitizedCompatibilityEnvironment(),
+    maxBuffer: MAX_COMPATIBILITY_SUBPROCESS_OUTPUT_BYTES,
+  })
   if (result.error === undefined && result.status === 0) {
     return { stderr: result.stderr ?? '', stdout: result.stdout ?? '' }
   }
@@ -608,10 +1056,12 @@ const writeProbeFiles = (fixtureRoot: string) => {
   const probeDirectory = resolve(fixtureRoot, '.release-compatibility')
   mkdirSync(probeDirectory)
   const apiProbe = resolve(probeDirectory, 'api-probe.mjs')
+  const budgetProbe = resolve(probeDirectory, 'budget-probe.mjs')
   const importProbe = resolve(probeDirectory, 'import-probe.mjs')
   const declarationConsumer = resolve(probeDirectory, 'consumer.ts')
   const declarationConfiguration = resolve(probeDirectory, 'tsconfig.json')
   writeFileSync(apiProbe, API_PROBE_SOURCE)
+  writeFileSync(budgetProbe, BUDGET_PROBE_SOURCE)
   writeFileSync(importProbe, IMPORT_PROBE_SOURCE)
   writeFileSync(declarationConsumer, DECLARATION_CONSUMER_SOURCE)
   writeFileSync(
@@ -632,13 +1082,14 @@ const writeProbeFiles = (fixtureRoot: string) => {
       2,
     )}\n`,
   )
-  return { apiProbe, declarationConfiguration, importProbe }
+  return { apiProbe, budgetProbe, declarationConfiguration, importProbe }
 }
 
 type ApiProbeResult = {
   limits: ResultLimitReport
   schemaAfter: string
   schemaBefore?: string
+  surface: unknown
   version: string
 }
 
@@ -663,6 +1114,127 @@ const runImportProbe = (probe: string, fixtureRoot: string, redactions: readonly
     redactions,
   })
   return parseJson<{ version: string }>(result.stdout, 'The side-effect-free API import probe')
+}
+
+type BudgetObservation = Readonly<
+  | { status: 'accepted' }
+  | {
+      error: Readonly<{
+        code: string
+        details: Readonly<Record<string, unknown>>
+        message: string
+      }>
+      status: 'rejected'
+    }
+>
+
+type BudgetBoundary = Readonly<{
+  overLimit: BudgetObservation
+  withinLimit: BudgetObservation
+}>
+
+type IndependentBudgetChannel = Readonly<Record<string, BudgetBoundary>>
+
+type IndependentBudgetReport = Readonly<{
+  api: IndependentBudgetChannel
+  cli: IndependentBudgetChannel
+}>
+
+const runBudgetProbe = (probe: string, fixtureRoot: string, redactions: readonly Buffer[]) => {
+  const result = runCompatibilityCommand(process.execPath, [probe, fixtureRoot], {
+    cwd: fixtureRoot,
+    label: 'The independent public budget probe',
+    redactions,
+  })
+  return parseJson<IndependentBudgetReport>(result.stdout, 'The independent public budget probe')
+}
+
+const acceptedBudgetObservation = Object.freeze({ status: 'accepted' as const })
+const rejectedBudgetObservation = (
+  code: string,
+  message: string,
+  details: Readonly<Record<string, unknown>>,
+): BudgetObservation =>
+  Object.freeze({
+    error: Object.freeze({ code, details: Object.freeze({ ...details }), message }),
+    status: 'rejected',
+  })
+const budgetBoundary = (overLimit: BudgetObservation, withinLimit: BudgetObservation = acceptedBudgetObservation) =>
+  Object.freeze({ overLimit, withinLimit })
+const budgetFailure = (budget: string, field: string, maximum: number, message: string) =>
+  rejectedBudgetObservation('INVALID_ARGUMENT', message, { budget, field, maximum })
+const fieldFailure = (message: string, field: string) =>
+  rejectedBudgetObservation('INVALID_ARGUMENT', message, { field })
+const validationFailure = (code: string, message: string) =>
+  rejectedBudgetObservation('VALIDATION_FAILED', 'The new record would make canonical records invalid.', {
+    errors: [{ code, message }],
+  })
+
+const commonCandidateBudgetEvidence = Object.freeze({
+  compactResponseBytes: budgetBoundary(
+    budgetFailure('compactResponseBytes', 'response', 4 * 1024 * 1024, 'response may contain at most 4194304 bytes.'),
+  ),
+  corpusBytes: budgetBoundary(
+    validationFailure('CORPUS_BYTE_LIMIT', 'Canonical corpus may contain at most 8388608 bytes of record JSON.'),
+  ),
+  corpusRecords: budgetBoundary(
+    validationFailure('CORPUS_RECORD_LIMIT', 'Canonical corpus may contain at most 1000 records.'),
+  ),
+  fullResponseBytes: budgetBoundary(
+    budgetFailure(
+      'fullResponseBytes',
+      'response',
+      4 * 1024 * 1024,
+      'full-record responses may contain at most 4194304 UTF-8 bytes.',
+    ),
+  ),
+  gatherResponseBytes: budgetBoundary(
+    budgetFailure('gatherResponseBytes', 'response', 4 * 1024 * 1024, 'response may contain at most 4194304 bytes.'),
+  ),
+  gatherSearches: budgetBoundary(
+    budgetFailure('gatherSearches', 'searches', 16, 'gather may contain at most 16 searches.'),
+  ),
+  gatherShows: budgetBoundary(budgetFailure('gatherShows', 'shows', 64, 'gather may contain at most 64 shows.')),
+  payloadDepth: budgetBoundary(
+    fieldFailure('payload may be nested at most 64 levels deep.', `payload${'[0]'.repeat(65)}`),
+  ),
+  payloadNodes: budgetBoundary(fieldFailure('payload may contain at most 10000 JSON nodes.', 'payload')),
+  queryBytes: budgetBoundary(
+    budgetFailure('queryBytes', 'query', 1024, 'query must contain at most 1024 UTF-8 bytes.'),
+  ),
+  queryTerms: budgetBoundary(budgetFailure('queryTerms', 'query', 32, 'query may contain at most 32 literal terms.')),
+})
+
+const candidateBudgetEvidence = Object.freeze({
+  api: Object.freeze({
+    ...commonCandidateBudgetEvidence,
+    supersessionEdges: budgetBoundary(
+      budgetFailure('supersessionEdges', 'supersedes', 1000, 'supersedes may contain at most 1000 record ids.'),
+      fieldFailure('supersedes must be a non-empty array of unique strings.', 'supersedes'),
+    ),
+  }),
+  cli: Object.freeze({
+    ...commonCandidateBudgetEvidence,
+    supersessionEdges: budgetBoundary(
+      budgetFailure('supersessionEdges', 'supersedes', 1000, '--supersedes may be supplied at most 1000 times.'),
+      fieldFailure('supersedes must be a non-empty array of unique strings.', 'supersedes'),
+    ),
+  }),
+})
+
+const assertCandidateIndependentBudgets = (actual: IndependentBudgetReport) => {
+  if (!isDeepStrictEqual(candidateBudgetEvidence, actual)) {
+    const differences = (['api', 'cli'] as const).flatMap(channel =>
+      Object.entries(candidateBudgetEvidence[channel]).flatMap(([budget, expected]) =>
+        isDeepStrictEqual(expected, actual[channel]?.[budget])
+          ? []
+          : publicSurfaceDifferencePaths(expected, actual[channel]?.[budget], `${channel}.${budget}`),
+      ),
+    )
+    throw new Error(
+      `The candidate does not enforce the approved independent public budget boundaries exactly (${differences.join(', ')}).`,
+    )
+  }
 }
 
 const runDeclarationProbe = (configuration: string, fixtureRoot: string, redactions: readonly Buffer[]) => {
@@ -697,6 +1269,123 @@ const cliFailure = (fixtureRoot: string, arguments_: readonly string[], redactio
 
 const assertCliJson = (fixtureRoot: string, arguments_: readonly string[], redactions: readonly Buffer[]) =>
   parseJson<unknown>(cliSuccess(fixtureRoot, arguments_, redactions), `The ${arguments_[0] ?? 'unknown'} CLI probe`)
+
+const normalisePublicValue = (value: unknown, fixtureRoot: string, key?: string): unknown => {
+  if (key === 'createdAt' && typeof value === 'string') {
+    return '<timestamp>'
+  }
+  if (typeof value === 'string') {
+    return value.replaceAll(fixtureRoot, '<fixture-root>')
+  }
+  if (Array.isArray(value)) {
+    return value.map(item => normalisePublicValue(item, fixtureRoot))
+  }
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([name, item]) => [name, normalisePublicValue(item, fixtureRoot, name)]),
+    )
+  }
+  return value
+}
+
+const captureCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) => {
+  const help = cliSuccess(fixtureRoot, ['--help'], redactions)
+  const versionOutput = cliSuccess(fixtureRoot, ['--version'], redactions)
+  if (versionOutput !== `${version}\n`) {
+    throw new Error('The installed CLI version output does not match its package manifest.')
+  }
+  const initialised = assertCliJson(fixtureRoot, ['init', '--root', fixtureRoot], redactions)
+  const added = assertCliJson(
+    fixtureRoot,
+    [
+      'add',
+      '--root',
+      fixtureRoot,
+      '--id',
+      'compatibility-cli-surface-add',
+      '--kind',
+      'decision',
+      '--subject',
+      'release.compatibility.cli-surface-add',
+      '--source',
+      'release-compatibility',
+      '--data',
+      '{"summary":"Compatibility CLI surface add"}',
+      '--text',
+      'compatibility-marker cli-surface-add',
+    ],
+    redactions,
+  )
+  rmSync(resolve(fixtureRoot, 'encephalon', 'decision', 'compatibility-cli-surface-add.json'))
+  const duplicate = cliFailure(
+    fixtureRoot,
+    [
+      'add',
+      '--root',
+      fixtureRoot,
+      '--id',
+      'compatibility-base',
+      '--kind',
+      'decision',
+      '--subject',
+      'release.compatibility.base',
+      '--source',
+      'release-compatibility',
+      '--data',
+      '{}',
+    ],
+    redactions,
+  )
+  const prepared = assertCliJson(fixtureRoot, ['prepare', '--root', fixtureRoot], redactions)
+  const hydrated = assertCliJson(fixtureRoot, ['hydrate', '--root', fixtureRoot], redactions)
+  return normalisePublicValue(
+    {
+      add: added,
+      addError: {
+        body: parseJson<unknown>(duplicate.stderr, 'The duplicate add CLI surface probe'),
+        exitCode: duplicate.exitCode,
+        stdout: duplicate.stdout,
+      },
+      gather: assertCliJson(
+        fixtureRoot,
+        [
+          'gather',
+          '--root',
+          fixtureRoot,
+          '--include-superseded',
+          '--search',
+          'compatibility-marker',
+          '--show',
+          'compatibility-base',
+        ],
+        redactions,
+      ),
+      help,
+      hydrate: hydrated,
+      init: initialised,
+      list: assertCliJson(
+        fixtureRoot,
+        ['list', '--root', fixtureRoot, '--include-superseded', '--kind', 'decision'],
+        redactions,
+      ),
+      prepare: prepared,
+      search: assertCliJson(
+        fixtureRoot,
+        ['search', '--root', fixtureRoot, '--include-superseded', '--', 'compatibility-marker'],
+        redactions,
+      ),
+      searchCompact: assertCliJson(
+        fixtureRoot,
+        ['search', '--root', fixtureRoot, '--compact', '--include-superseded', '--', 'compatibility-marker'],
+        redactions,
+      ),
+      show: assertCliJson(fixtureRoot, ['show', '--root', fixtureRoot, '--id', 'compatibility-base'], redactions),
+      validate: assertCliJson(fixtureRoot, ['validate', '--root', fixtureRoot], redactions),
+      version: '<package-version>\n',
+    },
+    fixtureRoot,
+  )
+}
 
 const cliLimitArguments = (operation: (typeof resultLimitOperations)[number], fixtureRoot: string, limit: number) => {
   const prefixes = {
@@ -743,71 +1432,15 @@ const assertCliResultLimits = (fixtureRoot: string, maximums: ResultLimitMaximum
 }
 
 const runCandidateCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) => {
-  const help = cliSuccess(fixtureRoot, ['--help'], redactions)
-  if (
-    !['init', 'add', 'prepare', 'hydrate', 'validate', 'list', 'show', 'search', 'gather'].every(command =>
-      help.includes(command),
-    ) ||
-    cliSuccess(fixtureRoot, ['--version'], redactions) !== `${version}\n`
-  ) {
-    throw new Error('The candidate CLI help/version surface does not match the published command set.')
-  }
-  assertCliJson(fixtureRoot, ['init', '--root', fixtureRoot], redactions)
-  const duplicate = cliFailure(
-    fixtureRoot,
-    [
-      'add',
-      '--root',
-      fixtureRoot,
-      '--id',
-      'compatibility-base',
-      '--kind',
-      'decision',
-      '--subject',
-      'release.compatibility.base',
-      '--source',
-      'release-compatibility',
-      '--data',
-      '{}',
-    ],
-    redactions,
-  )
-  const duplicateBody = parseJson<{ error?: { code?: unknown } }>(duplicate.stderr, 'The duplicate add CLI probe')
-  if (duplicate.exitCode !== 2 || duplicate.stdout !== '' || duplicateBody.error?.code !== 'RECORD_EXISTS') {
-    throw new Error('The candidate add CLI error framing does not match the published contract.')
-  }
-  const commands = [
-    ['prepare', '--root', fixtureRoot],
-    ['hydrate', '--root', fixtureRoot],
-    ['validate', '--root', fixtureRoot],
-    ['list', '--root', fixtureRoot, '--include-superseded', '--limit=1000'],
-    ['show', '--root', fixtureRoot, '--id', 'compatibility-base'],
-    ['search', '--root', fixtureRoot, '--include-superseded', '--', 'compatibility-marker'],
-    ['search', '--root', fixtureRoot, '--compact', '--include-superseded', '--', 'compatibility-marker'],
-    ['gather', '--root', fixtureRoot, '--search', 'compatibility-marker', '--show', 'compatibility-base'],
-  ]
-  commands.reduce((count, arguments_) => {
-    assertCliJson(fixtureRoot, arguments_, redactions)
-    return count + 1
-  }, 0)
-  return assertCliResultLimits(fixtureRoot, candidateResultLimitMaximums, redactions)
+  const surface = captureCliSurface(fixtureRoot, version, redactions)
+  const limits = assertCliResultLimits(fixtureRoot, candidateResultLimitMaximums, redactions)
+  return { limits, surface }
 }
 
-const runDowngradeCliSurface = (fixtureRoot: string, redactions: readonly Buffer[]) => {
-  const commands = [
-    ['validate', '--root', fixtureRoot],
-    ['list', '--root', fixtureRoot, '--include-superseded', '--limit=50'],
-    ['show', '--root', fixtureRoot, '--id', 'compatibility-base'],
-    ['search', '--root', fixtureRoot, '--include-superseded', '--', 'compatibility-marker'],
-    ['search', '--root', fixtureRoot, '--compact', '--include-superseded', '--', 'compatibility-marker'],
-    ['gather', '--root', fixtureRoot, '--search', 'compatibility-marker', '--show', 'compatibility-base'],
-    ['prepare', '--root', fixtureRoot],
-  ]
-  commands.reduce((count, arguments_) => {
-    assertCliJson(fixtureRoot, arguments_, redactions)
-    return count + 1
-  }, 0)
-  return assertCliResultLimits(fixtureRoot, oracleResultLimitMaximums, redactions)
+const runDowngradeCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) => {
+  const surface = captureCliSurface(fixtureRoot, version, redactions)
+  const limits = assertCliResultLimits(fixtureRoot, oracleResultLimitMaximums, redactions)
+  return { limits, surface }
 }
 
 const assertLimitReport = (actual: ResultLimitReport, maximums: ResultLimitMaximums, label: string) => {
@@ -844,6 +1477,10 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     if (initial.schemaAfter !== '1') {
       throw new Error('The published compatibility oracle did not prepare cache schema 1.')
     }
+    const oracleCliSurface = captureCliSurface(fixtureRoot, initial.version, predecessorRedactions)
+    const oracleCliLimits = assertCliResultLimits(fixtureRoot, oracleResultLimitMaximums, predecessorRedactions)
+    const oracleIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, predecessorRedactions)
+    const oraclePublicSurface = publicSurfaceDigests(initial.surface, oracleCliSurface)
     const durable = captureDurableSnapshot(fixtureRoot)
     const redactions = durableRedactions(durable)
 
@@ -853,6 +1490,10 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     const upgradeApi = runApiProbe(probes.apiProbe, 'upgrade', fixtureRoot, redactions)
     assertLimitReport(upgradeApi.limits, candidateResultLimitMaximums, 'The candidate API phase')
     const upgradeCli = runCandidateCliSurface(fixtureRoot, candidateImport.version, redactions)
+    const upgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, redactions)
+    assertStablePublicSurface(initial.surface, upgradeApi.surface, 'The candidate API')
+    assertCandidateCliSurface(oracleCliSurface, upgradeCli.surface)
+    assertCandidateIndependentBudgets(upgradeIndependentBudgets)
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
     if (upgradeApi.schemaBefore !== '1' || upgradeApi.schemaAfter !== '2') {
       throw new Error('The candidate package did not rebuild cache schema 1 as schema 2.')
@@ -862,7 +1503,15 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     const downgradeImport = runImportProbe(probes.importProbe, fixtureRoot, redactions)
     const downgradeApi = runApiProbe(probes.apiProbe, 'downgrade', fixtureRoot, redactions)
     assertLimitReport(downgradeApi.limits, oracleResultLimitMaximums, 'The downgraded oracle API phase')
-    const downgradeCli = runDowngradeCliSurface(fixtureRoot, redactions)
+    const downgradeCli = runDowngradeCliSurface(fixtureRoot, downgradeImport.version, redactions)
+    const downgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, redactions)
+    assertStablePublicSurface(initial.surface, downgradeApi.surface, 'The downgraded oracle API')
+    assertStablePublicSurface(oracleCliSurface, downgradeCli.surface, 'The downgraded oracle CLI')
+    assertStablePublicSurface(
+      oracleIndependentBudgets,
+      downgradeIndependentBudgets,
+      'The downgraded oracle independent budget evidence',
+    )
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
     if (downgradeApi.schemaBefore !== '2' || downgradeApi.schemaAfter !== '1') {
       throw new Error('The published oracle did not rebuild cache schema 2 as schema 1 after downgrade.')
@@ -875,7 +1524,9 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       candidate: Object.freeze({ digests: candidate.digests, version: candidateImport.version }),
       downgrade: Object.freeze({
         durableState: 'identical',
-        resultLimits: Object.freeze({ api: downgradeApi.limits, cli: downgradeCli }),
+        independentBudgets: downgradeIndependentBudgets,
+        publicSurface: publicSurfaceDigests(downgradeApi.surface, downgradeCli.surface),
+        resultLimits: Object.freeze({ api: downgradeApi.limits, cli: downgradeCli.limits }),
         schemas: Object.freeze({
           after: downgradeApi.schemaAfter,
           before: downgradeApi.schemaBefore,
@@ -883,13 +1534,18 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       }),
       oracle: Object.freeze({
         digests: oracle.digests,
+        independentBudgets: oracleIndependentBudgets,
+        publicSurface: oraclePublicSurface,
+        resultLimits: Object.freeze({ api: initial.limits, cli: oracleCliLimits }),
         specifier: oracle.identity.specifier,
         version: initial.version,
       }),
       status: 'ok',
       upgrade: Object.freeze({
         durableState: 'identical',
-        resultLimits: Object.freeze({ api: upgradeApi.limits, cli: upgradeCli }),
+        independentBudgets: upgradeIndependentBudgets,
+        publicSurface: publicSurfaceDigests(upgradeApi.surface, upgradeCli.surface),
+        resultLimits: Object.freeze({ api: upgradeApi.limits, cli: upgradeCli.limits }),
         schemas: Object.freeze({ after: upgradeApi.schemaAfter, before: upgradeApi.schemaBefore }),
       }),
     })

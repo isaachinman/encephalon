@@ -9,12 +9,15 @@ import { spawnNpmCommand } from './npm-command.ts'
 import { packageTarballDigests } from './package-tarball.ts'
 import {
   assertDurableSnapshotsEqual,
+  assertStablePublicSurface,
   CompatibilityCommandError,
   captureDurableSnapshot,
+  expectedCandidateCliHelp,
   MAX_COMPATIBILITY_DIAGNOSTIC_BYTES,
   ORACLE,
   runCompatibilityCommand,
   runReleaseCompatibility,
+  sanitizedCompatibilityEnvironment,
   verifyOracleTarball,
 } from './release-compatibility.ts'
 
@@ -35,12 +38,17 @@ const createDurableFixture = () => {
 }
 
 const standInIndex = (version: string, schemaVersion: string) => {
-  const fullMaximum = version === '0.2.0' ? 50 : 1000
-  const compactMaximum = version === '0.2.0' ? 100 : 1000
+  const fullMaximum = version.startsWith('0.2.0') ? 50 : 1000
+  const compactMaximum = version.startsWith('0.2.0') ? 100 : 1000
   return `
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+
+if (${String(version.includes('environment-witness'))} && Object.keys(process.env).some(key => key.toLowerCase() === 'node_options' || key.toLowerCase() === 'node_path')) {
+  throw new Error('compatibility subprocess inherited preload variables')
+}
 
 export const packageWitness = ${JSON.stringify(version)}
 
@@ -57,11 +65,49 @@ const repositoryRoot = input => resolve(input?.root ?? process.cwd())
 const recordsDirectory = root => resolve(root, 'encephalon', 'decision')
 const cachePath = root => resolve(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
 const recordPath = (root, id) => resolve(recordsDirectory(root), id + '.json')
-const readRecords = root => {
-  const directory = recordsDirectory(root)
-  return existsSync(directory)
-    ? readdirSync(directory).filter(name => name.endsWith('.json')).sort().map(name => JSON.parse(readFileSync(resolve(directory, name), 'utf8')))
+const canonicalEntries = root => {
+  const brain = resolve(root, 'encephalon')
+  return existsSync(brain)
+    ? readdirSync(brain, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && !entry.name.startsWith('_'))
+      .flatMap(entry => readdirSync(resolve(brain, entry.name)).filter(name => name.endsWith('.json')).map(name => resolve(brain, entry.name, name)))
+      .sort()
+      .map(path => ({ bytes: Buffer.byteLength(readFileSync(path, 'utf8')), record: JSON.parse(readFileSync(path, 'utf8')) }))
     : []
+}
+const readRecords = root => canonicalEntries(root).map(entry => entry.record)
+const budgetError = (budget, field, maximum, message) => {
+  throw new EncephalonError('INVALID_ARGUMENT', message, { budget, field, maximum })
+}
+const validationError = (code, message) => {
+  throw new EncephalonError('VALIDATION_FAILED', 'The new record would make canonical records invalid.', { errors: [{ code, message }] })
+}
+const assertQuery = query => {
+  const byteMaximum = ${version.includes('budget-drift') ? 2048 : 1024}
+  if (Buffer.byteLength(query, 'utf8') > byteMaximum) budgetError('queryBytes', 'query', byteMaximum, 'query must contain at most ' + byteMaximum + ' UTF-8 bytes.')
+  const terms = query.match(/[A-Za-z0-9]+/g) ?? []
+  if (terms.length > 32) budgetError('queryTerms', 'query', 32, 'query may contain at most 32 literal terms.')
+}
+const assertPayload = payload => {
+  const work = [{ depth: 0, path: 'payload', value: payload }]
+  let nodes = 0
+  while (work.length > 0) {
+    const current = work.pop()
+    nodes += 1
+    if (nodes > 10000) throw new EncephalonError('INVALID_ARGUMENT', 'payload may contain at most 10000 JSON nodes.', { field: current.path })
+    if (current.depth > 64) throw new EncephalonError('INVALID_ARGUMENT', 'payload may be nested at most 64 levels deep.', { field: current.path })
+    if (Array.isArray(current.value)) {
+      if (current.value.length > 10000 - nodes) throw new EncephalonError('INVALID_ARGUMENT', 'payload may contain at most 10000 JSON nodes.', { field: current.path })
+      current.value.map((value, index) => work.push({ depth: current.depth + 1, path: current.path + '[' + index + ']', value }))
+    } else if (current.value !== null && typeof current.value === 'object') {
+      Object.entries(current.value).map(([key, value]) => work.push({ depth: current.depth + 1, path: current.path + '.' + key, value }))
+    }
+  }
+}
+const responseBytes = value => Buffer.byteLength(JSON.stringify(value), 'utf8')
+const assertResponse = (value, budget, message) => {
+  if (responseBytes(value) > 4 * 1024 * 1024) budgetError(budget, 'response', 4 * 1024 * 1024, message)
+  return value
 }
 const assertLimit = (limit, budget) => {
   const maximum = budget === 'fullResultLimit' ? ${fullMaximum} : ${compactMaximum}
@@ -92,6 +138,23 @@ const writeCache = root => {
 export const initEncephalon = (input = {}) => {
   const root = repositoryRoot(input)
   mkdirSync(recordsDirectory(root), { recursive: true })
+  const baselineDirectory = resolve(root, 'encephalon', 'workflow')
+  mkdirSync(baselineDirectory, { recursive: true })
+  const baselineExists = readdirSync(baselineDirectory).some(name => name.endsWith('.json'))
+  const recordsCreated = baselineExists ? [] : (() => {
+    const id = randomUUID()
+    const record = {
+      createdAt: '2026-08-26T00:00:00.000Z',
+      id,
+      kind: 'workflow',
+      path: 'encephalon/workflow/' + id + '.json',
+      payload: { summary: 'Nondeterministic managed baseline' },
+      source: 'release-compatibility',
+      subject: 'release.compatibility.nondeterministic-baseline',
+    }
+    writeFileSync(resolve(baselineDirectory, id + '.json'), JSON.stringify(record) + '\\n')
+    return [record]
+  })()
   const managedBlock = '\\n<!-- encephalon:managed-instructions:start fixture -->\\nUse the installed Encephalon skill.\\n<!-- encephalon:managed-instructions:end -->\\n'
   ;['AGENTS.md', 'CLAUDE.md'].forEach(name => {
     const path = resolve(root, name)
@@ -100,12 +163,19 @@ export const initEncephalon = (input = {}) => {
       writeFileSync(path, predecessor + managedBlock)
     }
   })
-  return { instructionFiles: [], nextAction: 'ready', recordsCreated: [], skippedConflicts: [] }
+  return { instructionFiles: [], nextAction: 'ready', recordsCreated, skippedConflicts: [] }
 }
 
 export const addRecord = input => {
   const root = repositoryRoot(input)
   const path = recordPath(root, input.id)
+  if ((input.supersedes?.length ?? 0) > 1000) {
+    budgetError('supersessionEdges', 'supersedes', 1000, 'supersedes may contain at most 1000 record ids.')
+  }
+  if (input.supersedes !== undefined && new Set(input.supersedes).size !== input.supersedes.length) {
+    throw new EncephalonError('INVALID_ARGUMENT', 'supersedes must be a non-empty array of unique strings.', { field: 'supersedes' })
+  }
+  assertPayload(input.payload)
   if (existsSync(path)) {
     throw new EncephalonError('RECORD_EXISTS', 'The record already exists.', { id: input.id })
   }
@@ -121,6 +191,14 @@ export const addRecord = input => {
     subject: input.subject,
     supersedes: input.supersedes,
   }
+  const entries = canonicalEntries(root)
+  if (entries.length >= 1000) {
+    validationError('CORPUS_RECORD_LIMIT', 'Canonical corpus may contain at most 1000 records.')
+  }
+  const recordBytes = Buffer.byteLength(JSON.stringify(record) + '\\n')
+  if (entries.reduce((bytes, entry) => bytes + entry.bytes, 0) + recordBytes > 8 * 1024 * 1024) {
+    validationError('CORPUS_BYTE_LIMIT', 'Canonical corpus may contain at most 8388608 bytes of record JSON.')
+  }
   mkdirSync(recordsDirectory(root), { recursive: true })
   writeFileSync(path, JSON.stringify(record) + '\\n')
   return record
@@ -128,27 +206,55 @@ export const addRecord = input => {
 
 export const prepare = input => writeCache(repositoryRoot(input))
 export const hydrate = input => ({ recordsIndexed: writeCache(repositoryRoot(input)).recordsIndexed })
-export const validateRecords = input => ({ errors: [], recordsChecked: readRecords(repositoryRoot(input)).length, truncated: false, valid: true })
-export const listRecords = (input = {}) => readRecords(repositoryRoot(input)).slice(0, assertLimit(input.limit, 'fullResultLimit'))
-export const showRecord = input => readRecords(repositoryRoot(input)).find(record => record.id === input.id) ?? null
-export const searchRecords = input => readRecords(repositoryRoot(input))
-  .filter(record => JSON.stringify(record).includes(input.query))
-  .slice(0, assertLimit(input.limit, 'fullResultLimit'))
-export const searchCompactRecords = input => readRecords(repositoryRoot(input))
-  .filter(record => JSON.stringify(record).includes(input.query))
-  .slice(0, assertLimit(input.limit, 'compactResultLimit'))
-  .map(record => ({ id: record.id, kind: record.kind, path: record.path, rank: -1, snippet: record.searchText ?? '', subject: record.subject, summary: null }))
-export const gatherRecords = (input = {}) => ({
-  hydrated: input.hydrate ? hydrate(input) : null,
-  records: (input.shows ?? []).map(id => ({ id, record: showRecord({ ...input, id }) })),
-  searches: (input.searches ?? []).map(query => ({ kind: input.kind ?? null, query, results: searchCompactRecords({ ...input, query, limit: assertLimit(input.limit, 'compactResultLimit') }) })),
-})
+export const validateRecords = input => ({ errors: [], recordsChecked: readRecords(repositoryRoot(input)).length, truncated: false, valid: true${version.includes('shape-drift') ? ", drift: 'candidate-only'" : ''} })
+export const listRecords = (input = {}) => assertResponse(
+  readRecords(repositoryRoot(input))
+    .filter(record => input.kind === undefined || record.kind === input.kind)
+    .slice(0, assertLimit(input.limit, 'fullResultLimit')),
+  'fullResponseBytes',
+  'full-record responses may contain at most 4194304 UTF-8 bytes.',
+)
+export const showRecord = input => assertResponse(
+  readRecords(repositoryRoot(input)).find(record => record.id === input.id) ?? null,
+  'fullResponseBytes',
+  'full-record responses may contain at most 4194304 UTF-8 bytes.',
+)
+export const searchRecords = input => {
+  assertQuery(input.query)
+  return assertResponse(
+    readRecords(repositoryRoot(input)).filter(record => JSON.stringify(record).includes(input.query)).slice(0, assertLimit(input.limit, 'fullResultLimit')),
+    'fullResponseBytes',
+    'full-record responses may contain at most 4194304 UTF-8 bytes.',
+  )
+}
+export const searchCompactRecords = input => {
+  assertQuery(input.query)
+  return assertResponse(
+    readRecords(repositoryRoot(input))
+      .filter(record => JSON.stringify(record).includes(input.query))
+      .slice(0, assertLimit(input.limit, 'compactResultLimit'))
+      .map(record => ({ id: record.id, kind: record.kind, path: record.path, rank: -1, snippet: record.searchText ?? '', subject: record.subject, summary: record.payload?.summary ?? null })),
+    'compactResponseBytes',
+    'response may contain at most 4194304 bytes.',
+  )
+}
+export const gatherRecords = (input = {}) => {
+  if ((input.searches?.length ?? 0) > 16) budgetError('gatherSearches', 'searches', 16, 'gather may contain at most 16 searches.')
+  if ((input.shows?.length ?? 0) > 64) budgetError('gatherShows', 'shows', 64, 'gather may contain at most 64 shows.')
+  const value = {
+    hydrated: input.hydrate ? hydrate(input) : null,
+    records: (input.shows ?? []).map(id => ({ id, record: showRecord({ ...input, id }) })),
+    searches: (input.searches ?? []).map(query => ({ kind: input.kind ?? null, query, results: searchCompactRecords({ ...input, query, limit: assertLimit(input.limit, 'compactResultLimit') }) })),
+  }
+  return assertResponse(value, 'gatherResponseBytes', 'response may contain at most 4194304 bytes.')
+}
 `
 }
 
 const standInCli = (version: string) => `#!/usr/bin/env node
 import {
   addRecord,
+  EncephalonError,
   gatherRecords,
   hydrate,
   initEncephalon,
@@ -162,7 +268,7 @@ import {
 
 const raw = process.argv.slice(2)
 if (raw.length === 1 && (raw[0] === '--help' || raw[0] === '-h')) {
-  process.stdout.write('Usage: encephalon <command>\\nCommands: init add prepare hydrate validate list show search gather\\n')
+  process.stdout.write('Usage: encephalon <command>\\nCommands: init add prepare hydrate validate list show search gather${version.includes('shape-drift') ? ' candidate-only' : ''}\\n')
 } else if (raw.length === 1 && (raw[0] === '--version' || raw[0] === '-v')) {
   process.stdout.write(${JSON.stringify(`${version}\n`)})
 } else {
@@ -175,11 +281,23 @@ if (raw.length === 1 && (raw[0] === '--help' || raw[0] === '-h')) {
     const assigned = options.find(argument => argument.startsWith('--' + name + '='))
     return exact === -1 ? assigned?.slice(name.length + 3) : options[exact + 1]
   }
-  const many = name => options.reduce((values, argument, index) => argument === '--' + name ? [...values, options[index + 1]] : values, []).filter(Boolean)
+  const many = name => options.reduce((values, argument, index) => {
+    if (argument === '--' + name) return [...values, options[index + 1]]
+    if (argument.startsWith('--' + name + '=')) return [...values, argument.slice(name.length + 3)]
+    return values
+  }, []).filter(Boolean)
   const limitValue = one('limit')
   const limit = limitValue === undefined ? undefined : Number(limitValue)
-  const input = { root, ...(limit === undefined ? {} : { limit }) }
+  const kind = one('kind')
+  const input = { root, ...(kind === undefined ? {} : { kind }), ...(limit === undefined ? {} : { limit }) }
   try {
+    if (command === 'add' && many('supersedes').length > 1000) {
+      throw new EncephalonError('INVALID_ARGUMENT', '--supersedes may be supplied at most 1000 times.', {
+        budget: 'supersessionEdges',
+        field: 'supersedes',
+        maximum: 1000,
+      })
+    }
     const value = command === 'init'
       ? initEncephalon(input)
       : command === 'add'
@@ -363,6 +481,30 @@ describe('release compatibility authorities', () => {
     assert.equal(verifiedCases.every(Boolean), true)
   })
 
+  test('preserves and compares special permission bits in durable snapshots', {
+    skip: process.platform === 'win32',
+  }, () => {
+    const fixture = createDurableFixture()
+    try {
+      chmodSync(fixture.record, 0o4755)
+      const expected = captureDurableSnapshot(fixture.root)
+      const record = expected.find(entry => entry.path === 'encephalon/decision/compatibility.json')
+      assert.equal(record?.mode, 0o4755)
+
+      chmodSync(fixture.record, 0o755)
+      assert.throws(
+        () => assertDurableSnapshotsEqual(expected, captureDurableSnapshot(fixture.root)),
+        error =>
+          error instanceof Error &&
+          'changes' in error &&
+          Array.isArray(error.changes) &&
+          error.changes.some(change => change.kind === 'mode' && change.path === record?.path),
+      )
+    } finally {
+      rmSync(fixture.root, { force: true, recursive: true })
+    }
+  })
+
   test('ignores changes only beneath the disposable Encephalon cache', () => {
     const fixture = createDurableFixture()
     try {
@@ -425,6 +567,71 @@ describe('release compatibility authorities', () => {
       rmSync(directory, { force: true, recursive: true })
     }
   })
+
+  test('applies explicit environments and output bounds to npm subprocesses', () => {
+    const poisoned = spawnNpmCommand(['--version'], {
+      cwd: resolve(import.meta.dirname, '..'),
+      environment: { ...process.env, NODE_OPTIONS: '--encephalon-invalid-preload-option' },
+    })
+    assert.notEqual(poisoned.status, 0)
+
+    const bounded = spawnNpmCommand(['--version'], {
+      cwd: resolve(import.meta.dirname, '..'),
+      environment: { ...process.env, NODE_OPTIONS: undefined, NODE_PATH: undefined },
+      maxBuffer: 1,
+    })
+    assert.equal((bounded.error as NodeJS.ErrnoException | undefined)?.code, 'ENOBUFS')
+  })
+
+  test('removes preload variables case-insensitively from compatibility subprocess environments', () => {
+    assert.deepEqual(
+      sanitizedCompatibilityEnvironment({
+        NODE_OPTIONS: '--require=/private/preload.cjs',
+        Node_Options: '--require=/private/second-preload.cjs',
+        node_path: '/private/modules',
+        Path: '/usr/bin',
+      }),
+      { Path: '/usr/bin' },
+    )
+  })
+
+  test('rejects every stable public surface drift without normalising fields, values, messages, details, or help', () => {
+    const oracle = {
+      error: {
+        code: 'RECORD_EXISTS',
+        details: { id: 'compatibility-base' },
+        message: 'Record compatibility-base already exists.',
+        name: 'EncephalonError',
+      },
+      help: 'Usage: encephalon <command>\n',
+      success: { records: [{ id: 'compatibility-base', value: 'stable' }], valid: true },
+    }
+    const drifts = [
+      { ...oracle, success: { records: [{ id: 'compatibility-base' }], valid: true } },
+      { ...oracle, success: { records: [{ id: 'compatibility-base', value: 'changed' }], valid: true } },
+      { ...oracle, error: { ...oracle.error, message: 'Changed.' } },
+      { ...oracle, error: { ...oracle.error, details: { id: 'different' } } },
+      { ...oracle, help: 'Changed help.\n' },
+    ]
+
+    for (const drift of drifts) {
+      assert.throws(
+        () => assertStablePublicSurface(oracle, drift, 'The candidate API'),
+        /The candidate API does not exactly preserve the published public surface\./,
+      )
+    }
+    assert.doesNotThrow(() => assertStablePublicSurface(oracle, structuredClone(oracle), 'The candidate API'))
+  })
+
+  test('allows only the documented candidate additions to the pinned oracle help', () => {
+    const oracleHelp =
+      '  add [--artifact <path> ...]\n  search [--compact] [--limit <1..1000>] [--] <query>\n         [--limit <1..1000>]\n'
+    const candidateHelp =
+      '  add [--artifact <path> ...]\n      Accepts at most 1,000 supersession targets.\n  search [--limit <1..1000>] [--] <query>\n  search --compact [--limit <1..1000>] [--] <query>\n         [--limit <1..1000>]\n         Accepts at most 16 searches and 64 shows.\n'
+
+    assert.equal(expectedCandidateCliHelp(oracleHelp), candidateHelp)
+    assert.notEqual(expectedCandidateCliHelp(oracleHelp), `${candidateHelp}candidate-only\n`)
+  })
 })
 
 describe('release compatibility process fixture', () => {
@@ -471,6 +678,21 @@ describe('release compatibility process fixture', () => {
           tarball: oracle.tarball,
         },
       })
+      const repeatedFixtureRoot = resolve(temporaryRoot, 'repeated-repository')
+      mkdirSync(repeatedFixtureRoot)
+      const repeatedReport = runReleaseCompatibility({
+        candidateTarball: candidate.tarball,
+        fixtureRoot: repeatedFixtureRoot,
+        oracle: {
+          identity: {
+            integrity: oracleDigests.integrity,
+            shasum: oracleDigests.sha1,
+            specifier: 'local-encephalon@0.2.0',
+          },
+          tarball: oracle.tarball,
+        },
+      })
+      assert.deepEqual(repeatedReport, report)
 
       const expectedCandidateLimits = {
         gather: { accepted: [50, 100, 101, 999, 1000], rejected: [1001] },
@@ -497,6 +719,44 @@ describe('release compatibility process fixture', () => {
       assert.deepEqual(report.upgrade.resultLimits.cli, expectedCandidateLimits)
       assert.deepEqual(report.downgrade.resultLimits.api, expectedOracleLimits)
       assert.deepEqual(report.downgrade.resultLimits.cli, expectedOracleLimits)
+      const independentBudgetNames = [
+        'compactResponseBytes',
+        'corpusBytes',
+        'corpusRecords',
+        'fullResponseBytes',
+        'gatherResponseBytes',
+        'gatherSearches',
+        'gatherShows',
+        'payloadDepth',
+        'payloadNodes',
+        'queryBytes',
+        'queryTerms',
+        'supersessionEdges',
+      ]
+      assert.deepEqual(Object.keys(report.upgrade.independentBudgets.api).sort(), independentBudgetNames)
+      assert.deepEqual(Object.keys(report.upgrade.independentBudgets.cli).sort(), independentBudgetNames)
+      assert.deepEqual(report.upgrade.independentBudgets.api.queryBytes, {
+        overLimit: {
+          error: {
+            code: 'INVALID_ARGUMENT',
+            details: { budget: 'queryBytes', field: 'query', maximum: 1024 },
+            message: 'query must contain at most 1024 UTF-8 bytes.',
+          },
+          status: 'rejected',
+        },
+        withinLimit: { status: 'accepted' },
+      })
+      const cliSupersessionEvidence = report.upgrade.independentBudgets.cli.supersessionEdges
+      assert.ok(cliSupersessionEvidence)
+      assert.deepEqual(cliSupersessionEvidence.overLimit, {
+        error: {
+          code: 'INVALID_ARGUMENT',
+          details: { budget: 'supersessionEdges', field: 'supersedes', maximum: 1000 },
+          message: '--supersedes may be supplied at most 1000 times.',
+        },
+        status: 'rejected',
+      })
+      assert.deepEqual(report.oracle.independentBudgets, report.downgrade.independentBudgets)
       assert.equal(JSON.stringify(report).includes(temporaryRoot), false)
       assert.equal(
         readFileSync(resolve(fixtureRoot, 'AGENTS.md'), 'utf8').startsWith('oracle agents predecessor\n'),
@@ -559,6 +819,118 @@ describe('release compatibility process fixture', () => {
       assert.equal(existsSync(resolve(fixtureRoot, 'package.json')), false)
       assert.equal(existsSync(resolve(fixtureRoot, 'node_modules', 'encephalon')), false)
     } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects candidate API and CLI surface drift that loose success checks would accept', {
+    timeout: 120_000,
+  }, () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-shape-drift-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    try {
+      mkdirSync(fixtureRoot)
+      const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-shape-drift', '2')
+      const oracleDigests = packageTarballDigests(oracle.tarball)
+
+      assert.throws(
+        () =>
+          runReleaseCompatibility({
+            candidateTarball: candidate.tarball,
+            fixtureRoot,
+            oracle: {
+              identity: {
+                integrity: oracleDigests.integrity,
+                shasum: oracleDigests.sha1,
+                specifier: 'local-encephalon@0.2.0',
+              },
+              tarball: oracle.tarball,
+            },
+          }),
+        /does not exactly preserve the published public surface/,
+      )
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('rejects candidate independent-budget drift that result-limit checks cannot observe', {
+    timeout: 120_000,
+  }, () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-budget-drift-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    try {
+      mkdirSync(fixtureRoot)
+      const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-budget-drift', '2')
+      const oracleDigests = packageTarballDigests(oracle.tarball)
+
+      assert.throws(
+        () =>
+          runReleaseCompatibility({
+            candidateTarball: candidate.tarball,
+            fixtureRoot,
+            oracle: {
+              identity: {
+                integrity: oracleDigests.integrity,
+                shasum: oracleDigests.sha1,
+                specifier: 'local-encephalon@0.2.0',
+              },
+              tarball: oracle.tarball,
+            },
+          }),
+        /does not enforce the approved independent public budget boundaries exactly \(api\.queryBytes\.overLimit\.error, api\.queryBytes\.overLimit\.status, cli\.queryBytes\.overLimit\.error, cli\.queryBytes\.overLimit\.status\)\./,
+      )
+    } finally {
+      rmSync(temporaryRoot, { force: true, recursive: true })
+    }
+  })
+
+  test('removes preload variables from npm and every installed-package child process', {
+    timeout: 120_000,
+  }, () => {
+    const temporaryRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-preload-isolation-'))
+    const fixtureRoot = resolve(temporaryRoot, 'repository')
+    const marker = resolve(temporaryRoot, 'npm-preload-marker')
+    const preload = resolve(temporaryRoot, 'preload.cjs')
+    const originalNodeOptions = process.env.NODE_OPTIONS
+    const originalNodePath = process.env.NODE_PATH
+    try {
+      mkdirSync(fixtureRoot)
+      const oracle = buildStandInTarball(temporaryRoot, '0.2.0-environment-witness', '1')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-environment-witness', '2')
+      const oracleDigests = packageTarballDigests(oracle.tarball)
+      writeFileSync(preload, `require('node:fs').appendFileSync(${JSON.stringify(marker)}, 'loaded\\n')\n`)
+      process.env.NODE_OPTIONS = `--require=${preload}`
+      process.env.NODE_PATH = resolve(temporaryRoot, 'private-modules')
+
+      assert.doesNotThrow(() =>
+        runReleaseCompatibility({
+          candidateTarball: candidate.tarball,
+          fixtureRoot,
+          oracle: {
+            identity: {
+              integrity: oracleDigests.integrity,
+              shasum: oracleDigests.sha1,
+              specifier: 'local-encephalon@0.2.0',
+            },
+            tarball: oracle.tarball,
+          },
+        }),
+      )
+      assert.equal(existsSync(marker), false)
+    } finally {
+      if (originalNodeOptions === undefined) {
+        delete process.env.NODE_OPTIONS
+      } else {
+        process.env.NODE_OPTIONS = originalNodeOptions
+      }
+      if (originalNodePath === undefined) {
+        delete process.env.NODE_PATH
+      } else {
+        process.env.NODE_PATH = originalNodePath
+      }
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
