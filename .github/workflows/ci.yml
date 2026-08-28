@@ -60,7 +60,7 @@ jobs:
   package:
     name: Build exact package candidate
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
         with:
@@ -104,7 +104,7 @@ jobs:
         node:
           - 24.15.0
           - 26
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
         with:
@@ -136,7 +136,7 @@ jobs:
   release:
     name: Release-equivalent package gate
     needs: candidate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
         with:
