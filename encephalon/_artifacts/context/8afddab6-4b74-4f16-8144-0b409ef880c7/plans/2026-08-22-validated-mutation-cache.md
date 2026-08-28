@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript ESM, synchronous Node.js filesystem APIs, `node:sqlite`, Node test runner, Bun build tooling.
 
-**Spec:** `docs/superpowers/specs/2026-08-22-validated-mutation-cache-design.md`
+**Spec:** `encephalon/_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-22-validated-mutation-cache-design.md`
 
 ## Global Constraints
 

@@ -1,7 +1,7 @@
 # FTS Text Integrity Implementation Plan
 
 **Ticket:** MAR-2550
-**Design:** `docs/superpowers/specs/2026-08-17-fts-text-integrity-design.md`
+**Design:** `encephalon/_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-17-fts-text-integrity-design.md`
 
 ## Task 1: Witness semantic FTS mismatches
 

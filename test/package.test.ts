@@ -461,40 +461,48 @@ describe('package contract', () => {
     const implementationPlan = readFileSync(resolve(root, 'docs', 'implementation-plan.md'), 'utf8')
     const contract = readFileSync(resolve(root, 'docs', 'contract.md'), 'utf8')
     const performance = readFileSync(resolve(root, 'docs', 'performance.md'), 'utf8')
+    const superpowersArchive = resolve(
+      root,
+      'encephalon',
+      '_artifacts',
+      'context',
+      '8afddab6-4b74-4f16-8144-0b409ef880c7',
+      'specs',
+    )
     const operationBudgetsDesign = readFileSync(
-      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-13-operation-budgets-design.md'),
+      resolve(superpowersArchive, '2026-08-13-operation-budgets-design.md'),
       'utf8',
     )
     const boundedCacheValidationDesign = readFileSync(
-      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-16-bounded-cache-validation-design.md'),
+      resolve(superpowersArchive, '2026-08-16-bounded-cache-validation-design.md'),
       'utf8',
     )
     const semanticCacheSchemaDesign = readFileSync(
-      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-17-sqlite-schema-semantics-design.md'),
+      resolve(superpowersArchive, '2026-08-17-sqlite-schema-semantics-design.md'),
       'utf8',
     )
     const ftsTextIntegrityDesign = readFileSync(
-      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-17-fts-text-integrity-design.md'),
+      resolve(superpowersArchive, '2026-08-17-fts-text-integrity-design.md'),
       'utf8',
     )
     const responseByteBudgetsDesign = readFileSync(
-      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-17-response-byte-budgets-design.md'),
+      resolve(superpowersArchive, '2026-08-17-response-byte-budgets-design.md'),
       'utf8',
     )
     const unicodeLiteralSearchDesign = readFileSync(
-      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-unicode-literal-search-design.md'),
+      resolve(superpowersArchive, '2026-08-18-unicode-literal-search-design.md'),
       'utf8',
     )
     const singlePassCacheReadDesign = readFileSync(
-      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-single-pass-cache-read-design.md'),
+      resolve(superpowersArchive, '2026-08-18-single-pass-cache-read-design.md'),
       'utf8',
     )
     const gatherDeduplicationDesign = readFileSync(
-      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-18-gather-deduplication-design.md'),
+      resolve(superpowersArchive, '2026-08-18-gather-deduplication-design.md'),
       'utf8',
     )
     const validatedMutationCacheDesign = readFileSync(
-      resolve(root, 'docs', 'superpowers', 'specs', '2026-08-22-validated-mutation-cache-design.md'),
+      resolve(superpowersArchive, '2026-08-22-validated-mutation-cache-design.md'),
       'utf8',
     )
 

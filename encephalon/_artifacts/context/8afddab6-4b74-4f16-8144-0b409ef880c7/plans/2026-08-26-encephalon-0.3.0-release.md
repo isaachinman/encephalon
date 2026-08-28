@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript 7, Node.js 24.15.0 and 26, Bun 1.3.1, Node test runner, npm tarballs, GitHub Actions.
 
-**Spec:** `docs/superpowers/specs/2026-08-26-encephalon-0.3.0-release-design.md`
+**Spec:** `encephalon/_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-26-encephalon-0.3.0-release-design.md`
 
 ## Global Constraints
 

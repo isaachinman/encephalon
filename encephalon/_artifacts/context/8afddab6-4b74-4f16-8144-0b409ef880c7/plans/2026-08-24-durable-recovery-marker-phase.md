@@ -4,7 +4,7 @@
 
 **Goal:** Replace process-local abandoned-marker authority with a crash-safe, cross-process recovery phase while preserving all public behaviour and active-owner safety.
 
-**Architecture:** Keep recovery coordination in `src/lock.ts`; add one bounded immutable recovered-witness primitive to `src/cache-location.ts`; publish `owner.recovered.json` only while the exact explicit recovering owner and usable SQLite gate are held; and make the exact owner-plus-witness pair sufficient for token-safe reclaim in every process. Design: `docs/superpowers/specs/2026-08-24-durable-recovery-marker-phase-design.md`.
+**Architecture:** Keep recovery coordination in `src/lock.ts`; add one bounded immutable recovered-witness primitive to `src/cache-location.ts`; publish `owner.recovered.json` only while the exact explicit recovering owner and usable SQLite gate are held; and make the exact owner-plus-witness pair sufficient for token-safe reclaim in every process. Design: `encephalon/_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-24-durable-recovery-marker-phase-design.md`.
 
 **Tech Stack:** TypeScript, Node.js synchronous filesystem and SQLite APIs, Bun package scripts, Node test runner.
 

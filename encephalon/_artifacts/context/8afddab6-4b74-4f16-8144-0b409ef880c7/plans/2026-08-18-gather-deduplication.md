@@ -1,7 +1,7 @@
 # Gather Deduplication Implementation Plan
 
 **Ticket:** MAR-2560
-**Design:** `docs/superpowers/specs/2026-08-18-gather-deduplication-design.md`
+**Design:** `encephalon/_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-18-gather-deduplication-design.md`
 
 ## Task 1: Prove the current repeated work
 

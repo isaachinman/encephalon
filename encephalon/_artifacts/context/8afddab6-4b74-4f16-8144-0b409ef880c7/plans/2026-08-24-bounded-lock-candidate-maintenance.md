@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript, Node.js synchronous filesystem and SQLite APIs, Bun package scripts, Node test runner.
 
-**Spec:** `docs/superpowers/specs/2026-08-24-bounded-lock-candidate-maintenance-design.md`
+**Spec:** `encephalon/_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-24-bounded-lock-candidate-maintenance-design.md`
 
 ## Global Constraints
 
