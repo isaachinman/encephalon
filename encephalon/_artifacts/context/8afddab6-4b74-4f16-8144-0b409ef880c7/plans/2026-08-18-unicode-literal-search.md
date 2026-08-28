@@ -1,7 +1,7 @@
 # Unicode Literal Search Implementation Plan
 
 **Ticket:** MAR-2559
-**Design:** `docs/superpowers/specs/2026-08-18-unicode-literal-search-design.md`
+**Design:** `encephalon/_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-18-unicode-literal-search-design.md`
 
 ## Task 1: Characterise literal Unicode terms
 

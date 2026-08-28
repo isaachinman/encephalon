@@ -4,5 +4,7 @@ dist/
 *.tgz.metadata.json
 coverage/
 /encephalon/_staging/
+/.superpowers/
+/docs/superpowers/
 .DS_Store
 AGENTS.md

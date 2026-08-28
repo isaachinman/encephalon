@@ -1,7 +1,7 @@
 # Isolated Performance Benchmarks Implementation Plan
 
 **Ticket:** MAR-2566
-**Design:** `docs/superpowers/specs/2026-08-18-isolated-performance-benchmarks-design.md`
+**Design:** `encephalon/_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-18-isolated-performance-benchmarks-design.md`
 
 ## Task 1: Define the versioned benchmark model
 

@@ -1,0 +1,72 @@
+{
+  "artifacts": [
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-13-managed-instruction-finalisation.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-13-operation-budgets.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-13-partial-initialisation-progress.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-16-bounded-cache-validation.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-17-fts-text-integrity.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-17-response-byte-budgets.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-17-sqlite-schema-semantics.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-18-gather-deduplication.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-18-isolated-performance-benchmarks.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-18-unicode-literal-search.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-22-validated-mutation-cache.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-24-bounded-lock-candidate-maintenance.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-24-durable-recovery-marker-phase.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-24-hard-linked-sqlite-cache.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-24-lossless-filesystem-identity.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/plans/2026-08-26-encephalon-0.3.0-release.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-13-managed-instruction-finalisation-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-13-operation-budgets-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-13-partial-initialisation-progress-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-16-bounded-cache-validation-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-17-fts-text-integrity-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-17-response-byte-budgets-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-17-sqlite-schema-semantics-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-18-gather-deduplication-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-18-isolated-performance-benchmarks-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-18-single-pass-cache-read-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-18-unicode-literal-search-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-22-validated-mutation-cache-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-24-bounded-lock-candidate-maintenance-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-24-durable-recovery-marker-phase-design.md",
+    "_artifacts/context/8afddab6-4b74-4f16-8144-0b409ef880c7/specs/2026-08-26-encephalon-0.3.0-release-design.md"
+  ],
+  "createdAt": "2026-08-28T01:46:00.546Z",
+  "id": "8afddab6-4b74-4f16-8144-0b409ef880c7",
+  "kind": "context",
+  "payload": {
+    "summary": "Historical Superpowers design specifications and implementation plans are retained as immutable Encephalon artifacts.",
+    "documentCounts": {
+      "plans": 16,
+      "specifications": 15
+    },
+    "period": {
+      "from": "2026-08-13",
+      "through": "2026-08-26"
+    },
+    "topics": [
+      "managed instruction finalisation",
+      "operation budgets",
+      "partial initialisation progress",
+      "bounded cache validation",
+      "FTS text integrity",
+      "response byte budgets",
+      "SQLite schema semantics",
+      "gather deduplication",
+      "isolated performance benchmarks",
+      "Unicode literal search",
+      "single-pass cache read",
+      "validated mutation cache",
+      "bounded lock candidate maintenance",
+      "durable recovery marker phase",
+      "hard-linked SQLite cache",
+      "lossless filesystem identity",
+      "Encephalon 0.3.0 release"
+    ],
+    "provenance": "Moved from docs/superpowers during MAR-2684. Historical task file lists and Git commands retain their original paths; live plan-to-spec references use the artifact locations."
+  },
+  "searchText": "historical superpowers plans specifications designs managed instruction finalisation operation budgets partial initialisation progress bounded cache validation FTS text integrity response byte budgets SQLite schema semantics gather deduplication isolated performance benchmarks Unicode literal search single-pass cache read validated mutation cache bounded lock candidate maintenance durable recovery marker hard-linked SQLite cache lossless filesystem identity Encephalon 0.3.0 release",
+  "source": "agent",
+  "subject": "repository.superpowers-history"
+}
