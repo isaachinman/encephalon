@@ -1,4 +1,4 @@
-import { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
+// Freeze published input limits in the common harness so revisions perform identical work.
 
 export const shownIdForBenchmarkCase = (records: number) => {
   if (records === 0) {
@@ -9,10 +9,8 @@ export const shownIdForBenchmarkCase = (records: number) => {
 }
 
 export const gatherBenchmarkInput = (records: number) => ({
-  searches: Array.from({ length: OPERATION_BUDGETS.gatherSearches.maximum }, (_, index) =>
-    index % 2 === 0 ? 'benchmark needle' : 'large payload',
-  ),
-  shows: Array.from({ length: OPERATION_BUDGETS.gatherShows.maximum }, (_, index) =>
+  searches: Array.from({ length: 16 }, (_, index) => (index % 2 === 0 ? 'benchmark needle' : 'large payload')),
+  shows: Array.from({ length: 64 }, (_, index) =>
     index % 2 === 0 ? shownIdForBenchmarkCase(records) : 'benchmark-missing',
   ),
 })

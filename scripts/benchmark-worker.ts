@@ -7,6 +7,7 @@ import {
   searchCompactRecords,
   searchRecords,
   showRecord,
+  validateRecords,
 } from '../src/index.ts'
 import {
   type BenchmarkOperation,
@@ -39,14 +40,34 @@ const operationRunners: Record<BenchmarkOperation, OperationRunner> = {
   compactSearch: (_records, root) => searchCompactRecords({ limit: 20, query: 'benchmark needle', root }),
   fullSearch: (_records, root) => searchRecords({ limit: 20, query: 'benchmark needle', root }),
   gather: (records, root) => gatherRecords({ root, ...gatherBenchmarkInput(records) }),
+  largePayloadSearch: (_records, root) => searchCompactRecords({ query: 'large payload', root }),
   list: (_records, root) => listRecords({ limit: 20, root }),
+  listMaximum: (_records, root) => listRecords({ limit: 1000, root }),
+  maximumPayloadSearch: (_records, root) => searchCompactRecords({ query: 'maximum preview', root }),
+  missingSearch: (_records, root) => searchCompactRecords({ query: 'absentuniqueneedle', root }),
+  payloadOnlySearch: (_records, root) => searchCompactRecords({ query: 'deepuniqueneedle', root }),
   show: (records, root) => showRecord({ id: shownIdForBenchmarkCase(records), root }),
   stalePrepare: (_records, root) => prepare({ root }),
+  strictCacheValidation: (_records, root) => listRecords({ limit: 1, root }),
   unchangedPrepare: (_records, root) => prepare({ root }),
+  validateArtifacts: (_records, root) => validateRecords({ root }),
 }
 
 const hasExpectedResultCardinality = (records: number, result: unknown): boolean =>
   Array.isArray(result) && (records === 0 ? result.length === 0 : result.length > 0)
+
+const activeCount = (records: number) => (records === 0 ? 0 : records - Math.max(1, Math.floor(records * 0.1)) + 1)
+
+const hasMaximumPayloadMatch = (records: number, result: unknown): boolean =>
+  Array.isArray(result) &&
+  result.length === (records >= 4 ? 1 : 0) &&
+  result.every(
+    entry =>
+      isObject(entry) &&
+      entry.id === `small-${String(records - 1).padStart(5, '0')}` &&
+      typeof entry.snippet === 'string' &&
+      entry.snippet.length > 0,
+  )
 
 const hasExpectedGatherResult = (records: number, result: unknown): boolean => {
   const input = gatherBenchmarkInput(records)
@@ -67,11 +88,21 @@ const resultValidators: Record<BenchmarkOperation, ResultValidator> = {
   compactSearch: hasExpectedResultCardinality,
   fullSearch: hasExpectedResultCardinality,
   gather: hasExpectedGatherResult,
-  list: hasExpectedResultCardinality,
-  show: (records, result) => (records === 0 ? result === null : isObject(result)),
+  largePayloadSearch: (records, result) =>
+    Array.isArray(result) && (records < 2 ? result.length === 0 : result.length > 0),
+  list: (records, result) => Array.isArray(result) && result.length === Math.min(20, activeCount(records)),
+  listMaximum: (records, result) => Array.isArray(result) && result.length === activeCount(records),
+  maximumPayloadSearch: hasMaximumPayloadMatch,
+  missingSearch: (_records, result) => Array.isArray(result) && result.length === 0,
+  payloadOnlySearch: hasMaximumPayloadMatch,
+  show: (records, result) =>
+    records === 0 ? result === null : isObject(result) && result.id === shownIdForBenchmarkCase(records),
   stalePrepare: (records, result) => isObject(result) && result.recordsIndexed === records && result.hydrated === true,
+  strictCacheValidation: (records, result) => Array.isArray(result) && result.length === Math.min(1, records),
   unchangedPrepare: (records, result) =>
     isObject(result) && result.recordsIndexed === records && result.hydrated === false,
+  validateArtifacts: (records, result) =>
+    isObject(result) && result.valid === true && result.recordsChecked === records,
 }
 
 const runOperation = (operation: BenchmarkOperation, records: number, root: string): unknown =>
@@ -86,7 +117,8 @@ const assertOperationResult = (operation: BenchmarkOperation, records: number, r
 const measure = (operation: BenchmarkOperation, records: number, root: string): BenchmarkSample => {
   const startingRss = process.memoryUsage().rss
   const start = performance.now()
-  const preparationOnly = operation === 'coldHydrate' || operation.endsWith('Prepare')
+  const preparationOnly =
+    operation === 'coldHydrate' || operation.endsWith('Prepare') || operation === 'validateArtifacts'
   const boundary: { state: ReadBoundaryState } = {
     state: preparationOnly ? 'not-applicable' : 'awaiting-before',
   }

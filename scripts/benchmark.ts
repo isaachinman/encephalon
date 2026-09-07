@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   closeSync,
   cpSync,
@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -19,7 +20,7 @@ import { cpus, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { hydrate, prepare } from '../src/index.ts'
-import { formatRecordFile } from '../src/schema.ts'
+import { formatRecordFile, MAX_RECORD_BYTES } from '../src/schema.ts'
 import type { BrainRecordFile } from '../src/types.ts'
 import {
   assertPerformanceBudget,
@@ -44,6 +45,8 @@ type CorpusFacts = {
   largePayloads: number
   records: number
   supersessionDepth: number
+  fixtureSha256?: string
+  maximumFixtureSha256?: string
 }
 
 type CaseTemplates = {
@@ -188,6 +191,49 @@ const writeRecord = (root: string, record: BrainRecordFile) => {
 
 const largeText = (index: number) =>
   Array.from({ length: 96 }, (_, offset) => `large-payload-${index}-${offset}`).join(' ')
+
+const maximumRecord = (createdAt: string, id: string): BrainRecordFile => {
+  const payload = { body: '', deep: { marker: 'deepuniqueneedle' }, summary: 'Maximum preview' }
+  const record: BrainRecordFile = {
+    createdAt,
+    id,
+    kind: 'context',
+    payload,
+    searchText: `${'maximum preview '.repeat(17_477).slice(0, 256 * 1024 - 1)}x`,
+    source: 'benchmark',
+    subject: 'benchmark.maximum',
+  }
+  const remaining = MAX_RECORD_BYTES - Buffer.byteLength(formatRecordFile(record))
+  return {
+    ...record,
+    payload: {
+      ...payload,
+      body: 'x '.repeat(Math.ceil(remaining / 2)).slice(0, remaining),
+    },
+  }
+}
+
+const fixtureFingerprint = (root: string): string => {
+  const hash = createHash('sha256')
+  const visit = (relativePath: string) => {
+    for (const entry of readdirSync(join(root, relativePath), { withFileTypes: true }).sort(
+      (left, right) => Number(left.name > right.name) - Number(left.name < right.name),
+    )) {
+      const path = `${relativePath}/${entry.name}`
+      if (entry.isDirectory()) {
+        visit(path)
+      } else {
+        hash
+          .update(path)
+          .update('\0')
+          .update(readFileSync(join(root, path)))
+          .update('\0')
+      }
+    }
+  }
+  visit('encephalon')
+  return hash.digest('hex')
+}
 
 const createCorpus = (root: string, records: number): CorpusFacts => {
   if (records === 0) {
@@ -336,10 +382,20 @@ const createCaseTemplates = (
   let prepared: string | undefined
   try {
     const corpus = createCorpus(sampleRoot, records)
+    const fixtureSha256 = fixtureFingerprint(sampleRoot)
+    const maximumFixtureSha256 =
+      records >= 4
+        ? createHash('sha256')
+            .update(fixtureSha256)
+            .update(
+              formatRecordFile(maximumRecord(timestamp(records - 1), `small-${String(records - 1).padStart(5, '0')}`)),
+            )
+            .digest('hex')
+        : fixtureSha256
     unprepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation, removeRoot)
     hydrate({ root: sampleRoot })
     prepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation, removeRoot)
-    return { corpus, prepared, sampleRoot, unprepared }
+    return { corpus: { ...corpus, fixtureSha256, maximumFixtureSha256 }, prepared, sampleRoot, unprepared }
   } catch (error) {
     return completeBenchmarkCleanup<CaseTemplates>(
       { error, kind: 'failure' },
@@ -365,6 +421,10 @@ const runOperationSamples = async (
     }
     const root = templates.sampleRoot
     restoreBenchmarkSample(templateForOperation(operation, templates), root, operation)
+    if (records >= 4 && (operation === 'maximumPayloadSearch' || operation === 'payloadOnlySearch')) {
+      writeRecord(root, maximumRecord(timestamp(records - 1), `small-${String(records - 1).padStart(5, '0')}`))
+      prepare({ root })
+    }
     let outcome: BenchmarkOutcome<BenchmarkSample>
     try {
       const result = await runBenchmarkWorker({

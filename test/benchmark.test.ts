@@ -85,10 +85,17 @@ const operations = (
   compactSearch: null,
   fullSearch: null,
   gather: null,
+  largePayloadSearch: null,
   list: null,
+  listMaximum: null,
+  maximumPayloadSearch: null,
+  missingSearch: null,
+  payloadOnlySearch: null,
   show: null,
   stalePrepare: null,
+  strictCacheValidation: null,
   unchangedPrepare: null,
+  validateArtifacts: null,
   ...overrides,
 })
 
@@ -538,6 +545,17 @@ describe('isolated benchmark authority', () => {
       assert.equal(result.operations.stalePrepare, null)
       assert.equal(result.operations.coldHydrate?.totalMs.count, 1)
       assert.equal(result.operations.coldHydrate?.totalMs.samples.length, 1)
+      for (const operation of [
+        'largePayloadSearch',
+        'maximumPayloadSearch',
+        'payloadOnlySearch',
+        'missingSearch',
+        'listMaximum',
+        'validateArtifacts',
+        'strictCacheValidation',
+      ]) {
+        assert.equal(Reflect.get(result.operations, operation)?.totalMs.count, 1)
+      }
       assert.deepEqual(readdirSync(temporaryParent), [])
     } finally {
       rmSync(temporaryParent, { force: true, recursive: true })

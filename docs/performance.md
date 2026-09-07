@@ -4,6 +4,20 @@ Encephalon keeps canonical records in JSON and rebuilds a disposable SQLite/FTS 
 
 ## Commands
 
+For a required regression comparison, use two exact commits with the base contained in the candidate:
+
+```bash
+node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA /tmp/encephalon-comparison
+```
+
+The output directory must be new. Both revisions build and pack in clean detached worktrees before the common benchmark harness is copied into them. One Node executable measures both revisions on the same runner, with two discarded warmup rounds and twenty measured rounds per corpus size in alternating base/candidate order. Twenty samples give nearest-rank p95 its own position below the maximum. Do not run tests or builds concurrently. A fourth argument selects a fixed repetition count of at least three for diagnostic runs. The required Linux CI job retains the raw rounds, `base.json`, `candidate.json`, and `comparison.json`; macOS and Windows retain correctness coverage without required wall-clock gates.
+
+Every operation independently permits at most 15% median latency regression, 25% nearest-rank p95 latency regression, and 20% peak RSS regression. Cache bytes, emitted JavaScript bytes, declaration bytes, and packed archive bytes permit at most 10% regression. Equality passes. Zero-to-positive increases fail. Comparisons use unrounded samples, reject incomplete or incompatible evidence, and never adjust thresholds automatically. Reports identify both commits, the common harness hash, fixture hashes, runtime, architecture, CPU, sample configuration, raw samples, ranges, population variances, and each metric's values and differences. Peak RSS is the maximum worker-lifetime high-water mark across samples.
+
+The comparison requires empty, one-record, 100-record and 1,000-record cases. Named operations expose `largePayloadSearch`, `maximumPayloadSearch`, `payloadOnlySearch`, `missingSearch`, `listMaximum`, `validateArtifacts`, and `strictCacheValidation` alongside the existing operations. The 1,000-record mixed corpus references 100 distinct artifacts beneath their record-owned directories and shared ancestors. The two maximum-payload search cases replace the final small record with an exactly 1 MiB canonical record including 256 KiB of search text; the deep payload token appears only in payload data. Other operations retain the original mixed corpus so maximum-limit list remains within the independent response budget. The isolated strict-cache operation performs a one-result read and retains separate integrity/query timing and peak RSS.
+
+CLI startup runs `--help` and `--version` from each extracted package's declared executable, validates output, and measures complete process lifetime without npm/npx overhead. Package sizes come from those exact archives. All subprocesses retain independent hard timeouts; the existing absolute ceilings below remain generous runaway guards and do not constitute relative performance approval. “Cold hydrate” means an absent disposable application cache, not an artificially cold operating-system filesystem cache.
+
 Generate the committed stable baseline:
 
 ```bash

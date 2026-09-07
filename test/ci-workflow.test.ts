@@ -144,7 +144,7 @@ jobs:
   assert.match(verificationRunner, /^ {4}runs-on: \$\{\{ matrix\.os \}\}\n$/)
   assert.doesNotMatch(verificationJob, /^ {4}(?:if|continue-on-error|permissions):/m)
   const trustedVerificationPrefix =
-    /^ {4}steps:\n {6}- uses: actions\/checkout@\S+\n {8}with:\n {10}persist-credentials: false\n {6}- uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- if: matrix\.context == 'ubuntu-current'\n {8}uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: \$\{\{ matrix\.node \}\}\n {6}- uses: oven-sh\/setup-bun@v2\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile --ignore-scripts\n/u
+    /^ {4}steps:\n {6}- uses: actions\/checkout@\S+\n {8}with:\n {10}persist-credentials: false\n {10}fetch-depth: 0\n {10}ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}\n {6}- uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- if: matrix\.context == 'ubuntu-current'\n {8}uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: \$\{\{ matrix\.node \}\}\n {6}- uses: oven-sh\/setup-bun@v2\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile --ignore-scripts\n/u
   assert.match(verificationSteps, trustedVerificationPrefix)
   assert.doesNotMatch(
     verificationSteps.replace('    steps:\n', '    steps:\n      - uses: ./.github/actions/repair-generated-source\n'),
@@ -159,10 +159,11 @@ jobs:
       'bun run test',
       'bun run lint',
       'bun run benchmark:check',
+      'node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports',
     ],
   )
-  assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 6)
-  assert.equal(verificationSteps.match(/^\s{6}- if:/gm)?.length, 1)
+  assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
+  assert.equal(verificationSteps.match(/^\s{6}- if:/gm)?.length, 2)
   assert.doesNotMatch(verificationSteps, /^\s{8}continue-on-error:/m)
 
   assert.match(
@@ -277,7 +278,7 @@ jobs:
 
   assert.equal(workflow.match(/bun run build/g)?.length, 3)
   assert.equal(workflow.match(/node \.\/scripts\/check-package\.ts --retain-tarball/g)?.length, 1)
-  assert.equal(workflow.match(/actions\/upload-artifact/g)?.length, 1)
+  assert.equal(workflow.match(/actions\/upload-artifact/g)?.length, 2)
   assert.equal(workflow.match(/actions\/download-artifact/g)?.length, 2)
   assert.equal(workflow.match(/node \.\/scripts\/check-generated-version\.ts/g)?.length, 4)
   assert.equal(workflow.match(/node \.\/scripts\/check-package-metadata\.ts/g)?.length, 3)

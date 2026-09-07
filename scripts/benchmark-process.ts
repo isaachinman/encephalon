@@ -1,5 +1,6 @@
 import { fork } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { terminateBenchmarkTree } from './benchmark-command.ts'
 import type { BenchmarkOperation, BenchmarkWorkerResult } from './benchmark-model.ts'
 
 type RunBenchmarkWorkerOptions = {
@@ -50,6 +51,7 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
   }
   const nonce = randomUUID()
   const child = fork(options.workerPath, [], {
+    detached: process.platform !== 'win32',
     env: { ...process.env, NODE_OPTIONS: undefined, NODE_PATH: undefined },
     execArgv: [],
     serialization: 'json',
@@ -62,10 +64,20 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
   let aborted = false
   let childError: Error | undefined
   let sendError: Error | undefined
+  let cleanupFailed = false
+
+  const terminate = () => {
+    try {
+      terminateBenchmarkTree(child)
+    } catch {
+      cleanupFailed = true
+      child.kill('SIGKILL')
+    }
+  }
 
   const abort = () => {
     aborted = true
-    child.kill('SIGKILL')
+    terminate()
   }
   options.signal?.addEventListener('abort', abort, { once: true })
 
@@ -91,7 +103,7 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
   })
   const timeout = setTimeout(() => {
     timedOut = true
-    child.kill('SIGKILL')
+    terminate()
   }, options.timeoutMilliseconds)
 
   try {
@@ -105,6 +117,9 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
       sendError = error instanceof Error ? error : new Error('Unknown IPC send failure.')
     }
     const closed = await close
+    if (cleanupFailed) {
+      throw new Error(`${workerContext(options)} process-tree cleanup failed.`)
+    }
     if (timedOut) {
       throw new Error(`${workerContext(options)} timed out after ${options.timeoutMilliseconds} ms.`)
     }

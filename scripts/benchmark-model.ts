@@ -1,5 +1,3 @@
-import { MAX_CANONICAL_RECORDS } from '../src/records.ts'
-
 export const benchmarkOperations = [
   'coldHydrate',
   'unchangedPrepare',
@@ -9,6 +7,13 @@ export const benchmarkOperations = [
   'compactSearch',
   'fullSearch',
   'gather',
+  'largePayloadSearch',
+  'maximumPayloadSearch',
+  'payloadOnlySearch',
+  'missingSearch',
+  'listMaximum',
+  'validateArtifacts',
+  'strictCacheValidation',
 ] as const
 
 export type BenchmarkOperation = (typeof benchmarkOperations)[number]
@@ -56,6 +61,8 @@ export type CacheMetric = {
 }
 
 export type BenchmarkCase = {
+  fixtureSha256?: string
+  maximumFixtureSha256?: string
   artifacts: number
   cache: CacheMetric
   canonicalJsonBytes: number
@@ -125,8 +132,8 @@ const cacheMetrics = ['amplification', 'databaseBytes', 'shmBytes', 'totalBytes'
 
 const profileDefaults = {
   baseline: { records: [0, 100], repetitions: 3, warmups: 1 },
-  ci: { records: [0, 100, MAX_CANONICAL_RECORDS], repetitions: 1, warmups: 0 },
-  full: { records: [0, 100, MAX_CANONICAL_RECORDS], repetitions: 5, warmups: 2 },
+  ci: { records: [0, 100, 1000], repetitions: 1, warmups: 0 },
+  full: { records: [0, 100, 1000], repetitions: 5, warmups: 2 },
 } as const
 
 const roundSummary = (value: number) => Number(value.toFixed(summaryPrecision))
