@@ -109,7 +109,9 @@ test('parallel CI retains complete verification and exact-package release gates'
   const performance = jobs.performance ?? ''
   assert.match(performance, /runs-on: ubuntu-24.04-arm/)
   assert.match(performance, /fetch-depth: 0/)
-  assert.match(performance, /node scripts\/benchmark-compare.ts.*20.*matrix.shard/)
+  assert.match(performance, /node scripts\/benchmark-compare.ts.*matrix.repetitions \|\| 20.*matrix.shard/)
+  assert.match(performance, /shard: empty-cold\n\s+repetitions: 100/)
+  assert.match(performance, /shard: small-cold\n\s+repetitions: 100/)
   assert.match(performance, /name: performance-\$\{\{ github.run_attempt \}\}-\$\{\{ matrix.shard \}\}/)
   assert.match(jobs.verify ?? '', /needs: \[correctness, compatibility, benchmark-smoke, performance\]/)
   assert.match(jobs.verify ?? '', /node scripts\/benchmark-aggregate.ts/)

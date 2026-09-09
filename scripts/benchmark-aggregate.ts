@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { compareBenchmarkRuns, parseComparableRun } from './benchmark-comparison.ts'
-import { benchmarkShards } from './benchmark-shards.ts'
+import { benchmarkRepetitions, benchmarkShards } from './benchmark-shards.ts'
 
 export const aggregateBenchmarkShards = (
   evidence: Record<string, { base: unknown; candidate: unknown }>,
@@ -24,7 +24,7 @@ export const aggregateBenchmarkShards = (
     if (
       base.commit !== baseCommit ||
       candidate.commit !== candidateCommit ||
-      base.benchmark.configuration.repetitions !== 20 ||
+      base.benchmark.configuration.repetitions !== benchmarkRepetitions(name) ||
       base.benchmark.configuration.warmups !== 2 ||
       base.benchmark.environment.platform !== 'linux'
     ) {
@@ -40,7 +40,8 @@ export const aggregateBenchmarkShards = (
   for (const shard of shards) {
     if (
       shard.base.harnessSha256 !== first.base.harnessSha256 ||
-      JSON.stringify(shard.base.benchmark.configuration) !== JSON.stringify(first.base.benchmark.configuration) ||
+      shard.base.benchmark.configuration.timeoutMilliseconds !==
+        first.base.benchmark.configuration.timeoutMilliseconds ||
       shard.base.benchmark.environment.node !== first.base.benchmark.environment.node ||
       shard.base.benchmark.environment.arch !== first.base.benchmark.environment.arch
     ) {

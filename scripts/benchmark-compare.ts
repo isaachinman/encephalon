@@ -11,7 +11,7 @@ import {
   benchmarkOperations,
   summarizeDistribution,
 } from './benchmark-model.ts'
-import { benchmarkScope } from './benchmark-shards.ts'
+import { benchmarkScope, includesPackedBenchmarks } from './benchmark-shards.ts'
 import { npmCommand } from './npm-command.ts'
 import { readPackageTarEntries } from './package-tarball.ts'
 
@@ -241,7 +241,7 @@ export const runComparison = async (
       // biome-ignore lint/performance/noAwaitInLoops: builds must not contend with each other.
       await run('git', ['worktree', 'add', '--detach', side.checkout, side.commit], root, controller.signal)
       side.registered = true
-      if (scope.some(entry => entry.records === 0)) {
+      if (includesPackedBenchmarks(scope)) {
         const artifacts = join(temporary, `${side.name}-package`)
         mkdirSync(artifacts)
         side.packed = await packRevision(side.checkout, artifacts, controller.signal)
@@ -309,7 +309,7 @@ export const runComparison = async (
         }
       }
     }
-    for (const operation of scope.some(entry => entry.records === 0) ? (['help', 'version'] as const) : []) {
+    for (const operation of includesPackedBenchmarks(scope) ? (['help', 'version'] as const) : []) {
       for (const round of Array.from({ length: warmups + repetitions }, (_, index) => index)) {
         for (const side of round % 2 === 0 ? sides : sides.toReversed()) {
           if (!side.packed) {

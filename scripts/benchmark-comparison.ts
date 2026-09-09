@@ -1,6 +1,6 @@
 import { type BenchmarkReport, summarizeDistribution } from './benchmark-model.ts'
 
-import { type BenchmarkScope, completeBenchmarkScope } from './benchmark-shards.ts'
+import { type BenchmarkScope, completeBenchmarkScope, includesPackedBenchmarks } from './benchmark-shards.ts'
 
 export type ComparableRun = {
   schemaVersion: 1
@@ -121,7 +121,7 @@ export const parseComparableRun = (value: unknown, scope: BenchmarkScope = compl
     }
   }
   requireEvidence(seen.size === scope.length && scope.every(entry => seen.has(entry.records)))
-  if (scope.some(entry => entry.records === 0)) {
+  if (includesPackedBenchmarks(scope)) {
     const package_ = object(run.package)
     exactKeys(package_, ['javascriptBytes', 'declarationBytes', 'tarballBytes'])
     requireEvidence(Object.values(package_).every(metric => Number.isSafeInteger(metric) && (metric as number) > 0))

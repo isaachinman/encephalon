@@ -111,7 +111,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [empty, small, medium, medium-maximum, large-gather, large-payload, large-maximum, large-preparation, large-reads, large-validation]
+        shard: [empty, empty-cold, small, small-cold, medium, medium-maximum, large-gather, large-payload, large-maximum, large-preparation, large-reads, large-validation]
+        include:
+          - shard: empty-cold
+            repetitions: 100
+          - shard: small-cold
+            repetitions: 100
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -129,7 +134,7 @@ jobs:
         env:
           BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
           CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports 20 ${{ matrix.shard }}
+        run: node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports ${{ matrix.repetitions || 20 }} ${{ matrix.shard }}
       - name: Retain performance evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

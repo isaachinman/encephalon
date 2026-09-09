@@ -68,6 +68,8 @@ test('parallel benchmark shards partition every required workload exactly once',
   const actual = Object.values(benchmarkShards).flatMap(keys)
   assert.deepEqual(actual.toSorted(), keys(completeBenchmarkScope).toSorted())
   assert.equal(new Set(actual).size, actual.length)
+  assert.deepEqual(benchmarkShards['empty-cold'], [{ operations: ['coldHydrate'], records: 0 }])
+  assert.deepEqual(benchmarkShards['small-cold'], [{ operations: ['coldHydrate'], records: 1 }])
 })
 
 test('operation assembly rejects duplicate or changed fixtures and preserves the largest cache', () => {
@@ -265,32 +267,51 @@ test('zero baselines fail on any positive candidate without inventing a denomina
 })
 
 test('aggregate validates every same-runner pair and never approves a missing shard or regression', () => {
-  const evidence = Object.fromEntries(
-    Object.entries(benchmarkShards).map(([name, scope]) => {
-      const base = run(20)
-      base.runner = name
-      base.benchmark.environment.platform = 'linux'
-      base.benchmark.configuration.warmups = 2
-      base.benchmark.cases = scope.map(expected => {
-        const entry = base.benchmark.cases.find(item => item.records === expected.records)
-        assert.ok(entry)
-        return {
-          ...entry,
-          operations: Object.fromEntries(
-            expected.operations.map(operation => [operation, entry.operations[operation]]),
-          ) as typeof entry.operations,
+  const evidenceFor = (override?: { name: string; count: number }) =>
+    Object.fromEntries(
+      Object.entries(benchmarkShards).map(([name, scope]) => {
+        const expectedCount = name === 'empty-cold' || name === 'small-cold' ? 100 : 20
+        const base = run(override?.name === name ? override.count : expectedCount)
+        base.runner = name
+        base.benchmark.environment.platform = 'linux'
+        base.benchmark.configuration.warmups = 2
+        base.benchmark.cases = scope.map(expected => {
+          const entry = base.benchmark.cases.find(item => item.records === expected.records)
+          assert.ok(entry)
+          return {
+            ...entry,
+            operations: Object.fromEntries(
+              expected.operations.map(operation => [operation, entry.operations[operation]]),
+            ) as typeof entry.operations,
+          }
+        })
+        const scoped: ComparableRun = {
+          ...base,
+          package: name === 'empty' ? base.package : null,
+          startup: name === 'empty' ? base.startup : null,
         }
-      })
-      const scoped: ComparableRun = {
-        ...base,
-        package: scope.some(entry => entry.records === 0) ? base.package : null,
-        startup: scope.some(entry => entry.records === 0) ? base.startup : null,
-      }
-      return [name, { base: scoped, candidate: structuredClone(scoped) }]
-    }),
-  )
+        return [name, { base: scoped, candidate: structuredClone(scoped) }]
+      }),
+    )
+  const evidence = evidenceFor()
   const aggregate = (value: typeof evidence) => aggregateBenchmarkShards(value, 'a'.repeat(40), 'a'.repeat(40))
   assert.equal(aggregate(evidence).passed, true)
+  assert.throws(() => aggregate(evidenceFor({ count: 20, name: 'empty-cold' })), /sampling policy/)
+  assert.throws(() => aggregate(evidenceFor({ count: 20, name: 'small-cold' })), /sampling policy/)
+  assert.throws(() => aggregate(evidenceFor({ count: 100, name: 'large-gather' })), /sampling policy/)
+  const cold = evidence['empty-cold']?.candidate.benchmark.cases[0]?.operations.coldHydrate
+  assert.ok(cold)
+  cold.totalMs = summarizeDistribution(Array.from({ length: 100 }, (_, index) => (index < 2 ? 130 : 100)))
+  assert.equal(cold.totalMs.samples.length, 100)
+  assert.equal(cold.totalMs.maximum, 130)
+  assert.equal(aggregate(evidence).passed, true)
+  cold.totalMs = summarizeDistribution(Array.from({ length: 100 }, (_, index) => (index < 5 ? 130 : 100)))
+  assert.equal(cold.totalMs.p95, 100)
+  assert.equal(aggregate(evidence).passed, true)
+  cold.totalMs = summarizeDistribution(Array.from({ length: 100 }, (_, index) => (index < 6 ? 130 : 100)))
+  assert.equal(cold.totalMs.p95, 130)
+  assert.equal(aggregate(evidence).passed, false)
+  cold.totalMs = summarizeDistribution(Array.from({ length: 100 }, () => 100))
   assert.throws(() => aggregate(Object.fromEntries(Object.entries(evidence).slice(1))), /every declared shard/)
   const first = evidence.empty
   assert.ok(first?.candidate.package)
