@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
   closeSync,
@@ -440,6 +441,10 @@ const prepareOperationSample = (operation: BenchmarkOperation, templates: CaseTe
       maximumRecord(timestamp(records - 1), `small-${String(records - 1).padStart(5, '0')}`),
     )
     prepare({ root: templates.sampleRoot })
+  }
+  if (process.platform === 'linux') {
+    // Drain fixture setup on its filesystem before the fresh worker times the operation's own durability work.
+    execFileSync('sync', ['--file-system', templates.sampleRoot], { stdio: 'pipe', timeout: 30_000 })
   }
 }
 
