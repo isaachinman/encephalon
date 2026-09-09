@@ -12,7 +12,7 @@ node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA /tmp/encephalon-compari
 
 The output directory must be new. The default command runs the complete comparison sequentially for local investigation. One Node executable measures both revisions, with two discarded warmups and twenty measured samples per operation. Each adjacent base/candidate pair alternates AB/BA; samples never overlap. Twenty samples give nearest-rank p95 its own position below the maximum. Do not run tests or builds concurrently on that machine. A fourth argument selects a fixed repetition count of at least three for diagnostics.
 
-CI partitions the complete corpus/operation matrix into ten independent Linux jobs: `empty`, `small`, `medium`, `medium-maximum`, `large-gather`, `large-payload`, `large-maximum`, `large-preparation`, `large-reads`, and `large-validation`. Each job runs every sample for its assigned operations against both revisions on the same runner. No timing samples are pooled across machines. Reproduce one shard with:
+CI partitions the complete corpus/operation matrix into ten independent `ubuntu-24.04-arm` Linux jobs: `empty`, `small`, `medium`, `medium-maximum`, `large-gather`, `large-payload`, `large-maximum`, `large-preparation`, `large-reads`, and `large-validation`. Each job runs every sample for its assigned operations against both revisions on the same runner. No timing samples are pooled across machines or architectures. x64 Linux correctness remains covered separately. Reproduce one shard with:
 
 ```bash
 node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA /tmp/large-gather 20 large-gather
