@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 
 const request = JSON.parse(Buffer.from(process.argv[2] ?? '', 'base64url').toString('utf8'))
 const { maximumOutputBytes } = request
@@ -11,8 +11,58 @@ let spawnError
 let terminationPromise = Promise.resolve()
 let terminationStarted = false
 
+const drainProcessGroup = pid => {
+  const deadline = performance.now() + 5000
+  let emptySnapshots = 0
+  while (emptySnapshots < 2) {
+    const remaining = Math.ceil(deadline - performance.now())
+    if (remaining <= 0) {
+      throw new Error('Compatibility process-group cleanup timed out.')
+    }
+    let permissionError
+    if (emptySnapshots === 0) {
+      try {
+        process.kill(-pid, 'SIGKILL')
+      } catch (error) {
+        if (error?.code === 'EPERM') {
+          permissionError = error
+        } else if (error?.code !== 'ESRCH') {
+          throw error
+        }
+      }
+    }
+    const snapshot = spawnSync('ps', ['-A', '-o', 'pgid=,stat='], {
+      encoding: 'utf8',
+      killSignal: 'SIGKILL',
+      maxBuffer: 1024 * 1024,
+      timeout: remaining,
+    })
+    if (snapshot.status !== 0) {
+      throw new Error('Compatibility process-group inspection failed.', {
+        cause: snapshot.error ?? { signal: snapshot.signal, status: snapshot.status, stderr: snapshot.stderr },
+      })
+    }
+    const active = snapshot.stdout
+      .trim()
+      .split('\n')
+      .some(line => {
+        const [group, state] = line.trim().split(/\s+/)
+        return Number(group) === pid && !state?.startsWith('Z')
+      })
+    // Darwin can reject signalling a zombie-only group; a live member still makes this fatal.
+    if (active && permissionError !== undefined) {
+      throw permissionError
+    }
+    // A second fresh snapshot starts after the first has observed the leader exited.
+    emptySnapshots = active ? 0 : emptySnapshots + 1
+    if (emptySnapshots < 2) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+    }
+  }
+}
+
 const terminateTree = () => {
-  if (!terminationStarted && child?.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+  if (!terminationStarted && child?.pid !== undefined) {
     terminationStarted = true
     if (process.platform === 'win32') {
       const killer = spawn('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], {
@@ -24,13 +74,8 @@ const terminateTree = () => {
         killer.on('close', resolve)
       })
     } else {
-      try {
-        process.kill(-child.pid, 'SIGKILL')
-      } catch (error) {
-        if (error?.code !== 'ESRCH') {
-          throw error
-        }
-      }
+      // A fork can outlive the first group signal. Drain before close, which may await inherited pipes.
+      drainProcessGroup(child.pid)
     }
   }
 }
