@@ -29,6 +29,7 @@ process.once('message', value => {
   const result = () => ({ nonce, processId: process.pid, sample: sample() })
 
   if (request.root === '/crash') {
+    process.stderr.write('fixture worker diagnostic')
     process.exitCode = 23
     process.disconnect()
     return

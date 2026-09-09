@@ -37,8 +37,15 @@ test('benchmark command reports elapsed startup and refuses unsuccessful or unbo
   assert.equal(result.stdout, 'ready')
   assert.ok(result.elapsedMs > 0)
   await assert.rejects(
-    runBenchmarkCommand(process.execPath, ['-e', 'process.exit(3)'], { cwd: tmpdir(), timeoutMilliseconds: 5000 }),
-    /failed/,
+    runBenchmarkCommand(
+      process.execPath,
+      ['-e', 'process.stderr.write("fixture could not be prepared"); process.exit(3)'],
+      {
+        cwd: tmpdir(),
+        timeoutMilliseconds: 5000,
+      },
+    ),
+    /failed with code 3: fixture could not be prepared/,
   )
   await assert.rejects(
     runBenchmarkCommand(process.execPath, ['-e', 'process.stdout.write("x".repeat(100000))'], {

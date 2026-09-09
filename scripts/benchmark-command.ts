@@ -59,7 +59,7 @@ export const runBenchmarkCommand = async (
     environment?: NodeJS.ProcessEnv
     windowsVerbatimArguments?: boolean
   },
-): Promise<{ stdout: string; elapsedMs: number }> => {
+): Promise<{ stdout: string; stderr: string; elapsedMs: number }> => {
   if (options.signal?.aborted) {
     throw new Error('Benchmark command aborted.')
   }
@@ -72,6 +72,7 @@ export const runBenchmarkCommand = async (
     windowsVerbatimArguments: options.windowsVerbatimArguments,
   })
   const chunks: Buffer[] = []
+  const errors: Buffer[] = []
   const maximumOutputBytes = options.maximumOutputBytes ?? 4 * 1024 * 1024
   let bytes = 0
   let failure: string | undefined
@@ -91,6 +92,8 @@ export const runBenchmarkCommand = async (
     if (bytes <= maximumOutputBytes) {
       if (stdout) {
         chunks.push(chunk)
+      } else {
+        errors.push(chunk)
       }
     } else {
       stop('Benchmark command exceeded its output bound.')
@@ -100,16 +103,18 @@ export const runBenchmarkCommand = async (
   child.stderr.on('data', (chunk: Buffer) => consume(chunk, false))
   const timeout = setTimeout(() => stop('Benchmark command timed out.'), options.timeoutMilliseconds)
   try {
-    const code = await new Promise<number | null>(resolve => {
+    const closed = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
       child.once('error', () => {
         failure ??= 'Benchmark command failed to start.'
       })
-      child.once('close', resolve)
+      child.once('close', (code, signal) => resolve({ code, signal }))
     })
-    if (failure !== undefined || code !== 0) {
-      throw new Error(failure ?? 'Benchmark command failed.')
+    const stderr = Buffer.concat(errors).toString('utf8')
+    if (failure !== undefined || closed.code !== 0) {
+      const exit = closed.signal === null ? `code ${String(closed.code)}` : `signal ${closed.signal}`
+      throw new Error(failure ?? `Benchmark command failed with ${exit}: ${stderr.trim() || 'no stderr'}`)
     }
-    return { elapsedMs: performance.now() - start, stdout: Buffer.concat(chunks).toString('utf8') }
+    return { elapsedMs: performance.now() - start, stderr, stdout: Buffer.concat(chunks).toString('utf8') }
   } finally {
     clearTimeout(timeout)
     options.signal?.removeEventListener('abort', abort)

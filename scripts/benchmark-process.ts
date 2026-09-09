@@ -60,6 +60,7 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
   let messages = 0
   let result: BenchmarkWorkerResult | undefined
   let standardOutputBytes = 0
+  let standardError = Buffer.alloc(0)
   let timedOut = false
   let aborted = false
   let childError: Error | undefined
@@ -84,7 +85,9 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
   child.stdout?.on('data', chunk => {
     standardOutputBytes = Math.min(maximumOutputBytes, standardOutputBytes + Buffer.byteLength(chunk as Buffer))
   })
-  child.stderr?.on('data', () => undefined)
+  child.stderr?.on('data', (chunk: Buffer) => {
+    standardError = Buffer.concat([standardError, chunk]).subarray(-maximumOutputBytes)
+  })
   child.on('message', value => {
     messages += 1
     if (messages === 1 && isValidWorkerResult(value, nonce)) {
@@ -132,7 +135,10 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
     if (closed.code !== 0 || closed.signal !== null) {
       const exit = closed.signal === null ? `code ${String(closed.code)}` : `signal ${closed.signal}`
       const timing = messages === 0 ? 'before' : 'after'
-      throw new Error(`${workerContext(options)} exited with ${exit} ${timing} producing a result.`)
+      const diagnostic = standardError.toString('utf8').trim()
+      throw new Error(
+        `${workerContext(options)} exited with ${exit} ${timing} producing a result.${diagnostic ? ` ${diagnostic}` : ''}`,
+      )
     }
     if (messages > 1) {
       throw new Error(`${workerContext(options)} returned more than one worker result.`)

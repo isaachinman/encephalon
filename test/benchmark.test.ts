@@ -495,7 +495,7 @@ describe('isolated benchmark authority', () => {
         timeoutMilliseconds: 2000,
         workerPath: fixtureWorker,
       }),
-      /Benchmark fullSearch for 0 records exited with code 23 before producing a result\./,
+      /Benchmark fullSearch for 0 records exited with code 23 before producing a result\. fixture worker diagnostic/,
     )
     await assert.rejects(
       runBenchmarkWorker({
