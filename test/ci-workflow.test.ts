@@ -94,7 +94,10 @@ test('parallel CI retains complete verification and exact-package release gates'
   assert.match(correctness, /bun run lint/)
   assert.match(correctness, /bun run benchmark:check/)
   assert.match(correctness, /node scripts\/test-ci.ts.*windows-latest.*main.*all/)
-  assert.match(jobs.compatibility ?? '', /group: \[compatibility-a, compatibility-b, compatibility-c, package\]/)
+  assert.match(
+    jobs.compatibility ?? '',
+    /group: \[compatibility-a, compatibility-b, compatibility-c, package, benchmark, cache\]/,
+  )
   assert.match(jobs.compatibility ?? '', /runs-on: windows-latest/)
   const performance = jobs.performance ?? ''
   assert.match(performance, /runs-on: ubuntu-latest/)

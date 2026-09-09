@@ -471,24 +471,10 @@ const runOperationSamples = async (
       throw new Error(`Benchmark ${operation} for ${records} records was aborted.`)
     }
     const root = templates.sampleRoot
-    // Temporary investigation of hosted-runner tails; collected outside the worker's operation timer.
-    const observe = () =>
-      process.platform === 'linux' && process.env.ENCEPHALON_BENCHMARK_DIAGNOSTICS === '1'
-        ? {
-            at: performance.now(),
-            cpu: readFileSync('/proc/pressure/cpu', 'utf8'),
-            io: readFileSync('/proc/pressure/io', 'utf8'),
-            vm: readFileSync('/proc/vmstat', 'utf8')
-              .split('\n')
-              .filter(line => /^(nr_dirty|nr_writeback|nr_dirtied|nr_written) /.test(line)),
-          }
-        : undefined
-    const beforeSetup = observe()
     const reuseSample = templates.preparedOperation === operation
     if (!reuseSample) {
       prepareOperationSample(operation, templates)
     }
-    const afterSetup = observe()
     let outcome: BenchmarkOutcome<BenchmarkSample>
     try {
       const result = await runBenchmarkWorker({
@@ -511,11 +497,6 @@ const runOperationSamples = async (
       outcome = { kind: 'success', value: result.sample }
     } catch (error) {
       outcome = { error, kind: 'failure' }
-    }
-    if (beforeSetup) {
-      process.stderr.write(
-        `${JSON.stringify({ afterSetup, afterWorker: observe(), beforeSetup, operation, records })}\n`,
-      )
     }
     return completeBenchmarkCleanup(outcome, reuseSample ? [] : [root], options.removeRoot)
   })

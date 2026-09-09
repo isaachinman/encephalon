@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [compatibility-a, compatibility-b, compatibility-c, package]
+        group: [compatibility-a, compatibility-b, compatibility-c, package, benchmark, cache]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -108,14 +108,9 @@ jobs:
           bun-version: 1.3.1
       - name: Compare matched operation samples
         env:
-          ENCEPHALON_BENCHMARK_DIAGNOSTICS: '1'
           BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
           CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          findmnt -T /tmp -o TARGET,SOURCE,FSTYPE,OPTIONS
-          findmnt -T /mnt -o TARGET,SOURCE,FSTYPE,OPTIONS
-          lsblk -o NAME,TYPE,ROTA,SIZE,MOUNTPOINTS
-          node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports 20 ${{ matrix.shard }}
+        run: node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports 20 ${{ matrix.shard }}
       - name: Retain performance evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
