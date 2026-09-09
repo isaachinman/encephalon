@@ -149,13 +149,6 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
     if (standardOutputBytes > 0) {
       throw new Error(`${workerContext(options)} wrote unexpected stdout.`)
     }
-    if (
-      process.env.ENCEPHALON_DIAGNOSE_COLD_HYDRATION === '1' &&
-      options.operation === 'coldHydrate' &&
-      options.records === 1
-    ) {
-      process.stderr.write(standardError)
-    }
     return result
   } finally {
     clearTimeout(timeout)

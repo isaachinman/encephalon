@@ -285,7 +285,7 @@ export const runComparison = async (
           for (const side of round % 2 === 0 ? sides : sides.toReversed()) {
             const reportPath = join(temporary, `${side.name}-round.json`)
             // biome-ignore lint/performance/noAwaitInLoops: matched operation pairs alternate and never overlap.
-            const measured = await run(
+            await run(
               process.execPath,
               [
                 'scripts/benchmark-session.ts',
@@ -297,13 +297,6 @@ export const runComparison = async (
               side.checkout,
               controller.signal,
             )
-            if (
-              process.env.ENCEPHALON_DIAGNOSE_COLD_HYDRATION === '1' &&
-              operation === 'coldHydrate' &&
-              records === 1
-            ) {
-              process.stderr.write(`${side.name} round ${round - warmups + 1}: ${measured.stderr}`)
-            }
             const report = JSON.parse(readFileSync(reportPath, 'utf8')) as BenchmarkReport
             if (round >= warmups) {
               side.rounds.push(report)
@@ -381,37 +374,6 @@ export const runComparison = async (
       process.stderr.write(
         `${metric.operation} ${metric.metric}: ${metric.base} -> ${metric.candidate}; difference ${metric.absoluteDifference}; ${metric.percentageDifference ?? 'zero-base increase'}% (allowed ${metric.allowedPercent}%)\n`,
       )
-    }
-    if (process.env.ENCEPHALON_DIAGNOSE_COLD_HYDRATION === '1' && shard === 'small') {
-      // Temporary investigation after all gated evidence has been retained.
-      const diagnosticSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(110_000)])
-      for (const side of sides) {
-        // biome-ignore lint/performance/noAwaitInLoops: restore each revision's operation fixture independently.
-        await run(
-          process.execPath,
-          ['scripts/benchmark-session.ts', 'operation', join(temporary, `${side.name}-1-session.json`), 'coldHydrate'],
-          side.checkout,
-          diagnosticSignal,
-        )
-      }
-      for (const round of Array.from({ length: 128 }, (_, index) => index)) {
-        for (const side of round % 2 === 0 ? sides : sides.toReversed()) {
-          // biome-ignore lint/performance/noAwaitInLoops: diagnostic operations must not contend with one another.
-          const diagnostic = await run(
-            process.execPath,
-            [
-              'scripts/benchmark-session.ts',
-              'sample',
-              join(temporary, `${side.name}-1-session.json`),
-              'coldHydrate',
-              join(temporary, `${side.name}-diagnostic.json`),
-            ],
-            side.checkout,
-            diagnosticSignal,
-          )
-          process.stderr.write(`Diagnostic-only ${side.name} round ${round + 1}: ${diagnostic.stderr}`)
-        }
-      }
     }
     return comparison
   } finally {

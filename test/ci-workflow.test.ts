@@ -66,6 +66,9 @@ test('parallel CI retains complete verification and exact-package release gates'
   assert.doesNotMatch(workflow, /NODE_AUTH_TOKEN|NPM_TOKEN|registry-url|pull_request_target|continue-on-error/)
   assert.match(workflow, /types: \[opened, reopened, synchronize\]/)
   assert.match(workflow, /cancel-in-progress: true/)
+  for (const action of workflow.matchAll(/uses: ([^\s]+)/g)) {
+    assert.match(action[1] ?? '', /^[^@]+@[a-f0-9]{40}$/)
+  }
   for (const name of [
     'correctness',
     'compatibility',

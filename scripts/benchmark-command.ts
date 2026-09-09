@@ -59,7 +59,7 @@ export const runBenchmarkCommand = async (
     environment?: NodeJS.ProcessEnv
     windowsVerbatimArguments?: boolean
   },
-): Promise<{ stdout: string; stderr: string; elapsedMs: number }> => {
+): Promise<{ stdout: string; elapsedMs: number }> => {
   if (options.signal?.aborted) {
     throw new Error('Benchmark command aborted.')
   }
@@ -114,7 +114,7 @@ export const runBenchmarkCommand = async (
       const exit = closed.signal === null ? `code ${String(closed.code)}` : `signal ${closed.signal}`
       throw new Error(failure ?? `Benchmark command failed with ${exit}: ${stderr.trim() || 'no stderr'}`)
     }
-    return { elapsedMs: performance.now() - start, stderr, stdout: Buffer.concat(chunks).toString('utf8') }
+    return { elapsedMs: performance.now() - start, stdout: Buffer.concat(chunks).toString('utf8') }
   } finally {
     clearTimeout(timeout)
     options.signal?.removeEventListener('abort', abort)
