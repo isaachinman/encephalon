@@ -5,10 +5,18 @@ const [group] = process.argv.slice(2)
 const compatibility = 'scripts/release-compatibility.test.ts'
 const isolatedFiles: Record<string, string> = {
   benchmark: 'test/benchmark.test.ts',
+  'benchmark-cli': 'test/benchmark.test.ts',
+  'benchmark-report': 'test/benchmark.test.ts',
+  'benchmark-sessions': 'test/benchmark.test.ts',
   cache: 'test/cache.test.ts',
   package: 'test/package.test.ts',
 }
 const patterns: Record<string, string> = {
+  benchmark:
+    'prepared operation sessions reuse stable files|reports raw measured samples|preflights budgets and writes reports atomically',
+  'benchmark-cli': 'preflights budgets and writes reports atomically',
+  'benchmark-report': 'reports raw measured samples',
+  'benchmark-sessions': 'prepared operation sessions reuse stable files',
   'compatibility-a': 'release compatibility process fixture group [BC]',
   'compatibility-b': 'release compatibility process fixture group B',
   'compatibility-c': 'release compatibility process fixture group C',
@@ -30,7 +38,9 @@ if (group === 'main' || group === 'all' || isolatedFile || pattern) {
     process.execPath,
     [
       '--test',
-      ...(pattern ? [`--test-${group === 'compatibility-a' ? 'skip' : 'name'}-pattern=${pattern}`] : []),
+      ...(pattern
+        ? [`--test-${group === 'compatibility-a' || group === 'benchmark' ? 'skip' : 'name'}-pattern=${pattern}`]
+        : []),
       ...files,
     ],
     { stdio: 'inherit' },
@@ -41,6 +51,6 @@ if (group === 'main' || group === 'all' || isolatedFile || pattern) {
   process.exitCode = result.status ?? 1
 } else {
   throw new Error(
-    'Expected all, main, benchmark, cache, package, compatibility-a, compatibility-b, or compatibility-c test group.',
+    `Expected all, main, or one of these test groups: ${Object.keys({ ...isolatedFiles, ...patterns }).join(', ')}.`,
   )
 }

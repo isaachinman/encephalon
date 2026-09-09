@@ -69,6 +69,7 @@ test('parallel CI retains complete verification and exact-package release gates'
   for (const name of [
     'correctness',
     'compatibility',
+    'benchmark-smoke',
     'performance',
     'verify',
     'package',
@@ -92,11 +93,13 @@ test('parallel CI retains complete verification and exact-package release gates'
   assert.match(correctness, /context: ubuntu-current/)
   assert.match(correctness, /bun run typecheck/)
   assert.match(correctness, /bun run lint/)
-  assert.match(correctness, /bun run benchmark:check/)
+  assert.doesNotMatch(correctness, /bun run benchmark:check/)
+  assert.match(jobs['benchmark-smoke'] ?? '', /bun run benchmark:check/)
+  assert.doesNotMatch(jobs['benchmark-smoke'] ?? '', /needs:/)
   assert.match(correctness, /node scripts\/test-ci.ts.*windows-latest.*main.*all/)
   assert.match(
     jobs.compatibility ?? '',
-    /group: \[compatibility-a, compatibility-b, compatibility-c, package, benchmark, cache\]/,
+    /group: \[compatibility-a, compatibility-b, compatibility-c, package, benchmark, benchmark-sessions, benchmark-report, benchmark-cli, cache\]/,
   )
   assert.match(jobs.compatibility ?? '', /runs-on: windows-latest/)
   const performance = jobs.performance ?? ''
@@ -104,7 +107,7 @@ test('parallel CI retains complete verification and exact-package release gates'
   assert.match(performance, /fetch-depth: 0/)
   assert.match(performance, /node scripts\/benchmark-compare.ts.*20.*matrix.shard/)
   assert.match(performance, /name: performance-\$\{\{ github.run_attempt \}\}-\$\{\{ matrix.shard \}\}/)
-  assert.match(jobs.verify ?? '', /needs: \[correctness, compatibility, performance\]/)
+  assert.match(jobs.verify ?? '', /needs: \[correctness, compatibility, benchmark-smoke, performance\]/)
   assert.match(jobs.verify ?? '', /node scripts\/benchmark-aggregate.ts/)
   assert.match(jobs.verify ?? '', /pattern: performance-\$\{\{ github.run_attempt \}\}-\*/)
   for (const name of ['verify', 'release']) {
