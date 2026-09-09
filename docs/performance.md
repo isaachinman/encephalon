@@ -10,7 +10,23 @@ For a required regression comparison, use two exact commits with the base contai
 node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA /tmp/encephalon-comparison
 ```
 
-The output directory must be new. Both revisions build and pack in clean detached worktrees before the common benchmark harness is copied into them. One Node executable measures both revisions on the same runner, with two discarded warmup rounds and twenty measured rounds per corpus size in alternating base/candidate order. Twenty samples give nearest-rank p95 its own position below the maximum. Do not run tests or builds concurrently. A fourth argument selects a fixed repetition count of at least three for diagnostic runs. The required Linux CI job retains the raw rounds, `base.json`, `candidate.json`, and `comparison.json`; macOS and Windows retain correctness coverage without required wall-clock gates.
+The output directory must be new. The default command runs the complete comparison sequentially for local investigation. One Node executable measures both revisions, with two discarded warmups and twenty measured samples per operation. Each adjacent base/candidate pair alternates AB/BA; samples never overlap. Twenty samples give nearest-rank p95 its own position below the maximum. Do not run tests or builds concurrently on that machine. A fourth argument selects a fixed repetition count of at least three for diagnostics.
+
+CI partitions the complete corpus/operation matrix into eight independent Linux jobs: `small`, `medium`, `medium-maximum`, `large-gather`, `large-payload`, `large-maximum`, `large-reads`, and `large-validation`. Each job runs every sample for its assigned operations against both revisions on the same runner. No timing samples are pooled across machines. Reproduce one shard with:
+
+```bash
+node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA /tmp/large-gather 20 large-gather
+```
+
+Each revision prepares its own immutable fixture snapshots once. Short-lived revision-bound controllers restore those snapshots before fresh measurement workers. The `small` shard alone builds and packs pristine revisions before applying the common harness, and owns package sizes and packed startup checks; source-only shards avoid unnecessary package builds. All shards retain raw samples and their `base.json`, `candidate.json`, and `comparison.json`. The aggregate requires all eight declared shards, exact revisions, common harness and fixture identities, twenty samples, and matching runtime settings; each shard retains its own runner and CPU identity. Every comparison must pass, including cache-byte comparisons repeated where a corpus spans shards.
+
+After downloading this workflow attempt's `performance-ATTEMPT-*` shard artifacts into separate directories, reproduce aggregation with:
+
+```bash
+node scripts/benchmark-aggregate.ts performance-reports BASE_SHA CANDIDATE_SHA ATTEMPT
+```
+
+The CI execution target is under ten minutes for the complete workflow. Work runs in parallel with nine-minute job backstops and one-minute final gates; actual end-to-end duration must be verified rather than inferred from timeouts. Windows compatibility fixtures run in three independent groups while all other platform correctness coverage remains complete. Package construction starts alongside verification, and consumers check identical retained package bytes in parallel. macOS and Windows have no required wall-clock performance thresholds.
 
 Every operation independently permits at most 15% median latency regression, 25% nearest-rank p95 latency regression, and 20% peak RSS regression. Cache bytes, emitted JavaScript bytes, declaration bytes, and packed archive bytes permit at most 10% regression. Equality passes. Zero-to-positive increases fail. Comparisons use unrounded samples, reject incomplete or incompatible evidence, and never adjust thresholds automatically. Reports identify both commits, the common harness hash, fixture hashes, runtime, architecture, CPU, sample configuration, raw samples, ranges, population variances, and each metric's values and differences. Peak RSS is the maximum worker-lifetime high-water mark across samples.
 

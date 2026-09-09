@@ -1364,7 +1364,9 @@ describe('release compatibility process fixture', () => {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
+})
 
+describe('release compatibility process fixture group B', () => {
   test('rejects package self-rewrite, probe tamper, and unrelated per-phase side effects', {
     timeout: compatibilityRegressionTimeout,
   }, () => {
@@ -1470,7 +1472,9 @@ describe('release compatibility process fixture', () => {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
+})
 
+describe('release compatibility process fixture group C', () => {
   test('rejects candidate independent-budget drift that result-limit checks cannot observe', {
     timeout: compatibilityIntegrationTimeout,
   }, () => {
@@ -1596,7 +1600,9 @@ describe('release compatibility process fixture', () => {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
+})
 
+describe('release compatibility process fixture group A preloads', () => {
   test('removes preload variables from npm and every installed-package child process', {
     timeout: compatibilityIntegrationTimeout,
   }, () => {

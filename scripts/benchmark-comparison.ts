@@ -1,4 +1,6 @@
-import { type BenchmarkReport, benchmarkOperations, summarizeDistribution } from './benchmark-model.ts'
+import { type BenchmarkReport, summarizeDistribution } from './benchmark-model.ts'
+
+import { type BenchmarkScope, completeBenchmarkScope } from './benchmark-shards.ts'
 
 export type ComparableRun = {
   schemaVersion: 1
@@ -7,8 +9,8 @@ export type ComparableRun = {
   harnessSha256: string
   runner: string
   benchmark: BenchmarkReport
-  package: { javascriptBytes: number; declarationBytes: number; tarballBytes: number }
-  startup: { help: number[]; version: number[] }
+  package: { javascriptBytes: number; declarationBytes: number; tarballBytes: number } | null
+  startup: { help: number[]; version: number[] } | null
 }
 
 const requireEvidence: (condition: unknown) => asserts condition = condition => {
@@ -48,7 +50,7 @@ const metrics = [
   'rssDeltaBytes',
 ] as const
 
-export const parseComparableRun = (value: unknown): ComparableRun => {
+export const parseComparableRun = (value: unknown, scope: BenchmarkScope = completeBenchmarkScope): ComparableRun => {
   const run = object(value)
   requireEvidence(run.schemaVersion === 1 && run.fixtureVersion === 1)
   requireEvidence(typeof run.commit === 'string' && /^[a-f0-9]{40}$/.test(run.commit))
@@ -103,8 +105,10 @@ export const parseComparableRun = (value: unknown): ComparableRun => {
       cache.totalBytes === (cache.databaseBytes as number) + (cache.shmBytes as number) + (cache.walBytes as number),
     )
     const operations = object(entry.operations)
-    exactKeys(operations, benchmarkOperations)
-    for (const operation of benchmarkOperations) {
+    const expected = scope.find(item => item.records === entry.records)
+    requireEvidence(expected)
+    exactKeys(operations, expected.operations)
+    for (const operation of expected.operations) {
       if (entry.records === 0 && operation === 'stalePrepare') {
         requireEvidence(operations[operation] === null)
       } else {
@@ -116,17 +120,21 @@ export const parseComparableRun = (value: unknown): ComparableRun => {
       }
     }
   }
-  requireEvidence(seen.size === 4 && [0, 1, 100, 1000].every(records => seen.has(records)))
-  const package_ = object(run.package)
-  exactKeys(package_, ['javascriptBytes', 'declarationBytes', 'tarballBytes'])
-  requireEvidence(Object.values(package_).every(metric => Number.isSafeInteger(metric) && (metric as number) > 0))
-  const startup = object(run.startup)
-  exactKeys(startup, ['help', 'version'])
-  requireEvidence(
-    Object.values(startup).every(
-      samples => Array.isArray(samples) && samples.length === count && samples.every(sample => finite(sample)),
-    ),
-  )
+  requireEvidence(seen.size === scope.length && scope.every(entry => seen.has(entry.records)))
+  if (scope.some(entry => entry.records === 0)) {
+    const package_ = object(run.package)
+    exactKeys(package_, ['javascriptBytes', 'declarationBytes', 'tarballBytes'])
+    requireEvidence(Object.values(package_).every(metric => Number.isSafeInteger(metric) && (metric as number) > 0))
+    const startup = object(run.startup)
+    exactKeys(startup, ['help', 'version'])
+    requireEvidence(
+      Object.values(startup).every(
+        samples => Array.isArray(samples) && samples.length === count && samples.every(sample => finite(sample)),
+      ),
+    )
+  } else {
+    requireEvidence(run.package === null && run.startup === null)
+  }
   return value as ComparableRun
 }
 
@@ -194,10 +202,10 @@ const spread = (samples: number[]) => {
   }
 }
 
-const runSpread = (run: ComparableRun) => ({
+const runSpread = (run: ComparableRun, scope: BenchmarkScope) => ({
   cases: run.benchmark.cases.map(entry => ({
     operations: Object.fromEntries(
-      benchmarkOperations.map(operation => [
+      (scope.find(item => item.records === entry.records)?.operations ?? []).map(operation => [
         operation,
         entry.operations[operation] === null
           ? null
@@ -208,12 +216,16 @@ const runSpread = (run: ComparableRun) => ({
     ),
     records: entry.records,
   })),
-  startup: { help: spread(run.startup.help), version: spread(run.startup.version) },
+  startup: run.startup ? { help: spread(run.startup.help), version: spread(run.startup.version) } : null,
 })
 
-export const compareBenchmarkRuns = (baseValue: unknown, candidateValue: unknown) => {
-  const base = parseComparableRun(baseValue)
-  const candidate = parseComparableRun(candidateValue)
+export const compareBenchmarkRuns = (
+  baseValue: unknown,
+  candidateValue: unknown,
+  scope: BenchmarkScope = completeBenchmarkScope,
+) => {
+  const base = parseComparableRun(baseValue, scope)
+  const candidate = parseComparableRun(candidateValue, scope)
   requireEvidence(
     base.fixtureVersion === candidate.fixtureVersion &&
       base.harnessSha256 === candidate.harnessSha256 &&
@@ -228,7 +240,7 @@ export const compareBenchmarkRuns = (baseValue: unknown, candidateValue: unknown
   const results = base.benchmark.cases.flatMap((entry, index) => {
     const next = candidate.benchmark.cases[index]
     requireEvidence(next)
-    const operations = benchmarkOperations.flatMap(operation => {
+    const operations = (scope.find(item => item.records === entry.records)?.operations ?? []).flatMap(operation => {
       const before = entry.operations[operation]
       const after = next.operations[operation]
       return before && after
@@ -262,22 +274,26 @@ export const compareBenchmarkRuns = (baseValue: unknown, candidateValue: unknown
       compareMetric(`${entry.records}:cache`, 'totalBytes', entry.cache.totalBytes, next.cache.totalBytes, 10),
     ]
   })
-  const packageResults = (['javascriptBytes', 'declarationBytes', 'tarballBytes'] as const).map(metric =>
-    compareMetric('package', metric, base.package[metric], candidate.package[metric], 10),
+  const packageResults = (['javascriptBytes', 'declarationBytes', 'tarballBytes'] as const).flatMap(metric =>
+    base.package && candidate.package
+      ? [compareMetric('package', metric, base.package[metric], candidate.package[metric], 10)]
+      : [],
   )
   const startupResults = (['help', 'version'] as const).flatMap(operation => {
-    const before = base.startup[operation]
-    const after = candidate.startup[operation]
-    return [
-      compareMetric(
-        `cli:${operation}`,
-        'totalMs.median',
-        rawStatistic(before, 'median'),
-        rawStatistic(after, 'median'),
-        15,
-      ),
-      compareMetric(`cli:${operation}`, 'totalMs.p95', rawStatistic(before, 'p95'), rawStatistic(after, 'p95'), 25),
-    ]
+    const before = base.startup?.[operation]
+    const after = candidate.startup?.[operation]
+    return before && after
+      ? [
+          compareMetric(
+            `cli:${operation}`,
+            'totalMs.median',
+            rawStatistic(before, 'median'),
+            rawStatistic(after, 'median'),
+            15,
+          ),
+          compareMetric(`cli:${operation}`, 'totalMs.p95', rawStatistic(before, 'p95'), rawStatistic(after, 'p95'), 25),
+        ]
+      : []
   })
   const all = [...results, ...packageResults, ...startupResults]
   return {
@@ -291,7 +307,7 @@ export const compareBenchmarkRuns = (baseValue: unknown, candidateValue: unknown
     passed: all.every(metric => metric.passed),
     runner: base.runner,
     schemaVersion: 1,
-    spread: { base: runSpread(base), candidate: runSpread(candidate) },
+    spread: { base: runSpread(base, scope), candidate: runSpread(candidate, scope) },
     thresholds: { bytesPercent: 10, medianLatencyPercent: 15, p95LatencyPercent: 25, peakRssPercent: 20 },
   }
 }

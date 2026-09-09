@@ -18,6 +18,7 @@ import { join } from 'node:path'
 import { describe, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
+  createBenchmarkSession,
   makePreparedRepositoryStale,
   removeBenchmarkRoots,
   restoreBenchmarkSample,
@@ -41,6 +42,30 @@ const realWorker = join(import.meta.dirname, '..', 'scripts', 'benchmark-worker.
 const realWorkerExitTimeoutMilliseconds = process.platform === 'win32' ? 10_000 : 5000
 const benchmarkScript = join(import.meta.dirname, '..', 'scripts', 'benchmark.ts')
 const privateRenameGuard = join(import.meta.dirname, 'fixtures', 'require-private-benchmark-rename.ts')
+
+test('reused benchmark snapshots preserve cold and stale preconditions across samples', async () => {
+  const parent = mkdtempSync(join(tmpdir(), 'encephalon-session-test-'))
+  try {
+    const templates = createBenchmarkSession(1, parent)
+    const record = join('encephalon', 'decision', 'chain-00000.json')
+    const preparedRecord = readFileSync(join(templates.prepared, record))
+    const database = join(templates.prepared, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const preparedDatabase = readFileSync(database)
+    for (const operation of ['coldHydrate', 'stalePrepare', 'unchangedPrepare', 'stalePrepare'] as const) {
+      // biome-ignore lint/performance/noAwaitInLoops: exercise repeated restoration of the same sample root.
+      const report = await runBenchmark(['--records', '1', '--warmups', '0', '--repetitions', '1'], {
+        operations: [operation],
+        templates,
+      })
+      assert.equal(report.cases[0]?.operations[operation]?.totalMs.count, 1)
+      assert.deepEqual(readFileSync(join(templates.prepared, record)), preparedRecord)
+      assert.deepEqual(readFileSync(database), preparedDatabase)
+      assert.deepEqual(readFileSync(join(templates.unprepared, record)), preparedRecord)
+    }
+  } finally {
+    rmSync(parent, { force: true, recursive: true })
+  }
+})
 
 const privateFileModesSupported = (() => {
   const root = mkdtempSync(join(tmpdir(), 'encephalon-private-mode-probe-'))

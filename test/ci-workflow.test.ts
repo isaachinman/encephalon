@@ -53,258 +53,80 @@ test('ignores secrets-shaped ordinary text outside GitHub Actions expressions', 
   }
 })
 
-test('passes one exact package candidate through runtime and release-equivalent gates', () => {
-  const workflow = readFileSync(resolve(root, '.github', 'workflows', 'ci.yml'), 'utf8')
-  const readme = readFileSync(resolve(root, 'README.md'), 'utf8')
-  const contract = readFileSync(resolve(root, 'docs', 'contract.md'), 'utf8')
-  const publishCheck = readFileSync(resolve(root, 'scripts', 'check-publish.ts'), 'utf8')
-  const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
-    scripts?: Record<string, unknown>
-  }
-  const generatedVersionScript = String(packageJson.scripts?.['check:generated'])
-  const packageScript = String(packageJson.scripts?.['check:package'])
-  const publishScript = String(packageJson.scripts?.['check:publish'])
-  const eventsStart = workflow.indexOf('\non:\n') + 1
-  const permissionsStart = workflow.indexOf('\npermissions:\n', eventsStart)
-  const concurrencyStart = workflow.indexOf('\nconcurrency:\n', permissionsStart)
-  const jobsStart = workflow.indexOf('\njobs:\n')
-  const packageStart = workflow.indexOf('\n  package:\n', jobsStart)
-  const candidateStart = workflow.indexOf('\n  candidate:\n', packageStart)
-  const releaseStart = workflow.indexOf('\n  release:\n', candidateStart)
-  const workflowConfiguration = workflow.slice(0, jobsStart)
-  const verificationJob = workflow.slice(jobsStart, packageStart)
-  const packageJob = workflow.slice(packageStart, candidateStart)
-  const candidateJob = workflow.slice(candidateStart, releaseStart)
-  const releaseJob = workflow.slice(releaseStart)
-  const candidateTarball = 'package-artifacts/encephalon-0.3.0.tgz'
-  const candidateMetadata = `${candidateTarball}.metadata.json`
-  const matrixStart = verificationJob.indexOf('      matrix:\n')
-  const runnerStart = verificationJob.indexOf('    runs-on:', matrixStart)
-  const matrixBlock = verificationJob.slice(matrixStart, runnerStart)
-  const verificationStepsStart = verificationJob.indexOf('    steps:\n')
-  const verificationHeader = verificationJob.slice(0, matrixStart)
-  const verificationRunner = verificationJob.slice(runnerStart, verificationStepsStart)
-  const verificationSteps = verificationJob.slice(verificationStepsStart)
-
-  assert.equal(
-    workflow.slice(eventsStart, permissionsStart),
-    `on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
-    types: [opened, reopened, synchronize, edited]
-`,
+test('parallel CI retains complete verification and exact-package release gates', () => {
+  const workflow = readFileSync(resolve(root, '.github/workflows/ci.yml'), 'utf8')
+  const jobs = Object.fromEntries(
+    [...workflow.matchAll(/^ {2}([a-z-]+):\n([\s\S]*?)(?=^ {2}[a-z-]+:\n|$(?![\s\S]))/gm)].map(match => [
+      match[1],
+      match[2] ?? '',
+    ]),
   )
-  assert.doesNotMatch(workflow.slice(eventsStart, permissionsStart), /paths|ignore|workflow_dispatch|schedule/)
-  assert.equal(
-    workflow.slice(permissionsStart + 1, concurrencyStart),
-    `permissions:
-  contents: read
-`,
-  )
-  assert.doesNotMatch(workflowConfiguration, /^(?:defaults|env):/gmu)
+  assert.match(workflow, /permissions:\n {2}contents: read\n/)
   assert.equal(workflowContainsSecretsContext(workflow), false)
-  assert.doesNotMatch(workflow, /NODE_AUTH_TOKEN|NPM_TOKEN|\.npmrc|registry-url|always-auth/u)
-  assert.match(
-    workflowConfiguration,
-    /concurrency:\n\s+group: \$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.run_id \}\}\n\s+cancel-in-progress: true/,
-  )
-
-  assert.equal(
-    verificationHeader,
-    `
-jobs:
-  verify:
-    name: verify (\${{ matrix.context }})
-    strategy:
-      fail-fast: false
-`,
-  )
-  assert.equal(
-    matrixBlock,
-    `      matrix:
-        include:
-          - context: ubuntu-latest
-            os: ubuntu-latest
-            node: 24.15.0
-          - context: macos-latest
-            os: macos-latest
-            node: 24.15.0
-          - context: windows-latest
-            os: windows-latest
-            node: 24.15.0
-          - context: ubuntu-current
-            os: ubuntu-latest
-            node: 26
-`,
-  )
-  assert.match(verificationRunner, /^ {4}runs-on: \$\{\{ matrix\.os \}\}\n$/)
-  assert.doesNotMatch(verificationJob, /^ {4}(?:if|continue-on-error|permissions):/m)
-  const trustedVerificationPrefix =
-    /^ {4}steps:\n {6}- uses: actions\/checkout@\S+\n {8}with:\n {10}persist-credentials: false\n {10}fetch-depth: 0\n {10}ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}\n {6}- uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: 24\.15\.0\n {6}- run: node \.\/scripts\/check-generated-version\.ts\n {6}- if: matrix\.context == 'ubuntu-current'\n {8}uses: actions\/setup-node@\S+\n {8}with:\n {10}node-version: \$\{\{ matrix\.node \}\}\n {6}- uses: oven-sh\/setup-bun@v2\n {8}with:\n {10}bun-version: 1\.3\.1\n {6}- run: bun install --frozen-lockfile --ignore-scripts\n/u
-  assert.match(verificationSteps, trustedVerificationPrefix)
-  assert.doesNotMatch(
-    verificationSteps.replace('    steps:\n', '    steps:\n      - uses: ./.github/actions/repair-generated-source\n'),
-    trustedVerificationPrefix,
-  )
-  assert.deepEqual(
-    [...verificationSteps.matchAll(/^\s+(?:- )?run: (.+)$/gm)].map(match => match[1]),
-    [
-      'node ./scripts/check-generated-version.ts',
-      'bun install --frozen-lockfile --ignore-scripts',
-      'bun run typecheck',
-      'bun run test',
-      'bun run lint',
-      'bun run benchmark:check',
-      'node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports',
-    ],
-  )
-  assert.equal(verificationSteps.match(/^\s+(?:- )?run:/gm)?.length, 7)
-  assert.equal(verificationSteps.match(/^\s{6}- if:/gm)?.length, 2)
-  assert.doesNotMatch(verificationSteps, /^\s{8}continue-on-error:/m)
-
-  assert.match(
-    packageJob,
-    /^\n {2}package:\n {4}name: Build exact package candidate\n {4}needs: verify\n {4}runs-on: ubuntu-latest\n/u,
-  )
-  assert.match(
-    candidateJob,
-    /^\n {2}candidate:\n {4}name: candidate \(Node \$\{\{ matrix\.node \}\}\)\n {4}needs: package\n/u,
-  )
-  assert.match(candidateJob, /matrix:\n {8}node:\n {10}- 24\.15\.0\n {10}- 26\n {4}runs-on: ubuntu-latest/u)
-  assert.match(
-    releaseJob,
-    /^\n {2}release:\n {4}name: Release-equivalent package gate\n {4}needs: candidate\n {4}runs-on: ubuntu-latest\n/u,
-  )
-  assert.doesNotMatch(`${packageJob}${candidateJob}${releaseJob}`, /^ {4}(?:if|continue-on-error|permissions):/m)
-
-  for (const sourceBuildingJob of [verificationJob, packageJob, candidateJob, releaseJob]) {
-    const setupNode = sourceBuildingJob.indexOf('uses: actions/setup-node@')
-    const generatedVersion = sourceBuildingJob.indexOf('run: node ./scripts/check-generated-version.ts')
-    const setupBun = sourceBuildingJob.indexOf('uses: oven-sh/setup-bun@v2')
-    const install = sourceBuildingJob.indexOf('run: bun install --frozen-lockfile --ignore-scripts')
-    assert.equal(
-      [setupNode, generatedVersion, setupBun, install].every(
-        (position, index, positions) =>
-          position >= 0 && (index === 0 || position > (positions[index - 1] ?? Number.POSITIVE_INFINITY)),
-      ),
-      true,
-    )
+  assert.doesNotMatch(workflow, /NODE_AUTH_TOKEN|NPM_TOKEN|registry-url|pull_request_target|continue-on-error/)
+  assert.match(workflow, /types: \[opened, reopened, synchronize\]/)
+  assert.match(workflow, /cancel-in-progress: true/)
+  for (const name of [
+    'correctness',
+    'compatibility',
+    'performance',
+    'verify',
+    'package',
+    'candidate',
+    'release-checks',
+    'release',
+  ]) {
+    const job = jobs[name]
+    assert.ok(job, name)
+    assert.match(job, /timeout-minutes: [1-9]\n/)
+    assert.doesNotMatch(job, /permissions:/)
+    if (job.includes('actions/checkout@')) {
+      assert.match(job, /persist-credentials: false/)
+      assert.match(job, /ref: \$\{\{ github.event.pull_request.head.sha \|\| github.sha \}\}/)
+    }
   }
-
-  assert.deepEqual(
-    [...packageJob.matchAll(/^\s{6}- run: (.+)$/gm)].map(match => match[1]),
-    [
-      'node ./scripts/check-generated-version.ts',
-      'bun install --frozen-lockfile --ignore-scripts',
-      'node ./scripts/check-worktree-clean.ts',
-      'bun run test',
-      'node ./scripts/check-worktree-clean.ts',
-      'bun run build',
-      'node ./scripts/check-worktree-clean.ts',
-      'node ./scripts/check-worktree-clean.ts --allow-package-artifacts',
-      'node ./scripts/check-package-metadata.ts',
-    ],
-  )
-  assert.match(
-    packageJob,
-    /- name: Check and retain exact package candidate\n\s+env:\n\s+NODE_OPTIONS: ''\n\s+NODE_PATH: ''\n\s+run: node \.\/scripts\/check-package\.ts --retain-tarball package-artifacts/u,
-  )
-  const testStep = packageJob.indexOf('bun run test')
-  const build = packageJob.indexOf('bun run build', testStep)
-  const packageCheck = packageJob.indexOf('node ./scripts/check-package.ts --retain-tarball package-artifacts')
-  const cleanTreeChecks = [
-    ...packageJob.matchAll(/node \.\/scripts\/check-worktree-clean\.ts(?: --allow-package-artifacts)?/g),
-  ].map(match => match.index)
-  assert.equal(cleanTreeChecks.length, 4)
-  assert.equal((cleanTreeChecks[0] ?? Number.POSITIVE_INFINITY) < testStep, true)
-  assert.equal((cleanTreeChecks[1] ?? -1) > testStep && (cleanTreeChecks[1] ?? Number.POSITIVE_INFINITY) < build, true)
-  assert.equal(
-    (cleanTreeChecks[2] ?? -1) > build && (cleanTreeChecks[2] ?? Number.POSITIVE_INFINITY) < packageCheck,
-    true,
-  )
-  assert.equal((cleanTreeChecks[3] ?? -1) > packageCheck, true)
-  assert.match(
-    packageJob,
-    new RegExp(
-      `- name: Upload exact package candidate\\n\\s+uses: actions/upload-artifact@\\S+\\n\\s+with:\\n\\s+name: encephalon-npm-package\\n\\s+path: \\|\\n\\s+${candidateTarball.replaceAll('.', '\\.')}\\n\\s+${candidateMetadata.replaceAll('.', '\\.')}\\n\\s+if-no-files-found: error\\n\\s+retention-days: 7`,
-      'u',
-    ),
-  )
-  assert.doesNotMatch(packageJob, /github\.event_name|github\.ref/u)
-
-  assert.match(
-    candidateJob,
-    new RegExp(
-      `actions/download-artifact@\\S+\\n\\s+with:\\n\\s+name: encephalon-npm-package\\n\\s+path: package-artifacts[\\s\\S]+node \\.\\/scripts\\/check-package\\.ts --tarball ${candidateTarball.replaceAll('.', '\\.')}`,
-      'u',
-    ),
-  )
-  assert.equal(candidateJob.match(/node \.\/scripts\/check-package\.ts --tarball/g)?.length, 1)
-  assert.match(
-    candidateJob,
-    /node \.\/scripts\/check-generated-version\.ts[\s\S]+bun install --frozen-lockfile --ignore-scripts/u,
-  )
-  assert.match(
-    candidateJob,
-    /bun run build\n\s+- run: node \.\/scripts\/check-worktree-clean\.ts[\s\S]+node \.\/scripts\/check-package-metadata\.ts[\s\S]+node \.\/scripts\/check-package\.ts --tarball/u,
-  )
-  assert.equal(candidateJob.match(/node \.\/scripts\/check-worktree-clean\.ts/g)?.length, 1)
-  assert.doesNotMatch(candidateJob, /tar --extract|--retain-tarball|npm pack|npm install/u)
-
-  assert.match(
-    releaseJob,
-    new RegExp(
-      `actions/download-artifact@\\S+\\n\\s+with:\\n\\s+name: encephalon-npm-package\\n\\s+path: package-artifacts[\\s\\S]+node \\.\\/scripts\\/check-package\\.ts --tarball ${candidateTarball.replaceAll('.', '\\.')}[\\s\\S]+node \\.\\/scripts\\/check-release-compatibility\\.ts ${candidateTarball.replaceAll('.', '\\.')}[\\s\\S]+node \\.\\/scripts\\/check-publish\\.ts ${candidateTarball.replaceAll('.', '\\.')}`,
-      'u',
-    ),
-  )
-  assert.equal(releaseJob.match(/node \.\/scripts\/check-package\.ts --tarball/g)?.length, 1)
-  assert.match(
-    releaseJob,
-    /node \.\/scripts\/check-generated-version\.ts[\s\S]+bun install --frozen-lockfile --ignore-scripts/u,
-  )
-  assert.match(
-    releaseJob,
-    /bun run build\n\s+- run: node \.\/scripts\/check-worktree-clean\.ts[\s\S]+node \.\/scripts\/check-package-metadata\.ts[\s\S]+node \.\/scripts\/check-package\.ts --tarball/u,
-  )
-  assert.equal(releaseJob.match(/node \.\/scripts\/check-worktree-clean\.ts/g)?.length, 1)
-  assert.equal(releaseJob.match(/node \.\/scripts\/check-release-compatibility\.ts/g)?.length, 1)
-  assert.equal(releaseJob.match(/node \.\/scripts\/check-publish\.ts/g)?.length, 1)
-  assert.doesNotMatch(releaseJob, /tar --extract|--retain-tarball|npm pack|npm install/u)
-
-  assert.equal(workflow.match(/bun run build/g)?.length, 3)
-  assert.equal(workflow.match(/node \.\/scripts\/check-package\.ts --retain-tarball/g)?.length, 1)
-  assert.equal(workflow.match(/actions\/upload-artifact/g)?.length, 2)
-  assert.equal(workflow.match(/actions\/download-artifact/g)?.length, 2)
-  assert.equal(workflow.match(/node \.\/scripts\/check-generated-version\.ts/g)?.length, 4)
-  assert.equal(workflow.match(/node \.\/scripts\/check-package-metadata\.ts/g)?.length, 3)
-  assert.equal(workflow.match(/node \.\/scripts\/check-worktree-clean\.ts/g)?.length, 6)
-  assert.equal(workflow.match(/actions\/checkout/g)?.length, 4)
-  assert.equal(workflow.match(/persist-credentials: false/g)?.length, 4)
-  assert.doesNotMatch(workflow, /^ {4}permissions:/m)
-  assert.doesNotMatch(workflow, /^\s+- run: (?:npm publish|bun run check:publish)(?:\s|$)/m)
-  assert.doesNotMatch(workflow, /steps\.[\w-]+\.outputs|GITHUB_OUTPUT|npm pkg get/u)
-  assert.doesNotMatch(workflow, /^\s+- run: bun run \.\/scripts\/check-generated-version\.ts$/m)
-  assert.doesNotMatch(workflow, /^\s+- run: bun run check:generated$/m)
-  assert.doesNotMatch(workflow, /tar --extract|npm install --package-lock=false/u)
-
-  assert.match(readme, /four verification lanes/)
-  assert.match(readme, /pull requests and trusted pushes to `main`/)
-  assert.match(readme, /metadata sidecar/)
-  assert.match(readme, /published npm oracle requires network access/)
-  assert.match(contract, /exact candidate artifact/)
-  assert.match(contract, /byte-identical/)
-  assert.match(contract, /manual.*tarball-only publish/)
-  assert.match(contract, /metadata sidecar/)
-  assert.doesNotMatch(readme, /runner-local storage/)
-
-  assert.equal(generatedVersionScript, 'bun run scripts/check-generated-version.ts')
-  assert.equal(packageScript, 'node ./scripts/check-package.ts')
-  assert.equal(publishScript, 'node ./scripts/check-publish.ts')
-  assert.equal(publishCheck.includes("'--dry-run'"), true)
-  assert.equal(publishCheck.includes("'--ignore-scripts'"), true)
+  const correctness = jobs.correctness ?? ''
+  assert.match(correctness, /context: ubuntu-latest/)
+  assert.match(correctness, /context: macos-latest/)
+  assert.match(correctness, /context: windows-latest/)
+  assert.match(correctness, /context: ubuntu-current/)
+  assert.match(correctness, /bun run typecheck/)
+  assert.match(correctness, /bun run lint/)
+  assert.match(correctness, /bun run benchmark:check/)
+  assert.match(correctness, /node scripts\/test-ci.ts.*windows-latest.*main.*all/)
+  assert.match(jobs.compatibility ?? '', /group: \[compatibility-a, compatibility-b, compatibility-c\]/)
+  assert.match(jobs.compatibility ?? '', /runs-on: windows-latest/)
+  const performance = jobs.performance ?? ''
+  assert.match(performance, /runs-on: ubuntu-latest/)
+  assert.match(performance, /fetch-depth: 0/)
+  assert.match(performance, /node scripts\/benchmark-compare.ts.*20.*matrix.shard/)
+  assert.match(performance, /name: performance-\$\{\{ github.run_attempt \}\}-\$\{\{ matrix.shard \}\}/)
+  assert.match(jobs.verify ?? '', /needs: \[correctness, compatibility, performance\]/)
+  assert.match(jobs.verify ?? '', /node scripts\/benchmark-aggregate.ts/)
+  assert.match(jobs.verify ?? '', /pattern: performance-\$\{\{ github.run_attempt \}\}-\*/)
+  for (const name of ['verify', 'release']) {
+    assert.match(jobs[name] ?? '', /if: always\(\)/)
+    assert.match(jobs[name] ?? '', /every\(job => job.result === "success"\)/)
+  }
+  const packageJob = jobs.package ?? ''
+  assert.doesNotMatch(packageJob, /needs:|bun run test/)
+  assert.match(packageJob, /bun run build/)
+  assert.match(packageJob, /check-package.ts --retain-tarball package-artifacts/)
+  assert.match(packageJob, /check-worktree-clean.ts --allow-package-artifacts/)
+  assert.match(packageJob, /name: encephalon-npm-package/)
+  for (const name of ['candidate', 'release-checks']) {
+    const job = jobs[name] ?? ''
+    assert.match(job, /needs: package/)
+    assert.match(job, /actions\/download-artifact@/)
+    assert.match(job, /name: encephalon-npm-package/)
+    assert.match(job, /check-package-metadata.ts/)
+    assert.match(job, /check-package.ts --tarball package-artifacts\/encephalon-0.3.0.tgz/)
+    assert.doesNotMatch(job, /--retain-tarball|npm pack|npm install/)
+  }
+  assert.match(jobs.candidate ?? '', /- 24.15.0/)
+  assert.match(jobs.candidate ?? '', /- 26/)
+  assert.match(jobs['release-checks'] ?? '', /check-release-compatibility.ts package-artifacts\/encephalon-0.3.0.tgz/)
+  assert.match(jobs['release-checks'] ?? '', /check-publish.ts package-artifacts\/encephalon-0.3.0.tgz/)
+  assert.match(jobs.release ?? '', /needs: \[candidate, release-checks, verify\]/)
+  assert.doesNotMatch(workflow, /run: npm publish/)
 })

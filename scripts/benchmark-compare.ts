@@ -5,7 +5,13 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runBenchmarkCommand } from './benchmark-command.ts'
 import { type ComparableRun, compareBenchmarkRuns } from './benchmark-comparison.ts'
-import { type BenchmarkReport, benchmarkOperations, summarizeDistribution } from './benchmark-model.ts'
+import {
+  type BenchmarkOperation,
+  type BenchmarkReport,
+  benchmarkOperations,
+  summarizeDistribution,
+} from './benchmark-model.ts'
+import { benchmarkScope } from './benchmark-shards.ts'
 import { npmCommand } from './npm-command.ts'
 import { readPackageTarEntries } from './package-tarball.ts'
 
@@ -18,7 +24,10 @@ const harnessFiles = [
   'benchmark-process.ts',
   'benchmark-command.ts',
   'benchmark-comparison.ts',
+  'benchmark-aggregate.ts',
   'benchmark-compare.ts',
+  'benchmark-shards.ts',
+  'benchmark-session.ts',
   'npm-command.ts',
   'package-tarball.ts',
 ]
@@ -30,6 +39,14 @@ const sampleMetrics = [
   'peakRssBytes',
   'rssDeltaBytes',
 ] as const
+
+const reportIdentity = (report: BenchmarkReport) =>
+  JSON.stringify({
+    cases: report.cases.map(({ operations: _operations, cache: _cache, ...fixture }) => fixture),
+    configuration: report.configuration,
+    environment: report.environment,
+    schemaVersion: report.schemaVersion,
+  })
 
 const run = async (command: string, arguments_: string[], cwd: string, signal?: AbortSignal) =>
   runBenchmarkCommand(command, arguments_, { cwd, timeoutMilliseconds: 600_000, ...(signal ? { signal } : {}) })
@@ -98,19 +115,16 @@ const packRevision = async (checkout: string, destination: string, signal: Abort
   }
 }
 
-export const combineBenchmarkRounds = (rounds: BenchmarkReport[], warmups: number): BenchmarkReport => {
+export const combineBenchmarkRounds = (
+  rounds: BenchmarkReport[],
+  warmups: number,
+  operations: readonly BenchmarkOperation[] = benchmarkOperations,
+): BenchmarkReport => {
   const [first] = rounds
   if (!first || rounds.length < 3) {
     throw new Error('Benchmark comparison requires at least three complete rounds.')
   }
-  const identity = (report: BenchmarkReport) =>
-    JSON.stringify({
-      cases: report.cases.map(({ operations: _operations, cache: _cache, ...fixture }) => fixture),
-      configuration: report.configuration,
-      environment: report.environment,
-      schemaVersion: report.schemaVersion,
-    })
-  if (first.configuration.repetitions !== 1 || rounds.some(round => identity(round) !== identity(first))) {
+  if (first.configuration.repetitions !== 1 || rounds.some(round => reportIdentity(round) !== reportIdentity(first))) {
     throw new Error('Benchmark comparison rounds have incompatible metadata or fixtures.')
   }
   const cases = first.cases.map((entry, index) => ({
@@ -122,7 +136,7 @@ export const combineBenchmarkRounds = (rounds: BenchmarkReport[], warmups: numbe
         entry.cache,
       ),
     operations: Object.fromEntries(
-      benchmarkOperations.map(operation => {
+      operations.map(operation => {
         const values = rounds.map(round => round.cases[index]?.operations[operation])
         if (operation === 'stalePrepare' && entry.records === 0 && values.every(value => value === null)) {
           return [operation, null]
@@ -152,13 +166,44 @@ export const combineBenchmarkRounds = (rounds: BenchmarkReport[], warmups: numbe
   return { ...first, cases, configuration: { ...first.configuration, repetitions: rounds.length, warmups } }
 }
 
+export const combineBenchmarkOperations = (reports: BenchmarkReport[]): BenchmarkReport => {
+  const [first] = reports
+  if (
+    !first?.cases[0] ||
+    first.cases.length !== 1 ||
+    reports.some(report => reportIdentity(report) !== reportIdentity(first))
+  ) {
+    throw new Error('Benchmark operations have incompatible metadata or fixtures.')
+  }
+  const entries = reports.flatMap(report => Object.entries(report.cases[0]?.operations ?? {}))
+  if (new Set(entries.map(([operation]) => operation)).size !== entries.length) {
+    throw new Error('Benchmark comparison contains duplicate operations.')
+  }
+  const cache = reports.reduce((largest, report) => {
+    const current = report.cases[0]?.cache
+    return current && current.totalBytes > largest.totalBytes ? current : largest
+  }, first.cases[0].cache)
+  return {
+    ...first,
+    cases: [
+      {
+        ...first.cases[0],
+        cache,
+        operations: Object.fromEntries(entries) as BenchmarkReport['cases'][number]['operations'],
+      },
+    ],
+  }
+}
+
 export const runComparison = async (
   baseRevision: string,
   candidateRevision: string,
   output: string,
   repetitions = 20,
   warmups = 2,
+  shard?: string,
 ) => {
+  const scope = benchmarkScope(shard)
   if (!(Number.isSafeInteger(repetitions) && repetitions >= 3 && Number.isSafeInteger(warmups) && warmups >= 0)) {
     throw new Error('Benchmark comparison requires at least three repetitions and non-negative warmups.')
   }
@@ -196,76 +241,102 @@ export const runComparison = async (
       // biome-ignore lint/performance/noAwaitInLoops: builds must not contend with each other.
       await run('git', ['worktree', 'add', '--detach', side.checkout, side.commit], root, controller.signal)
       side.registered = true
-      const artifacts = join(temporary, `${side.name}-package`)
-      mkdirSync(artifacts)
-      side.packed = await packRevision(side.checkout, artifacts, controller.signal)
+      if (scope.some(entry => entry.records === 0)) {
+        const artifacts = join(temporary, `${side.name}-package`)
+        mkdirSync(artifacts)
+        side.packed = await packRevision(side.checkout, artifacts, controller.signal)
+      }
       for (const file of harness) {
         writeFileSync(join(side.checkout, 'scripts', file.name), file.bytes)
       }
     }
-    for (const records of [0, 1, 100, 1000]) {
-      for (const round of Array.from({ length: warmups + repetitions }, (_, index) => index)) {
-        process.stderr.write(
-          `Benchmark ${records} records, round ${round + 1}/${warmups + repetitions}${round < warmups ? ' (warmup)' : ''}\n`,
+    for (const { records, operations } of scope) {
+      for (const side of sides) {
+        // biome-ignore lint/performance/noAwaitInLoops: prepare both revision-specific snapshots before measurement.
+        await run(
+          process.execPath,
+          [
+            'scripts/benchmark-session.ts',
+            'prepare',
+            join(temporary, `${side.name}-${records}-session.json`),
+            String(records),
+          ],
+          side.checkout,
+          controller.signal,
         )
-        for (const side of round % 2 === 0 ? sides : sides.toReversed()) {
-          const reportPath = join(temporary, `${side.name}-round.json`)
-          // biome-ignore lint/performance/noAwaitInLoops: base/candidate rounds alternate and never overlap.
-          await run(
-            process.execPath,
-            [
-              'scripts/benchmark.ts',
-              '--records',
-              String(records),
-              '--warmups',
-              '0',
-              '--repetitions',
-              '1',
-              '--output',
-              reportPath,
-            ],
-            side.checkout,
-            controller.signal,
-          )
-          const report = JSON.parse(readFileSync(reportPath, 'utf8')) as BenchmarkReport
-          if (round >= warmups) {
-            side.rounds.push(report)
-            copyFileSync(reportPath, join(outputDirectory, `${side.name}-${records}-round-${round - warmups + 1}.json`))
-          }
-          for (const operation of records === 0 ? (['help', 'version'] as const) : []) {
-            if (!side.packed) {
-              throw new Error('Benchmark package setup is incomplete.')
-            }
-            // biome-ignore lint/performance/noAwaitInLoops: isolated startup samples must not overlap.
-            const startup = await runBenchmarkCommand(process.execPath, [side.packed.cli, `--${operation}`], {
-              cwd: temporary,
-              signal: controller.signal,
-              timeoutMilliseconds: 30_000,
-            })
-            if (
-              operation === 'version'
-                ? startup.stdout.trim() !== side.packed.version
-                : !startup.stdout.startsWith('Usage: encephalon ')
-            ) {
-              throw new Error('Benchmark packed CLI returned unexpected output.')
-            }
+      }
+      for (const operation of operations) {
+        process.stderr.write(`Benchmark ${records}:${operation} (${repetitions} samples per side)\n`)
+        for (const round of Array.from({ length: warmups + repetitions }, (_, index) => index)) {
+          for (const side of round % 2 === 0 ? sides : sides.toReversed()) {
+            const reportPath = join(temporary, `${side.name}-round.json`)
+            // biome-ignore lint/performance/noAwaitInLoops: matched operation pairs alternate and never overlap.
+            await run(
+              process.execPath,
+              [
+                'scripts/benchmark-session.ts',
+                'sample',
+                join(temporary, `${side.name}-${records}-session.json`),
+                operation,
+                reportPath,
+              ],
+              side.checkout,
+              controller.signal,
+            )
+            const report = JSON.parse(readFileSync(reportPath, 'utf8')) as BenchmarkReport
             if (round >= warmups) {
-              side.startup[operation].push(startup.elapsedMs)
+              side.rounds.push(report)
+              copyFileSync(
+                reportPath,
+                join(outputDirectory, `${side.name}-${records}-${operation}-round-${round - warmups + 1}.json`),
+              )
             }
           }
         }
       }
     }
-    const evidence = sides.map(side => {
-      if (!side.packed) {
-        throw new Error('Benchmark package setup is incomplete.')
+    for (const operation of scope.some(entry => entry.records === 0) ? (['help', 'version'] as const) : []) {
+      for (const round of Array.from({ length: warmups + repetitions }, (_, index) => index)) {
+        for (const side of round % 2 === 0 ? sides : sides.toReversed()) {
+          if (!side.packed) {
+            throw new Error('Benchmark package setup is incomplete.')
+          }
+          // biome-ignore lint/performance/noAwaitInLoops: packed startup samples are paired on the same runner.
+          const startup = await runBenchmarkCommand(process.execPath, [side.packed.cli, `--${operation}`], {
+            cwd: temporary,
+            signal: controller.signal,
+            timeoutMilliseconds: 30_000,
+          })
+          if (
+            operation === 'version'
+              ? startup.stdout.trim() !== side.packed.version
+              : !startup.stdout.startsWith('Usage: encephalon ')
+          ) {
+            throw new Error('Benchmark packed CLI returned unexpected output.')
+          }
+          if (round >= warmups) {
+            side.startup[operation].push(startup.elapsedMs)
+          }
+        }
       }
-      const caseReports = [0, 1, 100, 1000].map(records =>
-        combineBenchmarkRounds(
-          side.rounds.filter(report => report.cases.length === 1 && report.cases[0]?.records === records),
-          warmups,
-        ),
-      )
+    }
+    const evidence = sides.map(side => {
+      const caseReports = scope.map(({ records, operations }) => {
+        const reports = operations.map(operation =>
+          combineBenchmarkRounds(
+            side.rounds.filter(
+              report =>
+                report.cases.length === 1 &&
+                report.cases[0]?.records === records &&
+                Object.keys(report.cases[0].operations).length === 1 &&
+                Object.hasOwn(report.cases[0].operations, operation),
+            ),
+            warmups,
+            [operation],
+          ),
+        )
+        return combineBenchmarkOperations(reports)
+      })
       const [firstCase] = caseReports
       if (!firstCase) {
         throw new Error('Benchmark comparison has no cases.')
@@ -275,15 +346,15 @@ export const runComparison = async (
         commit: side.commit,
         fixtureVersion: 1,
         harnessSha256,
-        package: side.packed.package,
+        package: side.packed?.package ?? null,
         runner,
         schemaVersion: 1,
-        startup: side.startup,
+        startup: side.packed ? side.startup : null,
       }
       writeFileSync(join(outputDirectory, `${side.name}.json`), `${JSON.stringify(result, null, 2)}\n`)
       return result
     })
-    const comparison = compareBenchmarkRuns(evidence[0], evidence[1])
+    const comparison = compareBenchmarkRuns(evidence[0], evidence[1], scope)
     writeFileSync(join(outputDirectory, 'comparison.json'), `${JSON.stringify(comparison, null, 2)}\n`)
     for (const metric of comparison.metrics.filter(result => !result.passed)) {
       process.stderr.write(
@@ -303,16 +374,20 @@ export const runComparison = async (
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const [base, candidate, output, repetitions] = process.argv.slice(2)
+  const [base, candidate, output, repetitions, shard] = process.argv.slice(2)
   try {
     if (!(base && candidate && output)) {
-      throw new Error('Usage: node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA OUTPUT_DIRECTORY [REPETITIONS]')
+      throw new Error(
+        'Usage: node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA OUTPUT_DIRECTORY [REPETITIONS] [SHARD]',
+      )
     }
     const comparison = await runComparison(
       base,
       candidate,
       output,
       repetitions === undefined ? 20 : Number(repetitions),
+      2,
+      shard,
     )
     process.exitCode = comparison.passed ? 0 : 1
     process.stdout.write(

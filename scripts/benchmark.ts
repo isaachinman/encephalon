@@ -49,7 +49,7 @@ type CorpusFacts = {
   maximumFixtureSha256?: string
 }
 
-type CaseTemplates = {
+export type CaseTemplates = {
   corpus: CorpusFacts
   prepared: string
   sampleRoot: string
@@ -57,6 +57,8 @@ type CaseTemplates = {
 }
 
 type BenchmarkControllerOptions = {
+  operations?: readonly BenchmarkOperation[]
+  templates?: CaseTemplates
   afterTemporaryRepositoryAllocation?: ((phase: 'repository' | 'snapshot') => void) | undefined
   removeRoot?: ((path: string) => void) | undefined
   signal?: AbortSignal
@@ -65,6 +67,8 @@ type BenchmarkControllerOptions = {
 }
 
 type ResolvedBenchmarkControllerOptions = {
+  operations: readonly BenchmarkOperation[]
+  templates: CaseTemplates | undefined
   afterTemporaryRepositoryAllocation: ((phase: 'repository' | 'snapshot') => void) | undefined
   removeRoot: (path: string) => void
   signal: AbortSignal | undefined
@@ -405,6 +409,9 @@ const createCaseTemplates = (
   }
 }
 
+export const createBenchmarkSession = (records: number, temporaryParent: string) =>
+  createCaseTemplates(records, temporaryParent, undefined, path => rmSync(path, { force: true, recursive: true }))
+
 const templateForOperation = (operation: BenchmarkOperation, templates: CaseTemplates) =>
   operation === 'coldHydrate' ? templates.unprepared : templates.prepared
 
@@ -449,18 +456,20 @@ const runCase = async (
   configuration: BenchmarkArguments,
   options: ResolvedBenchmarkControllerOptions,
 ): Promise<BenchmarkCase> => {
-  const templates = createCaseTemplates(
-    records,
-    options.temporaryParent,
-    options.afterTemporaryRepositoryAllocation,
-    options.removeRoot,
-  )
+  const templates =
+    options.templates ??
+    createCaseTemplates(
+      records,
+      options.temporaryParent,
+      options.afterTemporaryRepositoryAllocation,
+      options.removeRoot,
+    )
   let outcome: { kind: 'success'; value: BenchmarkCase } | { error: unknown; kind: 'failure' }
   try {
     const operationEntries: Array<
       readonly [BenchmarkOperation, Awaited<ReturnType<typeof runOperationSamples>> | null]
     > = []
-    for (const operation of benchmarkOperations) {
+    for (const operation of options.operations) {
       const distributions =
         operation === 'stalePrepare' && records === 0
           ? null
@@ -481,7 +490,7 @@ const runCase = async (
   }
   return completeBenchmarkCleanup(
     outcome,
-    [templates.prepared, templates.sampleRoot, templates.unprepared],
+    options.templates ? [templates.sampleRoot] : [templates.prepared, templates.sampleRoot, templates.unprepared],
     options.removeRoot,
   )
 }
@@ -505,8 +514,10 @@ const runConfiguredBenchmark = async (
   const budget = loadBudget(configuration.budget, configuration.records)
   const options = {
     afterTemporaryRepositoryAllocation: controllerOptions.afterTemporaryRepositoryAllocation,
+    operations: controllerOptions.operations ?? benchmarkOperations,
     removeRoot: controllerOptions.removeRoot ?? (path => rmSync(path, { force: true, recursive: true })),
     signal: controllerOptions.signal,
+    templates: controllerOptions.templates,
     temporaryParent: controllerOptions.temporaryParent ?? tmpdir(),
     workerPath: controllerOptions.workerPath ?? defaultWorkerPath,
   }

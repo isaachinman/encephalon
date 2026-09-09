@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { combineBenchmarkRounds } from './benchmark-compare.ts'
+import { aggregateBenchmarkShards } from './benchmark-aggregate.ts'
+import { combineBenchmarkOperations, combineBenchmarkRounds } from './benchmark-compare.ts'
 import { type ComparableRun, compareBenchmarkRuns } from './benchmark-comparison.ts'
 import { benchmarkOperations, summarizeDistribution, summarizeSamples } from './benchmark-model.ts'
+import { benchmarkShards, completeBenchmarkScope } from './benchmark-shards.ts'
 
-const run = (): ComparableRun => ({
+const run = (
+  count = 3,
+): ComparableRun & {
+  package: NonNullable<ComparableRun['package']>
+  startup: NonNullable<ComparableRun['startup']>
+} => ({
   benchmark: {
     cases: [0, 1, 100, 1000].map(records => ({
       artifacts: 0,
@@ -25,7 +32,7 @@ const run = (): ComparableRun => ({
           operation === 'stalePrepare' && records === 0
             ? null
             : summarizeSamples(
-                Array.from({ length: 3 }, () => ({
+                Array.from({ length: count }, () => ({
                   overheadMs: 5,
                   peakRssBytes: 1000,
                   preparationIntegrityMs: 80,
@@ -39,7 +46,7 @@ const run = (): ComparableRun => ({
       records,
       supersessionDepth: 0,
     })),
-    configuration: { repetitions: 3, timeoutMilliseconds: 30_000, warmups: 1 },
+    configuration: { repetitions: count, timeoutMilliseconds: 30_000, warmups: 1 },
     environment: { arch: 'arm64', cpu: 'test', node: 'v24.15.0', platform: 'darwin' },
     generatedAt: '2026-09-07T00:00:00.000Z',
     memory: { peakRssBytes: 'isolated', rssDeltaBytes: 'isolated' },
@@ -52,7 +59,47 @@ const run = (): ComparableRun => ({
   package: { declarationBytes: 1000, javascriptBytes: 1000, tarballBytes: 1000 },
   runner: 'same-job',
   schemaVersion: 1,
-  startup: { help: [100, 100, 100], version: [100, 100, 100] },
+  startup: { help: Array.from({ length: count }, () => 100), version: Array.from({ length: count }, () => 100) },
+})
+
+test('parallel benchmark shards partition every required workload exactly once', () => {
+  const keys = (scope: typeof completeBenchmarkScope) =>
+    scope.flatMap(entry => entry.operations.map(operation => `${entry.records}:${operation}`))
+  const actual = Object.values(benchmarkShards).flatMap(keys)
+  assert.deepEqual(actual.toSorted(), keys(completeBenchmarkScope).toSorted())
+  assert.equal(new Set(actual).size, actual.length)
+})
+
+test('operation assembly rejects duplicate or changed fixtures and preserves the largest cache', () => {
+  const reports = ['list', 'show'].map(operation => {
+    const report = run().benchmark
+    const [entry] = report.cases
+    assert.ok(entry)
+    report.cases = [{ ...entry, operations: { [operation]: entry.operations.list } as typeof entry.operations }]
+    return report
+  })
+  const [first, second] = reports
+  assert.ok(first && second?.cases[0])
+  second.cases[0].cache.databaseBytes = 2000
+  second.cases[0].cache.totalBytes = 2000
+  const [combined] = combineBenchmarkOperations(reports).cases
+  assert.ok(combined)
+  assert.equal(combined.cache.totalBytes, 2000)
+  assert.throws(() => combineBenchmarkOperations([first, first]), /duplicate/)
+  second.cases[0].fixtureSha256 = 'd'.repeat(64)
+  assert.throws(() => combineBenchmarkOperations(reports), /incompatible/)
+})
+
+test('partial comparisons require the independently declared shard workload', () => {
+  const scope = benchmarkShards['large-gather']
+  assert.ok(scope)
+  const base: ComparableRun = { ...run(), package: null, startup: null }
+  base.benchmark.cases = base.benchmark.cases
+    .filter(entry => entry.records === 1000)
+    .map(entry => ({ ...entry, operations: { gather: entry.operations.gather } as typeof entry.operations }))
+  assert.equal(compareBenchmarkRuns(base, structuredClone(base), scope).passed, true)
+  assert.throws(() => compareBenchmarkRuns(base, structuredClone(base)), /benchmark/i)
+  assert.throws(() => compareBenchmarkRuns(base, structuredClone(base), benchmarkShards['large-payload']), /benchmark/i)
 })
 
 test('relative gate detects latency, tail, memory and byte regressions with actionable values', () => {
@@ -85,7 +132,7 @@ test('relative gate detects latency, tail, memory and byte regressions with acti
 })
 
 test('comparison refuses incompatible or incomplete evidence instead of approving absent metrics', () => {
-  const mutations: Array<(candidate: ComparableRun) => void> = [
+  const mutations: Array<(candidate: ReturnType<typeof run>) => void> = [
     candidate => {
       candidate.fixtureVersion += 1
     },
@@ -215,4 +262,45 @@ test('zero baselines fail on any positive candidate without inventing a denomina
   first.totalMs = summarizeDistribution([10, 20, 30])
   const report = compareBenchmarkRuns(base, structuredClone(base))
   assert.deepEqual(report.spread.base.cases[0]?.operations.list?.totalMs, { range: 20, variance: 200 / 3 })
+})
+
+test('aggregate validates every same-runner pair and never approves a missing shard or regression', () => {
+  const evidence = Object.fromEntries(
+    Object.entries(benchmarkShards).map(([name, scope]) => {
+      const base = run(20)
+      base.runner = name
+      base.benchmark.environment.platform = 'linux'
+      base.benchmark.configuration.warmups = 2
+      base.benchmark.cases = scope.map(expected => {
+        const entry = base.benchmark.cases.find(item => item.records === expected.records)
+        assert.ok(entry)
+        return {
+          ...entry,
+          operations: Object.fromEntries(
+            expected.operations.map(operation => [operation, entry.operations[operation]]),
+          ) as typeof entry.operations,
+        }
+      })
+      const scoped: ComparableRun = {
+        ...base,
+        package: name === 'small' ? base.package : null,
+        startup: name === 'small' ? base.startup : null,
+      }
+      return [name, { base: scoped, candidate: structuredClone(scoped) }]
+    }),
+  )
+  const aggregate = (value: typeof evidence) => aggregateBenchmarkShards(value, 'a'.repeat(40), 'a'.repeat(40))
+  assert.equal(aggregate(evidence).passed, true)
+  assert.throws(() => aggregate(Object.fromEntries(Object.entries(evidence).slice(1))), /every declared shard/)
+  const first = evidence.small
+  assert.ok(first?.candidate.package)
+  first.candidate.runner = 'unpaired'
+  assert.throws(() => aggregate(evidence), /compatible/)
+  first.candidate.runner = first.base.runner
+  first.candidate.package.javascriptBytes = 1101
+  assert.equal(aggregate(evidence).passed, false)
+  first.candidate.package.javascriptBytes = 1000
+  first.base.harnessSha256 = 'd'.repeat(64)
+  first.candidate.harnessSha256 = first.base.harnessSha256
+  assert.throws(() => aggregate(evidence), /incompatible harnesses/)
 })
