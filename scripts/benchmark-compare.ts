@@ -266,6 +266,20 @@ export const runComparison = async (
         )
       }
       for (const operation of operations) {
+        for (const side of sides) {
+          // biome-ignore lint/performance/noAwaitInLoops: establish separate stable operation fixtures before pairing.
+          await run(
+            process.execPath,
+            [
+              'scripts/benchmark-session.ts',
+              'operation',
+              join(temporary, `${side.name}-${records}-session.json`),
+              operation,
+            ],
+            side.checkout,
+            controller.signal,
+          )
+        }
         process.stderr.write(`Benchmark ${records}:${operation} (${repetitions} samples per side)\n`)
         for (const round of Array.from({ length: warmups + repetitions }, (_, index) => index)) {
           for (const side of round % 2 === 0 ? sides : sides.toReversed()) {

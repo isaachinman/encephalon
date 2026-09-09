@@ -52,6 +52,7 @@ type CorpusFacts = {
 export type CaseTemplates = {
   corpus: CorpusFacts
   prepared: string
+  preparedOperation?: BenchmarkOperation | undefined
   sampleRoot: string
   unprepared: string
 }
@@ -415,6 +416,44 @@ export const createBenchmarkSession = (records: number, temporaryParent: string)
 const templateForOperation = (operation: BenchmarkOperation, templates: CaseTemplates) =>
   operation === 'coldHydrate' ? templates.unprepared : templates.prepared
 
+export const reusablePreparedOperations: readonly BenchmarkOperation[] = [
+  'list',
+  'show',
+  'compactSearch',
+  'fullSearch',
+  'gather',
+  'largePayloadSearch',
+  'maximumPayloadSearch',
+  'payloadOnlySearch',
+  'missingSearch',
+  'listMaximum',
+  'validateArtifacts',
+  'strictCacheValidation',
+]
+
+const prepareOperationSample = (operation: BenchmarkOperation, templates: CaseTemplates): void => {
+  restoreBenchmarkSample(templateForOperation(operation, templates), templates.sampleRoot, operation)
+  const { records } = templates.corpus
+  if (records >= 4 && (operation === 'maximumPayloadSearch' || operation === 'payloadOnlySearch')) {
+    writeRecord(
+      templates.sampleRoot,
+      maximumRecord(timestamp(records - 1), `small-${String(records - 1).padStart(5, '0')}`),
+    )
+    prepare({ root: templates.sampleRoot })
+  }
+}
+
+export const prepareBenchmarkSessionOperation = (
+  templates: CaseTemplates,
+  operation: BenchmarkOperation,
+): CaseTemplates => {
+  if (reusablePreparedOperations.includes(operation)) {
+    prepareOperationSample(operation, templates)
+    return { ...templates, preparedOperation: operation }
+  }
+  return { ...templates, preparedOperation: undefined }
+}
+
 const runOperationSamples = async (
   operation: BenchmarkOperation,
   records: number,
@@ -427,10 +466,9 @@ const runOperationSamples = async (
       throw new Error(`Benchmark ${operation} for ${records} records was aborted.`)
     }
     const root = templates.sampleRoot
-    restoreBenchmarkSample(templateForOperation(operation, templates), root, operation)
-    if (records >= 4 && (operation === 'maximumPayloadSearch' || operation === 'payloadOnlySearch')) {
-      writeRecord(root, maximumRecord(timestamp(records - 1), `small-${String(records - 1).padStart(5, '0')}`))
-      prepare({ root })
+    const reuseSample = templates.preparedOperation === operation
+    if (!reuseSample) {
+      prepareOperationSample(operation, templates)
     }
     let outcome: BenchmarkOutcome<BenchmarkSample>
     try {
@@ -442,11 +480,20 @@ const runOperationSamples = async (
         timeoutMilliseconds: configuration.timeoutMilliseconds,
         workerPath: options.workerPath,
       })
+      if (reuseSample) {
+        const database = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+        if (byteSize(`${database}-wal`) !== 0) {
+          throw new Error(`The ${operation} benchmark wrote reusable cache state.`)
+        }
+        // The worker has exited; discard only its empty WAL and transient shared-memory index.
+        rmSync(`${database}-wal`, { force: true })
+        rmSync(`${database}-shm`, { force: true })
+      }
       outcome = { kind: 'success', value: result.sample }
     } catch (error) {
       outcome = { error, kind: 'failure' }
     }
-    return completeBenchmarkCleanup(outcome, [root], options.removeRoot)
+    return completeBenchmarkCleanup(outcome, reuseSample ? [] : [root], options.removeRoot)
   })
   return summarizeSamples(samples)
 }
@@ -488,9 +535,10 @@ const runCase = async (
   } catch (error) {
     outcome = { error, kind: 'failure' }
   }
+  const sampleRoots = templates.preparedOperation ? [] : [templates.sampleRoot]
   return completeBenchmarkCleanup(
     outcome,
-    options.templates ? [templates.sampleRoot] : [templates.prepared, templates.sampleRoot, templates.unprepared],
+    options.templates ? sampleRoots : [templates.prepared, templates.sampleRoot, templates.unprepared],
     options.removeRoot,
   )
 }

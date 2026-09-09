@@ -94,7 +94,7 @@ test('parallel CI retains complete verification and exact-package release gates'
   assert.match(correctness, /bun run lint/)
   assert.match(correctness, /bun run benchmark:check/)
   assert.match(correctness, /node scripts\/test-ci.ts.*windows-latest.*main.*all/)
-  assert.match(jobs.compatibility ?? '', /group: \[compatibility-a, compatibility-b, compatibility-c\]/)
+  assert.match(jobs.compatibility ?? '', /group: \[compatibility-a, compatibility-b, compatibility-c, package\]/)
   assert.match(jobs.compatibility ?? '', /runs-on: windows-latest/)
   const performance = jobs.performance ?? ''
   assert.match(performance, /runs-on: ubuntu-latest/)
@@ -113,12 +113,12 @@ test('parallel CI retains complete verification and exact-package release gates'
   assert.match(packageJob, /bun run build/)
   assert.match(packageJob, /check-package.ts --retain-tarball package-artifacts/)
   assert.match(packageJob, /check-worktree-clean.ts --allow-package-artifacts/)
-  assert.match(packageJob, /name: encephalon-npm-package/)
+  assert.match(packageJob, /name: encephalon-npm-package-\$\{\{ github.run_attempt \}\}/)
   for (const name of ['candidate', 'release-checks']) {
     const job = jobs[name] ?? ''
     assert.match(job, /needs: package/)
     assert.match(job, /actions\/download-artifact@/)
-    assert.match(job, /name: encephalon-npm-package/)
+    assert.match(job, /name: encephalon-npm-package-\$\{\{ github.run_attempt \}\}/)
     assert.match(job, /check-package-metadata.ts/)
     assert.match(job, /check-package.ts --tarball package-artifacts\/encephalon-0.3.0.tgz/)
     assert.doesNotMatch(job, /--retain-tarball|npm pack|npm install/)

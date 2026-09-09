@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [compatibility-a, compatibility-b, compatibility-c]
+        group: [compatibility-a, compatibility-b, compatibility-c, package]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -92,7 +92,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [small, medium, medium-maximum, large-gather, large-payload, large-maximum, large-reads, large-validation]
+        shard: [empty, small, medium, medium-maximum, large-gather, large-payload, large-maximum, large-preparation, large-reads, large-validation]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -144,7 +144,7 @@ jobs:
         with:
           node-version: 24.15.0
       - if: matrix.context == 'ubuntu-latest'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: performance-${{ github.run_attempt }}-*
           path: performance-reports
@@ -189,9 +189,9 @@ jobs:
       - run: node ./scripts/check-worktree-clean.ts --allow-package-artifacts
       - run: node ./scripts/check-package-metadata.ts
       - name: Upload exact package candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: encephalon-npm-package
+          name: encephalon-npm-package-${{ github.run_attempt }}
           path: |
             package-artifacts/encephalon-0.3.0.tgz
             package-artifacts/encephalon-0.3.0.tgz.metadata.json
@@ -227,9 +227,9 @@ jobs:
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run build
       - run: node ./scripts/check-worktree-clean.ts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: encephalon-npm-package
+          name: encephalon-npm-package-${{ github.run_attempt }}
           path: package-artifacts
       - run: node ./scripts/check-package-metadata.ts
       - name: Recheck exact package candidate
@@ -258,9 +258,9 @@ jobs:
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run build
       - run: node ./scripts/check-worktree-clean.ts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: encephalon-npm-package
+          name: encephalon-npm-package-${{ github.run_attempt }}
           path: package-artifacts
       - run: node ./scripts/check-package-metadata.ts
       - name: Recheck exact package candidate

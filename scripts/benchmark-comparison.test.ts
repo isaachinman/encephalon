@@ -283,8 +283,8 @@ test('aggregate validates every same-runner pair and never approves a missing sh
       })
       const scoped: ComparableRun = {
         ...base,
-        package: name === 'small' ? base.package : null,
-        startup: name === 'small' ? base.startup : null,
+        package: scope.some(entry => entry.records === 0) ? base.package : null,
+        startup: scope.some(entry => entry.records === 0) ? base.startup : null,
       }
       return [name, { base: scoped, candidate: structuredClone(scoped) }]
     }),
@@ -292,7 +292,7 @@ test('aggregate validates every same-runner pair and never approves a missing sh
   const aggregate = (value: typeof evidence) => aggregateBenchmarkShards(value, 'a'.repeat(40), 'a'.repeat(40))
   assert.equal(aggregate(evidence).passed, true)
   assert.throws(() => aggregate(Object.fromEntries(Object.entries(evidence).slice(1))), /every declared shard/)
-  const first = evidence.small
+  const first = evidence.empty
   assert.ok(first?.candidate.package)
   first.candidate.runner = 'unpaired'
   assert.throws(() => aggregate(evidence), /compatible/)
