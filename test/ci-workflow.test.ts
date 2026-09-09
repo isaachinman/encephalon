@@ -102,6 +102,7 @@ test('parallel CI retains complete verification and exact-package release gates'
     /group: \[compatibility-a, compatibility-b, compatibility-c, package, benchmark, benchmark-sessions, benchmark-report, benchmark-cli, cache\]/,
   )
   assert.match(jobs.compatibility ?? '', /runs-on: windows-latest/)
+  assert.match(jobs.compatibility ?? '', /needs: package/)
   const performance = jobs.performance ?? ''
   assert.match(performance, /runs-on: ubuntu-24.04-arm/)
   assert.match(performance, /fetch-depth: 0/)

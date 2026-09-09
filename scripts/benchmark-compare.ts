@@ -285,7 +285,7 @@ export const runComparison = async (
           for (const side of round % 2 === 0 ? sides : sides.toReversed()) {
             const reportPath = join(temporary, `${side.name}-round.json`)
             // biome-ignore lint/performance/noAwaitInLoops: matched operation pairs alternate and never overlap.
-            await run(
+            const measured = await run(
               process.execPath,
               [
                 'scripts/benchmark-session.ts',
@@ -297,6 +297,13 @@ export const runComparison = async (
               side.checkout,
               controller.signal,
             )
+            if (
+              process.env.ENCEPHALON_DIAGNOSE_COLD_HYDRATION === '1' &&
+              operation === 'coldHydrate' &&
+              records === 1
+            ) {
+              process.stderr.write(`${side.name} round ${round - warmups + 1}: ${measured.stderr}`)
+            }
             const report = JSON.parse(readFileSync(reportPath, 'utf8')) as BenchmarkReport
             if (round >= warmups) {
               side.rounds.push(report)

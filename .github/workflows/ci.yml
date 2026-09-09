@@ -81,6 +81,8 @@ jobs:
 
   compatibility:
     name: compatibility (windows-latest, ${{ matrix.group }})
+    # Admit the short Windows groups after the long jobs have entered the runner queue.
+    needs: package
     timeout-minutes: 9
     strategy:
       fail-fast: false
@@ -127,6 +129,7 @@ jobs:
         env:
           BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
           CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          ENCEPHALON_DIAGNOSE_COLD_HYDRATION: '1'
         run: node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports 20 ${{ matrix.shard }}
       - name: Retain performance evidence
         if: always()
@@ -136,12 +139,6 @@ jobs:
           path: performance-reports
           if-no-files-found: error
           retention-days: 7
-      - name: Diagnose cold hydration filesystem syncs
-        if: always() && matrix.shard == 'small'
-        timeout-minutes: 2
-        run: |
-          timeout 45s sudo apt-get install --yes --no-install-recommends strace
-          node scripts/diagnose-cold-hydration.mjs
 
   verify:
     name: verify (${{ matrix.context }})

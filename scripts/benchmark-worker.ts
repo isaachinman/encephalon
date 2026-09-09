@@ -116,6 +116,10 @@ const assertOperationResult = (operation: BenchmarkOperation, records: number, r
 
 const measure = (operation: BenchmarkOperation, records: number, root: string): BenchmarkSample => {
   const startingRss = process.memoryUsage().rss
+  const usageBefore =
+    process.env.ENCEPHALON_DIAGNOSE_COLD_HYDRATION === '1' && operation === 'coldHydrate' && records === 1
+      ? process.resourceUsage()
+      : undefined
   const start = performance.now()
   const preparationOnly =
     operation === 'coldHydrate' || operation.endsWith('Prepare') || operation === 'validateArtifacts'
@@ -149,6 +153,19 @@ const measure = (operation: BenchmarkOperation, records: number, root: string): 
   try {
     result = runOperation(operation, records, root)
     end = performance.now()
+    if (usageBefore) {
+      const usageAfter = process.resourceUsage()
+      process.stderr.write(
+        `${JSON.stringify({
+          diagnostic: 'cold-hydration',
+          involuntaryContextSwitches: usageAfter.involuntaryContextSwitches - usageBefore.involuntaryContextSwitches,
+          systemCpuMs: (usageAfter.systemCPUTime - usageBefore.systemCPUTime) / 1000,
+          totalMs: end - start,
+          userCpuMs: (usageAfter.userCPUTime - usageBefore.userCPUTime) / 1000,
+          voluntaryContextSwitches: usageAfter.voluntaryContextSwitches - usageBefore.voluntaryContextSwitches,
+        })}\n`,
+      )
+    }
   } finally {
     cacheReadInstrumentation.afterIntegrityValidation = undefined
     cacheReadInstrumentation.beforeResultRead = undefined
