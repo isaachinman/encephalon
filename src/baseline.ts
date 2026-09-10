@@ -1,5 +1,5 @@
 import { lstatSync } from 'node:fs'
-import { extname, resolve } from 'node:path'
+import { resolve } from 'node:path'
 import {
   CanonicalDirectoryChangedError,
   captureCanonicalDirectory,
@@ -24,12 +24,8 @@ import {
   type VerifiedRegularFileEvidence,
   type VerifiedRegularFileObservation,
 } from './verified-file.ts'
-import { observedArray, observedMap, observeWork, rethrowWorkObserverError } from './work-observer.ts'
+import { observedArray, observeWork, rethrowWorkObserverError } from './work-observer.ts'
 
-const MAX_SCANNED_FILES = 100_000
-const MAX_SCANNED_DIRECTORIES = 10_000
-const MAX_SCAN_DEPTH = 20
-const MAX_LANGUAGE_DIRECTORY_ENTRIES = 512
 const MAX_TOP_LEVEL_ENTRIES = 512
 const MAX_WORKFLOW_ENTRIES = 512
 const MAX_PACKAGE_BYTES = 1024 * 1024
@@ -56,7 +52,6 @@ const EXCLUDED_DIRECTORIES = new Set([
   'target',
   'vendor',
 ])
-const EXCLUDED_FILES = new Set(['agents.md', 'claude.md'])
 const RECOGNISED_FILES = new Set([
   'biome.json',
   'biome.jsonc',
@@ -89,31 +84,6 @@ const RECOGNISED_FILES = new Set([
   'vite.config.js',
   'vite.config.ts',
   'yarn.lock',
-])
-const LANGUAGE_BY_EXTENSION = new Map([
-  ['.c', 'C'],
-  ['.cc', 'C++'],
-  ['.cpp', 'C++'],
-  ['.cs', 'C#'],
-  ['.css', 'CSS'],
-  ['.go', 'Go'],
-  ['.html', 'HTML'],
-  ['.java', 'Java'],
-  ['.js', 'JavaScript'],
-  ['.jsx', 'JavaScript'],
-  ['.kt', 'Kotlin'],
-  ['.kts', 'Kotlin'],
-  ['.php', 'PHP'],
-  ['.py', 'Python'],
-  ['.rb', 'Ruby'],
-  ['.rs', 'Rust'],
-  ['.scss', 'SCSS'],
-  ['.sh', 'Shell'],
-  ['.sql', 'SQL'],
-  ['.swift', 'Swift'],
-  ['.ts', 'TypeScript'],
-  ['.tsx', 'TypeScript'],
-  ['.vue', 'Vue'],
 ])
 const PACKAGE_MANAGER_NAMES = ['bun', 'npm', 'pnpm', 'yarn']
 const PACKAGE_MANAGERS = new Set(PACKAGE_MANAGER_NAMES)
@@ -164,36 +134,22 @@ type PackageManagerEvidence =
       status: 'unknown'
     }
 
-type BaselineWork =
-  | 'language-count-write'
-  | 'language-entry'
-  | 'top-level-entry'
-  | 'top-level-fact-write'
-  | 'workflow-entry'
+type BaselineWork = 'top-level-entry' | 'top-level-fact-write' | 'workflow-entry'
 
 type BaselineScanHooks = {
   afterBaselineSources?: (() => void) | undefined
-  afterLanguageDirectoryCapture?: ((path: string) => void) | undefined
   afterOptionalDirectoryLstat?: ((path: string) => void) | undefined
   afterPackageMetadataLstat?: (() => void) | undefined
   afterWorkflowEnumeration?: (() => void) | undefined
-  beforeLanguageDirectoryCapture?: ((path: string) => void) | undefined
   beforePackageMetadataRead?: (() => void) | undefined
   beforeTopLevelRevalidation?: (() => void) | undefined
   beforeWorkflowDirectoryCapture?: (() => void) | undefined
-  maximumScannedDirectories?: number | undefined
-  maximumScannedFiles?: number | undefined
   now?: (() => number) | undefined
-  onLanguageDirectoryScheduled?: (() => void) | undefined
   onWork?: ((operation: BaselineWork) => void) | undefined
 }
 
 type BaselineReason =
-  | 'directory-entry-limit'
-  | 'directory-limit'
-  | 'max-depth'
   | 'package-metadata-error'
-  | 'regular-file-limit'
   | 'top-level-entry-limit'
   | 'unreadable-directory'
   | 'workflow-entry-limit'
@@ -353,12 +309,6 @@ class BaselineObservationAuthority {
       }
     }
   }
-}
-
-type ScanState = {
-  filesSeen: number
-  languageCounts: Map<string, number>
-  truncationReasons: Set<BaselineReason>
 }
 
 type SourceResult<Value> = {
@@ -539,107 +489,6 @@ const readPackageFacts = (
   }
 }
 
-const readBoundedDirectoryEntries = (
-  directory: string,
-  hooks: BaselineScanHooks,
-  authority: BaselineObservationAuthority,
-  parent?: DirectoryWitness,
-) => {
-  invokeBaselinePathHook(hooks.beforeLanguageDirectoryCapture, directory)
-  if (parent !== undefined) {
-    revalidateDirectoryWitness(parent)
-  }
-  const snapshot = captureCanonicalDirectory(
-    directory,
-    MAX_LANGUAGE_DIRECTORY_ENTRIES,
-    undefined,
-    observeWork(hooks.onWork, 'language-entry'),
-  )
-  invokeBaselinePathHook(hooks.afterLanguageDirectoryCapture, directory)
-  if (parent !== undefined) {
-    revalidateDirectoryWitness(parent)
-  }
-  authority.observeDirectory(snapshot.witness)
-  return {
-    entries: snapshot.entries.filter(entry => {
-      const excludedDirectory = entry.isDirectory() && EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())
-      return (
-        safeName(entry.name) &&
-        !entry.isSymbolicLink() &&
-        !EXCLUDED_FILES.has(entry.name.toLowerCase()) &&
-        !excludedDirectory
-      )
-    }),
-    overflow: snapshot.overflow,
-    witness: snapshot.witness,
-  }
-}
-
-const scanLanguages = (root: string, hooks: BaselineScanHooks, authority: BaselineObservationAuthority) => {
-  const state: ScanState = {
-    filesSeen: 0,
-    languageCounts: observedMap(observeWork(hooks.onWork, 'language-count-write')),
-    truncationReasons: new Set(),
-  }
-  const maximumDirectories = hooks.maximumScannedDirectories ?? MAX_SCANNED_DIRECTORIES
-  const maximumFiles = hooks.maximumScannedFiles ?? MAX_SCANNED_FILES
-  const queue: { depth: number; directory: string; parent?: DirectoryWitness }[] = [{ depth: 0, directory: root }]
-  let directoriesScheduled = 1
-  invokeBaselineHook(hooks.onLanguageDirectoryScheduled)
-  scanDirectories: for (const { depth, directory, parent } of queue) {
-    try {
-      const { entries, overflow, witness } = readBoundedDirectoryEntries(directory, hooks, authority, parent)
-      if (overflow) {
-        state.truncationReasons.add('directory-entry-limit')
-      } else {
-        revalidateDirectoryWitness(witness)
-        for (const entry of entries) {
-          const path = resolve(directory, entry.name)
-          if (entry.isDirectory()) {
-            if (depth >= MAX_SCAN_DEPTH) {
-              state.truncationReasons.add('max-depth')
-            } else if (directoriesScheduled >= maximumDirectories) {
-              state.truncationReasons.add('directory-limit')
-            } else {
-              queue.push({ depth: depth + 1, directory: path, parent: witness })
-              directoriesScheduled += 1
-              invokeBaselineHook(hooks.onLanguageDirectoryScheduled)
-            }
-          } else if (entry.isFile()) {
-            if (state.filesSeen >= maximumFiles) {
-              state.truncationReasons.add('regular-file-limit')
-              break scanDirectories
-            }
-            state.filesSeen += 1
-            const language = LANGUAGE_BY_EXTENSION.get(extname(entry.name).toLowerCase())
-            if (language !== undefined) {
-              state.languageCounts.set(language, (state.languageCounts.get(language) ?? 0) + 1)
-            }
-          }
-        }
-      }
-    } catch (error) {
-      rethrowWorkObserverError(error)
-      rethrowBaselineHookError(error)
-      if (error instanceof BaselineGenerationChanged) {
-        throw error
-      }
-      if (isObservedSourceReplacement(error)) {
-        return baselineGenerationChanged()
-      }
-      if (isRecognizedFilesystemError(error)) {
-        authority.observeExpectedFailure(error, () => {
-          captureCanonicalDirectory(directory, MAX_LANGUAGE_DIRECTORY_ENTRIES)
-        })
-        state.truncationReasons.add('unreadable-directory')
-      } else {
-        throw error
-      }
-    }
-  }
-  return state
-}
-
 const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT'
 
 const captureOptionalDirectory = (path: string, hooks: BaselineScanHooks, expected = false) => {
@@ -812,17 +661,10 @@ const invocationForScript = (manager: string, scriptKey: string) => {
   }
 }
 
-const emptyScanState = (): ScanState => ({
-  filesSeen: 0,
-  languageCounts: new Map(),
-  truncationReasons: new Set(),
-})
-
 type CollectedBaselineSources = {
   globalReasons: readonly BaselineReason[]
   layoutResult: SourceResult<ReturnType<typeof emptyTopLevelFacts>>
   packageResult: SourceResult<PackageSource>
-  scan: ScanState
   workflowResult: SourceResult<string[]>
 }
 
@@ -836,7 +678,6 @@ const emptyCollectedBaselineSources = (globalReasons: readonly BaselineReason[])
     reasons: [],
     value: { facts: emptyPackageFacts() },
   },
-  scan: emptyScanState(),
   workflowResult: {
     reasons: [],
     value: [],
@@ -870,16 +711,14 @@ const collectBaselineSources = (root: string, hooks: BaselineScanHooks, authorit
     layoutResult.value.recognisedFiles.includes('package.json'),
     authority,
   )
-  const scan = scanLanguages(root, hooks, authority)
   const workflowResult = workflowFiles(root, hooks, layoutResult.value.directories.includes('.github'), authority)
-  return { globalReasons: [], layoutResult, packageResult, scan, workflowResult }
+  return { globalReasons: [], layoutResult, packageResult, workflowResult }
 }
 
 const buildBaselineRecords = ({
   globalReasons,
   layoutResult,
   packageResult,
-  scan,
   workflowResult,
 }: CollectedBaselineSources): AddRecordInput[] => {
   const layout = layoutResult.value
@@ -889,15 +728,11 @@ const buildBaselineRecords = ({
     packageEvidence.status === 'unknown' || packageEvidence.status === 'conflicted'
       ? undefined
       : packageEvidence.manager
-  const languages = [...scan.languageCounts.entries()]
-    .sort(([first], [second]) => ordinalStringCompare(first, second))
-    .map(([language, files]) => ({ files, language }))
   const workflows = workflowResult.value
   const truncationReasons = new Set([
     ...globalReasons,
     ...layoutResult.reasons,
     ...packageResult.reasons,
-    ...scan.truncationReasons,
     ...workflowResult.reasons,
   ])
   const packageSource = packageResult.value.source === undefined ? [] : [packageResult.value.source]
@@ -913,13 +748,11 @@ const buildBaselineRecords = ({
     {
       kind: 'context',
       payload: {
-        languageCounts: languages,
         recognisedTopLevelFiles: [...layout.recognisedFiles],
-        scannedRegularFiles: scan.filesSeen,
         scanTruncated: truncationReasons.size > 0,
         scanTruncationReasons: [...truncationReasons].sort(ordinalStringCompare),
         sources: safeSources,
-        summary: 'Derived repository overview captured during Encephalon initialisation.',
+        summary: 'Derived shallow repository overview captured during Encephalon initialisation.',
         topLevelDirectories: [...layout.directories],
       },
       source: 'encephalon:init',

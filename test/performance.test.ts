@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import fs, { mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
-import { afterEach, describe, test } from 'node:test'
+import { afterEach, describe, mock, test } from 'node:test'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
 import { addRecordResolved, assertRecordGraph, readRecordsResolved, validateRecordsResolved } from '../src/records.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
@@ -402,7 +403,7 @@ describe('hot scan performance regressions', () => {
     }, undefined)
   })
 
-  test('bounds baseline accumulator work while preserving output order', () => {
+  test('keeps baseline work shallow as nested source inventory grows', () => {
     const root = createRoot()
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'sample-project' }))
     ensureParent(join(root, 'src', 'alpha.ts'))
@@ -413,60 +414,77 @@ describe('hot scan performance regressions', () => {
     ensureParent(join(root, '.github', 'workflows', 'ci.yml'))
     writeFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'name: CI')
 
-    const established = scanBaseline(root)
-    let attempts = 0
-    const work = new Map<string, number>()
-    const observed = scanBaselineWithHooks(root, {
-      afterBaselineSources: () => {
-        attempts += 1
-      },
-      onWork: operation => work.set(operation, (work.get(operation) ?? 0) + 1),
-    })
-
-    assert.equal(attempts, 1)
-    assert.deepEqual(observed, established)
-    assert.deepEqual(Buffer.from(JSON.stringify(observed)), Buffer.from(JSON.stringify(established)))
-    assert.deepEqual(
-      observed.map(record => {
-        const payload = record.payload as Record<string, unknown>
-        return {
-          languageCounts: payload.languageCounts,
-          recognisedFiles: payload.recognisedTopLevelFiles ?? payload.recognisedFiles,
-          subject: record.subject,
-          topLevelDirectories: payload.topLevelDirectories,
+    const canonicalRoot = fs.realpathSync(root)
+    const directoryReads = mock.method(fs, 'opendirSync')
+    syncBuiltinESMExports()
+    try {
+      const established = scanBaseline(root)
+      assert.deepEqual(
+        directoryReads.mock.calls.map(call => call.arguments[0]),
+        [canonicalRoot, join(canonicalRoot, '.github', 'workflows')],
+      )
+      directoryReads.mock.resetCalls()
+      for (const directory of Array.from({ length: 40 }, (_, index) => index)) {
+        const nested = join(root, 'src', `package-${directory}`)
+        mkdirSync(nested)
+        for (const file of Array.from({ length: 100 }, (_, fileIndex) => fileIndex)) {
+          writeFileSync(join(nested, `source-${file}.ts`), 'private body')
         }
-      }),
-      [
-        {
-          languageCounts: [
-            { files: 1, language: 'JavaScript' },
-            { files: 1, language: 'Shell' },
-            { files: 1, language: 'TypeScript' },
-          ],
-          recognisedFiles: ['package.json'],
-          subject: 'encephalon:init/repository-overview',
-          topLevelDirectories: ['.github', 'scripts', 'src'],
+      }
+      let attempts = 0
+      const work = new Map<string, number>()
+      const observed = scanBaselineWithHooks(root, {
+        afterBaselineSources: () => {
+          attempts += 1
         },
-        {
-          languageCounts: undefined,
-          recognisedFiles: ['package.json'],
-          subject: 'encephalon:init/tooling-layout',
-          topLevelDirectories: undefined,
-        },
-        {
-          languageCounts: undefined,
-          recognisedFiles: undefined,
-          subject: 'encephalon:init/commands-ci',
-          topLevelDirectories: undefined,
-        },
-      ],
-    )
-    assert.deepEqual(Object.fromEntries(work), {
-      'language-count-write': 3,
-      'language-entry': 11,
-      'top-level-entry': 6,
-      'top-level-fact-write': 4,
-      'workflow-entry': 1,
-    })
+        onWork: operation => work.set(operation, (work.get(operation) ?? 0) + 1),
+      })
+
+      assert.equal(attempts, 1)
+      assert.deepEqual(observed, established)
+      assert.deepEqual(Buffer.from(JSON.stringify(observed)), Buffer.from(JSON.stringify(established)))
+      assert.deepEqual(
+        observed.map(record => {
+          const payload = record.payload as Record<string, unknown>
+          return {
+            recognisedFiles: payload.recognisedTopLevelFiles ?? payload.recognisedFiles,
+            subject: record.subject,
+            topLevelDirectories: payload.topLevelDirectories,
+          }
+        }),
+        [
+          {
+            recognisedFiles: ['package.json'],
+            subject: 'encephalon:init/repository-overview',
+            topLevelDirectories: ['.github', 'scripts', 'src'],
+          },
+          {
+            recognisedFiles: ['package.json'],
+            subject: 'encephalon:init/tooling-layout',
+            topLevelDirectories: undefined,
+          },
+          {
+            recognisedFiles: undefined,
+            subject: 'encephalon:init/commands-ci',
+            topLevelDirectories: undefined,
+          },
+        ],
+      )
+      assert.deepEqual(Object.fromEntries(work), {
+        'top-level-entry': 6,
+        'top-level-fact-write': 4,
+        'workflow-entry': 1,
+      })
+      assert.deepEqual(
+        directoryReads.mock.calls.map(call => call.arguments[0]),
+        [canonicalRoot, join(canonicalRoot, '.github', 'workflows')],
+      )
+      const overview = observed[0]?.payload as Record<string, unknown>
+      assert.equal(Object.hasOwn(overview, 'languageCounts'), false)
+      assert.equal(Object.hasOwn(overview, 'scannedRegularFiles'), false)
+    } finally {
+      directoryReads.mock.restore()
+      syncBuiltinESMExports()
+    }
   })
 })
