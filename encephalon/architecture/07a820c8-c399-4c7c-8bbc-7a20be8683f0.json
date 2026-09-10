@@ -1,0 +1,39 @@
+{
+  "createdAt": "2026-09-10T16:35:32.130Z",
+  "id": "07a820c8-c399-4c7c-8bbc-7a20be8683f0",
+  "kind": "architecture",
+  "payload": {
+    "summary": "Reuse one immutable verified canonical corpus and a minimal SQLite identity, filter, ordering and FTS projection for each accepted operation.",
+    "authority": [
+      "Reuse ID, case-path, supersession, active-head and artifact indexes across validation, planning and cache operations.",
+      "Bind relative canonical paths to accepted raw SHA-256 witnesses with the domain-separated version-2 fingerprint; do not recursively hash normalised payloads.",
+      "Freeze owned payloads during parser exit actions, preserve mutable independent public results, and capture fixed publication evidence for committed assertions."
+    ],
+    "cache": [
+      "Schema 4 stores records(rowid, id, kind, subject, created_at, active) and ordinary FTS5(text, preview), linked by integer rowid. IDs are unique; writer replacement assigns and publishes both tables and generation metadata in one transaction. Keep WAL synchronous FULL.",
+      "Fresh reads require complete canonical equality in the same verified read transaction as the query. Stream bounded record identities and active bits, prove retained scalar bytes against canonical records, and bind each FTS rowid to exactly one canonical member.",
+      "List, show and full search select ordered IDs and resolve them through that operation's accepted byId map. Charge the existing serialised full-response bytes before cloning each selected record. Compact reads select ID, rank and bounded-preview snippet, deriving remaining fields from canonical facts.",
+      "Never store or parse a second full record JSON corpus in SQLite. Preserve independent mutable result occurrences, existing ordering, filters, Unicode error boundaries and response accounting.",
+      "Compute strict-validation body and preview projections transiently without populating corpus-wide memoised strings. Bound posting and auxiliary shadow rows and storage before native read-only FTS integrity checking.",
+      "Writer predecessors may be validated canonical subsets: derive their own active flags and fingerprint accepted member witnesses in canonical path order before replacement. Full reads separately require complete generation metadata.",
+      "Validate fixed application_id, user_version and metadata schemaVersion, plus the exact complete owned schema. Derive trusted DDL and implicit FTS objects from a short-lived in-memory database using the current SQLite runtime; compare inside SQLite without transferring untrusted schema SQL. Quarantine incompatible generations before rebuilding.",
+      "Reuse a replacement corpus during disposable recovery only after its fixed generation assertion succeeds."
+    ],
+    "scope": [
+      "Preserve graph/error budgets, bounded directory entry generations, numeric-first SQL admission and independent mutable public results.",
+      "Currentness compares retained filesystem observations after initial byte verification; it is not a second content read or an inter-operation metadata-only trust shortcut.",
+      "Keep cache containment, sidecar, hard-link, lock, quarantine and error-precedence protections. No global corpus cache or new public exports."
+    ],
+    "filesystem": [
+      "Read and hash accepted canonical bytes once per unchanged attempt. Closing assertions compare retained full metadata through no-follow descriptor/path checks and bounded canonical root/kind generation checks; they never refresh evidence from a changed generation.",
+      "Probe rejected unreadable evidence again before acceptance. Only accepting an authorised cleanup-induced ctime change rereads canonical bytes and verifies the original digest.",
+      "Capture each unique artifact and parent-linked ancestor once. Retain exact pathname metadata or absence for invalid boundaries; compare shared pathname expectations instead of overwriting them.",
+      "Close artifact evidence with parent-first directory checks, unique entry comparisons and child-first directory checks ending at the brain anchor. Retain the complete relevant ancestor chain for operational open-error classification.",
+      "Keep proof maps private and fixed after collection. Reuse their assertion at accepted query/publication boundaries, preserving fixed publication prefixes, primary-before-close errors and whole-attempt retry limits."
+    ]
+  },
+  "searchText": "minimal SQLite schema canonical corpus record_json removal integer FTS identity exact owned schema streaming proof MAR-2789",
+  "source": "agent",
+  "subject": "canonical.verified-corpus",
+  "supersedes": ["06a643f1-d077-4556-91e8-0929bb6c3f34"]
+}

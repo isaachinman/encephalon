@@ -1,0 +1,14 @@
+{
+  "createdAt": "2026-09-10T16:47:16.495Z",
+  "id": "59c66755-8eb0-4808-91cd-5ccc26bcbccc",
+  "kind": "architecture",
+  "payload": {
+    "summary": "Verify ordinary SQLite record indexes as well as canonical rows and FTS before trusting selection or ordering.",
+    "problem": "An empty replacement rootpage for records_active_order can preserve exact owned schema, canonical rows, metadata and FTS while causing an indexed list query to omit a canonical record.",
+    "decision": "After bounded scalar admission, require read-only pragma_integrity_check for records and its associated indexes inside the verified transaction. Keep the separate bounded FTS native check and exact canonical byte proof. Transfer only the numeric success result and quarantine failures.",
+    "verification": "A deterministic missing-index-entry fixture preserves the logical cache projection, reproduces an empty public list without this check, then proves one quarantine restores the canonical result."
+  },
+  "searchText": "SQLite ordinary index integrity missing ordering entry canonical equivalence MAR-2789",
+  "source": "agent",
+  "subject": "cache.index-integrity"
+}

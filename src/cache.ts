@@ -1,9 +1,7 @@
-import { isUtf8 } from 'node:buffer'
 import { type BigIntStats, lstatSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
-import { isDeepStrictEqual } from 'node:util'
 import {
   parseCompactSearchRecordsInput,
   parseFullSearchRecordsInput,
@@ -45,14 +43,13 @@ import { recordCorpusFingerprint } from './record-corpus-fingerprint.ts'
 import { MAX_SEARCH_PREVIEW_BYTES, searchDocumentForRecord, searchPreviewForRecord } from './record-projection.ts'
 import {
   canonicalCacheManifest,
-  canonicalRecordPath,
   type RecordReadHooks,
   readValidatedRecordSnapshotResolved,
   type VerifiedCorpus,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import { createResponseByteBudget, type ResponseByteBudget } from './response-budget.ts'
-import { parseRecordFile, validateArtifactPath } from './schema.ts'
+import { validateArtifactPath } from './schema.ts'
 import { literalMatchQuery, MAX_NFC_UTF8_EXPANSION_FACTOR } from './search-text.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type {
@@ -68,24 +65,23 @@ import type {
   ShowRecordInput,
 } from './types.ts'
 
-const SCHEMA_VERSION = '3'
+const SCHEMA_VERSION = '4'
+const CACHE_APPLICATION_ID = 0x45_4e_43_50
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
 const MAX_GATHER_SEARCHES = OPERATION_BUDGETS.gatherSearches.maximum
 const MAX_GATHER_SHOWS = OPERATION_BUDGETS.gatherShows.maximum
 const SQLITE_BUSY_TIMEOUT_MILLISECONDS = 1000
 const MAX_CACHE_METADATA_BYTES = 1024 * 1024
 const MAX_CACHE_SCHEMA_BYTES = 4 * 1024
-const MAX_CACHE_RECORD_OVERHEAD_BYTES = 4096
-const MAX_CACHE_RECORD_BYTES = CANONICAL_BUDGETS.recordBytes + MAX_CACHE_RECORD_OVERHEAD_BYTES
-const MAX_CACHE_RECORD_JSON_BYTES =
-  CANONICAL_BUDGETS.recordJsonBytes + CANONICAL_BUDGETS.records * MAX_CACHE_RECORD_OVERHEAD_BYTES
-const MAX_CACHE_RECORD_TEXT_BYTES = MAX_CACHE_RECORD_JSON_BYTES * 2
+// Search text contains canonical fields and the flattened payload, with NFC expansion.
+const MAX_CACHE_SEARCH_SOURCE_BYTES = CANONICAL_BUDGETS.recordBytes + 4096
+const MAX_CACHE_SEARCH_SOURCE_AGGREGATE_BYTES = CANONICAL_BUDGETS.recordJsonBytes + CANONICAL_BUDGETS.records * 4096
 const MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR = 2
 const MAX_CACHE_SEARCH_DOCUMENT_BYTES =
-  MAX_CACHE_RECORD_BYTES * MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR * MAX_NFC_UTF8_EXPANSION_FACTOR
+  MAX_CACHE_SEARCH_SOURCE_BYTES * MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR * MAX_NFC_UTF8_EXPANSION_FACTOR
 const MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES =
-  MAX_CACHE_RECORD_JSON_BYTES * MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR * MAX_NFC_UTF8_EXPANSION_FACTOR
-const MAX_CACHE_FTS_ID_BYTES = CANONICAL_BUDGETS.records * 255
+  MAX_CACHE_SEARCH_SOURCE_AGGREGATE_BYTES * MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR * MAX_NFC_UTF8_EXPANSION_FACTOR
+
 const MAX_CACHE_SEARCH_PREVIEW_BYTES = MAX_SEARCH_PREVIEW_BYTES
 const MAX_CACHE_SEARCH_PREVIEW_AGGREGATE_BYTES = CANONICAL_BUDGETS.records * MAX_CACHE_SEARCH_PREVIEW_BYTES
 const MAX_CACHE_SEARCH_INDEX_BYTES = MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES * 2
@@ -132,36 +128,16 @@ type ManifestEntry = {
   ctimeNanoseconds?: string
 }
 
-type RecordRow = {
-  record_json: unknown
-  record_bytes?: unknown
-}
+type RecordRow = { id?: unknown }
 
-type CompactRow = {
-  id: unknown
-  kind: unknown
-  subject: unknown
-  path: unknown
-  summary: unknown
-  rank: unknown
-  snippet: unknown
+type CompactRow = RecordRow & {
+  rank?: unknown
+  snippet?: unknown
 }
 
 type SearchStatementInput = Pick<SearchRecordsInput, 'includeSuperseded' | 'kind' | 'limit'>
 
-type CacheIntegrityProbeName =
-  | 'metadata'
-  | 'metadata-columns'
-  | 'metadata-schema'
-  | 'records'
-  | 'records-active-order-index'
-  | 'records-columns'
-  | 'records-indexes'
-  | 'records-kind-subject-index'
-  | 'records-schema'
-  | 'record-search'
-  | 'record-search-columns'
-  | 'record-search-schema'
+type CacheIntegrityProbeName = 'metadata' | 'records' | 'record-search' | 'schema'
 
 type CacheIntegrityProbe = {
   exceeds_aggregate_bytes?: unknown
@@ -178,126 +154,17 @@ type CacheIntegrityObservation = {
   rows: number
 }
 
-type ExpectedOrdinaryColumn = Readonly<{
-  constraint?: string
-  name: string
-  notNull: 0 | 1
-  primaryKeyPosition: 0 | 1
-  type: 'INTEGER' | 'TEXT'
-}>
-
-type ExpectedIndexColumn = Readonly<{
-  collation: 'BINARY'
-  descending: 0 | 1
-  name: string
-}>
-
-const METADATA_COLUMNS = [
-  { name: 'key', notNull: 0, primaryKeyPosition: 1, type: 'TEXT' },
-  { name: 'value', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
-] as const satisfies readonly ExpectedOrdinaryColumn[]
-
-const RECORD_COLUMNS = [
-  { name: 'id', notNull: 0, primaryKeyPosition: 1, type: 'TEXT' },
-  { name: 'kind', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
-  { name: 'subject', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
-  { name: 'source', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
-  { name: 'created_at', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
-  { name: 'path', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
-  {
-    constraint: 'CHECK (active IN (0, 1))',
-    name: 'active',
-    notNull: 1,
-    primaryKeyPosition: 0,
-    type: 'INTEGER',
-  },
-  { name: 'summary', notNull: 0, primaryKeyPosition: 0, type: 'TEXT' },
-  { name: 'record_json', notNull: 1, primaryKeyPosition: 0, type: 'TEXT' },
-] as const satisfies readonly ExpectedOrdinaryColumn[]
-
-const ordinaryTableDefinition = (columns: readonly ExpectedOrdinaryColumn[]) => `(
-${columns
-  .map(
-    column =>
-      `  ${[
-        column.name,
-        column.type,
-        column.primaryKeyPosition === 1 ? 'PRIMARY KEY' : undefined,
-        column.notNull === 1 ? 'NOT NULL' : undefined,
-        column.constraint,
-      ]
-        .filter(part => part !== undefined)
-        .join(' ')}`,
-  )
-  .join(',\n')}
-)`
-
-const METADATA_TABLE_DEFINITION = ordinaryTableDefinition(METADATA_COLUMNS)
-const RECORDS_TABLE_DEFINITION = ordinaryTableDefinition(RECORD_COLUMNS)
-
-const RECORDS_INDEXES = [
-  {
-    columns: [
-      { collation: 'BINARY', descending: 0, name: 'active' },
-      { collation: 'BINARY', descending: 1, name: 'created_at' },
-      { collation: 'BINARY', descending: 1, name: 'id' },
-    ],
-    name: 'records_active_order',
-    probeName: 'records-active-order-index',
-  },
-  {
-    columns: [
-      { collation: 'BINARY', descending: 0, name: 'kind' },
-      { collation: 'BINARY', descending: 0, name: 'subject' },
-    ],
-    name: 'records_kind_subject',
-    probeName: 'records-kind-subject-index',
-  },
-] as const satisfies readonly {
-  columns: readonly ExpectedIndexColumn[]
-  name: string
-  probeName: CacheIntegrityProbeName
-}[]
-
-const RECORDS_INDEX_DEFINITIONS = RECORDS_INDEXES.map(
-  index =>
-    `CREATE INDEX ${index.name} ON records(${index.columns
-      .map(column => `${column.name}${column.descending === 1 ? ' DESC' : ''}`)
-      .join(', ')})`,
-).join(';\n')
-
-const RECORD_SEARCH_DEFINITION = 'fts5(id UNINDEXED, text, preview)'
-
-const schemaTokenPattern =
-  /\s+|--[^\r\n]*|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[(?:\]\]|[^\]])*\]|[A-Za-z_][A-Za-z0-9_]*|\d+|[(),]|\S/g
-
-const schemaToken = (token: string) => {
-  if (/^\s+$|^--|^\/\*/.test(token)) {
-    return []
-  }
-  if (token.startsWith('"')) {
-    return [token.slice(1, -1).replaceAll('""', '"').toLowerCase()]
-  }
-  if (token.startsWith('`')) {
-    return [token.slice(1, -1).replaceAll('``', '`').toLowerCase()]
-  }
-  if (token.startsWith('[')) {
-    return [token.slice(1, -1).replaceAll(']]', ']').toLowerCase()]
-  }
-  return [token.toLowerCase()]
-}
-
-const ownedSchemaTokens = (sql: string) => {
-  const tokens = [...sql.matchAll(schemaTokenPattern)].flatMap(match => schemaToken(match[0]))
-  const tableIndex = tokens.indexOf('table')
-  const optionalClause = tokens.slice(tableIndex + 1, tableIndex + 4).join(' ')
-  return optionalClause === 'if not exists'
-    ? [...tokens.slice(0, tableIndex + 1), ...tokens.slice(tableIndex + 4)]
-    : tokens
-}
-
-const sameOwnedSchema = (actual: string, expected: string) =>
-  JSON.stringify(ownedSchemaTokens(actual)) === JSON.stringify(ownedSchemaTokens(expected))
+// These columns support identity joins, filtering and deterministic ordering. Full values,
+// paths and summaries belong to the operation's verified canonical corpus.
+const CACHE_SCHEMA = [
+  'CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+  `CREATE TABLE records (rowid INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL, subject TEXT NOT NULL, created_at TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0, 1)))`,
+  'CREATE INDEX records_active_order ON records(active, created_at DESC, id DESC)',
+  'CREATE INDEX records_kind_subject ON records(kind, subject)',
+  'CREATE VIRTUAL TABLE record_search USING fts5(text, preview)',
+] as const
 
 type CacheReadTestHooks = {
   afterCanonicalCacheEqualityValidation?: (() => void) | undefined
@@ -419,319 +286,6 @@ const readIntegrityProbe = (
   return observation
 }
 
-const assertTableColumns = (database: DatabaseSync, table: 'record_search', expected: readonly string[]) => {
-  const maximumRows = expected.length + 1
-  const maximumNameBytes = Math.max(...expected.map(name => Buffer.byteLength(name, 'utf8')))
-  const probeName = `${table.replace('_', '-')}-columns` as CacheIntegrityProbeName
-  const probe = readIntegrityProbe(
-    probeName,
-    database
-      .prepare(
-        `SELECT
-          COUNT(*) AS row_count,
-          0 AS exceeds_aggregate_bytes,
-          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
-          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
-        FROM (
-          SELECT
-            CASE WHEN typeof(name) = 'text' THEN 0 ELSE 1 END AS invalid_type,
-            CASE WHEN typeof(name) = 'text' AND length(CAST(name AS BLOB)) <= ? THEN 0 ELSE 1 END AS oversized
-          FROM pragma_table_info(?)
-          LIMIT ?
-        )`,
-      )
-      .get(maximumNameBytes, table, maximumRows) as CacheIntegrityProbe | undefined,
-    maximumRows,
-  )
-  if (
-    probe.rows !== expected.length ||
-    probe.exceedsAggregateBytes !== 0 ||
-    probe.hasInvalidType !== 0 ||
-    probe.hasOversizedValue !== 0
-  ) {
-    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
-  }
-  cacheReadTestHooks.beforeIntegrityTextRead?.(probeName)
-  const columns = database
-    .prepare('SELECT name FROM pragma_table_info(?) LIMIT ?')
-    .iterate(table, maximumRows) as Iterable<{
-    name?: unknown
-  }>
-  const names = [...columns].map(column => column.name)
-  if (JSON.stringify(names) !== JSON.stringify(expected)) {
-    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
-  }
-}
-
-const assertOrdinaryTableSchema = (
-  database: DatabaseSync,
-  table: 'metadata' | 'records',
-  expected: readonly ExpectedOrdinaryColumn[],
-) => {
-  const maximumRows = expected.length + 1
-  const maximumNameBytes = Math.max(...expected.map(column => Buffer.byteLength(column.name, 'utf8')))
-  const maximumTypeBytes = Math.max(...expected.map(column => Buffer.byteLength(column.type, 'utf8')))
-  const probeName = `${table.replace('_', '-')}-columns` as CacheIntegrityProbeName
-  const probe = readIntegrityProbe(
-    probeName,
-    database
-      .prepare(
-        `SELECT
-          COUNT(*) AS row_count,
-          0 AS exceeds_aggregate_bytes,
-          CASE WHEN TOTAL(invalid_type) > 0
-                    OR (SELECT COUNT(*) FROM (
-                      SELECT 1
-                      FROM pragma_table_list
-                      WHERE schema = 'main' AND name = ?1 AND type = 'table'
-                      LIMIT 2
-                    )) != 1
-               THEN 1 ELSE 0 END AS has_invalid_type,
-          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
-        FROM (
-          SELECT
-            CASE WHEN typeof(cid) = 'integer'
-                       AND typeof(name) = 'text'
-                       AND typeof(type) = 'text'
-                       AND typeof("notnull") = 'integer'
-                       AND "notnull" IN (0, 1)
-                       AND dflt_value IS NULL
-                       AND typeof(pk) = 'integer'
-                       AND pk IN (0, 1)
-                       AND typeof(hidden) = 'integer'
-                       AND hidden = 0
-                 THEN 0 ELSE 1 END AS invalid_type,
-            CASE WHEN typeof(name) = 'text' AND length(CAST(name AS BLOB)) <= ?2
-                       AND typeof(type) = 'text' AND length(CAST(type AS BLOB)) <= ?3
-                 THEN 0 ELSE 1 END AS oversized
-          FROM pragma_table_xinfo(?1)
-          LIMIT ?4
-        )`,
-      )
-      .get(table, maximumNameBytes, maximumTypeBytes, maximumRows) as CacheIntegrityProbe | undefined,
-    maximumRows,
-  )
-  if (
-    probe.rows !== expected.length ||
-    probe.exceedsAggregateBytes !== 0 ||
-    probe.hasInvalidType !== 0 ||
-    probe.hasOversizedValue !== 0
-  ) {
-    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
-  }
-  cacheReadTestHooks.beforeIntegrityTextRead?.(probeName)
-  const columns = database
-    .prepare(
-      `SELECT
-        cid,
-        name,
-        upper(type) AS type,
-        "notnull" AS not_null,
-        pk,
-        hidden,
-        CASE WHEN dflt_value IS NULL THEN 1 ELSE 0 END AS default_absent
-      FROM pragma_table_xinfo(?)
-      ORDER BY cid
-      LIMIT ?`,
-    )
-    .iterate(table, maximumRows) as Iterable<{
-    cid?: unknown
-    default_absent?: unknown
-    hidden?: unknown
-    name?: unknown
-    not_null?: unknown
-    pk?: unknown
-    type?: unknown
-  }>
-  const descriptors = [...columns].map(column => ({
-    defaultAbsent: column.default_absent,
-    hidden: column.hidden,
-    name: column.name,
-    notNull: column.not_null,
-    primaryKeyPosition: column.pk,
-    type: column.type,
-  }))
-  const expectedDescriptors = expected.map(column => ({
-    defaultAbsent: 1,
-    hidden: 0,
-    name: column.name,
-    notNull: column.notNull,
-    primaryKeyPosition: column.primaryKeyPosition,
-    type: column.type,
-  }))
-  if (JSON.stringify(descriptors) !== JSON.stringify(expectedDescriptors)) {
-    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
-  }
-}
-
-const assertOrdinaryTableDefinition = (database: DatabaseSync, table: 'metadata' | 'records', definition: string) => {
-  const probeName = `${table}-schema` as CacheIntegrityProbeName
-  const probe = readIntegrityProbe(
-    probeName,
-    database
-      .prepare(
-        `SELECT
-          COUNT(*) AS row_count,
-          0 AS exceeds_aggregate_bytes,
-          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
-          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
-        FROM (
-          SELECT
-            CASE WHEN typeof(sql) = 'text' THEN 0 ELSE 1 END AS invalid_type,
-            CASE WHEN typeof(sql) = 'text' AND length(CAST(sql AS BLOB)) <= ?1
-                 THEN 0 ELSE 1 END AS oversized
-          FROM sqlite_schema
-          WHERE type = 'table' AND name = ?2
-          LIMIT 2
-        )`,
-      )
-      .get(MAX_CACHE_SCHEMA_BYTES, table) as CacheIntegrityProbe | undefined,
-    2,
-  )
-  if (
-    probe.rows !== 1 ||
-    probe.exceedsAggregateBytes !== 0 ||
-    probe.hasInvalidType !== 0 ||
-    probe.hasOversizedValue !== 0
-  ) {
-    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
-  }
-  cacheReadTestHooks.beforeIntegrityTextRead?.(probeName)
-  const row = database.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ? LIMIT 2").get(table) as
-    | { sql?: unknown }
-    | undefined
-  if (typeof row?.sql !== 'string' || !sameOwnedSchema(row.sql, `CREATE TABLE ${table} ${definition}`)) {
-    throw new CacheSchemaMismatch(`The ${table} cache table has an incompatible schema.`)
-  }
-}
-
-const assertRecordsIndex = (
-  database: DatabaseSync,
-  name: string,
-  probeName: CacheIntegrityProbeName,
-  expected: readonly ExpectedIndexColumn[],
-) => {
-  const maximumRows = expected.length + 1
-  const maximumNameBytes = Math.max(...expected.map(column => Buffer.byteLength(column.name, 'utf8')))
-  const maximumCollationBytes = Buffer.byteLength('BINARY', 'utf8')
-  const probe = readIntegrityProbe(
-    probeName,
-    database
-      .prepare(
-        `SELECT
-          COUNT(*) AS row_count,
-          0 AS exceeds_aggregate_bytes,
-          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
-          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
-        FROM (
-          SELECT
-            CASE WHEN typeof(seqno) = 'integer'
-                       AND typeof(cid) = 'integer'
-                       AND cid >= 0
-                       AND typeof(name) = 'text'
-                       AND typeof(desc) = 'integer'
-                       AND desc IN (0, 1)
-                       AND typeof(coll) = 'text'
-                       AND key = 1
-                 THEN 0 ELSE 1 END AS invalid_type,
-            CASE WHEN typeof(name) = 'text' AND length(CAST(name AS BLOB)) <= ?2
-                       AND typeof(coll) = 'text' AND length(CAST(coll AS BLOB)) <= ?3
-                 THEN 0 ELSE 1 END AS oversized
-          FROM pragma_index_xinfo(?1)
-          WHERE key = 1
-          ORDER BY seqno
-          LIMIT ?4
-        )`,
-      )
-      .get(name, maximumNameBytes, maximumCollationBytes, maximumRows) as CacheIntegrityProbe | undefined,
-    maximumRows,
-  )
-  if (
-    probe.rows !== expected.length ||
-    probe.exceedsAggregateBytes !== 0 ||
-    probe.hasInvalidType !== 0 ||
-    probe.hasOversizedValue !== 0
-  ) {
-    throw new CacheSchemaMismatch(`The ${name} cache index has an incompatible schema.`)
-  }
-  cacheReadTestHooks.beforeIntegrityTextRead?.(probeName)
-  const rows = database
-    .prepare(
-      `SELECT name, desc AS descending, upper(coll) AS collation
-       FROM pragma_index_xinfo(?)
-       WHERE key = 1
-       ORDER BY seqno
-       LIMIT ?`,
-    )
-    .iterate(name, maximumRows) as Iterable<{
-    collation?: unknown
-    descending?: unknown
-    name?: unknown
-  }>
-  const observed = [...rows].map(row => ({
-    collation: row.collation,
-    descending: row.descending,
-    name: row.name,
-  }))
-  if (JSON.stringify(observed) !== JSON.stringify(expected)) {
-    throw new CacheSchemaMismatch(`The ${name} cache index has an incompatible schema.`)
-  }
-}
-
-const assertRecordsIndexes = (database: DatabaseSync) => {
-  const maximumRows = RECORDS_INDEXES.length + 1
-  const maximumNameBytes = Math.max(...RECORDS_INDEXES.map(index => Buffer.byteLength(index.name, 'utf8')))
-  const probe = readIntegrityProbe(
-    'records-indexes',
-    database
-      .prepare(
-        `SELECT
-          COUNT(*) AS row_count,
-          0 AS exceeds_aggregate_bytes,
-          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
-          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
-        FROM (
-          SELECT
-            CASE WHEN typeof(name) = 'text'
-                       AND typeof("unique") = 'integer'
-                       AND "unique" = 0
-                       AND origin = 'c'
-                       AND typeof(partial) = 'integer'
-                       AND partial = 0
-                 THEN 0 ELSE 1 END AS invalid_type,
-            CASE WHEN typeof(name) = 'text' AND length(CAST(name AS BLOB)) <= ?
-                 THEN 0 ELSE 1 END AS oversized
-          FROM pragma_index_list('records')
-          WHERE origin = 'c'
-          LIMIT ?
-        )`,
-      )
-      .get(maximumNameBytes, maximumRows) as CacheIntegrityProbe | undefined,
-    maximumRows,
-  )
-  if (
-    probe.rows !== RECORDS_INDEXES.length ||
-    probe.exceedsAggregateBytes !== 0 ||
-    probe.hasInvalidType !== 0 ||
-    probe.hasOversizedValue !== 0
-  ) {
-    throw new CacheSchemaMismatch('The records cache indexes have an incompatible schema.')
-  }
-  cacheReadTestHooks.beforeIntegrityTextRead?.('records-indexes')
-  const names = [
-    ...(database
-      .prepare("SELECT name FROM pragma_index_list('records') WHERE origin = 'c' ORDER BY name LIMIT ?")
-      .iterate(maximumRows) as Iterable<{ name?: unknown }>),
-  ].map(row => row.name)
-  const expectedNames = RECORDS_INDEXES.map(index => index.name).toSorted()
-  if (JSON.stringify(names) !== JSON.stringify(expectedNames)) {
-    throw new CacheSchemaMismatch('The records cache indexes have an incompatible schema.')
-  }
-  for (const index of RECORDS_INDEXES) {
-    assertRecordsIndex(database, index.name, index.probeName, index.columns)
-  }
-}
-
 const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync']) => {
   if (sqliteFeaturesVerified) {
     return
@@ -758,51 +312,47 @@ const verifySQLiteFeatures = (DatabaseConstructor: SQLiteModule['DatabaseSync'])
 }
 
 const assertCacheSchemaUnchecked = (database: DatabaseSync) => {
-  assertOrdinaryTableSchema(database, 'metadata', METADATA_COLUMNS)
-  assertOrdinaryTableDefinition(database, 'metadata', METADATA_TABLE_DEFINITION)
-  assertOrdinaryTableSchema(database, 'records', RECORD_COLUMNS)
-  assertOrdinaryTableDefinition(database, 'records', RECORDS_TABLE_DEFINITION)
-  assertRecordsIndexes(database)
-  const searchSchemaProbe = readIntegrityProbe(
-    'record-search-schema',
+  const version = database.prepare('SELECT * FROM pragma_application_id(), pragma_user_version()').get()
+  if (version?.application_id !== CACHE_APPLICATION_ID || version?.user_version !== Number(SCHEMA_VERSION)) {
+    throw new CacheSchemaMismatch('The cache schema version is incompatible.')
+  }
+  // Ask this SQLite runtime for its trusted normalised DDL, including implicit indexes
+  // and FTS shadow objects. Never interpret or transfer the cache's untrusted schema SQL.
+  const reference = new (loadSQLite().DatabaseSync)(':memory:')
+  const expected = (() => {
+    try {
+      createCacheSchema(reference)
+      return Array.from(reference.prepare('SELECT type, name, tbl_name, sql FROM sqlite_schema').iterate()) as Array<{
+        type: string
+        name: string
+        tbl_name: string
+        sql: string | null
+      }>
+    } finally {
+      reference.close()
+    }
+  })()
+  const maximumRows = expected.length + 1
+  const probe = readIntegrityProbe(
+    'schema',
     database
-      .prepare(
-        `SELECT
-          COUNT(*) AS row_count,
-          0 AS exceeds_aggregate_bytes,
-          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
-          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
-        FROM (
-          SELECT
-            CASE WHEN typeof(sql) = 'text' THEN 0 ELSE 1 END AS invalid_type,
-            CASE WHEN typeof(sql) = 'text' AND length(CAST(sql AS BLOB)) <= ? THEN 0 ELSE 1 END AS oversized
-          FROM sqlite_master
-          WHERE type = 'table' AND name = 'record_search'
-          LIMIT 2
-        )`,
-      )
-      .get(MAX_CACHE_SCHEMA_BYTES) as CacheIntegrityProbe | undefined,
-    2,
+      .prepare(`SELECT COUNT(*) AS row_count,
+      0 AS exceeds_aggregate_bytes, 0 AS has_invalid_type,
+      CASE WHEN MAX(octet_length(sql)) > ? THEN 1 ELSE 0 END AS has_oversized_value
+      FROM (SELECT sql FROM sqlite_schema LIMIT ?)`)
+      .get(MAX_CACHE_SCHEMA_BYTES, maximumRows) as CacheIntegrityProbe | undefined,
+    maximumRows,
   )
-  if (
-    searchSchemaProbe.rows !== 1 ||
-    searchSchemaProbe.exceedsAggregateBytes !== 0 ||
-    searchSchemaProbe.hasInvalidType !== 0 ||
-    searchSchemaProbe.hasOversizedValue !== 0
-  ) {
-    throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
+  if (probe.rows !== expected.length || probe.hasOversizedValue !== 0) {
+    throw new CacheSchemaMismatch('The cache has an incompatible owned schema.')
   }
-  cacheReadTestHooks.beforeIntegrityTextRead?.('record-search-schema')
-  const searchSchema = database
-    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'record_search' LIMIT 2")
-    .get() as { sql?: unknown } | undefined
-  if (
-    typeof searchSchema?.sql !== 'string' ||
-    !sameOwnedSchema(searchSchema.sql, `CREATE VIRTUAL TABLE record_search USING ${RECORD_SEARCH_DEFINITION}`)
-  ) {
-    throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
+  const match = database.prepare(`SELECT COUNT(*) AS matches FROM sqlite_schema
+    WHERE type = ? AND name = ? AND tbl_name = ? AND sql IS ?`)
+  for (const object of expected) {
+    if (match.get(object.type, object.name, object.tbl_name, object.sql)?.matches !== 1) {
+      throw new CacheSchemaMismatch('The cache has an incompatible owned schema.')
+    }
   }
-  assertTableColumns(database, 'record_search', ['id', 'text', 'preview'])
 }
 
 const assertCacheSchema = (database: DatabaseSync) => {
@@ -822,12 +372,8 @@ const assertCacheSchema = (database: DatabaseSync) => {
 }
 
 const createCacheSchema = (database: DatabaseSync) => {
-  database.exec(`
-    CREATE TABLE metadata ${METADATA_TABLE_DEFINITION};
-    CREATE TABLE records ${RECORDS_TABLE_DEFINITION};
-    ${RECORDS_INDEX_DEFINITIONS};
-    CREATE VIRTUAL TABLE record_search USING ${RECORD_SEARCH_DEFINITION};
-  `)
+  database.exec(`PRAGMA application_id = ${CACHE_APPLICATION_ID}; PRAGMA user_version = ${SCHEMA_VERSION};
+    ${CACHE_SCHEMA.join(';')};`)
 }
 
 const assertCacheTransaction = (database: DatabaseSync, validate: (opened: DatabaseSync) => void): void => {
@@ -1085,26 +631,6 @@ const validateCachedArtifactPath = (value: unknown) => {
   }
 }
 
-const parseCachedRecord = (value: unknown): BrainRecord => {
-  const parsed = parseCacheJson(value, MAX_CACHE_RECORD_BYTES)
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new CacheSchemaMismatch('Cached record JSON must be an object.')
-  }
-  const { path, ...recordFile } = parsed as Record<string, unknown>
-  if (typeof path !== 'string') {
-    throw new CacheSchemaMismatch('Cached record JSON must include a runtime path.')
-  }
-  try {
-    const record = parseRecordFile(recordFile)
-    if (path === canonicalRecordPath(record)) {
-      return { ...record, path }
-    }
-  } catch {
-    // Normalise every cached-row validation failure into disposable cache corruption.
-  }
-  throw new CacheSchemaMismatch('Cached record JSON does not match the canonical record schema.')
-}
-
 const readMetadata = (database: DatabaseSync): Metadata | undefined => {
   const maximumRows = METADATA_KEYS.length + 1
   const maximumKeyBytes = Math.max(...METADATA_KEYS.map(key => Buffer.byteLength(key, 'utf8')))
@@ -1180,6 +706,7 @@ const readMetadata = (database: DatabaseSync): Metadata | undefined => {
   const artifactPaths = parseCacheJson(artifactPathsValue, MAX_CACHE_METADATA_BYTES)
   const recordsIndexed = /^(?:0|[1-9]\d*)$/.test(recordsIndexedValue) ? Number(recordsIndexedValue) : Number.NaN
   if (
+    schemaVersion !== SCHEMA_VERSION ||
     !Array.isArray(artifactPaths) ||
     artifactPaths.length > CANONICAL_BUDGETS.records ||
     (recordFingerprint !== undefined && !/^[0-9a-f]{64}$/u.test(recordFingerprint)) ||
@@ -1262,7 +789,7 @@ const assertSearchIndexBounded = (database: DatabaseSync) => {
         typeof row.bytes !== 'number' ||
         !Number.isSafeInteger(row.bytes) ||
         row.bytes < 0 ||
-        row.bytes > MAX_CACHE_RECORD_BYTES ||
+        row.bytes > MAX_CACHE_SEARCH_SOURCE_BYTES ||
         row.bytes > MAX_CACHE_SEARCH_INDEX_BYTES - totalBytes
       ) {
         throw new CacheSchemaMismatch('The cache search index exceeds its storage bounds.')
@@ -1277,51 +804,20 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
   const recordsProbe = readIntegrityProbe(
     'records',
     database
-      .prepare(
-        `SELECT
-          COUNT(*) AS row_count,
-          CASE WHEN TOTAL(record_json_bytes) > ?1 OR TOTAL(record_text_bytes) > ?2
-            THEN 1 ELSE 0 END AS exceeds_aggregate_bytes,
-          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
-          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
-        FROM (
-          SELECT
-            CASE WHEN typeof(id) = 'text'
-                       AND typeof(kind) = 'text'
-                       AND typeof(subject) = 'text'
-                       AND typeof(source) = 'text'
-                       AND typeof(created_at) = 'text'
-                       AND typeof(path) = 'text'
-                       AND typeof(active) = 'integer'
-                       AND active IN (0, 1)
-                       AND typeof(summary) IN ('null', 'text')
-                       AND typeof(record_json) = 'text'
-                 THEN 0 ELSE 1 END AS invalid_type,
-            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= ?3
-                       AND typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= ?3
-                       AND typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= ?3
-                       AND typeof(source) = 'text' AND length(CAST(source AS BLOB)) <= ?3
-                       AND typeof(created_at) = 'text' AND length(CAST(created_at AS BLOB)) <= ?3
-                       AND typeof(path) = 'text' AND length(CAST(path AS BLOB)) <= ?3
-                       AND (typeof(summary) = 'null'
-                         OR (typeof(summary) = 'text' AND length(CAST(summary AS BLOB)) <= ?3))
-                       AND typeof(record_json) = 'text' AND length(CAST(record_json AS BLOB)) <= ?3
-                 THEN 0 ELSE 1 END AS oversized,
-            CASE WHEN typeof(record_json) = 'text'
-                 THEN length(CAST(record_json AS BLOB)) ELSE 0 END AS record_json_bytes,
-            (CASE WHEN typeof(id) = 'text' THEN length(CAST(id AS BLOB)) ELSE 0 END
-              + CASE WHEN typeof(kind) = 'text' THEN length(CAST(kind AS BLOB)) ELSE 0 END
-              + CASE WHEN typeof(subject) = 'text' THEN length(CAST(subject AS BLOB)) ELSE 0 END
-              + CASE WHEN typeof(source) = 'text' THEN length(CAST(source AS BLOB)) ELSE 0 END
-              + CASE WHEN typeof(created_at) = 'text' THEN length(CAST(created_at AS BLOB)) ELSE 0 END
-              + CASE WHEN typeof(path) = 'text' THEN length(CAST(path AS BLOB)) ELSE 0 END
-              + CASE WHEN typeof(summary) = 'text' THEN length(CAST(summary AS BLOB)) ELSE 0 END
-            ) AS record_text_bytes
-          FROM records
-          LIMIT ?4
-        )`,
-      )
-      .get(MAX_CACHE_RECORD_JSON_BYTES, MAX_CACHE_RECORD_TEXT_BYTES, MAX_CACHE_RECORD_BYTES, maximumRows) as
+      .prepare(`SELECT COUNT(*) AS row_count,
+      CASE WHEN TOTAL(text_bytes) > ?1 THEN 1 ELSE 0 END AS exceeds_aggregate_bytes,
+      CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+      CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+      FROM (SELECT
+        CASE WHEN typeof(id) = 'text' AND typeof(kind) = 'text' AND typeof(subject) = 'text'
+          AND typeof(created_at) = 'text' AND typeof(active) = 'integer' AND active IN (0, 1)
+          THEN 0 ELSE 1 END AS invalid_type,
+        CASE WHEN octet_length(id) <= 255 AND octet_length(kind) <= 255
+          AND octet_length(subject) <= ?2 AND octet_length(created_at) <= ?2
+          THEN 0 ELSE 1 END AS oversized,
+        octet_length(id) + octet_length(kind) + octet_length(subject) + octet_length(created_at) AS text_bytes
+        FROM records LIMIT ?3)`)
+      .get(CANONICAL_BUDGETS.recordJsonBytes, CANONICAL_BUDGETS.recordBytes, maximumRows) as
       | CacheIntegrityProbe
       | undefined,
     maximumRows,
@@ -1335,77 +831,61 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
   ) {
     throw new CacheSchemaMismatch('The cache record table does not match its metadata.')
   }
+  const recordsIntegrity = database
+    .prepare("SELECT integrity_check = 'ok' AS valid FROM pragma_integrity_check('records') LIMIT 1")
+    .get()
+  if (recordsIntegrity?.valid !== 1) {
+    throw new CacheSchemaMismatch('The cache record indexes are inconsistent.')
+  }
   cacheReadTestHooks.beforeIntegrityTextRead?.('records')
-  const recordRows = database
-    .prepare('SELECT id, active FROM records ORDER BY id COLLATE BINARY LIMIT ?')
-    .iterate(maximumRows) as Iterable<{
+  const recordKeys = database.prepare(
+    'SELECT rowid, CAST(id AS BLOB) AS id_bytes, active FROM records ORDER BY id LIMIT ?',
+  )
+  recordKeys.setReadBigInts(true)
+  const recordRows = recordKeys.iterate(maximumRows) as Iterable<{
+    rowid?: unknown
+    id_bytes?: unknown
     active?: unknown
-    id?: unknown
   }>
-  // One bounded identity/active-bit map also tracks unmatched FTS rows; it never retains documents.
+  // Only identities/active bits survive each streamed comparison, including for writer subsets.
   const members = new Map<string, 0 | 1>()
   const subsetSuperseded = recordsProbe.rows === snapshot.records.length ? undefined : new Set<string>()
   const representation = database.prepare(`SELECT
-    CASE WHEN CAST(record_json AS BLOB) = CAST(?1 AS BLOB) THEN NULL
-      ELSE CAST(record_json AS BLOB) END AS mismatch_bytes,
-    CAST(id AS BLOB) = CAST(?2 AS BLOB) AND CAST(kind AS BLOB) = CAST(?3 AS BLOB)
-      AND CAST(subject AS BLOB) = CAST(?4 AS BLOB) AND CAST(source AS BLOB) = CAST(?5 AS BLOB)
-      AND CAST(created_at AS BLOB) = CAST(?6 AS BLOB) AND CAST(path AS BLOB) = CAST(?7 AS BLOB)
-      AND (CAST(summary AS BLOB) IS CAST(?8 AS BLOB)) AS projection_matches
-    FROM records WHERE id = ?2`)
+    CAST(id AS BLOB) = CAST(?1 AS BLOB) AND CAST(kind AS BLOB) = CAST(?2 AS BLOB)
+      AND CAST(subject AS BLOB) = CAST(?3 AS BLOB) AND CAST(created_at AS BLOB) = CAST(?4 AS BLOB) AS matches
+    FROM records WHERE rowid = ?5`)
   for (const row of recordRows) {
-    const canonical = typeof row.id === 'string' ? snapshot.byId.get(row.id) : undefined
-    if (canonical === undefined || members.has(canonical.id)) {
+    const id = row.id_bytes instanceof Uint8Array ? Buffer.from(row.id_bytes).toString('utf8') : undefined
+    const canonical = id === undefined ? undefined : snapshot.byId.get(id)
+    if (canonical === undefined || members.has(canonical.id) || typeof row.rowid !== 'bigint') {
       throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
     }
-    // The writer's exact representation needs no transfer or parse. Preserve structural and
-    // normalisation compatibility for other encodings with the existing bounded parser.
     const { summary } = snapshot.recordFacts(canonical).projection
-    const encoded = representation.get(
-      JSON.stringify(canonical),
-      canonical.id,
-      canonical.kind,
-      canonical.subject,
-      canonical.source,
-      canonical.createdAt,
-      canonical.path,
-      summary,
-    ) as { mismatch_bytes?: unknown; projection_matches?: unknown } | undefined
     if (
-      encoded === undefined ||
-      (encoded.mismatch_bytes !== null &&
-        !(
-          encoded.mismatch_bytes instanceof Uint8Array &&
-          isUtf8(encoded.mismatch_bytes) &&
-          isDeepStrictEqual(parseCachedRecord(Buffer.from(encoded.mismatch_bytes).toString('utf8')), canonical)
-        ))
-    ) {
-      throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
-    }
-    // SQL bindings replace lone surrogates; byte equality must not relax the old scalar string equality.
-    if (
-      encoded.projection_matches !== 1 ||
-      !canonical.source.isWellFormed() ||
+      representation.get(canonical.id, canonical.kind, canonical.subject, canonical.createdAt, row.rowid)?.matches !==
+        1 ||
       !canonical.subject.isWellFormed() ||
+      !canonical.source.isWellFormed() ||
       (summary !== null && !summary.isWellFormed()) ||
-      (row.active !== 0 && row.active !== 1)
+      (row.active !== 0n && row.active !== 1n)
     ) {
-      throw new CacheSchemaMismatch('The cache record table does not match its canonical JSON.')
+      throw new CacheSchemaMismatch('The cache record projection does not match the canonical record corpus.')
     }
-    members.set(canonical.id, row.active)
+    members.set(canonical.id, row.active === 1n ? 1 : 0)
     if (subsetSuperseded !== undefined) {
-      for (const id of canonical.supersedes ?? []) {
-        subsetSuperseded.add(id)
+      for (const supersededId of canonical.supersedes ?? []) {
+        subsetSuperseded.add(supersededId)
       }
     }
   }
+
   if (members.size !== recordsProbe.rows) {
     throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
   }
   const superseded = subsetSuperseded ?? snapshot.supersededIds
   for (const [id, active] of members) {
     if (active !== (superseded.has(id) ? 0 : 1)) {
-      throw new CacheSchemaMismatch('The cache record table does not match its canonical JSON.')
+      throw new CacheSchemaMismatch('The cache record projection does not match the canonical record corpus.')
     }
   }
   // A writer can replace a proper predecessor subset, but its active bits and raw witnesses
@@ -1420,39 +900,25 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
   const searchProbe = readIntegrityProbe(
     'record-search',
     database
-      .prepare(
-        `SELECT
-          COUNT(*) AS row_count,
-          CASE WHEN TOTAL(id_bytes) > ?1 OR TOTAL(text_bytes) > ?2 OR TOTAL(preview_bytes) > ?6
-            THEN 1 ELSE 0 END AS exceeds_aggregate_bytes,
-          CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
-          CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
-        FROM (
-          SELECT
-            CASE WHEN typeof(id) = 'text' AND typeof(text) = 'text' AND typeof(preview) = 'text'
-                 THEN 0 ELSE 1 END AS invalid_type,
-            CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= ?3
-                       AND typeof(text) = 'text' AND length(CAST(text AS BLOB)) <= ?4
-                       AND typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= ?7
-                 THEN 0 ELSE 1 END AS oversized,
-            CASE WHEN typeof(id) = 'text' THEN length(CAST(id AS BLOB)) ELSE 0 END AS id_bytes,
-            CASE WHEN typeof(text) = 'text' THEN length(CAST(text AS BLOB)) ELSE 0 END AS text_bytes,
-            CASE WHEN typeof(preview) = 'text' THEN length(CAST(preview AS BLOB)) ELSE 0 END AS preview_bytes
-          FROM record_search
-          LIMIT ?5
-        )`,
-      )
+      .prepare(`SELECT COUNT(*) AS row_count,
+      CASE WHEN TOTAL(text_bytes) > ?1 OR TOTAL(preview_bytes) > ?2 THEN 1 ELSE 0 END AS exceeds_aggregate_bytes,
+      CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
+      CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
+      FROM (SELECT
+        CASE WHEN typeof(text) = 'text' AND typeof(preview) = 'text' THEN 0 ELSE 1 END AS invalid_type,
+        CASE WHEN octet_length(text) <= ?3 AND octet_length(preview) <= ?4 THEN 0 ELSE 1 END AS oversized,
+        octet_length(text) AS text_bytes, octet_length(preview) AS preview_bytes
+        FROM record_search LIMIT ?5)`)
       .get(
-        MAX_CACHE_FTS_ID_BYTES,
         MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES,
-        255,
-        MAX_CACHE_SEARCH_DOCUMENT_BYTES,
-        maximumRows,
         MAX_CACHE_SEARCH_PREVIEW_AGGREGATE_BYTES,
+        MAX_CACHE_SEARCH_DOCUMENT_BYTES,
         MAX_CACHE_SEARCH_PREVIEW_BYTES,
+        maximumRows,
       ) as CacheIntegrityProbe | undefined,
     maximumRows,
   )
+
   if (
     searchProbe.rows !== metadata.recordsIndexed ||
     searchProbe.rows >= maximumRows ||
@@ -1470,39 +936,32 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
     throw new CacheSchemaMismatch('The cache search index is inconsistent.')
   }
   cacheReadTestHooks.beforeIntegrityTextRead?.('record-search')
-  // Sort keys only: including full FTS documents here would retain them in SQLite's sorter.
-  const searchKeys = database.prepare(`SELECT rowid AS search_rowid, CAST(id AS BLOB) AS id_bytes
-    FROM record_search ORDER BY CAST(id AS BLOB), rowid LIMIT ?`)
+  // LEFT JOIN keeps orphans visible; only keys cross into JavaScript. Each records rowid is
+  // unique, so equal counts plus one consumed canonical member per FTS row prove a bijection.
+  const searchKeys = database.prepare(`SELECT record_search.rowid AS search_rowid, CAST(records.id AS BLOB) AS id_bytes
+    FROM record_search LEFT JOIN records ON records.rowid = record_search.rowid LIMIT ?`)
   searchKeys.setReadBigInts(true)
-  const searchRows = searchKeys.iterate(maximumRows) as Iterable<{
-    id_bytes?: unknown
-    search_rowid?: unknown
-  }>
-  const searchContent = database.prepare(`SELECT
-      CAST(id AS BLOB) = CAST(? AS BLOB) AND CAST(text AS BLOB) = CAST(? AS BLOB)
-        AND CAST(preview AS BLOB) = CAST(? AS BLOB) AS matches
-    FROM record_search WHERE rowid = ?`)
+  const searchRows = searchKeys.iterate(maximumRows) as Iterable<{ id_bytes?: unknown; search_rowid?: unknown }>
+  const searchContent = database.prepare(`SELECT CAST(text AS BLOB) = CAST(? AS BLOB)
+    AND CAST(preview AS BLOB) = CAST(? AS BLOB) AS matches FROM record_search WHERE rowid = ?`)
   let searchRowsRead = 0
   for (const row of searchRows) {
-    if (!(row.id_bytes instanceof Uint8Array) || typeof row.search_rowid !== 'bigint') {
-      throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
-    }
-    const id = Buffer.from(row.id_bytes).toString('utf8')
-    const canonical = snapshot.byId.get(id)
-    if (canonical === undefined || !members.has(id) || Buffer.compare(row.id_bytes, Buffer.from(id, 'utf8')) !== 0) {
+    const id = row.id_bytes instanceof Uint8Array ? Buffer.from(row.id_bytes).toString('utf8') : undefined
+    const canonical = id === undefined ? undefined : snapshot.byId.get(id)
+    if (canonical === undefined || !members.has(canonical.id) || typeof row.search_rowid !== 'bigint') {
       throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
     }
     const { summary } = snapshot.recordFacts(canonical).projection
-    const content = searchContent.get(
-      id,
-      searchDocumentForRecord(canonical, summary),
-      searchPreviewForRecord(canonical, summary),
-      row.search_rowid,
-    ) as { matches?: unknown } | undefined
-    if (content?.matches !== 1) {
+    if (
+      searchContent.get(
+        searchDocumentForRecord(canonical, summary),
+        searchPreviewForRecord(canonical, summary),
+        row.search_rowid,
+      )?.matches !== 1
+    ) {
       throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
     }
-    members.delete(id)
+    members.delete(canonical.id)
     searchRowsRead += 1
   }
   if (searchRowsRead !== searchProbe.rows || members.size !== 0) {
@@ -1684,27 +1143,21 @@ const writeCacheSnapshot = (
       }
       assertCacheWriteSnapshotCurrent(snapshot)
       database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
-      const insertRecord = database.prepare(`
-        INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      const insertSearch = database.prepare('INSERT INTO record_search(id, text, preview) VALUES (?, ?, ?)')
+      const insertRecord = database.prepare(`INSERT INTO records(id, kind, subject, created_at, active)
+        VALUES (?, ?, ?, ?, ?)`)
+      const insertSearch = database.prepare('INSERT INTO record_search(rowid, text, preview) VALUES (?, ?, ?)')
       for (const record of snapshot.records) {
-        const projected = record
         const { projection } = snapshot.recordFacts(record)
-        insertRecord.run(
-          projected.id,
-          projected.kind,
-          projected.subject,
-          projected.source,
-          projected.createdAt,
-          projected.path,
-          snapshot.activeIds.has(projected.id) ? 1 : 0,
-          projection.summary,
-          JSON.stringify(record),
+        const { lastInsertRowid } = insertRecord.run(
+          record.id,
+          record.kind,
+          record.subject,
+          record.createdAt,
+          snapshot.activeIds.has(record.id) ? 1 : 0,
         )
-        insertSearch.run(projected.id, projection.text, projection.preview)
+        insertSearch.run(lastInsertRowid, projection.text, projection.preview)
       }
+
       writeMetadata(database, {
         artifactPaths,
         manifest: snapshot.manifest,
@@ -2034,7 +1487,7 @@ const runWithDisposableCacheRecovery = <Result>(
 
 type CachePreparationCompletion<Result> =
   | { kind: 'prepare' }
-  | { kind: 'read'; read: (database: DatabaseSync) => Result; state: CacheReadRecoveryState }
+  | { kind: 'read'; read: (database: DatabaseSync, corpus: VerifiedCorpus) => Result; state: CacheReadRecoveryState }
 
 type FreshCacheResult<Result> = { kind: 'fresh'; result: Result } | { kind: 'stale' }
 
@@ -2062,7 +1515,7 @@ const readFreshCacheResult = <Result>(
           const result = (() => {
             if (completion.kind === 'read') {
               cacheReadInstrumentation.beforeResultRead?.()
-              const read = completion.read(database)
+              const read = completion.read(database, snapshot)
               cacheReadInstrumentation.afterResultRead?.()
               return read
             }
@@ -2094,7 +1547,7 @@ function requireFreshCacheResult<Result>(
   location: CacheLocation,
   completion: {
     kind: 'read'
-    read: (database: DatabaseSync) => Result
+    read: (database: DatabaseSync, corpus: VerifiedCorpus) => Result
     state: CacheReadRecoveryState
   },
   expectedRebuild?: CompletedCacheRebuild,
@@ -2127,7 +1580,7 @@ function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
   location: CacheLocation,
   completion: {
     kind: 'read'
-    read: (database: DatabaseSync) => Result
+    read: (database: DatabaseSync, corpus: VerifiedCorpus) => Result
     state: CacheReadRecoveryState
   },
   lockMode?: CacheRecoveryLockMode,
@@ -2293,11 +1746,14 @@ const compactResultLimit = (value: unknown) => positiveLimit(value, 'compactResu
 const readFreshCache = <Result>(
   root: string,
   location: CacheLocation,
-  read: (database: DatabaseSync) => Result,
+  read: (database: DatabaseSync, corpus: VerifiedCorpus) => Result,
   state: CacheReadRecoveryState,
 ) => requireFreshCacheResult(root, location, { kind: 'read', read, state }, state.rebuild)
 
-const withPreparedDatabase = <Result>(input: RootInput, read: (database: DatabaseSync) => Result) => {
+const withPreparedDatabase = <Result>(
+  input: RootInput,
+  read: (database: DatabaseSync, corpus: VerifiedCorpus) => Result,
+) => {
   const root = resolveRepository(input)
   const readState: CacheReadRecoveryState = {}
   try {
@@ -2321,32 +1777,29 @@ const withPreparedDatabase = <Result>(input: RootInput, read: (database: Databas
   }
 }
 
-const parseRecordRow = (row: RecordRow) => parseCachedRecord(row.record_json)
-
-const recordRowBytes = (row: RecordRow) => {
-  if (typeof row.record_bytes === 'number' && Number.isFinite(row.record_bytes) && row.record_bytes >= 0) {
-    return row.record_bytes
+const canonicalRecordFromRow = (row: RecordRow, corpus: VerifiedCorpus): BrainRecord => {
+  const record = typeof row.id === 'string' ? corpus.byId.get(row.id) : undefined
+  if (record !== undefined) {
+    return record
   }
-  if (typeof row.record_json === 'string') {
-    return byteLength(row.record_json)
-  }
-  return 0
+  throw new CacheSchemaMismatch('The cache returned an unknown canonical record identity.')
 }
 
-const parseRecordRowWithinBudget = (row: RecordRow, budget: ResponseByteBudget) => {
-  budget.chargeBytes(recordRowBytes(row))
-  return parseRecordRow(row)
+const materializeRecordRow = (row: RecordRow, corpus: VerifiedCorpus, budget: ResponseByteBudget) => {
+  const record = canonicalRecordFromRow(row, corpus)
+  budget.chargeBytes(byteLength(JSON.stringify(record)))
+  return structuredClone(record)
 }
 
-const parseRecordRowsWithinBudget = (rows: Iterable<RecordRow>) => {
+const materializeRecordRows = (rows: Iterable<RecordRow>, corpus: VerifiedCorpus) => {
   const budget = createResponseByteBudget('fullResponseBytes')
-  return Array.from(rows, row => parseRecordRowWithinBudget(row, budget))
+  return Array.from(rows, row => materializeRecordRow(row, corpus, budget))
 }
 
 export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] => {
   const parsed = parseListRecordsInput(input)
   const limit = fullResultLimit(parsed.limit)
-  return withPreparedDatabase(parsed, database => {
+  return withPreparedDatabase(parsed, (database, corpus) => {
     const conditions = [
       parsed.includeSuperseded === true ? undefined : 'active = 1',
       parsed.kind === undefined ? undefined : 'kind = ?',
@@ -2359,27 +1812,24 @@ export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] => {
     ]
     const where = conditions.length === 0 ? '' : `WHERE ${conditions.join(' AND ')}`
     const rows = database
-      .prepare(
-        `SELECT record_json, length(cast(record_json AS BLOB)) AS record_bytes FROM records ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
-      )
+      .prepare(`SELECT id FROM records ${where} ORDER BY created_at DESC, id DESC LIMIT ?`)
       .iterate(...parameters) as Iterable<RecordRow>
-    return parseRecordRowsWithinBudget(rows)
+    return materializeRecordRows(rows, corpus)
   })
 }
 
 export const showRecord = (input: ShowRecordInput): BrainRecord | null => {
   const parsed = parseShowRecordInput(input)
-  return withPreparedDatabase(parsed, database => {
+  return withPreparedDatabase(parsed, (database, corpus) => {
     const activeClause = parsed.activeOnly === true ? ' AND active = 1' : ''
-    const row = database
-      .prepare(
-        `SELECT record_json, length(cast(record_json AS BLOB)) AS record_bytes FROM records WHERE id = ?${activeClause}`,
-      )
-      .get(parsed.id) as RecordRow | undefined
-    return row === undefined ? null : parseRecordRowWithinBudget(row, createResponseByteBudget('fullResponseBytes'))
+    const row = database.prepare(`SELECT id FROM records WHERE id = ?${activeClause}`).get(parsed.id) as
+      | RecordRow
+      | undefined
+    return row === undefined ? null : materializeRecordRow(row, corpus, createResponseByteBudget('fullResponseBytes'))
   })
 }
 
+// Keep FTS outermost in both search joins; older SQLite otherwise repeats MATCH for every active record.
 const searchRows = (database: DatabaseSync, input: SearchRecordsInput, match: string, limit: number) => {
   if (match.length === 0) {
     return []
@@ -2393,29 +1843,14 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput, match: st
   return database
     .prepare(`
     SELECT
-      records.record_json,
-      length(cast(records.record_json AS BLOB)) AS record_bytes
+      records.id
     FROM record_search
-    JOIN records ON records.id = record_search.id
+    CROSS JOIN records ON records.rowid = record_search.rowid
     WHERE ${conditions.join(' AND ')}
     ORDER BY bm25(record_search) ASC, records.created_at DESC, records.id DESC
     LIMIT ?
   `)
     .iterate(...parameters) as Iterable<RecordRow>
-}
-
-const compactText = (value: unknown, field: string) => {
-  if (typeof value === 'string') {
-    return value
-  }
-  throw new CacheSchemaMismatch(`Cached compact ${field} must be text.`)
-}
-
-const compactSummary = (value: unknown) => {
-  if (value === null || typeof value === 'string') {
-    return value
-  }
-  throw new CacheSchemaMismatch('Cached compact summary must be text or null.')
 }
 
 const compactRank = (value: unknown) => {
@@ -2432,17 +1867,25 @@ const compactSnippet = (value: unknown) => {
   throw new CacheSchemaMismatch('Cached search snippet must be text.')
 }
 
-const compactRecordFromRow = (row: CompactRow): CompactBrainRecord => ({
-  id: compactText(row.id, 'id'),
-  kind: compactText(row.kind, 'kind'),
-  path: compactText(row.path, 'path'),
-  rank: compactRank(row.rank),
-  snippet: compactSnippet(row.snippet),
-  subject: compactText(row.subject, 'subject'),
-  summary: compactSummary(row.summary),
-})
+const compactRecordFromRow = (row: CompactRow, corpus: VerifiedCorpus): CompactBrainRecord => {
+  const record = canonicalRecordFromRow(row, corpus)
+  return {
+    id: record.id,
+    kind: record.kind,
+    path: record.path,
+    rank: compactRank(row.rank),
+    snippet: compactSnippet(row.snippet),
+    subject: record.subject,
+    summary: corpus.recordFacts(record).projection.summary,
+  }
+}
 
-const createCompactSearchReader = (database: DatabaseSync, input: SearchStatementInput, budget: ResponseByteBudget) => {
+const createCompactSearchReader = (
+  database: DatabaseSync,
+  corpus: VerifiedCorpus,
+  input: SearchStatementInput,
+  budget: ResponseByteBudget,
+) => {
   const conditions = [
     'record_search MATCH ?',
     input.includeSuperseded === true ? undefined : 'records.active = 1',
@@ -2453,14 +1896,10 @@ const createCompactSearchReader = (database: DatabaseSync, input: SearchStatemen
   const source = `
     SELECT
       records.id,
-      records.kind,
-      records.subject,
-      records.path,
-      records.summary,
       bm25(record_search) AS rank,
-      snippet(record_search, 2, '[', ']', '...', 16) AS snippet
+      snippet(record_search, 1, '[', ']', '...', 16) AS snippet
     FROM record_search
-    JOIN records ON records.id = record_search.id
+    CROSS JOIN records ON records.rowid = record_search.rowid
     WHERE ${conditions.join(' AND ')}
     ORDER BY rank ASC, records.created_at DESC, records.id DESC
     LIMIT ?
@@ -2472,7 +1911,7 @@ const createCompactSearchReader = (database: DatabaseSync, input: SearchStatemen
       return []
     }
     const records = Array.from(statement.iterate(match, ...kindParameters, limit) as Iterable<CompactRow>, row =>
-      budget.charge(compactRecordFromRow(row)),
+      budget.charge(compactRecordFromRow(row, corpus)),
     )
     cacheReadTestHooks.afterCompactSearchRead?.(query)
     return records
@@ -2484,8 +1923,8 @@ export const searchRecords = (input: SearchRecordsInput): BrainRecord[] => {
   const match = literalMatchQuery(parsed.query)
   const limit = fullResultLimit(parsed.limit)
   if (match.length > 0) {
-    return withPreparedDatabase(parsed, database =>
-      parseRecordRowsWithinBudget(searchRows(database, parsed, match, limit)),
+    return withPreparedDatabase(parsed, (database, corpus) =>
+      materializeRecordRows(searchRows(database, parsed, match, limit), corpus),
     )
   }
   resolveRepository(parsed)
@@ -2497,25 +1936,25 @@ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRec
   const match = literalMatchQuery(parsed.query)
   compactResultLimit(parsed.limit)
   if (match.length > 0) {
-    return withPreparedDatabase(parsed, database => {
+    return withPreparedDatabase(parsed, (database, corpus) => {
       const budget = createResponseByteBudget('compactResponseBytes')
       budget.charge([])
-      return createCompactSearchReader(database, parsed, budget)(parsed.query, match)
+      return createCompactSearchReader(database, corpus, parsed, budget)(parsed.query, match)
     })
   }
   resolveRepository(parsed)
   return []
 }
 
-const createShowReader = (database: DatabaseSync, includeSuperseded: boolean | undefined) => {
+const createShowReader = (database: DatabaseSync, corpus: VerifiedCorpus, includeSuperseded: boolean | undefined) => {
   const activeClause = includeSuperseded === true ? '' : ' AND active = 1'
-  const source = `SELECT record_json FROM records WHERE id = ?${activeClause}`
+  const source = `SELECT id FROM records WHERE id = ?${activeClause}`
   cacheReadTestHooks.onShowPrepare?.(source)
   const statement = database.prepare(source)
   return (id: string) => {
     const row = statement.get(id) as RecordRow | undefined
     cacheReadTestHooks.afterShowRead?.(id)
-    return row === undefined ? null : parseRecordRow(row)
+    return row === undefined ? null : structuredClone(canonicalRecordFromRow(row, corpus))
   }
 }
 
@@ -2535,6 +1974,7 @@ const assertGatherBudgets = (input: GatherInput): LiteralSearch[] => {
 
 const readGatherFromDatabase = (
   database: DatabaseSync,
+  corpus: VerifiedCorpus,
   input: GatherInput,
   hydrated: HydrateResult | null,
   searches: readonly LiteralSearch[],
@@ -2542,9 +1982,9 @@ const readGatherFromDatabase = (
   const shows = input.shows ?? []
   const budget = createResponseByteBudget('gatherResponseBytes')
   budget.charge({ hydrated, records: [], searches: [] })
-  const showRecordForId = shows.length === 0 ? () => null : createShowReader(database, input.includeSuperseded)
+  const showRecordForId = shows.length === 0 ? () => null : createShowReader(database, corpus, input.includeSuperseded)
   const searchCompactRecordsForQuery =
-    searches.length === 0 ? () => [] : createCompactSearchReader(database, input, budget)
+    searches.length === 0 ? () => [] : createCompactSearchReader(database, corpus, input, budget)
   const shownRecords = new Map<string, BrainRecord | null>()
   const searchResults = new Map<string, readonly CompactBrainRecord[]>()
   const memoizedShowRecordForId = (id: string) => {
@@ -2600,8 +2040,14 @@ const gatherRecordsFromDatabase = (input: GatherInput, searches: readonly Litera
         return readFreshCache(
           root,
           heldLocation,
-          database =>
-            readGatherFromDatabase(database, input, { recordsIndexed: rebuild.result.recordsIndexed }, searches),
+          (database, corpus) =>
+            readGatherFromDatabase(
+              database,
+              corpus,
+              input,
+              { recordsIndexed: rebuild.result.recordsIndexed },
+              searches,
+            ),
           readState,
         )
       }
@@ -2627,7 +2073,7 @@ const gatherRecordsFromDatabase = (input: GatherInput, searches: readonly Litera
       () =>
         resolvePreparedCacheWithoutCorruptionRecovery(root, location, {
           kind: 'read',
-          read: database => readGatherFromDatabase(database, input, null, searches),
+          read: (database, corpus) => readGatherFromDatabase(database, corpus, input, null, searches),
           state: readState,
         }),
       { completion: { kind: 'retry-operation' }, lockMode: 'acquire', readState },
