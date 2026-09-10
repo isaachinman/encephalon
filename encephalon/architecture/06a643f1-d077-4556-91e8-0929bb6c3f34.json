@@ -1,0 +1,38 @@
+{
+  "createdAt": "2026-09-10T15:03:28.659Z",
+  "id": "06a643f1-d077-4556-91e8-0929bb6c3f34",
+  "kind": "architecture",
+  "payload": {
+    "summary": "Share one immutable operation-local VerifiedCorpus, retained filesystem proof and streaming strict cache equivalence for each accepted canonical generation.",
+    "authority": [
+      "Reuse ID, case-path, supersession, active-head and artifact indexes across validation, planning and cache operations.",
+      "Bind relative canonical paths to accepted raw SHA-256 witnesses with the domain-separated version-2 fingerprint; do not recursively hash normalised payloads.",
+      "Freeze owned payloads during parser exit actions, preserve mutable independent public results, and capture fixed publication evidence for committed assertions."
+    ],
+    "cache": [
+      "Fresh reads require complete canonical equality in the same verified read transaction as the query, even when cached metadata copies the canonical fingerprint.",
+      "Stream ID-ordered record comparisons and key-only FTS rowid lookups. Retain bounded membership and active bits, never a second parsed corpus or expected-document buffer map.",
+      "Compare scalar and FTS bytes inside SQLite. Exact writer JSON avoids a second parse; alternate valid UTF-8 representations retain existing structural and signed-zero normalisation semantics.",
+      "Compute strict-validation body and preview projections without populating corpus-wide memoised strings; ordinary projection consumers retain their existing memoisation.",
+      "Bound posting and auxiliary shadow row counts, per-value bytes and aggregate storage before native read-only FTS integrity checking; native integrity supplements exact canonical projection identity.",
+      "Writer predecessors may be validated canonical subsets: check their own active flags and fingerprint their accepted member witnesses in existing canonical path order before replacement.",
+      "Reuse a replacement corpus during disposable recovery only after its generation assertion succeeds."
+    ],
+    "scope": [
+      "Preserve graph/error budgets, bounded directory entry generations, numeric-first SQL admission, schema 3 and independent mutable public results.",
+      "Currentness compares the retained filesystem metadata observations after initial byte verification; it is not a second content read or an inter-operation metadata-only cache trust shortcut.",
+      "Recover incompatible disposable caches through the existing locked quarantine/rebuild path; no new metadata fields, global cache or public exports."
+    ],
+    "filesystem": [
+      "Read and hash accepted canonical bytes once per unchanged attempt. Closing assertions compare retained full metadata through no-follow descriptor/path checks and bounded canonical root/kind generation checks; they never refresh evidence from a changed generation.",
+      "Probe rejected unreadable evidence again before acceptance. Only accepting an authorised cleanup-induced ctime change rereads canonical bytes and verifies the original digest.",
+      "Capture each unique artifact and parent-linked ancestor once. Retain exact pathname metadata or absence for invalid boundaries; compare shared pathname expectations instead of overwriting them.",
+      "Close artifact evidence with parent-first directory checks, unique entry comparisons and child-first directory checks ending at the brain anchor. Retain the complete relevant ancestor chain for operational open-error classification.",
+      "Keep proof maps private and fixed after collection. Reuse their assertion at accepted query/publication boundaries, preserving fixed publication prefixes, primary-before-close errors and whole-attempt retry limits."
+    ]
+  },
+  "searchText": "verified corpus canonical read once raw digest shared artifact ancestors metadata proof strict cache FTS MAR-2788",
+  "source": "agent",
+  "subject": "canonical.verified-corpus",
+  "supersedes": ["89820a16-b53f-4109-acc8-c656c4fb2b06"]
+}

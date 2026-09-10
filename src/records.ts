@@ -18,10 +18,9 @@ import { TextDecoder } from 'node:util'
 import { parseAddRecordInput, parseRootInput } from './api-input.ts'
 import {
   ArtifactChangedError,
-  type ArtifactInspectionResult,
+  type ArtifactInspection,
   type ArtifactObservation,
   inspectArtifactFiles,
-  sameArtifactInspectionResult,
 } from './artifact-inspection.ts'
 import {
   hydrateResolvedMutationSnapshot,
@@ -121,7 +120,7 @@ type RecordRejectionEvidence = PathObservation & {
 
 type ValidatedRecordScan = {
   index: RecordCorpusIndex
-  artifactEvidence: readonly ArtifactInspectionResult[]
+  artifactEvidence: ArtifactInspection | undefined
   artifacts: readonly ArtifactObservation[]
   result: ValidateResult
 }
@@ -1457,19 +1456,16 @@ const artifactIssues = (
           `Canonical corpus may contain at most ${MAX_ARTIFACT_REFERENCES} artifact references.`,
         ),
       ],
-      evidence: Object.freeze([] as ArtifactInspectionResult[]),
+      evidence: undefined,
       observations: [] as readonly ArtifactObservation[],
     }
   }
   const brainDirectory = resolve(root, 'encephalon')
   const paths = new Map<string, string>()
   const errors: ValidationIssue[] = []
-  const evidence =
-    artifactPaths.length === 0
-      ? Object.freeze([] as ArtifactInspectionResult[])
-      : inspectArtifactFiles(brainDirectory, artifactPaths)
+  const evidence = artifactPaths.length === 0 ? undefined : inspectArtifactFiles(brainDirectory, artifactPaths)
   const inspectionResults = new Map(
-    evidence.map(result => [result.kind === 'stable' ? result.observation.path : result.path, result]),
+    evidence?.results.map(result => [result.kind === 'stable' ? result.observation.path : result.path, result]),
   )
   for (const record of records) {
     for (const artifact of record.artifacts ?? []) {
@@ -1490,7 +1486,9 @@ const artifactIssues = (
   return {
     errors,
     evidence,
-    observations: Object.freeze(evidence.flatMap(result => (result.kind === 'stable' ? [result.observation] : []))),
+    observations: Object.freeze(
+      evidence?.results.flatMap(result => (result.kind === 'stable' ? [result.observation] : [])) ?? [],
+    ),
   }
 }
 
@@ -1637,14 +1635,13 @@ const sameCanonicalLayoutGeneration = (root: string, layout: CanonicalLayoutWitn
   return current
 }
 
-const reinspectRecordObservation = (
+const assertRecordObservationCurrent = (
   observation: RecordObservation,
   changed: () => never,
   hooks: RecordReadHooks,
-): RecordObservation => {
+) => {
   let descriptor: number | undefined
   let primaryError: unknown
-  let result: RecordObservation | undefined
   try {
     const pathMetadata = currentRecordPathMetadata(observation.path, changed)
     if (
@@ -1654,30 +1651,22 @@ const reinspectRecordObservation = (
     ) {
       changed()
     }
-    const { descriptor: openedDescriptor } = openObservedRecordDescriptor(
+    const { descriptor: openedDescriptor, metadata: descriptorMetadata } = openObservedRecordDescriptor(
       observation.path,
       pathMetadata,
       changed,
       hooks,
     )
     descriptor = openedDescriptor
-    const bytes = readBoundedDescriptor(descriptor, observation.metadata.size, changed)
-    const finalDescriptorMetadata = fstatSync(descriptor, { bigint: true })
     const finalPathMetadata = currentRecordPathMetadata(observation.path, changed)
     if (
       !(
-        sameStableEntryMetadata(observation.metadata, finalDescriptorMetadata) &&
-        sameStableEntryMetadata(finalDescriptorMetadata, finalPathMetadata)
-      ) ||
-      recordDigest(bytes) !== observation.digest
+        sameStableEntryMetadata(observation.metadata, descriptorMetadata) &&
+        sameStableEntryMetadata(descriptorMetadata, finalPathMetadata)
+      )
     ) {
       changed()
     }
-    result = Object.freeze({
-      digest: observation.digest,
-      metadata: Object.freeze(finalDescriptorMetadata),
-      path: observation.path,
-    })
   } catch (error) {
     primaryError = error
   }
@@ -1698,7 +1687,6 @@ const reinspectRecordObservation = (
   if (closeError !== undefined) {
     throw closeError
   }
-  return result ?? changed()
 }
 
 const assertPathObservationCurrent = (observation: PathObservation, changed: () => never) => {
@@ -1765,38 +1753,21 @@ const assertRejectedRecordEvidenceCurrent = (
   }
 }
 
-const artifactEvidencePath = (evidence: ArtifactInspectionResult) =>
-  evidence.kind === 'stable' ? evidence.observation.path : evidence.path
-
-const assertArtifactEvidenceCurrent = (
-  root: string,
-  evidence: readonly ArtifactInspectionResult[],
-  changed: () => never,
-) => {
-  if (evidence.length > 0) {
-    try {
-      const current = inspectArtifactFiles(resolve(root, 'encephalon'), evidence.map(artifactEvidencePath))
-      if (
-        current.length !== evidence.length ||
-        !evidence.every(
-          (expected, index) => current[index] !== undefined && sameArtifactInspectionResult(expected, current[index]),
-        )
-      ) {
-        changed()
-      }
-    } catch (error) {
-      if (error instanceof ArtifactChangedError) {
-        return changed()
-      }
-      throw error
+const assertArtifactEvidenceCurrent = (evidence: ArtifactInspection | undefined, changed: () => never) => {
+  try {
+    evidence?.assertCurrent()
+  } catch (error) {
+    if (error instanceof ArtifactChangedError) {
+      return changed()
     }
+    throw error
   }
 }
 
 const assertCanonicalSnapshotCurrent = (
   root: string,
   scan: RecordScan,
-  artifactEvidence: readonly ArtifactInspectionResult[],
+  artifactEvidence: ArtifactInspection | undefined,
   changed: () => never,
   hooks: RecordReadHooks = {},
 ) => {
@@ -1807,16 +1778,15 @@ const assertCanonicalSnapshotCurrent = (
     if (!sameCanonicalLayoutGeneration(root, scan.layout)) {
       changed()
     }
-    assertArtifactEvidenceCurrent(root, artifactEvidence, changed)
     scan.observations.reduce<undefined>((verified, observation) => {
-      reinspectRecordObservation(observation, changed, hooks)
+      assertRecordObservationCurrent(observation, changed, hooks)
       return verified
     }, undefined)
     scan.rejections.reduce<undefined>((verified, evidence) => {
       assertRejectedRecordEvidenceCurrent(evidence, changed, hooks)
       return verified
     }, undefined)
-    assertArtifactEvidenceCurrent(root, artifactEvidence, changed)
+    assertArtifactEvidenceCurrent(artifactEvidence, changed)
     if (!sameCanonicalLayoutGeneration(root, scan.layout)) {
       changed()
     }
@@ -1864,7 +1834,7 @@ const readStableCanonicalSnapshot = (root: string, hooks: RecordReadHooks = {}):
 const readCanonicalPlanningScanAttempt = (root: string, hooks: RecordReadHooks = {}) => {
   hooks.canonicalScan?.()
   const scan = scanCanonicalRecords(root, { hooks })
-  assertCanonicalSnapshotCurrent(root, scan, [], canonicalGenerationChanged, hooks)
+  assertCanonicalSnapshotCurrent(root, scan, undefined, canonicalGenerationChanged, hooks)
   return scan
 }
 
@@ -2039,7 +2009,7 @@ const canonicalPublicationAuthority = (
   initialRecords: readonly BrainRecord[],
   cacheLocation?: CacheLocation,
   changed: () => never = repositoryChangedBeforePublication,
-  artifactEvidence: readonly ArtifactInspectionResult[] = [],
+  artifactEvidence?: ArtifactInspection,
   hooks: RecordReadHooks = {},
   replanAfterPreparation = false,
 ): CanonicalPublicationAuthority => {
@@ -2062,6 +2032,9 @@ const canonicalPublicationAuthority = (
     let result: RecordObservation | undefined
     try {
       const pathMetadata = currentObservationMetadata(observation.path)
+      if (sameStableEntryMetadata(observation.metadata, pathMetadata)) {
+        return observation
+      }
       if (!sameStableEntryMetadataExceptCtime(observation.metadata, pathMetadata)) {
         changed()
       }
@@ -2284,7 +2257,7 @@ const recordPlanningSnapshot = (
   changed: () => never = repositoryChangedBeforePublication,
   replanAfterPreparation = false,
 ): RecordPlanningSnapshot => {
-  let acceptedArtifactEvidence: readonly ArtifactInspectionResult[] = []
+  let acceptedArtifactEvidence: ArtifactInspection | undefined
   let planningIndex: RecordCorpusIndex | undefined
   const activeHeads = (kind: string, subject: string) => {
     planningIndex ??= indexRecordCorpus(scan.records)

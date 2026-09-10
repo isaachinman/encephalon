@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import {
+import fs, {
   closeSync,
   mkdirSync,
   mkdtempSync,
@@ -11,12 +11,20 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
-import { ArtifactChangedError, inspectArtifactFiles } from '../src/artifact-inspection.ts'
+import { ArtifactChangedError, inspectArtifactFiles as inspectArtifactSnapshot } from '../src/artifact-inspection.ts'
+
+const inspectArtifactFiles = (...arguments_: Parameters<typeof inspectArtifactSnapshot>) => {
+  const inspection = inspectArtifactSnapshot(...arguments_)
+  inspection.assertCurrent()
+  return inspection.results
+}
 
 const temporaryRoots: string[] = []
+const mutableFs = fs as { lstatSync: typeof fs.lstatSync }
 
 const filesystemCapabilities = (() => {
   const root = mkdtempSync(join(tmpdir(), 'encephalon-artifact-capability-test-'))
@@ -131,6 +139,44 @@ test('returns immutable verified path metadata and closes its descriptor', () =>
   }
   assert.equal(descriptorsOpened > 0, true)
   assert.equal(descriptorsClosed, descriptorsOpened)
+})
+
+test('captures shared artifact ancestors and opens each unique file once per attempt', () => {
+  const { artifact, brainDirectory } = createArtifact()
+  const artifacts = Array.from({ length: 12 }, (_, index) => artifact.replace('evidence.txt', `${index}.txt`))
+  for (const path of artifacts) {
+    writeFileSync(join(brainDirectory, ...path.split('/')), 'evidence')
+  }
+  let captures = 0
+  let opened = 0
+  let closed = 0
+  const inspection = inspectArtifactSnapshot(brainDirectory, [...artifacts, ...artifacts], {
+    close: descriptor => {
+      closed += 1
+      closeSync(descriptor)
+    },
+    fault: point => {
+      if (point === 'after-ancestor-capture') {
+        captures += 1
+      }
+    },
+    open: (path, flags) => {
+      opened += 1
+      return openSync(path, flags)
+    },
+  })
+
+  inspection.assertCurrent()
+  inspection.assertCurrent()
+  const { results } = inspection
+  assert.equal(results.length, artifacts.length * 2)
+  assert.equal(
+    results.every(result => result.kind === 'stable'),
+    true,
+  )
+  assert.equal(captures, 3)
+  assert.equal(opened, artifacts.length)
+  assert.equal(closed, opened)
 })
 
 test('preserves an inspection failure when descriptor close also fails', () => {
@@ -449,19 +495,15 @@ test('rejects a higher ancestor replacement even when the final artifact keeps t
   const displacedDecision = join(root, 'displaced-decision-ancestor')
   const replacementDecision = join(root, 'replacement-decision-ancestor')
   mkdirSync(replacementDecision)
-  let ancestorLstats = 0
 
   assert.throws(
     () =>
       inspectArtifactFiles(brainDirectory, [artifact], {
         fault: point => {
-          if (point === 'before-ancestor-lstat') {
-            ancestorLstats += 1
-            if (ancestorLstats === 4) {
-              renameSync(finalParent, join(replacementDecision, 'artifact-inspection'))
-              renameSync(decisionDirectory, displacedDecision)
-              renameSync(replacementDecision, decisionDirectory)
-            }
+          if (point === 'before-closing-revalidation') {
+            renameSync(finalParent, join(replacementDecision, 'artifact-inspection'))
+            renameSync(decisionDirectory, displacedDecision)
+            renameSync(replacementDecision, decisionDirectory)
           }
         },
       }),
@@ -478,19 +520,15 @@ test('rejects a higher ancestor replacement for the same stable invalid final pa
   const displacedDecision = join(root, 'displaced-invalid-decision-ancestor')
   const replacementDecision = join(root, 'replacement-invalid-decision-ancestor')
   mkdirSync(replacementDecision)
-  let ancestorLstats = 0
 
   assert.throws(
     () =>
       inspectArtifactFiles(brainDirectory, [artifact], {
         fault: point => {
-          if (point === 'before-ancestor-lstat') {
-            ancestorLstats += 1
-            if (ancestorLstats === 4) {
-              renameSync(finalParent, join(replacementDecision, 'artifact-inspection'))
-              renameSync(decisionDirectory, displacedDecision)
-              renameSync(replacementDecision, decisionDirectory)
-            }
+          if (point === 'before-closing-revalidation') {
+            renameSync(finalParent, join(replacementDecision, 'artifact-inspection'))
+            renameSync(decisionDirectory, displacedDecision)
+            renameSync(replacementDecision, decisionDirectory)
           }
         },
       }),
@@ -531,23 +569,91 @@ test('propagates operational descriptor errors without exposing the artifact pat
 })
 
 test('reclassifies open failure only when the final entry changed', () => {
-  for (const changed of [false, true]) {
+  for (const changed of ['none', 'file', 'ancestor']) {
     const { artifact, brainDirectory, path, root } = createArtifact()
     const captured = join(root, `captured-open-${changed}.txt`)
     const failure = Object.assign(new Error('simulated open I/O failure'), { code: 'EIO' })
     const operation = () =>
       inspectArtifactFiles(brainDirectory, [artifact], {
         open: () => {
-          if (changed) {
+          if (changed === 'file') {
             renameSync(path, captured)
+          }
+          if (changed === 'ancestor') {
+            const artifacts = join(brainDirectory, '_artifacts')
+            renameSync(artifacts, captured)
+            mkdirSync(artifacts)
+            renameSync(join(captured, 'decision'), join(artifacts, 'decision'))
           }
           throw failure
         },
       })
-    if (changed) {
-      assert.throws(operation, ArtifactChangedError)
-    } else {
+    if (changed === 'none') {
       assert.throws(operation, error => error === failure)
+    } else {
+      assert.throws(operation, ArtifactChangedError)
+    }
+  }
+})
+
+test('rejects changed metadata when a file is also an invalid ancestor', () => {
+  const { artifact, brainDirectory, path } = createArtifact()
+  const nested = `${artifact}/child.txt`
+  assert.throws(
+    () =>
+      inspectArtifactFiles(brainDirectory, [artifact, nested], {
+        fault: (point, currentArtifact) => {
+          if (point === 'before-ancestor-lstat' && currentArtifact === nested) {
+            writeFileSync(path, 'changed while observing the same pathname as an ancestor')
+          }
+        },
+      }),
+    ArtifactChangedError,
+  )
+})
+
+test('preserves ancestor replacement before late inspection and close failures', () => {
+  for (const failurePhase of ['accepted-path', 'close', 'stable-close']) {
+    const { artifact, brainDirectory, path, root } = createArtifact()
+    const originalLstat = fs.lstatSync
+    const failure = Object.assign(new Error('late artifact I/O failure'), { code: 'EIO' })
+    let artifactLstats = 0
+    mutableFs.lstatSync = ((...arguments_: unknown[]) => {
+      if (arguments_[0] === path) {
+        artifactLstats += 1
+        if (failurePhase === 'accepted-path' && artifactLstats === 3) {
+          throw failure
+        }
+      }
+      return Reflect.apply(originalLstat, fs, arguments_)
+    }) as typeof fs.lstatSync
+    syncBuiltinESMExports()
+    try {
+      assert.throws(
+        () =>
+          inspectArtifactFiles(brainDirectory, [artifact], {
+            close: descriptor => {
+              closeSync(descriptor)
+              if (failurePhase !== 'accepted-path') {
+                throw failure
+              }
+            },
+            open: (filePath, flags) => {
+              if (failurePhase !== 'stable-close') {
+                const artifacts = join(brainDirectory, '_artifacts')
+                const displaced = join(root, 'displaced-artifacts')
+                renameSync(artifacts, displaced)
+                mkdirSync(artifacts)
+                renameSync(join(displaced, 'decision'), join(artifacts, 'decision'))
+              }
+              return openSync(filePath, flags)
+            },
+          }),
+        failurePhase === 'stable-close' ? (error: unknown) => error === failure : ArtifactChangedError,
+      )
+    } finally {
+      mutableFs.lstatSync = originalLstat
+      syncBuiltinESMExports()
     }
   }
 })
