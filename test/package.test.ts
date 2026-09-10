@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { describe, test } from 'node:test'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import { spawnNpmCommand } from '../scripts/npm-command.ts'
@@ -460,169 +460,57 @@ describe('package contract', () => {
     assert.equal(skill.includes('Do not stage, commit, push'), true)
   })
 
-  test('marks the old implementation plan historical and maintains a concise contract', () => {
-    const implementationPlan = readFileSync(resolve(root, 'docs', 'implementation-plan.md'), 'utf8')
+  test('keeps public documentation separate from archived implementation history', () => {
     const contract = readFileSync(resolve(root, 'docs', 'contract.md'), 'utf8')
-    const performance = readFileSync(resolve(root, 'docs', 'performance.md'), 'utf8')
-    const superpowersArchive = resolve(
-      root,
-      'encephalon',
-      '_artifacts',
-      'context',
-      '8afddab6-4b74-4f16-8144-0b409ef880c7',
-      'specs',
+    const readme = readFileSync(resolve(root, 'README.md'), 'utf8')
+    assert.equal(existsSync(resolve(root, 'docs', 'implementation-plan.md')), false)
+    for (const section of [
+      'Runtime and repository',
+      'Public API',
+      'CLI',
+      'Search and ordering',
+      'Canonical records and artifacts',
+      'Limits',
+      'Initialisation and managed instructions',
+      'Commit points and recovery',
+      'Errors',
+      'Compatibility and threat boundary',
+    ]) {
+      assert.equal(contract.includes(`## ${section}\n`), true, section)
+    }
+    for (const command of ['init', 'add', 'list', 'show', 'search', 'gather', 'validate', 'prepare', 'hydrate']) {
+      assert.equal(readme.includes(`npx --no-install encephalon ${command}`), true, command)
+    }
+    assert.match(
+      readme,
+      /\[Public contract\]\(https:\/\/github\.com\/isaachinman\/encephalon\/blob\/main\/docs\/contract\.md\)/,
     )
-    const operationBudgetsDesign = readFileSync(
-      resolve(superpowersArchive, '2026-08-13-operation-budgets-design.md'),
-      'utf8',
-    )
-    const boundedCacheValidationDesign = readFileSync(
-      resolve(superpowersArchive, '2026-08-16-bounded-cache-validation-design.md'),
-      'utf8',
-    )
-    const semanticCacheSchemaDesign = readFileSync(
-      resolve(superpowersArchive, '2026-08-17-sqlite-schema-semantics-design.md'),
-      'utf8',
-    )
-    const ftsTextIntegrityDesign = readFileSync(
-      resolve(superpowersArchive, '2026-08-17-fts-text-integrity-design.md'),
-      'utf8',
-    )
-    const responseByteBudgetsDesign = readFileSync(
-      resolve(superpowersArchive, '2026-08-17-response-byte-budgets-design.md'),
-      'utf8',
-    )
-    const unicodeLiteralSearchDesign = readFileSync(
-      resolve(superpowersArchive, '2026-08-18-unicode-literal-search-design.md'),
-      'utf8',
-    )
-    const singlePassCacheReadDesign = readFileSync(
-      resolve(superpowersArchive, '2026-08-18-single-pass-cache-read-design.md'),
-      'utf8',
-    )
-    const gatherDeduplicationDesign = readFileSync(
-      resolve(superpowersArchive, '2026-08-18-gather-deduplication-design.md'),
-      'utf8',
-    )
-    const validatedMutationCacheDesign = readFileSync(
-      resolve(superpowersArchive, '2026-08-22-validated-mutation-cache-design.md'),
-      'utf8',
-    )
+    assert.match(readme, /\[Changelog\]\(https:\/\/github\.com\/isaachinman\/encephalon\/blob\/main\/CHANGELOG\.md\)/)
+  })
 
-    assert.match(implementationPlan, /Status: historical design input; not the maintained normative contract/)
-    assert.match(implementationPlan, /\[`docs\/contract\.md`]\(\.\/contract\.md\)/)
-    assert.doesNotMatch(implementationPlan, /createdAt is assigned only after the repository operation lock is held/)
-    assert.match(contract, /## Public API and CLI/)
-    assert.match(contract, /## Operation Budgets/)
-    assert.match(contract, /## Unicode Literal Search/)
-    assert.match(contract, /## Canonical Storage/)
-    assert.match(contract, /## Stable Canonical Read Snapshots/)
-    assert.match(contract, /## Partial Initialisation Progress/)
-    assert.match(contract, /## Cache Compatibility/)
-    assert.match(contract, /## Bounded Disposable Cache Validation/)
-    assert.match(contract, /## Gather Deduplication/)
-    assert.match(contract, /Cache schema compatibility requires the exact owned ordinary-table semantics/)
-    assert.match(contract, /## Package and Release Gates/)
-    assert.match(contract, /## Historical Plan Divergence Checklist/)
-    assert.doesNotMatch(contract, /MAR-2640 required current-Node.*`[0-9a-f]{40}`/u)
-    assert.match(
-      contract,
-      /Stable response-budget names are `fullResponseBytes`, `compactResponseBytes`, and `gatherResponseBytes`\./,
-    )
-    assert.match(
-      contract,
-      /MAR-2554 bounded full, compact, and gather read responses: `b43daf795de35d34602d1018ad509f68e494fe3d`\./,
-    )
-    assert.match(
-      contract,
-      /Last reviewed: 2026-08-26 for code and behavioural-test snapshot `c17834e5d4f4129c8f8374713be224c54ab4a39f`\./,
-    )
-    assert.match(
-      contract,
-      /MAR-2575 stable canonical read and validation snapshots with one bounded operation-scoped retry ledger: `c17834e5d4f4129c8f8374713be224c54ab4a39f`\./,
-    )
-    assert.match(
-      contract,
-      /MAR-2641 negative-zero confidence normalisation across validation, canonical storage, mutation-cache hydration, public reads, and CLI output: `b6de02d1c5c6eab7d98e7d4525b8dee41035f1ab`\./,
-    )
-    assert.match(
-      contract,
-      /MAR-2576 bounded payload property inspection, allocation-order enforcement, canonical-output compatibility, and packed API coverage: `58ba821f4b655fad1b1e79be9df57600e7409381`\./,
-    )
-    assert.match(contract, /Each successful public cache read validates its cache generation exactly once/)
-    assert.match(
-      contract,
-      /MAR-2552 single-pass cache reads and identity-bound recovery: `9b5821d59999215f975d613edf4a9c252fb6258d`\./,
-    )
-    assert.match(
-      singlePassCacheReadDesign,
-      /The exact code and behavioural-test snapshot implementing this design is `9b5821d59999215f975d613edf4a9c252fb6258d`\./,
-    )
-    assert.match(
-      gatherDeduplicationDesign,
-      /The exact implementation and behavioural-test snapshot is `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`\./,
-    )
-    assert.match(
-      validatedMutationCacheDesign,
-      /The exact implementation and behavioural-test snapshot is `30104a049f72ba2e87f51af95d5da11b55045cc3`\./,
-    )
-    assert.match(
-      contract,
-      /MAR-2560 snapshot-local exact-key gather deduplication: `36091c7e886b67b5c5bc355e6bcdb078f9a74f85`\./,
-    )
-    assert.match(
-      contract,
-      /MAR-2565 validated mutation cache construction, deterministic disk fallback, and unchanged public error semantics: `30104a049f72ba2e87f51af95d5da11b55045cc3`\./,
-    )
-    assert.match(contract, /## Performance Evidence/)
-    assert.match(contract, /implementing the MAR-2566 benchmark guarantees above/)
-    assert.match(contract, /MAR-2568 behavioural hot-scan work bounds: `de66f6ab7e10696fc878e380dd5417d194d60fe8`\./)
-    assert.match(performance, /## Validated mutation snapshot comparison/)
-    assert.match(
-      contract,
-      /MAR-2566 isolated operation performance samples, additive phase boundaries, schema-version 2 distributions and strict budgets: `eae98315e53ce568c62f6854a8542b285b7f9e4f`\./,
-    )
-    assert.match(
-      contract,
-      /MAR-2548 restart-safe partial initialisation progress and convergence: `f388a67819e2bebcabcaa5051bab6fe8985dd4ab`\./,
-    )
-    assert.match(
-      contract,
-      /MAR-2563 operation-locked record timestamp assignment, locked canonical authority, and cross-process ordering: `2874874096bb7d327e084d7e17d5243564244c43`\./,
-    )
-    assert.match(
-      contract,
-      /MAR-2549 bounded disposable cache validation and exact-generation recovery: `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`\./,
-    )
-    assert.match(contract, /Historical plan's wall-clock-only `createdAt` policy/)
-    assert.match(
-      operationBudgetsDesign,
-      /The exact reviewed code and behavioural-test snapshot implementing this design is `1e913807c20a332dc49a004be672205fbeabfe15`\./,
-    )
-    assert.match(
-      boundedCacheValidationDesign,
-      /The exact reviewed code and behavioural-test snapshot implementing this design is `fa5c1688c274b4f0f8fdc94ea102ed6cb1f0a4dd`\./,
-    )
-    assert.match(
-      semanticCacheSchemaDesign,
-      /The exact reviewed code and behavioural-test snapshot implementing this design is `f539720542a3302dd849002652e958da4a6063bf`\./,
-    )
-    assert.match(
-      ftsTextIntegrityDesign,
-      /The exact reviewed code and behavioural-test snapshot implementing this design is `2a68ce4dc839481a91b9afd6fb44a13ace13cb26`\./,
-    )
-    assert.match(
-      responseByteBudgetsDesign,
-      /The exact reviewed code and behavioural-test snapshot implementing this design is `b43daf795de35d34602d1018ad509f68e494fe3d`\./,
-    )
-    assert.match(
-      unicodeLiteralSearchDesign,
-      /The exact implementation and behavioural-test snapshot is `aa1a2596f4ca5be42b8896beedc802040eb57161`\./,
-    )
-    assert.match(
-      readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),
-      /creation timestamps under the repository operation lock/,
-    )
+  test('resolves active documentation links without rewriting historical artifacts', () => {
+    for (const path of ['README.md', 'docs/contract.md', 'docs/performance.md', 'skills/encephalon/SKILL.md']) {
+      const document = readFileSync(resolve(root, path), 'utf8')
+      for (const match of document.matchAll(/\]\(([^)]+)\)/gu)) {
+        const link = match[1] ?? ''
+        const repositoryPrefix = 'https://github.com/isaachinman/encephalon/blob/main/'
+        if (link.startsWith(repositoryPrefix) || !link.includes('://')) {
+          const [target, fragment] = link.replace(repositoryPrefix, '').split('#')
+          const directory = link.startsWith(repositoryPrefix) ? root : dirname(resolve(root, path))
+          const targetPath = resolve(directory, target || basename(path))
+          assert.equal(existsSync(targetPath), true, `${path}: ${link}`)
+          if (fragment !== undefined) {
+            const headings = [...readFileSync(targetPath, 'utf8').matchAll(/^#+ (.+)$/gmu)].map(heading =>
+              (heading[1] ?? '')
+                .toLowerCase()
+                .replace(/[^\w -]/gu, '')
+                .replaceAll(' ', '-'),
+            )
+            assert.equal(headings.includes(fragment), true, `${path}: ${link}`)
+          }
+        }
+      }
+    }
   })
 
   test('keeps installed command guidance aligned with root-install verification', () => {
@@ -635,6 +523,27 @@ describe('package contract', () => {
     assert.match(skill, /npx --no-install encephalon validate/)
     assert.match(contract, /npx --no-install encephalon/)
     assert.doesNotMatch(skill, /node \.\/node_modules\/encephalon\/dist\/cli\.mjs/)
+  })
+
+  test('preserves the original documentation bytes in their record-owned archive', () => {
+    const archive = resolve(root, 'encephalon', '_artifacts', 'context', '3ae9fa5c-490d-4a55-b988-22609b49ba00')
+    // Captured from a60fbf4028f999189820d948da5904e55ec16b5b before replacing active documents.
+    const originals = {
+      'docs/contract.md': '0f72a335b2429a36469ed7ee7f20666b0bb0685ad139f909db23d68b8e161343',
+      'docs/implementation-plan.md': 'f957dc18421ffcdca65008a85cf3710b8688fcb6fb861c765f1ef7b67de9169a',
+      'docs/performance-baseline.json': '53af256dc35ece00dbc870005da5bfa20c7d417057b63bb8483fdb540da12981',
+      'docs/performance.md': 'c6577b457b1c5c6e5d5628758033c62bc9ef2d91483a0cd541f505ff9c8ef35a',
+      'README.md': 'eb82f7b9f5dd45c60726648a2c0d890c713737849e117b060be4ce52d9f1c99e',
+    }
+    for (const [path, digest] of Object.entries(originals)) {
+      assert.equal(
+        createHash('sha256')
+          .update(readFileSync(resolve(archive, path)))
+          .digest('hex'),
+        digest,
+        path,
+      )
+    }
   })
 
   test('retains the exact package tarball exercised by the package checker', { timeout: 75_000 }, () => {

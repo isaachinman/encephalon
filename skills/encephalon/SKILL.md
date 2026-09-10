@@ -18,6 +18,8 @@ npx --no-install encephalon show --id "<relevant-id>" --active-only
 
 Prefer compact search or one batched `gather` call before loading full records. Treat missing results as missing stored knowledge, not proof that a fact is false. Do not inspect or edit record JSON directly.
 
+Search terms are literal and combined with AND. Payload-only matches can have a metadata/summary fallback snippet; use `show` to understand them. Reads prepare the disposable cache automatically. Recoverable corruption rebuilds once; a foreign cache or unsafe layout fails closed. Follow the reported recovery action rather than deleting cache or canonical files blindly. An add error with `canonicalCommitted: true` means the record already exists: inspect its ID and validate before retrying.
+
 ## Decide whether to record
 
 Record only durable, high-signal knowledge:
