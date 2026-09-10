@@ -13,14 +13,14 @@ export const summaryForRecord = (record: BrainRecord) => {
   return null
 }
 
-const searchDocumentForRecord = (record: BrainRecord, summary: string | null) =>
+export const searchDocumentForRecord = (record: BrainRecord, summary: string | null) =>
   normalizeSearchText(
     [record.kind, record.subject, record.source, summary, JSON.stringify(record.payload), record.searchText ?? '']
       .filter((value): value is string => typeof value === 'string' && value.length > 0)
       .join('\n'),
   )
 
-const searchPreviewForRecord = (record: BrainRecord, summary: string | null) => {
+export const searchPreviewForRecord = (record: BrainRecord, summary: string | null) => {
   const preview = normalizeSearchText(
     [record.kind, record.subject, record.source, summary]
       .filter((value): value is string => typeof value === 'string' && value.length > 0)
