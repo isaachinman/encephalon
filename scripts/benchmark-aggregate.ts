@@ -4,6 +4,44 @@ import { fileURLToPath } from 'node:url'
 import { compareBenchmarkRuns, parseComparableRun } from './benchmark-comparison.ts'
 import { benchmarkRepetitions, benchmarkShards } from './benchmark-shards.ts'
 
+export const readBenchmarkEvidence = (directory: string, attempt: number) => {
+  const selected = readdirSync(directory, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .reduce<Record<string, { attempt: number; directory: string }>>((result, entry) => {
+      const match = /^performance-([1-9][0-9]*)-(.+)$/.exec(entry.name)
+      const sourceAttempt = Number(match?.[1])
+      const name = match?.[2]
+      if (
+        !(
+          name &&
+          Object.hasOwn(benchmarkShards, name) &&
+          Number.isSafeInteger(sourceAttempt) &&
+          sourceAttempt <= attempt
+        )
+      ) {
+        throw new Error('Unexpected benchmark shard or workflow attempt.')
+      }
+      if (sourceAttempt > (result[name]?.attempt ?? 0)) {
+        result[name] = { attempt: sourceAttempt, directory: entry.name }
+      }
+      return result
+    }, {})
+  return {
+    attempts: Object.fromEntries(Object.entries(selected).map(([name, entry]) => [name, entry.attempt])),
+    evidence: Object.fromEntries(
+      Object.entries(selected).map(([name, entry]) => [
+        name,
+        Object.fromEntries(
+          ['base', 'candidate'].map(side => [
+            side,
+            JSON.parse(readFileSync(join(directory, entry.directory, `${side}.json`), 'utf8')),
+          ]),
+        ) as { base: unknown; candidate: unknown },
+      ]),
+    ),
+  }
+}
+
 export const aggregateBenchmarkShards = (
   evidence: Record<string, { base: unknown; candidate: unknown }>,
   baseCommit: string,
@@ -24,7 +62,7 @@ export const aggregateBenchmarkShards = (
     if (
       base.commit !== baseCommit ||
       candidate.commit !== candidateCommit ||
-      base.benchmark.configuration.repetitions !== benchmarkRepetitions(name) ||
+      base.benchmark.configuration.repetitions !== benchmarkRepetitions ||
       base.benchmark.configuration.warmups !== 2 ||
       base.benchmark.environment.platform !== 'linux'
     ) {
@@ -73,23 +111,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   if (!(directory && base && candidate && attempt && /^[1-9][0-9]*$/.test(attempt))) {
     throw new Error('Usage: node scripts/benchmark-aggregate.ts DIRECTORY BASE_SHA CANDIDATE_SHA RUN_ATTEMPT')
   }
-  const prefix = `performance-${attempt}-`
-  const directories = readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isDirectory())
-  if (directories.some(entry => !entry.name.startsWith(prefix))) {
-    throw new Error('Benchmark evidence belongs to a different workflow attempt.')
-  }
-  const evidence = Object.fromEntries(
-    directories.map(entry => [
-      entry.name.slice(prefix.length),
-      Object.fromEntries(
-        ['base', 'candidate'].map(side => [
-          side,
-          JSON.parse(readFileSync(join(directory, entry.name, `${side}.json`), 'utf8')),
-        ]),
-      ) as { base: unknown; candidate: unknown },
-    ]),
-  )
-  const result = aggregateBenchmarkShards(evidence, base, candidate)
+  const { evidence, attempts } = readBenchmarkEvidence(directory, Number(attempt))
+  const result = { ...aggregateBenchmarkShards(evidence, base, candidate), attempts }
   writeFileSync(join(directory, 'comparison.json'), `${JSON.stringify(result, null, 2)}\n`)
   process.stdout.write(
     `Performance comparison ${result.passed ? 'passed' : 'failed'} across ${result.shards.length} same-runner shards.\n`,

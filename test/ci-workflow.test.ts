@@ -71,7 +71,7 @@ test('parallel CI retains complete verification and exact-package release gates'
   }
   for (const name of [
     'correctness',
-    'compatibility',
+    'tooling',
     'benchmark-smoke',
     'performance',
     'verify',
@@ -94,28 +94,30 @@ test('parallel CI retains complete verification and exact-package release gates'
   assert.match(correctness, /context: macos-latest/)
   assert.match(correctness, /context: windows-latest/)
   assert.match(correctness, /context: ubuntu-current/)
-  assert.match(correctness, /bun run typecheck/)
-  assert.match(correctness, /bun run lint/)
+  assert.match(jobs.tooling ?? '', /bun run typecheck/)
+  assert.match(jobs.tooling ?? '', /bun run lint/)
+  assert.match(jobs.tooling ?? '', /bun run test:tooling/)
+  assert.match(jobs.tooling ?? '', /runs-on: ubuntu-latest/)
+  assert.doesNotMatch(correctness, /bun run typecheck|bun run lint|test:tooling/)
   assert.doesNotMatch(correctness, /bun run benchmark:check/)
   assert.match(jobs['benchmark-smoke'] ?? '', /bun run benchmark:check/)
   assert.doesNotMatch(jobs['benchmark-smoke'] ?? '', /needs:/)
-  assert.match(correctness, /node scripts\/test-ci.ts.*windows-latest.*main.*all/)
-  assert.match(
-    jobs.compatibility ?? '',
-    /group: \[compatibility-a, compatibility-b, compatibility-c, package, benchmark, benchmark-sessions, benchmark-report, benchmark-cli, cache\]/,
-  )
-  assert.match(jobs.compatibility ?? '', /runs-on: windows-latest/)
-  assert.match(jobs.compatibility ?? '', /needs: package/)
+  assert.match(correctness, /node scripts\/test-ci.ts.*matrix.group.*runtime/)
+  assert.match(correctness, /context: windows-latest\n\s+os: windows-latest\n\s+node: 24.15.0\n\s+group: runtime-core/)
+  assert.match(correctness, /context: windows-cache\n\s+os: windows-latest\n\s+node: 24.15.0\n\s+group: cache/)
   const performance = jobs.performance ?? ''
   assert.match(performance, /runs-on: ubuntu-24.04-arm/)
   assert.match(performance, /fetch-depth: 0/)
-  assert.match(performance, /node scripts\/benchmark-compare.ts.*matrix.repetitions \|\| 20.*matrix.shard/)
-  assert.match(performance, /shard: empty-cold\n\s+repetitions: 100/)
-  assert.match(performance, /shard: small-cold\n\s+repetitions: 100/)
+  assert.match(performance, /node scripts\/benchmark-compare.ts.*20.*matrix.shard/)
+  assert.match(
+    performance,
+    /shard: \[large-gather, large-payload, large-maximum, large-preparation, large-reads, large-validation\]/,
+  )
   assert.match(performance, /name: performance-\$\{\{ github.run_attempt \}\}-\$\{\{ matrix.shard \}\}/)
-  assert.match(jobs.verify ?? '', /needs: \[correctness, compatibility, benchmark-smoke, performance\]/)
+  assert.match(jobs.verify ?? '', /needs: \[correctness, tooling, benchmark-smoke, performance\]/)
   assert.match(jobs.verify ?? '', /node scripts\/benchmark-aggregate.ts/)
-  assert.match(jobs.verify ?? '', /pattern: performance-\$\{\{ github.run_attempt \}\}-\*/)
+  assert.match(jobs.verify ?? '', /pattern: performance-\*/)
+  assert.match(performance, /if-no-files-found: error/)
   for (const name of ['verify', 'release']) {
     assert.match(jobs[name] ?? '', /if: always\(\)/)
     assert.match(jobs[name] ?? '', /every\(job => job.result === "success"\)/)
@@ -126,17 +128,20 @@ test('parallel CI retains complete verification and exact-package release gates'
   assert.match(packageJob, /check-package.ts --retain-tarball package-artifacts/)
   assert.match(packageJob, /check-worktree-clean.ts --allow-package-artifacts/)
   assert.match(packageJob, /name: encephalon-npm-package-\$\{\{ github.run_attempt \}\}/)
+  assert.match(packageJob, /artifact: \$\{\{ steps.artifact.outputs.name \}\}/)
   for (const name of ['candidate', 'release-checks']) {
     const job = jobs[name] ?? ''
     assert.match(job, /needs: package/)
     assert.match(job, /actions\/download-artifact@/)
-    assert.match(job, /name: encephalon-npm-package-\$\{\{ github.run_attempt \}\}/)
+    assert.match(job, /name: \$\{\{ needs.package.outputs.artifact \}\}/)
     assert.match(job, /check-package-metadata.ts/)
     assert.match(job, /check-package.ts --tarball package-artifacts\/encephalon-0.3.0.tgz/)
     assert.doesNotMatch(job, /--retain-tarball|npm pack|npm install/)
   }
-  assert.match(jobs.candidate ?? '', /- 24.15.0/)
-  assert.match(jobs.candidate ?? '', /- 26/)
+  assert.match(jobs.candidate ?? '', /node: 24.15.0/)
+  assert.match(jobs.candidate ?? '', /node: 26/)
+  assert.match(jobs.candidate ?? '', /os: windows-latest/)
+  assert.match(jobs.candidate ?? '', /os: macos-latest/)
   assert.match(jobs['release-checks'] ?? '', /check-release-compatibility.ts package-artifacts\/encephalon-0.3.0.tgz/)
   assert.match(jobs['release-checks'] ?? '', /check-publish.ts package-artifacts\/encephalon-0.3.0.tgz/)
   assert.match(jobs.release ?? '', /needs: \[candidate, release-checks, verify\]/)

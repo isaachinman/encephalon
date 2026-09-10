@@ -23,7 +23,7 @@ import {
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync, StatementSync } from 'node:sqlite'
-import { afterEach, describe, test } from 'node:test'
+import { afterEach, describe, mock, test } from 'node:test'
 import { artifactInspectionTestHooks } from '../src/artifact-inspection.ts'
 import { cacheReadTestHooks } from '../src/cache.ts'
 import {
@@ -34,6 +34,7 @@ import {
   inspectCacheDatabase,
   inspectCacheLocation,
   inspectCacheOwnedDirectory,
+  observeCacheOwnedDirectory,
   observeCacheOwner,
   observeCacheRecoveryWitness,
   openVerifiedCacheDatabase,
@@ -9818,6 +9819,42 @@ describe('SQLite cache and reads', () => {
         true,
       )
       assert.deepEqual(JSON.parse(readFileSync(join(preservedReplacementPath, 'owner.json'), 'utf8')), replacementOwner)
+    }
+  })
+
+  test('reobserves changed recovery identities before rejecting a resolved path mismatch', () => {
+    for (const state of ['moved', 'replaced', 'stable']) {
+      const root = createRoot()
+      const location = inspectCacheLocation(root)
+      const path = join(location.directory, 'operation-lock.recovery')
+      const displacedPath = join(location.directory, 'displaced-recovery')
+      mkdirSync(path)
+      const nativeRealpath = realpathSync.native
+      const mocked = mock.method(realpathSync, 'native', (observedPath: string) => {
+        if (observedPath === path) {
+          mocked.mock.restore()
+          if (state !== 'stable') {
+            renameSync(path, displacedPath)
+            if (state === 'replaced') {
+              mkdirSync(path)
+            }
+          }
+          return displacedPath
+        }
+        return nativeRealpath(observedPath)
+      })
+      try {
+        if (state === 'stable') {
+          assert.throws(() => observeCacheOwnedDirectory(location, 'operation-lock.recovery'), {
+            code: 'VALIDATION_FAILED',
+            details: { entry: 'node_modules/.cache/encephalon/operation-lock.recovery', invariant: 'real-directory' },
+          })
+        } else {
+          assert.deepEqual(observeCacheOwnedDirectory(location, 'operation-lock.recovery'), { kind: 'changed' }, state)
+        }
+      } finally {
+        mocked.mock.restore()
+      }
     }
   })
 

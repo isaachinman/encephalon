@@ -1087,9 +1087,6 @@ const observeOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
     }
     throw error
   }
-  if (!samePath(actualRealpath, path)) {
-    return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
-  }
   cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity?.(path)
   let finalMetadata: BigIntStats
   try {
@@ -1105,6 +1102,9 @@ const observeOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
   }
   if (!sameCacheEntryIdentity(captured, entryIdentityFrom(finalMetadata))) {
     return { kind: 'changed' }
+  }
+  if (!samePath(actualRealpath, path)) {
+    return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
   }
   return { directory: { ...captured, name, path }, kind: 'stable' }
 }

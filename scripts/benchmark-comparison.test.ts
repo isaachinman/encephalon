@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
-import { aggregateBenchmarkShards } from './benchmark-aggregate.ts'
+import { aggregateBenchmarkShards, readBenchmarkEvidence } from './benchmark-aggregate.ts'
 import { combineBenchmarkOperations, combineBenchmarkRounds } from './benchmark-compare.ts'
 import { type ComparableRun, compareBenchmarkRuns } from './benchmark-comparison.ts'
 import { benchmarkOperations, summarizeDistribution, summarizeSamples } from './benchmark-model.ts'
-import { benchmarkShards, completeBenchmarkScope } from './benchmark-shards.ts'
+import { benchmarkShards, completeBenchmarkScope, includesPackedBenchmarks } from './benchmark-shards.ts'
 
 const run = (
   count = 3,
@@ -13,7 +16,7 @@ const run = (
   startup: NonNullable<ComparableRun['startup']>
 } => ({
   benchmark: {
-    cases: [0, 1, 100, 1000].map(records => ({
+    cases: [1000].map(records => ({
       artifacts: 0,
       cache: {
         amplification: records === 0 ? null : 1,
@@ -62,14 +65,47 @@ const run = (
   startup: { help: Array.from({ length: count }, () => 100), version: Array.from({ length: count }, () => 100) },
 })
 
+test('partial workflow reruns select the latest complete pair per shard and retain its attempt', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'encephalon-rerun-'))
+  const writePair = (name: string, attempt: number) => {
+    const path = join(directory, `performance-${attempt}-${name}`)
+    mkdirSync(path)
+    for (const side of ['base', 'candidate']) {
+      writeFileSync(join(path, `${side}.json`), JSON.stringify({ attempt, side }))
+    }
+  }
+  try {
+    writePair('large-gather', 1)
+    writePair('large-gather', 2)
+    writePair('large-payload', 1)
+    const result = readBenchmarkEvidence(directory, 2)
+    assert.deepEqual(result.attempts, { 'large-gather': 2, 'large-payload': 1 })
+    assert.deepEqual(result.evidence['large-gather'], {
+      base: { attempt: 2, side: 'base' },
+      candidate: { attempt: 2, side: 'candidate' },
+    })
+    assert.throws(() => readBenchmarkEvidence(directory, 1), /attempt/)
+    rmSync(join(directory, 'performance-2-large-gather', 'candidate.json'))
+    assert.throws(() => readBenchmarkEvidence(directory, 2), /ENOENT/)
+  } finally {
+    rmSync(directory, { force: true, recursive: true })
+  }
+})
+
 test('parallel benchmark shards partition every required workload exactly once', () => {
   const keys = (scope: typeof completeBenchmarkScope) =>
     scope.flatMap(entry => entry.operations.map(operation => `${entry.records}:${operation}`))
   const actual = Object.values(benchmarkShards).flatMap(keys)
   assert.deepEqual(actual.toSorted(), keys(completeBenchmarkScope).toSorted())
   assert.equal(new Set(actual).size, actual.length)
-  assert.deepEqual(benchmarkShards['empty-cold'], [{ operations: ['coldHydrate'], records: 0 }])
-  assert.deepEqual(benchmarkShards['small-cold'], [{ operations: ['coldHydrate'], records: 1 }])
+  assert.equal(actual.length, 15)
+  assert.ok(actual.every(key => key.startsWith('1000:')))
+  assert.deepEqual(
+    Object.entries(benchmarkShards)
+      .filter(([, scope]) => includesPackedBenchmarks(scope))
+      .map(([name]) => name),
+    ['large-reads'],
+  )
 })
 
 test('operation assembly rejects duplicate or changed fixtures and preserves the largest cache', () => {
@@ -123,9 +159,9 @@ test('relative gate detects latency, tail, memory and byte regressions with acti
       .filter(metric => !metric.passed)
       .map(metric => [metric.operation, metric.metric, metric.percentageDifference, metric.allowedPercent]),
     [
-      ['0:list', 'totalMs.median', 16, 15],
-      ['0:list', 'totalMs.p95', 30, 25],
-      ['0:list', 'peakRssBytes.maximum', 21, 20],
+      ['1000:list', 'totalMs.median', 16, 15],
+      ['1000:list', 'totalMs.p95', 30, 25],
+      ['1000:list', 'peakRssBytes.maximum', 21, 20],
       ['package', 'javascriptBytes', 10.1, 10],
     ],
   )
@@ -184,7 +220,7 @@ test('comparison refuses incompatible or incomplete evidence instead of approvin
 
 test('comparison rejects jointly omitted workloads and does not round away threshold violations', () => {
   const incomplete = run()
-  incomplete.benchmark.cases = incomplete.benchmark.cases.slice(0, 1)
+  incomplete.benchmark.cases = []
   assert.throws(() => compareBenchmarkRuns(incomplete, structuredClone(incomplete)), /benchmark/i)
   const candidate = run()
   const [entry] = candidate.benchmark.cases
@@ -270,7 +306,7 @@ test('aggregate validates every same-runner pair and never approves a missing sh
   const evidenceFor = (override?: { name: string; count: number }) =>
     Object.fromEntries(
       Object.entries(benchmarkShards).map(([name, scope]) => {
-        const expectedCount = name === 'empty-cold' || name === 'small-cold' ? 100 : 20
+        const expectedCount = 20
         const base = run(override?.name === name ? override.count : expectedCount)
         base.runner = name
         base.benchmark.environment.platform = 'linux'
@@ -287,8 +323,8 @@ test('aggregate validates every same-runner pair and never approves a missing sh
         })
         const scoped: ComparableRun = {
           ...base,
-          package: name === 'empty' ? base.package : null,
-          startup: name === 'empty' ? base.startup : null,
+          package: name === 'large-reads' ? base.package : null,
+          startup: name === 'large-reads' ? base.startup : null,
         }
         return [name, { base: scoped, candidate: structuredClone(scoped) }]
       }),
@@ -296,24 +332,10 @@ test('aggregate validates every same-runner pair and never approves a missing sh
   const evidence = evidenceFor()
   const aggregate = (value: typeof evidence) => aggregateBenchmarkShards(value, 'a'.repeat(40), 'a'.repeat(40))
   assert.equal(aggregate(evidence).passed, true)
-  assert.throws(() => aggregate(evidenceFor({ count: 20, name: 'empty-cold' })), /sampling policy/)
-  assert.throws(() => aggregate(evidenceFor({ count: 20, name: 'small-cold' })), /sampling policy/)
+  assert.throws(() => aggregate(evidenceFor({ count: 5, name: 'large-reads' })), /sampling policy/)
   assert.throws(() => aggregate(evidenceFor({ count: 100, name: 'large-gather' })), /sampling policy/)
-  const cold = evidence['empty-cold']?.candidate.benchmark.cases[0]?.operations.coldHydrate
-  assert.ok(cold)
-  cold.totalMs = summarizeDistribution(Array.from({ length: 100 }, (_, index) => (index < 2 ? 130 : 100)))
-  assert.equal(cold.totalMs.samples.length, 100)
-  assert.equal(cold.totalMs.maximum, 130)
-  assert.equal(aggregate(evidence).passed, true)
-  cold.totalMs = summarizeDistribution(Array.from({ length: 100 }, (_, index) => (index < 5 ? 130 : 100)))
-  assert.equal(cold.totalMs.p95, 100)
-  assert.equal(aggregate(evidence).passed, true)
-  cold.totalMs = summarizeDistribution(Array.from({ length: 100 }, (_, index) => (index < 6 ? 130 : 100)))
-  assert.equal(cold.totalMs.p95, 130)
-  assert.equal(aggregate(evidence).passed, false)
-  cold.totalMs = summarizeDistribution(Array.from({ length: 100 }, () => 100))
   assert.throws(() => aggregate(Object.fromEntries(Object.entries(evidence).slice(1))), /every declared shard/)
-  const first = evidence.empty
+  const first = evidence['large-reads']
   assert.ok(first?.candidate.package)
   first.candidate.runner = 'unpaired'
   assert.throws(() => aggregate(evidence), /compatible/)
