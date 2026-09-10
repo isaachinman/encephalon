@@ -4,7 +4,11 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symli
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
-import { assertPackageVersionSource, renderPackageVersionSource } from '../scripts/package-version.ts'
+import {
+  assertPackageVersionSource,
+  packageArtifactFilename,
+  renderPackageVersionSource,
+} from '../scripts/package-version.ts'
 
 const root = resolve(import.meta.dirname, '..')
 const staleGeneratedVersionMessage =
@@ -230,5 +234,13 @@ test('build regenerates the exact package-version source in an isolated reposito
     )
   } finally {
     rmSync(temporaryRoot, { force: true, recursive: true })
+  }
+})
+
+test('derives filenames using the same release-version grammar as retained metadata', () => {
+  assert.equal(packageArtifactFilename('0.4.0'), 'encephalon-0.4.0.tgz')
+  assert.equal(packageArtifactFilename('1.2.3-rc.1'), 'encephalon-1.2.3-rc.1.tgz')
+  for (const version of ['1.2.3-rc.1+build.2', '1.2.3+build.2', '../0.4.0', '0.4.0\nother=value', '', undefined]) {
+    assert.throws(() => packageArtifactFilename(version), /version/)
   }
 })

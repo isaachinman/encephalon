@@ -3,13 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { assertReviewedManifest, type PackageManifest, preflightExactPackageArtifact } from './package-preflight.ts'
-import {
-  packageArtifactFilename,
-  readPackageTarEntries,
-  snapshotPackageTarball,
-  verifyPackageArtifactMetadata,
-} from './package-tarball.ts'
-import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
+import { readPackageTarEntries, snapshotPackageTarball, verifyPackageArtifactMetadata } from './package-tarball.ts'
+import { assertPackageVersionSource, packageArtifactFilename, readPackageVersionSource } from './package-version.ts'
 
 export const restorePackageCandidate = (root: string, expectedSha256: string) => {
   const version = assertReviewedManifest(

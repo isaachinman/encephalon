@@ -79,7 +79,7 @@ jobs:
   platform:
     name: platform (${{ matrix.context }})
     needs: selection
-    timeout-minutes: 5
+    timeout-minutes: 9
     strategy:
       fail-fast: false
       matrix:

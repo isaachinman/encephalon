@@ -6,13 +6,12 @@ import { assertPublicDeclarations, reviewedRuntimePaths } from './package-graph.
 import {
   type PackageArtifactMetadata,
   type PackageTarballSnapshot,
-  packageArtifactFilename,
   packageArtifactMetadataPath,
   readPackageTarEntries,
   snapshotPackageTarball,
   verifyPackageArtifactMetadata,
 } from './package-tarball.ts'
-import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
+import { assertPackageVersionSource, packageArtifactFilename, readPackageVersionSource } from './package-version.ts'
 
 export const REVIEWED_PACKAGE_FILES = Object.freeze([
   'dist',

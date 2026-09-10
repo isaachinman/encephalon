@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { lstatSync, opendirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { packageArtifactFilename } from './package-tarball.ts'
+import { packageArtifactFilename } from './package-version.ts'
 
 export const assertCleanReleaseWorktree = (root: string, allowPackageArtifacts: boolean) => {
   const status = spawnSync('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], {

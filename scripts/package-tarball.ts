@@ -21,13 +21,6 @@ import { basename, dirname, isAbsolute, parse, posix, relative, resolve, sep, wi
 import { fileURLToPath } from 'node:url'
 import { gunzipSync } from 'node:zlib'
 
-export const packageArtifactFilename = (version: unknown) => {
-  if (typeof version === 'string' && /^\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)*$/.test(version)) {
-    return `encephalon-${version}.tgz`
-  }
-  throw new Error('The package version cannot form a safe candidate filename.')
-}
-
 export type PackageCheckArguments = Readonly<{
   retainedDirectory?: string
   suppliedTarball?: string

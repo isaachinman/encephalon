@@ -26,3 +26,10 @@ export const assertPackageVersionSource = (version: string, source: string): voi
     throw createStaleGeneratedVersionError()
   }
 }
+
+export const packageArtifactFilename = (version: unknown) => {
+  if (typeof version === 'string' && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) {
+    return `encephalon-${version}.tgz`
+  }
+  throw new Error('The package version cannot form a safe candidate filename.')
+}
