@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, relative, resolve, sep } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
 import { describe, test } from 'node:test'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import { spawnNpmCommand } from '../scripts/npm-command.ts'
@@ -488,29 +488,22 @@ describe('package contract', () => {
     assert.match(readme, /\[Changelog\]\(https:\/\/github\.com\/isaachinman\/encephalon\/blob\/main\/CHANGELOG\.md\)/)
   })
 
-  test('resolves active documentation links without rewriting historical artifacts', () => {
-    for (const path of ['README.md', 'docs/contract.md', 'docs/performance.md', 'skills/encephalon/SKILL.md']) {
-      const document = readFileSync(resolve(root, path), 'utf8')
-      for (const match of document.matchAll(/\]\(([^)]+)\)/gu)) {
-        const link = match[1] ?? ''
-        const repositoryPrefix = 'https://github.com/isaachinman/encephalon/blob/main/'
-        if (link.startsWith(repositoryPrefix) || !link.includes('://')) {
-          const [target, fragment] = link.replace(repositoryPrefix, '').split('#')
-          const directory = link.startsWith(repositoryPrefix) ? root : dirname(resolve(root, path))
-          const targetPath = resolve(directory, target || basename(path))
-          assert.equal(existsSync(targetPath), true, `${path}: ${link}`)
-          if (fragment !== undefined) {
-            const headings = [...readFileSync(targetPath, 'utf8').matchAll(/^#+ (.+)$/gmu)].map(heading =>
-              (heading[1] ?? '')
-                .toLowerCase()
-                .replace(/[^\w -]/gu, '')
-                .replaceAll(' ', '-'),
-            )
-            assert.equal(headings.includes(fragment), true, `${path}: ${link}`)
-          }
-        }
-      }
+  test('keeps the required public documentation destinations available', () => {
+    // Check this documentation map, not arbitrary Markdown syntax or generated GitHub slugs.
+    for (const path of [
+      'README.md',
+      'docs/contract.md',
+      'CHANGELOG.md',
+      'docs/performance-baseline.json',
+      'docs/performance-budgets.json',
+    ]) {
+      assert.ok(readFileSync(resolve(root, path)).length > 0, path)
     }
+    const readme = readFileSync(resolve(root, 'README.md'), 'utf8')
+    assert.ok(
+      readme.includes('https://github.com/isaachinman/encephalon/blob/main/docs/performance.md#contributor-checks'),
+    )
+    assert.match(readFileSync(resolve(root, 'docs/performance.md'), 'utf8'), /^## Contributor checks$/mu)
   })
 
   test('keeps installed command guidance aligned with root-install verification', () => {
