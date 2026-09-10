@@ -1,0 +1,25 @@
+{
+  "createdAt": "2026-09-10T10:22:44.620Z",
+  "id": "1228daeb-c260-4542-b798-9d828ce95cd9",
+  "kind": "architecture",
+  "payload": {
+    "summary": "Share one immutable operation-local VerifiedCorpus for each accepted canonical generation.",
+    "authority": [
+      "Reuse ID, case-path, supersession, active-head and artifact indexes across validation, planning and cache operations.",
+      "Bind relative canonical paths to accepted raw SHA-256 witnesses with the domain-separated version-2 fingerprint; do not recursively hash normalised payloads.",
+      "Freeze owned payloads during parser exit actions, preserve mutable independent public results, and capture fixed publication evidence for committed assertions."
+    ],
+    "cache": [
+      "Fresh reads require complete canonical equality and exact body/preview bytes even when cached metadata copies the canonical fingerprint.",
+      "Writer predecessors may be validated canonical subsets: check their own active flags and fingerprint only their accepted member witnesses before replacement.",
+      "Reuse a replacement corpus during disposable recovery only after its generation assertion succeeds."
+    ],
+    "scope": [
+      "Keep existing filesystem proof passes, graph/error budgets, bounded SQL probes and expected-FTS buffers.",
+      "Raw fingerprint changes recover through the existing locked disposable-cache path without new metadata fields or public exports."
+    ]
+  },
+  "searchText": "verified corpus immutable raw digest fingerprint cache predecessor subset indexes MAR-2786",
+  "source": "agent",
+  "subject": "canonical.verified-corpus"
+}

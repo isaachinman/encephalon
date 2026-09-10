@@ -299,6 +299,39 @@ describe('canonical records', () => {
     assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
   })
 
+  test('reuses a signed-zero predecessor while superseding its previously active head', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'signed-zero', payload: { value: 0 }, subject: 'corpus.subset' })
+    const path = join(root, 'encephalon', 'decision', 'signed-zero.json')
+    const original = readFileSync(path, 'utf8').replace('"value": 0', '"value": -0')
+    writeFileSync(path, original)
+    api.prepare({ root })
+    let recoveries = 0
+    let diskValidations = 0
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      recoveries += 1
+    }
+    cacheReadTestHooks.afterCanonicalValidation = () => {
+      diskValidations += 1
+    }
+    const added = api.addRecord({
+      id: 'after-signed-zero',
+      kind: 'decision',
+      payload: { value: 1 },
+      root,
+      source: 'test',
+      subject: 'corpus.subset',
+      supersedes: ['signed-zero'],
+    })
+    assert.equal(recoveries, 0)
+    assert.equal(diskValidations, 0)
+    assert.deepEqual(
+      api.listRecords({ root }).map(record => record.id),
+      [added.id],
+    )
+    assert.equal(readFileSync(path, 'utf8'), original)
+  })
+
   test('orders add and generated baseline timestamps after canonical history', () => {
     const root = createRoot()
     const future = new Date(Date.now() + 86_400_000).toISOString()
@@ -785,6 +818,45 @@ describe('canonical records', () => {
     assert.equal(Object.isFrozen(validated.artifacts), true)
     assert.equal(validated.artifacts.length, 1)
     assert.equal(Object.isFrozen(validated.artifacts[0]), true)
+  })
+
+  test('binds a verified corpus to exact canonical bytes and keeps its accepted data immutable', () => {
+    const root = createRoot()
+    writeCanonicalRecord(root, { id: 'raw-corpus', payload: { nested: [{ value: 'original' }] } })
+    const accepted = readValidatedRecordSnapshotResolved(root)
+    const [record] = accepted.records
+    assert.ok(record)
+    const path = join(root, ...record.path.split('/'))
+    const bytes = readFileSync(path)
+    const facts = accepted.recordFacts(record)
+    assert.equal(accepted.byId.get(record.id), record)
+    assert.equal(accepted.byCasePath.get(record.path.toLowerCase()), record)
+    assert.equal(facts.digest, createHash('sha256').update(bytes).digest('hex'))
+    assert.equal(facts.bytes, bytes.length)
+    assert.equal(accepted.recordFacts(record), facts)
+    assert.equal(Object.isFrozen(facts), true)
+    writeFileSync(path, `${bytes.toString('utf8')}\n`)
+    const changed = readValidatedRecordSnapshotResolved(root)
+
+    assert.deepEqual(changed.records, accepted.records)
+    assert.notEqual(changed.recordFingerprint, accepted.recordFingerprint)
+    assert.throws(accepted.assertCurrent, { code: 'REPOSITORY_CHANGED' })
+    const payload = record.payload as { nested: Array<{ value: string }> }
+    const [nested] = payload.nested
+    assert.ok(nested)
+    assert.throws(() => {
+      nested.value = 'changed'
+    }, TypeError)
+    assert.throws(() => {
+      payload.nested.push({ value: 'changed' })
+    }, TypeError)
+    const shown = api.showRecord({ id: record.id, root })
+    assert.ok(shown)
+    const shownPayload = shown.payload as typeof payload
+    shownPayload.nested.push({ value: 'public result only' })
+    const again = api.showRecord({ id: record.id, root })
+    assert.ok(again)
+    assert.deepEqual(again.payload, { nested: [{ value: 'original' }] })
   })
 
   test('does not inspect the artifact filesystem for an artifact-free corpus', () => {
