@@ -1,0 +1,18 @@
+{
+  "createdAt": "2026-09-10T18:19:00.032Z",
+  "id": "f15451c0-ff87-48d6-abb5-40f18accb8cf",
+  "kind": "architecture",
+  "payload": {
+    "summary": "Gather reserves the complete memoised occurrence cost before copying a duplicate, while first distinct searches remain streamed against the shared response budget.",
+    "rules": [
+      "The existing logical byte contract counts UTF-8 strings and property names plus eight bytes per scalar or container. Raw canonical file size and JSON serialisation length are different contracts and must not replace gather accounting.",
+      "Memoise a canonical show reference and its complete logical envelope cost only for requested IDs, including missing IDs. Charge each occurrence before constructing its public envelope or cloning its record; never expose the accepted canonical reference.",
+      "Measure and charge each first-query compact row once before retaining it in the streamed result array. Save the sum with the empty search envelope cost, which already includes the results array node.",
+      "Exact query strings identify memo entries because kind, supersession and limit are fixed for the gather. Charge a duplicate search envelope and all rows in one step before allocating its result array or copying rows. Preserve independent output objects and duplicate order.",
+      "Keep the ledger, measured costs and both memos inside one verified attempt. A failed attempt discards all partial state; recovery starts fresh. Do not add an eager whole-corpus sizing pass or persist costs between operations."
+    ]
+  },
+  "searchText": "gather memoised duplicate precharge clone allocation logical response budget streaming MAR-2790",
+  "source": "agent",
+  "subject": "gather.response-accounting"
+}
