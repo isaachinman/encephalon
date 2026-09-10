@@ -41,13 +41,12 @@ export const collectBoundedDirectoryEntries = <Entry extends { name: string } = 
   directory: string,
   maximum: number,
   openDirectory: OpenDirectory<Entry> = opendirSync as unknown as OpenDirectory<Entry>,
-  onEntry?: () => void,
 ) => {
   const reader = openDirectory(directory)
   let primaryError: unknown
   let result: { entries: Entry[]; overflow: false } | { entries: never[]; overflow: true } | undefined
   try {
-    const collected = readBoundedDirectoryEntries(reader, maximum + 1, () => onEntry?.())
+    const collected = readBoundedDirectoryEntries(reader, maximum + 1)
     result =
       collected.entries.length > maximum
         ? { entries: [], overflow: true as const }
@@ -94,11 +93,10 @@ export const captureCanonicalDirectory = (
   path: string,
   maximum: number,
   afterEnumeration?: (path: string) => void,
-  onEntry?: () => void,
 ): CanonicalDirectorySnapshot => {
   try {
     const witness = captureDirectoryWitness(path, { allowLink: false })
-    const collected = collectBoundedDirectoryEntries(witness.canonicalPath, maximum, undefined, onEntry)
+    const collected = collectBoundedDirectoryEntries(witness.canonicalPath, maximum)
     afterEnumeration?.(path)
     revalidateDirectoryWitness(witness)
     return { ...collected, maximum, witness }

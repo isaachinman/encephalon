@@ -12,7 +12,6 @@ import {
   PROPERTY_INSPECTION_FAILED,
 } from './property-inspection.ts'
 import type { AddRecordInput, BrainRecordFile, JsonValue } from './types.ts'
-import { observeWork, rethrowWorkObserverError } from './work-observer.ts'
 
 export const MAX_RECORD_BYTES = CANONICAL_BUDGETS.recordBytes
 export const MAX_PAYLOAD_DEPTH = 64
@@ -117,17 +116,6 @@ const validateStringArray = (value: unknown[], field: string, item: (value: unkn
 type PayloadTarget = {
   container: JsonValue[] | { [key: string]: JsonValue }
   key: number | string
-}
-
-type PayloadValidationWork = 'payload-output-container' | 'payload-retained-value'
-
-type PayloadValidationHooks = {
-  onWork?: (operation: PayloadValidationWork) => void
-}
-
-type PayloadValidationObservers = {
-  outputContainer: (() => void) | undefined
-  retainedValue: (() => void) | undefined
 }
 
 type PayloadWorkItem =
@@ -244,7 +232,6 @@ const validateJsonValueAt = (
   stack: PayloadWorkItem[],
   seen: WeakSet<object>,
   nodeCount: { value: number },
-  observers: PayloadValidationObservers,
 ) => {
   nodeCount.value += 1
   if (nodeCount.value > MAX_PAYLOAD_NODES) {
@@ -284,9 +271,6 @@ const validateJsonValueAt = (
     }
     const keys = getPayloadOwnKeys(value, path)
     const values = lengthIsValid ? new Array<unknown>(length) : undefined
-    if (values !== undefined) {
-      observers.outputContainer?.()
-    }
     let hasAccessor = false
     let hasSymbol = false
     let presentIndices = 0
@@ -310,7 +294,6 @@ const validateJsonValueAt = (
         ) {
           presentIndices += 1
           values[index] = descriptor.value
-          observers.retainedValue?.()
         }
       }
     }
@@ -388,7 +371,6 @@ const validateJsonValueAt = (
             keys[enumerableKeyCount] = key
             values[enumerableKeyCount] = descriptor.value
             enumerableKeyCount += 1
-            observers.retainedValue?.()
           }
         }
       }
@@ -406,7 +388,6 @@ const validateJsonValueAt = (
         })
       }
       const result: { [key: string]: unknown } = {}
-      observers.outputContainer?.()
       for (let index = 0; index < enumerableKeyCount; index += 1) {
         const key = keys[index]
         if (typeof key === 'string') {
@@ -444,49 +425,31 @@ const validateJsonValueAt = (
   return fail('INVALID_ARGUMENT', 'payload contains a value that is not JSON serializable.', { field: path })
 }
 
-export const validateJsonValue = (value: unknown, hooks: PayloadValidationHooks = {}, immutable = false) => {
+export const validateJsonValue = (value: unknown, immutable = false) => {
   const stack: PayloadWorkItem[] = [{ action: 'enter', depth: 0, path: 'payload', value }]
   const seen = new WeakSet<object>()
   const nodeCount = { value: 0 }
-  const observers: PayloadValidationObservers = {
-    outputContainer: observeWork(hooks.onWork, 'payload-output-container'),
-    retainedValue: observeWork(hooks.onWork, 'payload-retained-value'),
-  }
-  try {
-    let result: JsonValue | undefined
-    while (stack.length > 0) {
-      const item = stack.pop()
-      if (item !== undefined) {
-        if (item.action === 'exit') {
-          seen.delete(item.value)
-          if (immutable) {
-            Object.freeze(item.output)
-          }
-        } else {
-          const assigned = validateJsonValueAt(
-            item.value,
-            item.path,
-            item.depth,
-            item.target,
-            stack,
-            seen,
-            nodeCount,
-            observers,
-          )
-          if (item.target === undefined && assigned !== undefined) {
-            result = assigned
-          }
+  let result: JsonValue | undefined
+  while (stack.length > 0) {
+    const item = stack.pop()
+    if (item !== undefined) {
+      if (item.action === 'exit') {
+        seen.delete(item.value)
+        if (immutable) {
+          Object.freeze(item.output)
+        }
+      } else {
+        const assigned = validateJsonValueAt(item.value, item.path, item.depth, item.target, stack, seen, nodeCount)
+        if (item.target === undefined && assigned !== undefined) {
+          result = assigned
         }
       }
     }
-    if (result !== undefined) {
-      return result
-    }
-    return fail('INTERNAL_ERROR', 'Payload validation did not produce a value.')
-  } catch (error) {
-    rethrowWorkObserverError(error)
-    throw error
   }
+  if (result !== undefined) {
+    return result
+  }
+  return fail('INTERNAL_ERROR', 'Payload validation did not produce a value.')
 }
 
 const portableArtifactSegments = (value: unknown, field: string) => {
@@ -658,7 +621,7 @@ export const parseRecordFile = (value: unknown, immutable = false): BrainRecordF
     createdAt: validateTimestamp(object.createdAt),
     id,
     kind,
-    payload: validateJsonValue(object.payload, {}, immutable),
+    payload: validateJsonValue(object.payload, immutable),
     source: requiredText(object.source, 'source'),
     subject: requiredText(object.subject, 'subject'),
   }

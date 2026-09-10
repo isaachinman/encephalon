@@ -4,11 +4,7 @@ export type DirectoryReader<Entry> = {
 }
 
 /** @internal */
-export const readBoundedDirectoryEntries = <Entry>(
-  reader: DirectoryReader<Entry>,
-  maximum: number,
-  onEntry?: ((entry: Entry) => void) | undefined,
-) => {
+export const readBoundedDirectoryEntries = <Entry>(reader: DirectoryReader<Entry>, maximum: number) => {
   const entries: Entry[] = []
   let exhausted = false
   while (entries.length < maximum) {
@@ -17,7 +13,6 @@ export const readBoundedDirectoryEntries = <Entry>(
       exhausted = true
       break
     }
-    onEntry?.(entry)
     entries.push(entry)
   }
   return { entries, exhausted }

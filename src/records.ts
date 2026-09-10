@@ -89,7 +89,6 @@ import type {
   ValidateResult,
   ValidationIssue,
 } from './types.ts'
-import { observedArray, observedSet, observeWork, reportWork, rethrowWorkObserverError } from './work-observer.ts'
 
 type RecordScan = {
   records: BrainRecord[]
@@ -232,25 +231,13 @@ type RecordReadFault =
   | 'after-record-read'
   | 'before-kind-lstat'
   | 'before-parent-lstat'
+  | 'before-record-lstat'
   | 'before-record-open'
   | 'before-rejected-record-read'
 
-type RecordWork =
-  | 'active-group-read'
-  | 'active-group-write'
-  | 'active-issue-read'
-  | 'active-issue-write'
-  | 'allowed-id-write'
-  | 'canonical-entry'
-  | 'cycle-edge'
-  | 'duplicate-issue-read'
-  | 'duplicate-issue-write'
-  | 'duplicate-record'
-  | 'edge-validation'
-  | 'superseded-edge'
-
 /** @internal */
 export type RecordReadHooks = {
+  afterArtifactValidation?: () => void
   afterBrainRootEnumeration?: (() => void) | undefined
   afterBrainRootSnapshot?: (() => void) | undefined
   afterKindEnumeration?: ((path: string) => void) | undefined
@@ -260,7 +247,6 @@ export type RecordReadHooks = {
   fault?: (point: RecordReadFault, path: string) => void
   graphValidation?: () => void
   now?: (() => number) | undefined
-  onWork?: ((operation: RecordWork) => void) | undefined
 }
 
 type AddRecordOptions = {
@@ -280,15 +266,6 @@ type PlannedRecord = {
 
 type ValidateRecordsOptions = {
   hooks?: RecordReadHooks
-}
-
-const preserveWorkObserverFailure = <Result>(operation: () => Result) => {
-  try {
-    return operation()
-  } catch (error) {
-    rethrowWorkObserverError(error)
-    throw error
-  }
 }
 
 type AllowedMultiHead = {
@@ -855,6 +832,7 @@ const readRecord = (
   | { bytes: Buffer; kind: 'accepted'; observation: RecordObservation }
   | { evidence: RecordRejectionEvidence; kind: 'rejected'; message: string } => {
   let pathMetadata: BigIntStats
+  readFault(hooks, 'before-record-lstat', path)
   try {
     pathMetadata = lstatSync(path, { bigint: true })
   } catch (error) {
@@ -1046,7 +1024,6 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
       records: [],
       rejections: [],
     }
-    const onWork = options.hooks?.onWork
     let recordBytes = 0n
     let stopScanning = false
     const addScanError = (validationIssue: ValidationIssue) => {
@@ -1118,9 +1095,6 @@ const scanCanonicalRecords = (root: string, options: ValidateRecordsOptions = {}
           for (const recordEntry of recordEntries.entries) {
             if (stopScanning) {
               break
-            }
-            if (onWork !== undefined) {
-              reportWork(onWork, 'canonical-entry')
             }
             const recordPath = join(kindPath, recordEntry.name)
             const relativePath = posixRelative(root, recordPath)
@@ -1263,24 +1237,13 @@ const indexArtifactReferences = (records: readonly BrainRecord[]) => {
   }
 }
 
-const indexRecordCorpus = (
-  records: readonly BrainRecord[],
-  hooks: RecordReadHooks = {},
-  artifacts = indexArtifactReferences(records),
-) => {
+const indexRecordCorpus = (records: readonly BrainRecord[], artifacts = indexArtifactReferences(records)) => {
   const ids = new Map<string, BrainRecord>()
   const paths = new Map<string, BrainRecord>()
   const superseded = new Set<string>()
-  const { onWork } = hooks
   let edgeCount = 0
-  const duplicateIssues = observedArray<ValidationIssue>(
-    observeWork(onWork, 'duplicate-issue-read'),
-    observeWork(onWork, 'duplicate-issue-write'),
-  )
+  const duplicateIssues: ValidationIssue[] = []
   for (const record of records) {
-    if (onWork !== undefined) {
-      reportWork(onWork, 'duplicate-record')
-    }
     const pathKey = record.path.normalize('NFC').toLowerCase()
     const idCollision = ids.get(record.id)
     const pathCollision = paths.get(pathKey)
@@ -1301,9 +1264,6 @@ const indexRecordCorpus = (
   if (edgeCount <= MAX_SUPERSESSION_EDGES) {
     for (const record of records) {
       for (const targetId of record.supersedes ?? []) {
-        if (onWork !== undefined) {
-          reportWork(onWork, 'superseded-edge')
-        }
         superseded.add(targetId)
       }
     }
@@ -1313,12 +1273,7 @@ const indexRecordCorpus = (
         const key = `${record.kind}\0${record.subject}`
         const group = groups.get(key)
         if (group === undefined) {
-          const first = observedArray<BrainRecord>(
-            observeWork(onWork, 'active-group-read'),
-            observeWork(onWork, 'active-group-write'),
-          )
-          first.push(record)
-          groups.set(key, first)
+          groups.set(key, [record])
         } else {
           group.push(record)
         }
@@ -1342,9 +1297,8 @@ const indexRecordCorpus = (
 
 type RecordCorpusIndex = ReturnType<typeof indexRecordCorpus>
 
-const supersessionIssues = (index: RecordCorpusIndex, hooks: RecordReadHooks) => {
+const supersessionIssues = (index: RecordCorpusIndex) => {
   const { byId, edgeCount, records } = index
-  const { onWork } = hooks
   if (edgeCount > MAX_SUPERSESSION_EDGES) {
     return [
       corpusIssue(
@@ -1356,9 +1310,6 @@ const supersessionIssues = (index: RecordCorpusIndex, hooks: RecordReadHooks) =>
   const edgeIssues: ValidationIssue[] = []
   for (const record of records) {
     for (const targetId of record.supersedes ?? []) {
-      if (onWork !== undefined) {
-        reportWork(onWork, 'edge-validation')
-      }
       const target = byId.get(targetId)
       if (target === undefined) {
         edgeIssues.push(
@@ -1397,9 +1348,6 @@ const supersessionIssues = (index: RecordCorpusIndex, hooks: RecordReadHooks) =>
         } else {
           const targetId = targets[frame.index] ?? ''
           frame.index += 1
-          if (onWork !== undefined) {
-            reportWork(onWork, 'cycle-edge')
-          }
           const target = byId.get(targetId)
           if (target !== undefined) {
             const targetState = state.get(target.id)
@@ -1422,10 +1370,7 @@ const supersessionIssues = (index: RecordCorpusIndex, hooks: RecordReadHooks) =>
     }
   }
 
-  const activeIssues = observedArray<ValidationIssue>(
-    observeWork(hooks.onWork, 'active-issue-read'),
-    observeWork(hooks.onWork, 'active-issue-write'),
-  )
+  const activeIssues: ValidationIssue[] = []
   for (const group of index.activeGroups) {
     if (group.length > 1) {
       for (const record of group) {
@@ -1561,12 +1506,13 @@ const validateScannedSnapshot = (
   hooks.graphValidation?.()
   const artifacts = existingIndex ?? indexArtifactReferences(scan.records)
   const artifactValidation = validatedArtifactIssues(root, { ...artifacts, records: scan.records }, changed)
-  const index = existingIndex ?? indexRecordCorpus(scan.records, hooks, artifacts)
+  hooks.afterArtifactValidation?.()
+  const index = existingIndex ?? indexRecordCorpus(scan.records, artifacts)
   const collectedErrors = [
     ...scan.errors,
     ...corpusBudgetIssues(scan),
     ...index.duplicateIssues,
-    ...supersessionIssues(index, hooks),
+    ...supersessionIssues(index),
     ...artifactValidation.errors,
   ]
   const { errors, truncated } = truncateValidationIssues(collectedErrors)
@@ -1844,13 +1790,9 @@ const readStableCanonicalPlanningScan = (root: string, hooks: RecordReadHooks = 
     createCanonicalSnapshotRetryLedger(hooks.now),
   )
 
-const allowedMultiHeadRecordIds = (
-  index: RecordCorpusIndex,
-  allowed: readonly AllowedMultiHead[],
-  hooks: RecordReadHooks,
-) => {
+const allowedMultiHeadRecordIds = (index: RecordCorpusIndex, allowed: readonly AllowedMultiHead[]) => {
   const allowedKeys = new Set(allowed.map(candidate => `${candidate.kind}\0${candidate.subject}\0${candidate.source}`))
-  const ids = observedSet<string>(observeWork(hooks.onWork, 'allowed-id-write'))
+  const ids = new Set<string>()
   for (const group of index.activeGroups) {
     if (
       group.length > 1 &&
@@ -1869,7 +1811,6 @@ export const validateRecordsResolved = (root: string, options: ValidateRecordsOp
   try {
     return readStableCanonicalSnapshot(root, options.hooks).validation.result
   } catch (error) {
-    rethrowWorkObserverError(error)
     if (error instanceof EncephalonError) {
       throw error
     }
@@ -1882,11 +1823,7 @@ export const validateRecords = (input: RootInput = {}): ValidateResult => {
   return validateRecordsResolved(root)
 }
 
-const acceptValidatedRecordScan = (
-  snapshot: StableCanonicalSnapshot,
-  hooks: RecordReadHooks,
-  allowed?: AllowedMultiHead[],
-) => {
+const acceptValidatedRecordScan = (snapshot: StableCanonicalSnapshot, allowed?: AllowedMultiHead[]) => {
   const { scan, validation } = snapshot
   const { result } = validation
   if (allowed === undefined) {
@@ -1905,7 +1842,7 @@ const acceptValidatedRecordScan = (
       })),
     })
   }
-  const allowedIds = allowedMultiHeadRecordIds(validation.index, allowed, hooks)
+  const allowedIds = allowedMultiHeadRecordIds(validation.index, allowed)
   const blockingErrors = result.errors.filter(
     error =>
       !(error.code === 'MULTIPLE_ACTIVE_HEADS' && error.recordId !== undefined && allowedIds.has(error.recordId)),
@@ -1926,16 +1863,12 @@ const acceptValidatedRecordScan = (
   })
 }
 
-const readRecordScanResolvedUnchecked = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
-  acceptValidatedRecordScan(readStableCanonicalSnapshot(root, hooks), hooks, allowed)
+const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
+  acceptValidatedRecordScan(readStableCanonicalSnapshot(root, hooks), allowed)
 
-const readRecordScanAttemptResolvedUnchecked = (
-  root: string,
-  hooks: RecordReadHooks = {},
-  allowed?: AllowedMultiHead[],
-) => {
+const readRecordScanAttemptResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
   try {
-    return acceptValidatedRecordScan(readCanonicalSnapshotAttempt(root, hooks), hooks, allowed)
+    return acceptValidatedRecordScan(readCanonicalSnapshotAttempt(root, hooks), allowed)
   } catch (error) {
     if (error instanceof CanonicalGenerationChanged) {
       return fail('REPOSITORY_CHANGED', 'The canonical repository changed during the operation.')
@@ -1943,9 +1876,6 @@ const readRecordScanAttemptResolvedUnchecked = (
     throw error
   }
 }
-
-const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
-  preserveWorkObserverFailure(() => readRecordScanResolvedUnchecked(root, hooks, allowed))
 
 const createVerifiedCorpus = (
   root: string,
@@ -2303,7 +2233,7 @@ const recordPlanningSnapshot = (
       if (allowed === undefined) {
         return validation.result.errors
       }
-      const allowedIds = allowedMultiHeadRecordIds(validation.index, allowed, hooks)
+      const allowedIds = allowedMultiHeadRecordIds(validation.index, allowed)
       return validation.result.errors.filter(
         error =>
           !(error.code === 'MULTIPLE_ACTIVE_HEADS' && error.recordId !== undefined && allowedIds.has(error.recordId)),
@@ -2374,17 +2304,15 @@ export const readValidatedRecordSnapshotResolved = (
   hooks: RecordReadHooks = {},
   allowed?: AllowedMultiHead[],
 ) => {
-  const validated = preserveWorkObserverFailure(() => readRecordScanAttemptResolvedUnchecked(root, hooks, allowed))
+  const validated = readRecordScanAttemptResolved(root, hooks, allowed)
   const artifacts = Object.freeze([...validated.artifacts])
   const assertCurrent = () =>
-    preserveWorkObserverFailure(() =>
-      assertCanonicalSnapshotCurrent(
-        root,
-        validated.scan,
-        validated.artifactEvidence,
-        () => fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.'),
-        hooks,
-      ),
+    assertCanonicalSnapshotCurrent(
+      root,
+      validated.scan,
+      validated.artifactEvidence,
+      () => fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.'),
+      hooks,
     )
   return createVerifiedCorpus(root, validated.scan, validated.index, artifacts, assertCurrent)
 }
@@ -2464,18 +2392,16 @@ export const assertRecordGraph = (
   hooks: RecordReadHooks = {},
   bytes?: number,
 ) => {
-  const result = preserveWorkObserverFailure(() =>
-    validateScanned(
-      root,
-      {
-        bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
-        errors: [],
-        observations: [],
-        records: [...records],
-        rejections: [],
-      },
-      hooks,
-    ),
+  const result = validateScanned(
+    root,
+    {
+      bytes: bytes ?? records.reduce((total, record) => total + canonicalRecordBytes(record), 0),
+      errors: [],
+      observations: [],
+      records: [...records],
+      rejections: [],
+    },
+    hooks,
   )
   if (result.valid) {
     return

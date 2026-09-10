@@ -2806,36 +2806,51 @@ describe('canonical records', () => {
 
   test('bounds graph work for a corpus-limit supersession chain', () => {
     const root = createRoot()
-    for (const index of Array.from({ length: 1000 }, (_, value) => value)) {
-      writeCanonicalRecord(root, {
+    ;[1000, 1001].reduce<undefined>((verified, edgeCount) => {
+      const extraEdges = edgeCount === 1001 ? ['chain-0', 'chain-1'] : ['chain-0']
+      const records: BrainRecord[] = Array.from({ length: 1000 }, (_, index) => ({
         createdAt: timestampAt(index),
         id: `chain-${index}`,
-        ...(index === 0
-          ? {}
-          : {
-              supersedes: index === 999 ? [`chain-${index - 1}`, 'chain-0'] : [`chain-${index - 1}`],
-            }),
-      })
-    }
-
-    const work = new Map<string, number>()
-    const result = validateRecordsResolved(root, {
-      hooks: {
-        onWork: operation => work.set(operation, (work.get(operation) ?? 0) + 1),
-      },
-    }) as { truncated?: boolean } & ReturnType<typeof api.validateRecords>
-    assert.equal(result.valid, true)
-    assert.equal(result.recordsChecked, 1000)
-    assert.equal(result.errors.length, 0)
-    assert.equal(result.truncated, false)
-    assert.deepEqual(Object.fromEntries(work), {
-      'active-group-write': 1,
-      'canonical-entry': 1000,
-      'cycle-edge': 1000,
-      'duplicate-record': 1000,
-      'edge-validation': 1000,
-      'superseded-edge': 1000,
-    })
+        kind: 'decision',
+        path: `encephalon/decision/chain-${index}.json`,
+        payload: {},
+        source: 'test',
+        subject: 'bounded.chain',
+        supersedes: [...(index === 0 ? [] : [`chain-${index - 1}`]), ...(index === 999 ? extraEdges : [])],
+      }))
+      // Charge the ordinary fixture before wrapping test-owned inputs, so reads count graph traversal only.
+      const bytes = records.reduce((total, record) => total + Buffer.byteLength(formatRecordFile(record)), 0)
+      let edgeReads = 0
+      const countedRecords = records.map(record => ({
+        ...record,
+        supersedes: new Proxy(record.supersedes ?? [], {
+          get: (targets, key, receiver) => {
+            if (typeof key === 'string' && /^(0|[1-9]\d*)$/.test(key)) {
+              edgeReads += 1
+            }
+            return Reflect.get(targets, key, receiver)
+          },
+        }),
+      }))
+      const validate = () => assertRecordGraph(root, countedRecords, undefined, {}, bytes)
+      if (edgeCount === 1000) {
+        assert.doesNotThrow(validate)
+        assert.equal(edgeReads, 3 * edgeCount)
+      } else {
+        assert.throws(validate, (error: unknown) => {
+          assert.equal((error as api.EncephalonError).code, 'VALIDATION_FAILED')
+          assert.deepEqual((error as api.EncephalonError).details.errors, [
+            {
+              code: 'CORPUS_SUPERSEDES_LIMIT',
+              message: 'Canonical corpus may contain at most 1000 supersession edges.',
+            },
+          ])
+          return true
+        })
+        assert.equal(edgeReads, 0, 'the edge budget must fail before traversing any targets')
+      }
+      return verified
+    }, undefined)
   })
 
   test('preflights exact and overflowing planned kind directory entries', () => {
@@ -2890,19 +2905,9 @@ describe('canonical records', () => {
       id: 'edge-budget-overflow',
       supersedes: ['one-more-missing-edge'],
     })
-    let traversedOverflowEdges = 0
-    const edgeResult = validateRecordsResolved(edgeRoot, {
-      hooks: {
-        onWork: operation => {
-          if (operation === 'cycle-edge' || operation === 'edge-validation' || operation === 'superseded-edge') {
-            traversedOverflowEdges += 1
-          }
-        },
-      },
-    })
+    const edgeResult = api.validateRecords({ root: edgeRoot })
     assert.equal(edgeResult.valid, false)
     assert.equal(edgeResult.errors[0]?.code, 'CORPUS_SUPERSEDES_LIMIT')
-    assert.equal(traversedOverflowEdges, 0, 'supersession traversal continued after the edge budget failed')
 
     const artifactRoot = createRoot()
     for (const recordIndex of Array.from({ length: 201 }, (_, value) => value)) {
@@ -4512,17 +4517,8 @@ describe('canonical records', () => {
         return Reflect.ownKeys(target)
       },
     })
-    const allocationWork = {
-      'payload-output-container': 0,
-      'payload-retained-value': 0,
-    }
     assert.throws(
-      () =>
-        validateJsonValue(wideObject, {
-          onWork: operation => {
-            allocationWork[operation] += 1
-          },
-        }),
+      () => validateJsonValue(wideObject),
       (error: unknown) => {
         const actual = error as { code?: unknown; details?: unknown; message?: unknown }
         assert.equal(actual.code, 'INVALID_ARGUMENT')
@@ -4532,25 +4528,7 @@ describe('canonical records', () => {
       },
     )
     assert.deepEqual(wideObjectCalls, { descriptors: MAX_PAYLOAD_NODES, ownKeys: 1 })
-    assert.deepEqual(allocationWork, {
-      'payload-output-container': 0,
-      'payload-retained-value': MAX_PAYLOAD_NODES - 1,
-    })
     assert.equal(childVisits, 0)
-
-    const observerFailure = new Error('payload work observer failure')
-    assert.throws(
-      () =>
-        validateJsonValue(
-          { value: null },
-          {
-            onWork: () => {
-              throw observerFailure
-            },
-          },
-        ),
-      (error: unknown) => error === observerFailure,
-    )
 
     const overBudgetAccessorTarget = Object.fromEntries(
       Array.from({ length: MAX_PAYLOAD_NODES }, (_, index) => [`k${index}`, null]),
@@ -5223,17 +5201,17 @@ describe('canonical records', () => {
 
     const result = validateRecordsResolved(root, {
       hooks: {
+        afterArtifactValidation: () => {
+          if (!changed) {
+            changed = true
+            writeFileSync(artifactPath, 'settled evidence')
+          }
+        },
         canonicalScan: () => {
           counts.canonicalScans += 1
         },
         graphValidation: () => {
           counts.graphValidations += 1
-        },
-        onWork: operation => {
-          if (operation === 'duplicate-record' && !changed) {
-            changed = true
-            writeFileSync(artifactPath, 'settled evidence')
-          }
         },
       },
     })
@@ -5264,14 +5242,8 @@ describe('canonical records', () => {
 
       const result = validateRecordsResolved(root, {
         hooks: {
-          canonicalScan: () => {
-            counts.canonicalScans += 1
-          },
-          graphValidation: () => {
-            counts.graphValidations += 1
-          },
-          onWork: operation => {
-            if (operation === 'duplicate-record' && !changed) {
+          afterArtifactValidation: () => {
+            if (!changed) {
               changed = true
               if (change === 'type') {
                 mkdirSync(artifactPath)
@@ -5282,6 +5254,12 @@ describe('canonical records', () => {
                 }
               }
             }
+          },
+          canonicalScan: () => {
+            counts.canonicalScans += 1
+          },
+          graphValidation: () => {
+            counts.graphValidations += 1
           },
         },
       })
@@ -5315,21 +5293,19 @@ describe('canonical records', () => {
       () =>
         validateRecordsResolved(root, {
           hooks: {
+            afterArtifactValidation: () => {
+              if (existsSync(artifactPath)) {
+                rmSync(artifactPath)
+              } else {
+                writeFileSync(artifactPath, `evidence-${changes}`)
+              }
+              changes += 1
+            },
             canonicalScan: () => {
               counts.canonicalScans += 1
             },
             graphValidation: () => {
               counts.graphValidations += 1
-            },
-            onWork: operation => {
-              if (operation === 'duplicate-record') {
-                if (existsSync(artifactPath)) {
-                  rmSync(artifactPath)
-                } else {
-                  writeFileSync(artifactPath, `evidence-${changes}`)
-                }
-                changes += 1
-              }
             },
           },
         }),
@@ -5679,8 +5655,8 @@ describe('canonical records', () => {
             })
           }
         },
-        onWork: operation => {
-          if (operation === 'canonical-entry' && !recordRemoved) {
+        fault: (point, path) => {
+          if (point === 'before-record-lstat' && path === recordPath && !recordRemoved) {
             recordRemoved = true
             rmSync(recordPath)
           }

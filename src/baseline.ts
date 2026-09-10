@@ -24,7 +24,6 @@ import {
   type VerifiedRegularFileEvidence,
   type VerifiedRegularFileObservation,
 } from './verified-file.ts'
-import { observedArray, observeWork, rethrowWorkObserverError } from './work-observer.ts'
 
 const MAX_TOP_LEVEL_ENTRIES = 512
 const MAX_WORKFLOW_ENTRIES = 512
@@ -134,8 +133,6 @@ type PackageManagerEvidence =
       status: 'unknown'
     }
 
-type BaselineWork = 'top-level-entry' | 'top-level-fact-write' | 'workflow-entry'
-
 type BaselineScanHooks = {
   afterBaselineSources?: (() => void) | undefined
   afterOptionalDirectoryLstat?: ((path: string) => void) | undefined
@@ -145,7 +142,6 @@ type BaselineScanHooks = {
   beforeTopLevelRevalidation?: (() => void) | undefined
   beforeWorkflowDirectoryCapture?: (() => void) | undefined
   now?: (() => number) | undefined
-  onWork?: ((operation: BaselineWork) => void) | undefined
 }
 
 type BaselineReason =
@@ -549,12 +545,7 @@ const workflowFiles = (
         result = { reasons: ['workflow-enumeration-error'], value: [] }
       } else {
         authority.observeDirectory(workflows.witness)
-        const collected = collectBoundedDirectoryEntries(
-          workflows.witness.canonicalPath,
-          MAX_WORKFLOW_ENTRIES,
-          undefined,
-          observeWork(hooks.onWork, 'workflow-entry'),
-        )
+        const collected = collectBoundedDirectoryEntries(workflows.witness.canonicalPath, MAX_WORKFLOW_ENTRIES)
         invokeBaselineHook(hooks.afterWorkflowEnumeration)
         revalidateDirectoryWitness(workflows.witness)
         revalidateDirectoryWitness(github.witness)
@@ -574,7 +565,6 @@ const workflowFiles = (
       }
     }
   } catch (error) {
-    rethrowWorkObserverError(error)
     rethrowBaselineHookError(error)
     if (error instanceof BaselineGenerationChanged) {
       throw error
@@ -594,9 +584,9 @@ const workflowFiles = (
   return result
 }
 
-const emptyTopLevelFacts = (hooks?: BaselineScanHooks) => ({
-  directories: observedArray<string>(undefined, observeWork(hooks?.onWork, 'top-level-fact-write')),
-  recognisedFiles: observedArray<string>(undefined, observeWork(hooks?.onWork, 'top-level-fact-write')),
+const emptyTopLevelFacts = () => ({
+  directories: [] as string[],
+  recognisedFiles: [] as string[],
 })
 
 const topLevelFacts = (root: string, hooks: BaselineScanHooks, authority: BaselineObservationAuthority) => {
@@ -605,12 +595,7 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks, authority: Baseli
     value: emptyTopLevelFacts(),
   }
   try {
-    const snapshot = captureCanonicalDirectory(
-      root,
-      MAX_TOP_LEVEL_ENTRIES,
-      undefined,
-      observeWork(hooks.onWork, 'top-level-entry'),
-    )
+    const snapshot = captureCanonicalDirectory(root, MAX_TOP_LEVEL_ENTRIES)
     authority.observeDirectory(snapshot.witness)
     if (snapshot.overflow) {
       result = { reasons: ['top-level-entry-limit'], value: emptyTopLevelFacts() }
@@ -624,13 +609,12 @@ const topLevelFacts = (root: string, hooks: BaselineScanHooks, authority: Baseli
             candidate.recognisedFiles.push(entry.name)
           }
           return candidate
-        }, emptyTopLevelFacts(hooks))
+        }, emptyTopLevelFacts())
       invokeBaselineHook(hooks.beforeTopLevelRevalidation)
       revalidateCanonicalDirectory(snapshot)
       result = { reasons: [], value: facts }
     }
   } catch (error) {
-    rethrowWorkObserverError(error)
     rethrowBaselineHookError(error)
     if (error instanceof BaselineGenerationChanged) {
       throw error
