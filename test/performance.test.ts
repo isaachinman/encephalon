@@ -414,7 +414,8 @@ describe('hot scan performance regressions', () => {
     ensureParent(join(root, '.github', 'workflows', 'ci.yml'))
     writeFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'name: CI')
 
-    const canonicalRoot = fs.realpathSync(root)
+    // Native resolution expands Windows short-name aliases just as the directory witness does.
+    const canonicalRoot = fs.realpathSync.native(root)
     const directoryReads = mock.method(fs, 'opendirSync')
     syncBuiltinESMExports()
     try {
