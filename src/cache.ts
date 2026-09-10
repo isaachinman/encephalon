@@ -1829,6 +1829,7 @@ export const showRecord = (input: ShowRecordInput): BrainRecord | null => {
   })
 }
 
+// Keep FTS outermost in both search joins; older SQLite otherwise repeats MATCH for every active record.
 const searchRows = (database: DatabaseSync, input: SearchRecordsInput, match: string, limit: number) => {
   if (match.length === 0) {
     return []
@@ -1844,7 +1845,7 @@ const searchRows = (database: DatabaseSync, input: SearchRecordsInput, match: st
     SELECT
       records.id
     FROM record_search
-    JOIN records ON records.rowid = record_search.rowid
+    CROSS JOIN records ON records.rowid = record_search.rowid
     WHERE ${conditions.join(' AND ')}
     ORDER BY bm25(record_search) ASC, records.created_at DESC, records.id DESC
     LIMIT ?
@@ -1898,7 +1899,7 @@ const createCompactSearchReader = (
       bm25(record_search) AS rank,
       snippet(record_search, 1, '[', ']', '...', 16) AS snippet
     FROM record_search
-    JOIN records ON records.rowid = record_search.rowid
+    CROSS JOIN records ON records.rowid = record_search.rowid
     WHERE ${conditions.join(' AND ')}
     ORDER BY rank ASC, records.created_at DESC, records.id DESC
     LIMIT ?

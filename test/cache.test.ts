@@ -4441,6 +4441,43 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('drives full and compact searches from FTS matches before record lookups', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      kind: 'context',
+      payload: { summary: 'needle' },
+      root,
+      source: 'agent',
+      subject: 'search.join-order',
+    })
+    const plans: string[][] = []
+    const { prepare } = DatabaseSync.prototype
+    const observer = mock.method(DatabaseSync.prototype, 'prepare', function (this: DatabaseSync, source: string) {
+      if (source.includes('record_search MATCH ?')) {
+        const plan = prepare.call(this, `EXPLAIN QUERY PLAN ${source}`).all('needle', 20)
+        plans.push(plan.map(row => String(row.detail)))
+      }
+      return prepare.call(this, source)
+    })
+    try {
+      assert.deepEqual(
+        api.searchRecords({ query: 'needle', root }).map(result => result.id),
+        [record.id],
+      )
+      assert.deepEqual(
+        api.searchCompactRecords({ query: 'needle', root }).map(result => result.id),
+        [record.id],
+      )
+      assert.equal(plans.length, 2)
+      assert.ok(
+        plans.every(plan => plan[0]?.includes('record_search')),
+        JSON.stringify(plans),
+      )
+    } finally {
+      observer.mock.restore()
+    }
+  })
+
   test('charges compact response containers in their composing callers', () => {
     const root = createRoot()
     const query = 'structural ownership marker'
