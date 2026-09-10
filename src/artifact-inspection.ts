@@ -139,6 +139,15 @@ const revalidateAncestorChain = (directory: ArtifactDirectory): undefined => {
   revalidateDirectories([directory])
 }
 
+const ancestorFailureBefore = (parent: ArtifactDirectory, failure: unknown) => {
+  try {
+    revalidateAncestorChain(parent)
+    return failure
+  } catch (error) {
+    return error
+  }
+}
+
 const captureAncestor = (
   parent: ArtifactDirectory,
   segment: string,
@@ -271,6 +280,7 @@ const inspectFinalFile = (
   }
   let observation: ArtifactObservation | undefined
   let primaryError: unknown
+  let ancestorProofDeferred = false
   try {
     hooks.fault?.('after-artifact-open', artifact)
     const metadata = fstatSync(descriptor, { bigint: true })
@@ -290,6 +300,7 @@ const inspectFinalFile = (
       return changed()
     }
     hooks.fault?.('before-final-directory-revalidation', artifact)
+    ancestorProofDeferred = true
     revalidateDirectories([parent])
     const acceptedMetadata = fstatSync(descriptor, { bigint: true })
     const acceptedPathMetadata = lstatSync(path, { bigint: true })
@@ -307,17 +318,19 @@ const inspectFinalFile = (
       path: artifact,
     })
   } catch (error) {
-    if (isReplacementError(error)) {
+    const failure = ancestorProofDeferred ? ancestorFailureBefore(parent, error) : error
+    if (isReplacementError(failure)) {
       primaryError = new ArtifactChangedError()
     } else {
-      primaryError = error
+      primaryError = failure
     }
   }
   let closeError: unknown
   try {
     ;(hooks.close ?? closeSync)(descriptor)
   } catch (error) {
-    closeError = error
+    // Settle deferred checks that preceded close in the original inspection protocol.
+    closeError = primaryError === undefined && ancestorProofDeferred ? ancestorFailureBefore(parent, error) : error
   }
   if (primaryError !== undefined) {
     throw primaryError
