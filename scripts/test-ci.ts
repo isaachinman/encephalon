@@ -1,37 +1,20 @@
 import { spawnSync } from 'node:child_process'
 import { readdirSync } from 'node:fs'
+import { selectTestFiles } from './test-selection.ts'
 
-const [group] = process.argv.slice(2)
-const compatibility = 'scripts/release-compatibility.test.ts'
-const cache = 'test/cache.test.ts'
-const runtime = group === 'runtime' || group === 'runtime-core' || group === 'cache'
-const tooling = [
-  'scripts/benchmark-comparison.test.ts',
-  'test/benchmark.test.ts',
-  'test/package.test.ts',
-  'test/ci-workflow.test.ts',
-]
-if (runtime || group === 'tooling' || group === 'all') {
-  const files = ['scripts', 'test']
-    .flatMap(directory =>
-      readdirSync(directory)
-        .filter(name => name.endsWith('.test.ts'))
-        .map(name => `${directory}/${name}`),
-    )
-    .filter(path => {
-      const isRuntime = !tooling.includes(path)
-      const selectedRuntime = group === 'runtime' || (group === 'cache' ? path === cache : path !== cache)
-      return group === 'all' || (runtime ? isRuntime && selectedRuntime : !isRuntime || path === compatibility)
-    })
-  const result = spawnSync(
-    process.execPath,
-    ['--test', ...(runtime ? ['--test-skip-pattern=release compatibility process fixture'] : []), ...files],
-    { stdio: 'inherit' },
-  )
-  if (result.error) {
-    throw result.error
-  }
-  process.exitCode = result.status ?? 1
-} else {
-  throw new Error('Expected runtime, runtime-core, cache, tooling, or all.')
+const group = process.argv[2] ?? ''
+const discovered = ['scripts', 'test'].flatMap(directory =>
+  readdirSync(directory, { encoding: 'utf8', recursive: true })
+    .filter(name => name.endsWith('.test.ts'))
+    .map(name => `${directory}/${name.replaceAll('\\', '/')}`),
+)
+const changed: unknown = JSON.parse(process.env.CI_CHANGED_TESTS ?? '[]')
+if (!(Array.isArray(changed) && changed.every(path => typeof path === 'string'))) {
+  throw new Error('CI_CHANGED_TESTS must contain the changed test paths.')
 }
+const files = selectTestFiles(group, discovered, changed)
+const result = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit' })
+if (result.error) {
+  throw result.error
+}
+process.exitCode = result.status ?? 1

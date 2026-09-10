@@ -45,9 +45,9 @@ export {
 } from './release-compatibility-filesystem.ts'
 
 export const ORACLE = Object.freeze({
-  integrity: 'sha512-dgGi7fL43v9KQJ7Rb42fRAT+Z+h6WIOKhbPz9JzNBtnpqSyf4HyN6zBmIy6ftkTazZO6SyGU4MUi1FTVJyBvEw==',
-  shasum: '1db80715ac2028cb8f12ae029577aed3428d52ef',
-  specifier: 'encephalon@0.2.0',
+  integrity: 'sha512-wRDny+n6df42ZImjuqYNDOoi9PuoA5hRXPwaX7pXV4Nud3FqgSUEtK/CBQLtpLWpvqtrUn/cSlUIl/sX7OxGCA==',
+  shasum: '3dffeac3c66b60d398fb00eedd68243296c67b7b',
+  specifier: 'encephalon@0.3.0',
 })
 
 export const MAX_COMPATIBILITY_DIAGNOSTIC_BYTES = 8192
@@ -205,31 +205,6 @@ export const assertStablePublicSurface = (
   }
 }
 
-export const expectedCandidateCliHelp = (oracleHelp: string) =>
-  oracleHelp
-    .replace(/^(.*\[--artifact <path> \.\.\.\])$/mu, '$1\n      Accepts at most 1,000 supersession targets.')
-    .replace(/^ {2}search \[--compact\] (.+)$/mu, '  search $1\n  search --compact $1')
-    .replace(/^( {9}.*\[--limit <1\.\.1000>\])$/mu, '$1\n         Accepts at most 16 searches and 64 shows.')
-
-const publicSurfaceWithHelp = (value: unknown, label: string) => {
-  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-    const { help, ...surface } = value as Record<string, unknown>
-    if (typeof help === 'string') {
-      return { help, surface }
-    }
-  }
-  throw new Error(`${label} did not capture one CLI help surface.`)
-}
-
-const assertCandidateCliSurface = (oracle: unknown, candidate: unknown) => {
-  const expected = publicSurfaceWithHelp(oracle, 'The published oracle')
-  const actual = publicSurfaceWithHelp(candidate, 'The candidate')
-  assertStablePublicSurface(expected.surface, actual.surface, 'The candidate CLI', true)
-  if (actual.help !== expectedCandidateCliHelp(expected.help)) {
-    throw new Error('The candidate CLI does not exactly preserve the published public surface. Differences: $.help.')
-  }
-}
-
 const ordinalCompare = (left: string, right: string) => {
   if (left < right) {
     return -1
@@ -353,8 +328,7 @@ export const verifyOracleTarball = (path: string, identity: OracleIdentity = ORA
   throw new Error('The published compatibility oracle does not match its pinned SHA-1 and SHA-512 identities.')
 }
 
-const candidateResultLimitMaximums = Object.freeze({ compact: 1000, full: 1000 })
-const oracleResultLimitMaximums = Object.freeze({ compact: 100, full: 50 })
+const resultLimitMaximums = Object.freeze({ compact: 1000, full: 1000 })
 
 type SuppliedOracle = Readonly<{
   identity: OracleIdentity
@@ -1267,12 +1241,10 @@ const assertCliResultLimits = (fixtureRoot: string, maximums: ResultLimitMaximum
     )
     const hasExpectedEnvelope =
       failure.exitCode === 2 && failure.stdout === '' && body.error?.code === 'INVALID_ARGUMENT'
-    const isOracleParserRejection = maximums.full === 50 && maximums.compact === 100 && limit === 1001
-    const hasExpectedDetails = isOracleParserRejection
-      ? true
-      : body.error?.details?.budget === operation.budget &&
-        body.error.details.field === 'limit' &&
-        body.error.details.maximum === maximum
+    const hasExpectedDetails =
+      body.error?.details?.budget === operation.budget &&
+      body.error.details.field === 'limit' &&
+      body.error.details.maximum === maximum
     if (!(hasExpectedEnvelope && hasExpectedDetails)) {
       throw new Error(`The rejected ${operation.name} CLI result-limit contract did not match the published oracle.`)
     }
@@ -1284,17 +1256,10 @@ const assertCliResultLimits = (fixtureRoot: string, maximums: ResultLimitMaximum
   return resultLimitReport(maximums)
 }
 
-const runCandidateCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) =>
+const runCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) =>
   runFixturePhase(fixtureRoot, () => {
     const surface = captureCliSurface(fixtureRoot, version, redactions)
-    const limits = assertCliResultLimits(fixtureRoot, candidateResultLimitMaximums, redactions)
-    return { limits, surface }
-  })
-
-const runDowngradeCliSurface = (fixtureRoot: string, version: string, redactions: readonly Buffer[]) =>
-  runFixturePhase(fixtureRoot, () => {
-    const surface = captureCliSurface(fixtureRoot, version, redactions)
-    const limits = assertCliResultLimits(fixtureRoot, oracleResultLimitMaximums, redactions)
+    const limits = assertCliResultLimits(fixtureRoot, resultLimitMaximums, redactions)
     return { limits, surface }
   })
 
@@ -1357,12 +1322,12 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     const initialImport = runImportProbe(probes.importProbe, fixtureRoot, predecessorRedactions)
     runDeclarationProbe(probes.declarationConfiguration, fixtureRoot, predecessorRedactions)
     const initial = runApiProbe(probes.apiProbe, 'initialise', fixtureRoot, predecessorRedactions)
-    assertLimitReport(initial.limits, oracleResultLimitMaximums, 'The published oracle API phase')
-    if (initial.schemaAfter !== '1') {
-      throw new Error('The published compatibility oracle did not prepare cache schema 1.')
+    assertLimitReport(initial.limits, resultLimitMaximums, 'The published oracle API phase')
+    if (initial.schemaAfter !== '2') {
+      throw new Error('The published compatibility oracle did not prepare cache schema 2.')
     }
     const initialCli = runFixturePhase(fixtureRoot, () => ({
-      limits: assertCliResultLimits(fixtureRoot, oracleResultLimitMaximums, predecessorRedactions),
+      limits: assertCliResultLimits(fixtureRoot, resultLimitMaximums, predecessorRedactions),
       surface: captureCliSurface(fixtureRoot, initial.version, predecessorRedactions),
     }))
     const oracleCliSurface = initialCli.surface
@@ -1387,15 +1352,15 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     }
     runDeclarationProbe(probes.declarationConfiguration, fixtureRoot, redactions)
     const upgradeApi = runApiProbe(probes.apiProbe, 'upgrade', fixtureRoot, redactions)
-    assertLimitReport(upgradeApi.limits, candidateResultLimitMaximums, 'The candidate API phase')
-    const upgradeCli = runCandidateCliSurface(fixtureRoot, candidateImport.version, redactions)
+    assertLimitReport(upgradeApi.limits, resultLimitMaximums, 'The candidate API phase')
+    const upgradeCli = runCliSurface(fixtureRoot, candidateImport.version, redactions)
     const upgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, 'candidate', redactions)
     assertStablePublicSurface(initial.surface, upgradeApi.surface, 'The candidate API', true)
-    assertCandidateCliSurface(oracleCliSurface, upgradeCli.surface)
+    assertStablePublicSurface(oracleCliSurface, upgradeCli.surface, 'The candidate CLI', true)
     assertCandidateIndependentBudgets(upgradeIndependentBudgets)
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
-    if (upgradeApi.schemaBefore !== '1' || upgradeApi.schemaAfter !== '4') {
-      throw new Error('The candidate package did not rebuild cache schema 1 as schema 4.')
+    if (upgradeApi.schemaBefore !== '2' || upgradeApi.schemaAfter !== '4') {
+      throw new Error('The candidate package did not rebuild cache schema 2 as schema 4.')
     }
 
     options.hooks?.beforeOracleDowngrade?.(oracle.path)
@@ -1410,8 +1375,8 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     )
     const downgradeImport = runImportProbe(probes.importProbe, fixtureRoot, redactions)
     const downgradeApi = runApiProbe(probes.apiProbe, 'downgrade', fixtureRoot, redactions)
-    assertLimitReport(downgradeApi.limits, oracleResultLimitMaximums, 'The downgraded oracle API phase')
-    const downgradeCli = runDowngradeCliSurface(fixtureRoot, downgradeImport.version, redactions)
+    assertLimitReport(downgradeApi.limits, resultLimitMaximums, 'The downgraded oracle API phase')
+    const downgradeCli = runCliSurface(fixtureRoot, downgradeImport.version, redactions)
     const downgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, 'oracle', redactions)
     assertStablePublicSurface(initial.surface, downgradeApi.surface, 'The downgraded oracle API')
     assertStablePublicSurface(oracleCliSurface, downgradeCli.surface, 'The downgraded oracle CLI')
@@ -1421,8 +1386,8 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       'The downgraded oracle independent budget evidence',
     )
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
-    if (downgradeApi.schemaBefore !== '4' || downgradeApi.schemaAfter !== '1') {
-      throw new Error('The published oracle did not rebuild cache schema 4 as schema 1 after downgrade.')
+    if (downgradeApi.schemaBefore !== '4' || downgradeApi.schemaAfter !== '2') {
+      throw new Error('The published oracle did not rebuild cache schema 4 as schema 2 after downgrade.')
     }
     if (initialImport.version !== initial.version || downgradeImport.version !== initial.version) {
       throw new Error('The published oracle process did not execute the installed oracle package version.')

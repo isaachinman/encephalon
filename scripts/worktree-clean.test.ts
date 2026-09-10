@@ -24,9 +24,13 @@ test('rejects untracked output and permits only the exact ignored artifact pair 
       ].join('\n'),
     )
     writeFileSync(resolve(root, 'tracked.txt'), 'tracked\n')
+    writeFileSync(resolve(root, 'package.json'), '{"version":"0.4.0"}\n')
     const initialise = spawnSync('git', ['init', '--quiet'], { cwd: root, encoding: 'utf8' })
     assert.equal(initialise.status, 0, `${initialise.stdout}${initialise.stderr}`)
-    const stage = spawnSync('git', ['add', '--', '.gitignore', 'tracked.txt'], { cwd: root, encoding: 'utf8' })
+    const stage = spawnSync('git', ['add', '--', '.gitignore', 'tracked.txt', 'package.json'], {
+      cwd: root,
+      encoding: 'utf8',
+    })
     assert.equal(stage.status, 0, `${stage.stdout}${stage.stderr}`)
     const commit = spawnSync(
       'git',
@@ -65,8 +69,8 @@ test('rejects untracked output and permits only the exact ignored artifact pair 
 
     const artifacts = resolve(root, 'package-artifacts')
     mkdirSync(artifacts)
-    writeFileSync(resolve(artifacts, 'encephalon-0.3.0.tgz'), 'tarball')
-    writeFileSync(resolve(artifacts, 'encephalon-0.3.0.tgz.metadata.json'), '{}\n')
+    writeFileSync(resolve(artifacts, 'encephalon-0.4.0.tgz'), 'tarball')
+    writeFileSync(resolve(artifacts, 'encephalon-0.4.0.tgz.metadata.json'), '{}\n')
     assert.throws(() => assertCleanReleaseWorktree(root, false), /retention phase/u)
     assert.doesNotThrow(() => assertCleanReleaseWorktree(root, true))
 

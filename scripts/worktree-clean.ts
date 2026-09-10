@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process'
-import { lstatSync, opendirSync } from 'node:fs'
+import { lstatSync, opendirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { packageArtifactFilename } from './package-version.ts'
 
 export const assertCleanReleaseWorktree = (root: string, allowPackageArtifacts: boolean) => {
   const status = spawnSync('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], {
@@ -56,7 +57,9 @@ export const assertCleanReleaseWorktree = (root: string, allowPackageArtifacts: 
     ) {
       throw new Error('The exact package artifact directory is missing or redirected.')
     }
-    const expectedFiles = ['encephalon-0.3.0.tgz', 'encephalon-0.3.0.tgz.metadata.json']
+    const manifest = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as { version?: unknown }
+    const filename = packageArtifactFilename(manifest.version)
+    const expectedFiles = [filename, `${filename}.metadata.json`]
     const directory = opendirSync(artifactDirectory)
     const entries = (() => {
       try {

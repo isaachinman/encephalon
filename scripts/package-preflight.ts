@@ -11,7 +11,7 @@ import {
   snapshotPackageTarball,
   verifyPackageArtifactMetadata,
 } from './package-tarball.ts'
-import { assertPackageVersionSource, readPackageVersionSource } from './package-version.ts'
+import { assertPackageVersionSource, packageArtifactFilename, readPackageVersionSource } from './package-version.ts'
 
 export const REVIEWED_PACKAGE_FILES = Object.freeze([
   'dist',
@@ -244,7 +244,7 @@ export const preflightExactPackageArtifact = (
   }>,
 ): ExactPackagePreflight => {
   const identity = packageIdentity(options.root)
-  const expectedTarball = resolve(options.root, 'package-artifacts', `encephalon-${identity.packageVersion}.tgz`)
+  const expectedTarball = resolve(options.root, 'package-artifacts', packageArtifactFilename(identity.packageVersion))
   const tarballPath = resolve(options.tarballPath ?? expectedTarball)
   const expectedMetadataPath = `${expectedTarball}.metadata.json`
   const artifactDirectory = resolve(options.root, 'package-artifacts')

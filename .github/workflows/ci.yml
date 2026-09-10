@@ -2,46 +2,58 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
-    types: [opened, reopened, synchronize]
+    branches: [main]
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  correctness:
-    name: correctness (${{ matrix.context }})
-    timeout-minutes: 9
+  selection:
+    name: Select compatibility and platform coverage
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    timeout-minutes: 2
+    runs-on: ubuntu-latest
+    outputs:
+      base: ${{ steps.selection.outputs.base }}
+      head: ${{ steps.selection.outputs.head }}
+      compatibility: ${{ steps.selection.outputs.compatibility }}
+      historyTools: ${{ steps.selection.outputs.historyTools }}
+      changedTests: ${{ steps.selection.outputs.changedTests }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
+      - id: selection
+        run: node scripts/select-ci.ts
+
+  source:
+    name: source (${{ matrix.context }})
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
         include:
           - context: ubuntu-latest
-            os: ubuntu-latest
             node: 24.15.0
-          - context: macos-latest
-            os: macos-latest
-            node: 24.15.0
-          - context: windows-latest
-            os: windows-latest
-            node: 24.15.0
-            group: runtime-core
-          - context: windows-cache
-            os: windows-latest
-            node: 24.15.0
-            group: cache
           - context: ubuntu-current
-            os: ubuntu-latest
             node: 26
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -60,52 +72,94 @@ jobs:
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
-      - run: bun run build
-      - run: node scripts/test-ci.ts ${{ matrix.group || 'runtime' }}
+      - run: bun run test
+      - name: Source tests must not create build output
+        run: node -e 'if (require("node:fs").existsSync("dist")) process.exit(1)'
 
-  benchmark-smoke:
-    name: Benchmark smoke checks
-    timeout-minutes: 5
-    runs-on: ubuntu-latest
+  platform:
+    name: platform (${{ matrix.context }})
+    needs: selection
+    timeout-minutes: 9
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - context: macos-latest
+            os: macos-latest
+            group: platform
+          - context: windows-latest
+            os: windows-latest
+            group: platform-core
+          - context: windows-cache
+            os: windows-latest
+            group: cache
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
-      - run: bun run build
-      - run: bun run benchmark:check
+      - run: node scripts/test-ci.ts ${{ matrix.group }}
+        env:
+          CI_CHANGED_TESTS: ${{ needs.selection.outputs.changedTests }}
 
   tooling:
-    name: Test benchmark and release tooling
+    name: Lint, types and cheap tool tests
     timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run typecheck
       - run: bun run lint
-      - run: bun run build
       - run: bun run test:tooling
+
+  history:
+    name: Historical release-tool regression
+    needs: selection
+    if: needs.selection.outputs.historyTools == 'true'
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.1
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run test:history
 
   performance:
     name: performance (${{ matrix.shard }})
     timeout-minutes: 9
+    needs: selection
     strategy:
       fail-fast: false
       matrix:
@@ -120,13 +174,14 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.1
       - name: Compare matched operation samples
         env:
-          BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
-          CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_COMMIT: ${{ needs.selection.outputs.base }}
+          CANDIDATE_COMMIT: ${{ needs.selection.outputs.head }}
         run: node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports 20 ${{ matrix.shard }}
       - name: Retain performance evidence
         if: always()
@@ -137,11 +192,190 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  package:
+    name: Build exact package candidate
+    needs: [source, tooling, selection]
+    outputs:
+      artifact: ${{ steps.artifact.outputs.artifact-id }}
+      tarball: ${{ steps.metadata.outputs.tarball }}
+      sha256: ${{ steps.metadata.outputs.sha256 }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.1
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: node ./scripts/check-worktree-clean.ts
+      - run: bun run build
+      - run: node ./scripts/check-worktree-clean.ts
+      - name: Check and retain exact package candidate
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+        run: node ./scripts/check-package.ts --retain-tarball package-artifacts
+      - run: node ./scripts/check-worktree-clean.ts --allow-package-artifacts
+      - id: metadata
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+        run: node ./scripts/check-package-metadata.ts
+      - name: Upload exact package candidate
+        id: artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: encephalon-npm-package-${{ github.run_attempt }}
+          path: |
+            ${{ steps.metadata.outputs.tarball }}
+            ${{ steps.metadata.outputs.tarball }}.metadata.json
+          if-no-files-found: error
+          retention-days: 7
+
+  candidate:
+    name: candidate (${{ matrix.os }}, Node ${{ matrix.node }})
+    needs: package
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: 26
+            group: package
+          - os: macos-latest
+            node: 24.15.0
+            group: package-platform
+          - os: windows-latest
+            node: 24.15.0
+            group: package-platform
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.1
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: node ./scripts/check-worktree-clean.ts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact }}
+          path: package-artifacts
+          merge-multiple: true
+      - run: node ./scripts/check-package-metadata.ts --restore
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          CANDIDATE_SHA256: ${{ needs.package.outputs.sha256 }}
+      - name: Recheck exact package candidate
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          CANDIDATE_TARBALL: ${{ needs.package.outputs.tarball }}
+        shell: bash
+        run: node ./scripts/check-package.ts --tarball "$CANDIDATE_TARBALL"
+      - run: node scripts/test-ci.ts ${{ matrix.group }}
+
+  release-checks:
+    name: Release-equivalent package checks
+    needs: [package, selection]
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.1
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: node ./scripts/check-worktree-clean.ts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact }}
+          path: package-artifacts
+          merge-multiple: true
+      - run: node ./scripts/check-package-metadata.ts --restore
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          CANDIDATE_SHA256: ${{ needs.package.outputs.sha256 }}
+      - name: Check published 0.3 compatibility
+        if: needs.selection.outputs.compatibility == 'true'
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          CANDIDATE_TARBALL: ${{ needs.package.outputs.tarball }}
+        run: node ./scripts/check-release-compatibility.ts "$CANDIDATE_TARBALL"
+      - name: Check npm publish dry run
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          CANDIDATE_TARBALL: ${{ needs.package.outputs.tarball }}
+        run: node ./scripts/check-publish.ts "$CANDIDATE_TARBALL"
+
+  benchmark-smoke:
+    name: Benchmark smoke checks
+    needs: package
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.1
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: node ./scripts/check-worktree-clean.ts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact }}
+          path: package-artifacts
+          merge-multiple: true
+      - run: node ./scripts/check-package-metadata.ts --restore
+        env:
+          NODE_OPTIONS: ''
+          NODE_PATH: ''
+          CANDIDATE_SHA256: ${{ needs.package.outputs.sha256 }}
+      - run: bun run benchmark:check
+
   verify:
     name: verify (${{ matrix.context }})
-    needs: [correctness, tooling, benchmark-smoke, performance]
+    needs: [source, platform, tooling, benchmark-smoke, performance, selection]
     if: always()
-    timeout-minutes: 1
+    timeout-minutes: 2
     strategy:
       matrix:
         context: [ubuntu-latest, macos-latest, windows-latest, ubuntu-current]
@@ -167,8 +401,8 @@ jobs:
           path: performance-reports
       - if: matrix.context == 'ubuntu-latest'
         env:
-          BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
-          CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_COMMIT: ${{ needs.selection.outputs.base }}
+          CANDIDATE_COMMIT: ${{ needs.selection.outputs.head }}
         run: node scripts/benchmark-aggregate.ts performance-reports "$BASE_COMMIT" "$CANDIDATE_COMMIT" ${{ github.run_attempt }}
       - if: always() && matrix.context == 'ubuntu-latest'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -178,140 +412,40 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  package:
-    name: Build exact package candidate
-    outputs:
-      artifact: ${{ steps.artifact.outputs.name }}
-    timeout-minutes: 9
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: 24.15.0
-      - run: node ./scripts/check-generated-version.ts
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.1
-      - run: bun install --frozen-lockfile --ignore-scripts
-      - run: node ./scripts/check-worktree-clean.ts
-      - run: bun run build
-      - run: node ./scripts/check-worktree-clean.ts
-      - name: Check and retain exact package candidate
-        env:
-          NODE_OPTIONS: ''
-          NODE_PATH: ''
-        run: node ./scripts/check-package.ts --retain-tarball package-artifacts
-      - run: node ./scripts/check-worktree-clean.ts --allow-package-artifacts
-      - run: node ./scripts/check-package-metadata.ts
-      - name: Upload exact package candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: encephalon-npm-package-${{ github.run_attempt }}
-          path: |
-            package-artifacts/encephalon-0.3.0.tgz
-            package-artifacts/encephalon-0.3.0.tgz.metadata.json
-          if-no-files-found: error
-          retention-days: 7
-      - name: Identify the retained candidate for dependent job reruns
-        id: artifact
-        run: echo 'name=encephalon-npm-package-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
-
-  candidate:
-    name: candidate (${{ matrix.os }}, Node ${{ matrix.node }})
-    needs: package
-    timeout-minutes: 9
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            node: 26
-          - os: macos-latest
-            node: 24.15.0
-          - os: windows-latest
-            node: 24.15.0
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: 24.15.0
-      - run: node ./scripts/check-generated-version.ts
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: ${{ matrix.node }}
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.1
-      - run: bun install --frozen-lockfile --ignore-scripts
-      - run: bun run build
-      - run: node ./scripts/check-worktree-clean.ts
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ${{ needs.package.outputs.artifact }}
-          path: package-artifacts
-      - run: node ./scripts/check-package-metadata.ts
-      - name: Recheck exact package candidate
-        env:
-          NODE_OPTIONS: ''
-          NODE_PATH: ''
-        run: node ./scripts/check-package.ts --tarball package-artifacts/encephalon-0.3.0.tgz
-
-  release-checks:
-    name: Release-equivalent package checks
-    needs: package
-    timeout-minutes: 9
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: 24.15.0
-      - run: node ./scripts/check-generated-version.ts
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version: 1.3.1
-      - run: bun install --frozen-lockfile --ignore-scripts
-      - run: bun run build
-      - run: node ./scripts/check-worktree-clean.ts
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ${{ needs.package.outputs.artifact }}
-          path: package-artifacts
-      - run: node ./scripts/check-package-metadata.ts
-      - name: Recheck exact package candidate
-        env:
-          NODE_OPTIONS: ''
-          NODE_PATH: ''
-        run: node ./scripts/check-package.ts --tarball package-artifacts/encephalon-0.3.0.tgz
-      - name: Check published-oracle compatibility
-        env:
-          NODE_OPTIONS: ''
-          NODE_PATH: ''
-        run: node ./scripts/check-release-compatibility.ts package-artifacts/encephalon-0.3.0.tgz
-      - name: Check npm publish dry run
-        env:
-          NODE_OPTIONS: ''
-          NODE_PATH: ''
-        run: node ./scripts/check-publish.ts package-artifacts/encephalon-0.3.0.tgz
-
   release:
     name: Release-equivalent package gate
-    needs: [candidate, release-checks, verify]
+    needs: [candidate, release-checks, verify, history, selection, package]
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 2
     steps:
-      - env:
+      - name: Require complete selected coverage
+        env:
           RESULTS: ${{ toJSON(needs) }}
-        run: node -e 'if (!Object.values(JSON.parse(process.env.RESULTS)).every(job => job.result === "success")) process.exit(1)'
+        run: |
+          node -e '
+            const { history, selection, ...jobs } = JSON.parse(process.env.RESULTS);
+            if (selection.result !== "success" || !Object.values(jobs).every(job => job.result === "success") ||
+                !["true", "false"].includes(selection.outputs.historyTools) ||
+                !["true", "false"].includes(selection.outputs.compatibility) ||
+                history.result !== (selection.outputs.historyTools === "true" ? "success" : "skipped")) process.exit(1);
+          '
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.package.outputs.artifact }}
+          path: package-artifacts
+          merge-multiple: true
+      - name: Verify the producer digest before retaining the successful candidate
+        env:
+          CANDIDATE_TARBALL: ${{ needs.package.outputs.tarball }}
+          CANDIDATE_SHA256: ${{ needs.package.outputs.sha256 }}
+        run: node -e 'const bytes = require("node:fs").readFileSync(process.env.CANDIDATE_TARBALL); if (require("node:crypto").createHash("sha256").update(bytes).digest("hex") !== process.env.CANDIDATE_SHA256) process.exit(1)'
+      - name: Retain candidate for post-completion promotion
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-candidate-${{ github.run_attempt }}
+          path: |
+            ${{ needs.package.outputs.tarball }}
+            ${{ needs.package.outputs.tarball }}.metadata.json
+          if-no-files-found: error
+          retention-days: 7
