@@ -33,6 +33,11 @@ jobs:
           - context: windows-latest
             os: windows-latest
             node: 24.15.0
+            group: runtime-core
+          - context: windows-cache
+            os: windows-latest
+            node: 24.15.0
+            group: cache
           - context: ubuntu-current
             os: ubuntu-latest
             node: 26
@@ -56,7 +61,7 @@ jobs:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run build
-      - run: bun run test
+      - run: node scripts/test-ci.ts ${{ matrix.group || 'runtime' }}
 
   benchmark-smoke:
     name: Benchmark smoke checks

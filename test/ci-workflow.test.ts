@@ -102,7 +102,9 @@ test('parallel CI retains complete verification and exact-package release gates'
   assert.doesNotMatch(correctness, /bun run benchmark:check/)
   assert.match(jobs['benchmark-smoke'] ?? '', /bun run benchmark:check/)
   assert.doesNotMatch(jobs['benchmark-smoke'] ?? '', /needs:/)
-  assert.match(correctness, /bun run test\n/)
+  assert.match(correctness, /node scripts\/test-ci.ts.*matrix.group.*runtime/)
+  assert.match(correctness, /context: windows-latest\n\s+os: windows-latest\n\s+node: 24.15.0\n\s+group: runtime-core/)
+  assert.match(correctness, /context: windows-cache\n\s+os: windows-latest\n\s+node: 24.15.0\n\s+group: cache/)
   const performance = jobs.performance ?? ''
   assert.match(performance, /runs-on: ubuntu-24.04-arm/)
   assert.match(performance, /fetch-depth: 0/)
