@@ -7550,7 +7550,15 @@ describe('SQLite cache and reads', () => {
     mutateCache(root, database => {
       const stored = database.prepare('SELECT text FROM record_search').get()
       assert.ok(typeof stored?.text === 'string')
-      database.prepare('UPDATE record_search SET text = ?').run('wrongpostingmarker')
+      const statistics = () => ({
+        sizes: database.prepare('SELECT sz FROM record_search_docsize').get(),
+        totals: database.prepare('SELECT block FROM record_search_data WHERE id = 1').get(),
+      })
+      const before = statistics()
+      const wrongTerms = stored.text.replaceAll('corruption', 'wrongpostingmarker')
+      assert.notEqual(wrongTerms, stored.text)
+      database.prepare('UPDATE record_search SET text = ?').run(wrongTerms)
+      assert.deepEqual(statistics(), before)
       database.enableDefensive(false)
       database.prepare('UPDATE record_search_content SET c1 = ?').run(stored.text)
     })
