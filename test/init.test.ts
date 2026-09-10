@@ -2546,11 +2546,9 @@ describe('initialisation', () => {
     api.initEncephalon({ root })
     const overview = generatedRecord(root, 'encephalon:init/repository-overview')
 
-    assert.equal((overview.payload as { scannedRegularFiles?: unknown }).scannedRegularFiles, 0)
     assert.deepEqual((overview.payload as { recognisedTopLevelFiles?: unknown }).recognisedTopLevelFiles, [])
     assert.deepEqual((overview.payload as { topLevelDirectories?: unknown }).topLevelDirectories, [])
     assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, [
-      'directory-entry-limit',
       'top-level-entry-limit',
     ])
     assert.doesNotMatch(JSON.stringify(overview), /package-lock\.json|secret-/)
@@ -2577,8 +2575,6 @@ describe('initialisation', () => {
 
     assert.equal(overview.scanTruncated, false)
     assert.deepEqual(overview.scanTruncationReasons, [])
-    assert.deepEqual(overview.languageCounts, [{ files: 1, language: 'TypeScript' }])
-    assert.equal(overview.scannedRegularFiles, 3)
     assert.deepEqual(overview.recognisedTopLevelFiles, ['package.json'])
     assert.deepEqual(overview.topLevelDirectories, ['.github'])
     assert.deepEqual(tooling.recognisedFiles, ['package.json'])
@@ -2623,57 +2619,6 @@ describe('initialisation', () => {
     assert.equal(tooling.packageName, 'new-public-project')
     assert.deepEqual(workflow.scriptKeys, ['new-command'])
     assert.doesNotMatch(JSON.stringify(baseline), /old-private-project|old-command/)
-  })
-
-  test('retries a nested source addition after collection and returns only successor language facts', () => {
-    const root = createRoot()
-    const addedSource = join(root, 'src', 'added.py')
-    ensureParent(join(root, 'src', 'existing.ts'))
-    writeFileSync(join(root, 'src', 'existing.ts'), 'export {}\n')
-    let attempts = 0
-
-    const baseline = scanBaselineWithHooks(root, {
-      afterBaselineSources: () => {
-        attempts += 1
-        if (attempts === 1) {
-          writeFileSync(addedSource, 'pass\n')
-        }
-      },
-    })
-    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
-
-    assert.equal(attempts, 2)
-    assert.deepEqual(overview.languageCounts, [
-      { files: 1, language: 'Python' },
-      { files: 1, language: 'TypeScript' },
-    ])
-    assert.equal(overview.scannedRegularFiles, 2)
-    assert.equal(overview.scanTruncated, false)
-    assert.deepEqual(overview.scanTruncationReasons, [])
-  })
-
-  test('retries a nested source removal after collection and returns only successor language facts', () => {
-    const root = createRoot()
-    const removedSource = join(root, 'src', 'removed.py')
-    ensureParent(join(root, 'src', 'remaining.ts'))
-    writeFileSync(join(root, 'src', 'remaining.ts'), 'export {}\n')
-    writeFileSync(removedSource, 'pass\n')
-    let attempts = 0
-
-    const baseline = scanBaselineWithHooks(root, {
-      afterBaselineSources: () => {
-        attempts += 1
-        if (attempts === 1) {
-          unlinkSync(removedSource)
-        }
-      },
-    })
-    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
-
-    assert.equal(attempts, 2)
-    assert.deepEqual(overview.languageCounts, [{ files: 1, language: 'TypeScript' }])
-    assert.equal(overview.scannedRegularFiles, 1)
-    assert.deepEqual(overview.scanTruncationReasons, [])
   })
 
   test('retries a workflow rename after source collection and returns only the successor filename', () => {
@@ -2722,15 +2667,6 @@ describe('initialisation', () => {
       source: 'top-level',
     },
     {
-      createError: () => new Error('unexpected language hook failure'),
-      hooks: (error: Error) => ({
-        afterLanguageDirectoryCapture: () => {
-          throw error
-        },
-      }),
-      source: 'language',
-    },
-    {
       createError: () => new Error('unexpected workflow hook failure'),
       hooks: (error: Error) => ({
         beforeWorkflowDirectoryCapture: () => {
@@ -2767,14 +2703,6 @@ describe('initialisation', () => {
         },
       }),
       source: 'top-level',
-    },
-    {
-      hooks: (error: Error) => ({
-        afterLanguageDirectoryCapture: () => {
-          throw error
-        },
-      }),
-      source: 'language',
     },
     {
       hooks: (error: Error) => ({
@@ -2816,20 +2744,19 @@ describe('initialisation', () => {
       const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
 
       assert.equal(attempts, 2)
-      assert.deepEqual(overview.languageCounts, [{ files: 1, language: 'TypeScript' }])
       assert.deepEqual(overview.scanTruncationReasons, [])
     } finally {
       chmodSync(root, 0o700)
     }
   })
 
-  test('propagates null from the language source unchanged', () => {
+  test('propagates null from the top-level source unchanged', () => {
     const root = createRoot()
 
     assertThrowsExactValue(
       () =>
         scanBaselineWithHooks(root, {
-          afterLanguageDirectoryCapture: () => {
+          beforeTopLevelRevalidation: () => {
             // biome-ignore lint/style/useThrowOnlyError: This verifies arbitrary JavaScript hook throws retain identity.
             throw null
           },
@@ -2881,107 +2808,6 @@ describe('initialisation', () => {
     assert.deepEqual(overview.scanTruncationReasons, [])
   })
 
-  test('reserves the global language-directory budget before scheduling children', () => {
-    const root = createRoot()
-    for (const name of ['a', 'b', 'c']) {
-      ensureParent(join(root, name, 'index.ts'))
-      writeFileSync(join(root, name, 'index.ts'), 'export {}\n')
-    }
-    let scheduled = 0
-
-    const baseline = scanBaselineWithHooks(root, {
-      maximumScannedDirectories: 2,
-      onLanguageDirectoryScheduled: () => {
-        scheduled += 1
-      },
-    })
-    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
-
-    assert.equal(scheduled, 2)
-    assert.deepEqual(overview.languageCounts, [{ files: 1, language: 'TypeScript' }])
-    assert.deepEqual(overview.scanTruncationReasons, ['directory-limit'])
-  })
-
-  test('does not combine a queued parent generation with a replacement grandchild', () => {
-    const root = createRoot()
-    const parent = join(root, 'area')
-    const child = join(parent, 'src')
-    const moved = join(parent, 'moved-src')
-    const replacement = join(parent, 'private-replacement-src')
-    ensureParent(join(child, 'old.ts'))
-    ensureParent(join(replacement, 'new.py'))
-    writeFileSync(join(child, 'old.ts'), 'export {}\n')
-    writeFileSync(join(replacement, 'new.py'), 'pass\n')
-    let replaced = false
-
-    const baseline = scanBaselineWithHooks(root, {
-      beforeLanguageDirectoryCapture: path => {
-        if (path === child && !replaced) {
-          replaced = true
-          renameSync(child, moved)
-          renameSync(replacement, child)
-        }
-      },
-    })
-    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
-
-    assert.deepEqual(overview.languageCounts, [
-      { files: 1, language: 'Python' },
-      { files: 1, language: 'TypeScript' },
-    ])
-    assert.equal(overview.scannedRegularFiles, 2)
-    assert.deepEqual(overview.scanTruncationReasons, [])
-  })
-
-  test('rejects a queued parent replaced after its child directory is captured', () => {
-    const root = createRoot()
-    const parent = join(root, 'area')
-    const child = join(parent, 'src')
-    const moved = join(parent, 'moved-src')
-    const replacement = join(parent, 'private-replacement-src')
-    ensureParent(join(child, 'old.ts'))
-    ensureParent(join(replacement, 'new.py'))
-    writeFileSync(join(child, 'old.ts'), 'export {}\n')
-    writeFileSync(join(replacement, 'new.py'), 'pass\n')
-    let replaced = false
-
-    const baseline = scanBaselineWithHooks(root, {
-      afterLanguageDirectoryCapture: path => {
-        if (path === child && !replaced) {
-          replaced = true
-          renameSync(child, moved)
-          renameSync(replacement, child)
-        }
-      },
-    })
-    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
-
-    assert.deepEqual(overview.languageCounts, [
-      { files: 1, language: 'Python' },
-      { files: 1, language: 'TypeScript' },
-    ])
-    assert.equal(overview.scannedRegularFiles, 2)
-    assert.deepEqual(overview.scanTruncationReasons, [])
-  })
-
-  test('stops before reading one regular file beyond the global limit', () => {
-    const root = createRoot()
-    writeFileSync(join(root, 'a.ts'), 'export {}\n')
-    writeFileSync(join(root, 'b.py'), 'pass\n')
-    writeFileSync(join(root, 'c.js'), 'export {}\n')
-
-    const baseline = scanBaselineWithHooks(root, { maximumScannedFiles: 2 })
-    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
-
-    assert.deepEqual(overview.languageCounts, [
-      { files: 1, language: 'Python' },
-      { files: 1, language: 'TypeScript' },
-    ])
-    assert.equal(overview.scannedRegularFiles, 2)
-    assert.equal(overview.scanTruncated, true)
-    assert.deepEqual(overview.scanTruncationReasons, ['regular-file-limit'])
-  })
-
   test('retries all sources when the repository generation changes across baseline passes', () => {
     const root = createRoot()
     const moved = `${root}-moved`
@@ -3005,7 +2831,6 @@ describe('initialisation', () => {
     const tooling = generatedPayload(baseline, 'encephalon:init/tooling-layout')
     const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
 
-    assert.deepEqual(overview.languageCounts, [])
     assert.deepEqual(overview.recognisedTopLevelFiles, [])
     assert.deepEqual(overview.sources, [])
     assert.equal(attempts, 2)
@@ -3102,25 +2927,6 @@ describe('initialisation', () => {
     )
   })
 
-  test('omits an overflowing nested language directory without dropping sibling facts', () => {
-    const root = createRoot()
-    writeFileSync(join(root, 'keep.ts'), 'export {}\n')
-    for (let index = 0; index < 512; index += 1) {
-      const source = join(root, 'large', `secret-${String(index).padStart(3, '0')}.py`)
-      ensureParent(source)
-      writeFileSync(source, 'pass\n')
-    }
-    writeFileSync(join(root, 'large', 'visible-sentinel.py'), 'pass\n')
-
-    const baseline = scanBaseline(root)
-    const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
-
-    assert.deepEqual(overview.languageCounts, [{ files: 1, language: 'TypeScript' }])
-    assert.equal(overview.scannedRegularFiles, 1)
-    assert.deepEqual(overview.scanTruncationReasons, ['directory-entry-limit'])
-    assert.doesNotMatch(JSON.stringify(overview), /Python|visible-sentinel|secret-/)
-  })
-
   test('omits workflow facts when raw workflow enumeration overflows', () => {
     const root = createRoot()
     for (let index = 0; index < 512; index += 1) {
@@ -3137,7 +2943,7 @@ describe('initialisation', () => {
     assert.deepEqual(workflow.workflowFiles, [])
     assert.deepEqual(workflow.sources, [])
     assert.equal(overview.scanTruncated, true)
-    assert.deepEqual(overview.scanTruncationReasons, ['directory-entry-limit', 'workflow-entry-limit'])
+    assert.deepEqual(overview.scanTruncationReasons, ['workflow-entry-limit'])
     assert.doesNotMatch(JSON.stringify(baseline), /customer-|visible-sentinel/)
   })
 
@@ -3407,27 +3213,6 @@ describe('initialisation', () => {
     assert.doesNotMatch(JSON.stringify(baseline), /private\.yml|moved-github/)
   })
 
-  test('reports an unreadable language directory without retaining its names', {
-    skip: unreadableDirectorySkip,
-  }, () => {
-    const root = createRoot()
-    const directory = join(root, 'customer-project')
-    ensureParent(join(directory, 'private-source.ts'))
-    writeFileSync(join(directory, 'private-source.ts'), 'export {}\n')
-    chmodSync(directory, 0o000)
-    try {
-      const baseline = scanBaseline(root)
-      const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
-
-      assert.equal(overview.scanTruncated, true)
-      assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory'])
-      assert.deepEqual(overview.languageCounts, [])
-      assert.doesNotMatch(JSON.stringify(overview), /private-source/)
-    } finally {
-      chmodSync(directory, 0o700)
-    }
-  })
-
   test('retains stable top-level permission failures as deterministic truncation', {
     skip: unreadableDirectorySkip,
   }, () => {
@@ -3446,7 +3231,6 @@ describe('initialisation', () => {
       const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
 
       assert.deepEqual(overview.recognisedTopLevelFiles, [])
-      assert.deepEqual(overview.languageCounts, [])
       assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory'])
       assert.equal(tooling.packageName, 'sample-project')
       assert.deepEqual(workflow.workflowFiles, ['.github/workflows/ci.yml'])
@@ -3470,28 +3254,13 @@ describe('initialisation', () => {
       const overview = generatedPayload(baseline, 'encephalon:init/repository-overview')
       const workflow = generatedPayload(baseline, 'encephalon:init/commands-ci')
 
-      assert.deepEqual(overview.scanTruncationReasons, ['unreadable-directory', 'workflow-enumeration-error'])
+      assert.deepEqual(overview.scanTruncationReasons, ['workflow-enumeration-error'])
       assert.deepEqual(workflow.workflowFiles, [])
       assert.deepEqual(workflow.sources, [])
       assert.doesNotMatch(JSON.stringify(baseline), /private\.yml/)
     } finally {
       chmodSync(workflowsPath, 0o700)
     }
-  })
-
-  test('bounds baseline scanner depth without following deep chains forever', () => {
-    const root = createRoot()
-    let current = root
-    for (let index = 0; index < 30; index += 1) {
-      current = join(current, `level-${String(index).padStart(2, '0')}`)
-      ensureParent(join(current, 'placeholder'))
-    }
-    writeFileSync(join(current, 'deep.ts'), 'export {}\n')
-
-    api.initEncephalon({ root })
-    const overview = generatedRecord(root, 'encephalon:init/repository-overview')
-
-    assert.deepEqual((overview.payload as { scanTruncationReasons?: unknown }).scanTruncationReasons, ['max-depth'])
   })
 
   test('does not enumerate workflows through a symlinked .github ancestor', {

@@ -947,15 +947,14 @@ The baseline scanner performs no network access, does not invoke models, and doe
 
 Directory traversal:
 
-- Walk regular files recursively without following symlinks.
-- Stream at most 513 raw entries from each language-scan directory, the repository root, and `.github/workflows`, then sort accepted bounded entries to ensure deterministic output.
-- Omit an entire directory source on overflow instead of retaining a filesystem-order-dependent prefix. Bind successful enumeration to a stable real-directory generation, including each queued child and its enumerated parent, both `.github` and its `workflows` child, and one repository-root generation shared by all baseline source passes.
-- Reserve the 10,000-directory traversal budget while scheduling children so queued paths and attempted directory reads cannot exceed the bound.
-- Report skipped work in the repository overview through the finite, ordinal-sorted reason vocabulary: `directory-entry-limit`, `directory-limit`, `max-depth`, `package-metadata-error`, `regular-file-limit`, `top-level-entry-limit`, `unreadable-directory`, `workflow-entry-limit`, and `workflow-enumeration-error`. Any reason makes `scanTruncated` true.
+- Observe the repository root and `.github/workflows` without following symlinks; do not descend into source directories.
+- Stream at most 513 raw entries from the repository root and `.github/workflows`, then sort accepted bounded entries to ensure deterministic output.
+- Omit an entire directory source on overflow instead of retaining a filesystem-order-dependent prefix. Bind successful enumeration to a stable real-directory generation, including both `.github` and its `workflows` child, and one repository-root generation shared by all baseline source passes.
+- Report skipped work in the repository overview through the finite, ordinal-sorted reason vocabulary: `package-metadata-error`, `top-level-entry-limit`, `unreadable-directory`, `workflow-entry-limit`, and `workflow-enumeration-error`. Any reason makes `scanTruncated` true.
 - Exclude `.git`, `encephalon`, `node_modules`, common dependency/vendor directories, caches, coverage, build output, generated output, temporary directories, and package-manager stores.
 - Do not read hidden environment or registry files.
 - Do not inspect the Git index, Git objects, Git history, remotes, branches, or commits.
-- Do not read source-file bodies for language detection; count recognised extensions.
+- Do not read source-file bodies or generate language counts or regular-file totals. Agents may discover languages separately when needed.
 
 Persistable facts:
 
@@ -965,7 +964,6 @@ Persistable facts:
 - Package-manager evidence is recorded as `unknown`, `declared`, `lockfile-derived`, `declared-and-lockfile`, or `conflicted`; `packageManager` is present only when declaration and lockfile evidence identify one unambiguous manager.
 - Derived package script invocations as structured `{ executable, arguments, scriptKey }` argv data; never shell command strings or the script body. These invocations are omitted when the package manager is unknown or conflicted. Script keys beginning with `-` remain discoverable in `scriptKeys` but do not produce runnable invocations.
 - CI workflow filenames under `.github/workflows`; never YAML content, triggers, jobs, steps, secrets, or environment values.
-- Recognised language/file counts derived from extensions.
 - Repository identity derived from a safe root package name, or the root directory basename when no manifest provides a name.
 - Repository-relative safe source references identifying which manifest filenames informed the record.
 
@@ -991,7 +989,6 @@ Generate no more than these subjects:
    - Safe top-level layout.
    - Manifest source filenames.
 2. Kind `architecture`, subject `encephalon:init/tooling-layout`.
-   - Recognised languages and counts.
    - Manifest, lockfile, workspace, and configuration presence.
 3. Kind `workflow`, subject `encephalon:init/commands-ci`.
    - Package script keys as discovery-only data and safe derived structured invocations as the only execution source of truth.

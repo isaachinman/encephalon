@@ -53,7 +53,7 @@ Include new records and artifacts with the Git change that made them true. Do no
 
 ## Enrich an initial baseline
 
-After `encephalon init`, read the active generated baseline and inspect the repository semantically. Add only durable facts the safe scanner could not derive, such as architectural boundaries, non-obvious conventions, and the reasons behind essential workflows. Do not restate manifests, script keys, filenames, or language counts already captured by the generated records.
+After `encephalon init`, read the active generated baseline and inspect the repository semantically. Add only durable facts the safe scanner could not derive, such as architectural boundaries, non-obvious conventions, and the reasons behind essential workflows. Do not restate manifests, script keys, or filenames already captured by the generated records. Init does not traverse source directories or generate language counts or file totals; discover languages or frameworks separately when the task needs them.
 
 ## Finish
 

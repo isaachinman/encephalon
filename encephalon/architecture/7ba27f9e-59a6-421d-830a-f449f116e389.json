@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-09-10T18:59:54.510Z",
+  "id": "7ba27f9e-59a6-421d-830a-f449f116e389",
+  "kind": "architecture",
+  "payload": {
+    "summary": "Init derives a shallow baseline from root names, verified root package metadata and workflow filenames; nested source files do not contribute language counts or regular-file totals.",
+    "decision": "MAR-2791 removes the recursive language scanner, its work observers, queue, limits and truncation reasons. The three generated subjects remain unchanged. New overview payloads omit languageCounts and scannedRegularFiles; existing JSON search projection indexes the remaining facts.",
+    "retained": [
+      "One bounded root snapshot and recognised configuration/lockfile evidence.",
+      "Verified literal package.json bytes, package-manager conflicts, workspace patterns and structured script argv.",
+      "Bounded .github/workflows filenames with no-follow ancestry witnesses.",
+      "Final proof of all retained source witnesses and expected failures; three complete attempts and a shared non-resetting deadline.",
+      "Existing init publication, partial-commit recovery and instruction sequencing."
+    ],
+    "compatibility": "Ordinary init leaves existing generated records unchanged. Explicit refresh appends replacements only for changed or conflicting generated heads, supersedes all matching generated heads and preserves historical bytes and historical search access. Agents can discover languages and frameworks separately when a task needs them.",
+    "verification": "A complementary regression observes actual directory opens before and after adding 4,000 nested files. A separate Node 24 diagnostic verifies untruncated 40,000-file baseline traversal and constant candidate shallow work. Existing source consistency, privacy, overflow and append-only publication tests remain."
+  },
+  "source": "agent",
+  "subject": "init.shallow-baseline"
+}
