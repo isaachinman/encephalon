@@ -277,7 +277,7 @@ const logicalCacheProjection = (root: string) => {
           'SELECT id, kind, subject, source, created_at, path, active, summary, record_json FROM records ORDER BY id',
         )
         .all(),
-      search: database.prepare('SELECT id, text FROM record_search ORDER BY id').all(),
+      search: database.prepare('SELECT id, text, preview FROM record_search ORDER BY id').all(),
     }
   } finally {
     database.close()
@@ -712,7 +712,9 @@ const overwriteCacheWithInternallyConsistentForgery = (
       .run(forged.subject, forgedSummary, JSON.stringify(forged), canonical.id)
     database.prepare('UPDATE records SET id = ?, path = ? WHERE id = ?').run(forged.id, forged.path, canonical.id)
     database.prepare('DELETE FROM record_search WHERE id = ?').run(canonical.id)
-    database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)').run(forged.id, forgedSearchDocument)
+    database
+      .prepare('INSERT INTO record_search(id, text, preview) VALUES (?, ?, ?)')
+      .run(forged.id, forgedSearchDocument, [forged.kind, forged.subject, forged.source, forgedSummary].join('\n'))
     database
       .prepare("UPDATE metadata SET value = ? WHERE key = 'recordFingerprint'")
       .run(recordCorpusFingerprint([forged]))
@@ -2895,16 +2897,17 @@ describe('SQLite cache and reads', () => {
         subject: string
         summary: string | null
       }>
-      const search = database.prepare('SELECT id, text FROM record_search ORDER BY rowid').all() as Array<{
+      const search = database.prepare('SELECT id, text, preview FROM record_search ORDER BY rowid').all() as Array<{
         id: string
         text: string
+        preview: string
       }>
       database.exec('BEGIN IMMEDIATE; DELETE FROM record_search; DELETE FROM records;')
       const insertRecord = database.prepare(`
         INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
-      const insertSearch = database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
+      const insertSearch = database.prepare('INSERT INTO record_search(id, text, preview) VALUES (?, ?, ?)')
       for (const row of records.reverse()) {
         insertRecord.run(
           row.id,
@@ -2919,7 +2922,7 @@ describe('SQLite cache and reads', () => {
         )
       }
       for (const row of search.reverse()) {
-        insertSearch.run(row.id, row.text)
+        insertSearch.run(row.id, row.text, row.preview)
       }
       database.exec('COMMIT')
     })
@@ -3760,27 +3763,36 @@ describe('SQLite cache and reads', () => {
 
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 1 })
 
-    const schemaDatabase = new DatabaseSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'))
-    schemaDatabase.prepare("UPDATE metadata SET value = '1' WHERE key = 'schemaVersion'").run()
-    schemaDatabase.prepare("DELETE FROM metadata WHERE key = 'recordFingerprint'").run()
-    schemaDatabase.close()
-
     let writerInitialisations = 0
     cacheReadTestHooks.duringDatabaseInitialisation = mode => {
       if (mode === 'writer') {
         writerInitialisations += 1
       }
     }
-    assert.deepEqual(api.listRecords({ root }), [canonical])
-    assert.equal(writerInitialisations, 0)
-    assert.equal(logicalCacheProjection(root).metadata.find(row => row.key === 'schemaVersion')?.value, '1')
-
-    assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 1 })
-    assert.equal(writerInitialisations, 1)
-    const upgraded = logicalCacheProjection(root).metadata
-    assert.equal(upgraded.find(row => row.key === 'schemaVersion')?.value, '2')
-    assert.match(String(upgraded.find(row => row.key === 'recordFingerprint')?.value), /^[0-9a-f]{64}$/u)
-    assert.deepEqual(api.listRecords({ root }), [canonical])
+    for (const version of ['1', '2']) {
+      mutateCache(root, old => {
+        old.exec(`
+          CREATE TEMP TABLE previous_search AS SELECT id, text FROM record_search;
+          DROP TABLE record_search;
+          CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text);
+          INSERT INTO record_search(id, text) SELECT id, text FROM previous_search;
+        `)
+        old.prepare("UPDATE metadata SET value = ? WHERE key = 'schemaVersion'").run(version)
+        if (version === '1') {
+          old.prepare("DELETE FROM metadata WHERE key = 'recordFingerprint'").run()
+        }
+      })
+      assert.deepEqual(
+        api.searchCompactRecords({ query: 'cache corruption marker', root }).map(record => record.id),
+        [canonical.id],
+      )
+      assert.equal(writerInitialisations, Number(version))
+      const upgraded = logicalCacheProjection(root).metadata
+      assert.equal(upgraded.find(row => row.key === 'schemaVersion')?.value, '3')
+      assert.match(String(upgraded.find(row => row.key === 'recordFingerprint')?.value), /^[0-9a-f]{64}$/u)
+      assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+      assert.deepEqual(api.listRecords({ root }), [canonical])
+    }
   })
 
   test('automatically prepares active list, show, search, compact search, and gather reads', () => {
@@ -3857,7 +3869,7 @@ describe('SQLite cache and reads', () => {
       'summary',
     ])
     assert.equal(compact[0]?.summary, 'Use SQLite')
-    assert.match(String(compact[0]?.snippet), /\[(portable|persistence)\]/i)
+    assert.match(String(compact[0]?.snippet), /Use SQLite/)
     assert.equal(compact[0]?.path, 'encephalon/decision/database-v2.json')
 
     const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
@@ -3908,6 +3920,74 @@ describe('SQLite cache and reads', () => {
       subject: 'no.summary',
     })
     assert.equal(searchCompactRecords({ query: 'searchable marker', root })[0]?.summary, null)
+  })
+
+  test('keeps maximum payload and late searchText matches out of bounded preview snippets', () => {
+    const root = createRoot()
+    const input = {
+      id: 'bounded-preview',
+      kind: 'context',
+      payload: { body: '', deep: { marker: 'deepuniqueneedle' }, summary: 'Preview café anchor' },
+      searchText: `${'filler '.repeat(300)}lateuniqueneedle`,
+      source: 'agent',
+      subject: 'search.preview',
+    }
+    const remaining =
+      1024 * 1024 -
+      Buffer.byteLength(`${JSON.stringify({ createdAt: '2026-09-10T00:00:00.000Z', ...input }, null, 2)}\n`)
+    const record = api.addRecord({
+      ...input,
+      payload: { ...input.payload, body: 'x '.repeat(Math.ceil(remaining / 2)).slice(0, remaining) },
+      root,
+    })
+    assert.equal(statSync(join(root, record.path)).size, 1024 * 1024)
+    const queries = ['deepuniqueneedle', 'lateuniqueneedle', 'café deepuniqueneedle']
+    const gathered = api.gatherRecords({ root, searches: queries })
+    for (const [index, query] of queries.entries()) {
+      const [compact] = gathered.searches[index]?.results ?? []
+      assert.equal(compact?.id, record.id)
+      assert.ok(compact && Buffer.byteLength(compact.snippet) <= 1100)
+      assert.ok(compact.snippet.length > 0)
+      assert.doesNotMatch(compact.snippet, /deepuniqueneedle|lateuniqueneedle/)
+      assert.deepEqual(api.searchCompactRecords({ query, root }), [compact])
+    }
+    const [previewMatch] = api.searchCompactRecords({ query: 'café', root })
+    assert.ok(previewMatch)
+    assert.match(previewMatch.snippet, /\[café\]/)
+    assert.deepEqual(api.searchRecords({ query: 'deepuniqueneedle', root }), [record])
+  })
+
+  test('does not invent literal matches by truncating a preview token', () => {
+    const root = createRoot()
+    api.addRecord({
+      id: 'preview-boundary',
+      kind: 'context',
+      payload: { summary: 'x'.repeat(2048) },
+      root,
+      source: 'agent',
+      subject: 'search.boundary',
+    })
+    const truncatedToken = 'x'.repeat(1024 - Buffer.byteLength('context\nsearch.boundary\nagent\n'))
+    assert.deepEqual(api.searchCompactRecords({ query: truncatedToken, root }), [])
+    const [match] = api.searchCompactRecords({ query: 'boundary', root })
+    assert.equal(match?.id, 'preview-boundary')
+    assert.ok(match && Buffer.byteLength(match.snippet) <= 1100)
+    assert.doesNotMatch(match.snippet, /x{2}/)
+  })
+
+  test('does not introduce underscore phrases across omitted payload text', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'preview-phrase-gap',
+      kind: 'context',
+      payload: { summary: 'alpha', trailer: 'filler' },
+      root,
+      searchText: 'beta',
+      source: 'agent',
+      subject: 'search.phrase',
+    })
+    assert.deepEqual(api.searchCompactRecords({ query: 'alpha_beta', root }), [])
+    assert.deepEqual(api.searchRecords({ query: 'alpha beta', root }), [record])
   })
 
   test('keeps compact search and repeated gather ordering aligned with full search for large records', () => {
@@ -4000,6 +4080,28 @@ describe('SQLite cache and reads', () => {
       gathered.searches.map(search => search.results.map(result => result.id)),
       [[record.id], [record.id], [], [record.id], [record.id], [record.id], [record.id], [record.id]],
     )
+  })
+
+  test('reinforces preview matches when complete search bodies have equal term weights', () => {
+    const root = createRoot()
+    const records = [
+      { detail: 'neutral', id: 'preview-rank', source: 'needle' },
+      { detail: 'needle', id: 'payload-rank', source: 'neutral' },
+    ].map(({ id, detail, source }) =>
+      api.addRecord({
+        id,
+        kind: 'context',
+        payload: { detail },
+        root,
+        source,
+        subject: `search.ranking.${id}`,
+      }),
+    )
+    assert.deepEqual(
+      api.searchCompactRecords({ query: 'needle', root }).map(record => record.id),
+      ['preview-rank', 'payload-rank'],
+    )
+    assert.deepEqual(api.searchRecords({ query: 'needle', root }), records)
   })
 
   test('accepts worst-case NFC expansion in valid derived search documents', () => {
@@ -6084,24 +6186,28 @@ describe('SQLite cache and reads', () => {
   test('rebuilds caches with incompatible FTS5 semantics', () => {
     const cases = [
       {
-        definition: 'CREATE TABLE record_search(id TEXT, text TEXT)',
+        definition: 'CREATE TABLE record_search(id TEXT, text TEXT, preview TEXT)',
         name: 'ordinary table',
       },
       {
-        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(id, text)',
+        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(id, text, preview)',
         name: 'indexed id',
       },
       {
-        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text UNINDEXED)',
+        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text UNINDEXED, preview)',
         name: 'unindexed text',
       },
       {
-        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(text, id UNINDEXED)',
+        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(text, id UNINDEXED, preview)',
         name: 'reversed columns',
       },
       {
-        definition: "CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text, tokenize='porter')",
+        definition: "CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text, preview, tokenize='porter')",
         name: 'changed tokenizer',
+      },
+      {
+        definition: 'CREATE VIRTUAL TABLE record_search USING fts5(id UNINDEXED, text, preview UNINDEXED)',
+        name: 'unindexed preview',
       },
     ] as const
 
@@ -6111,10 +6217,10 @@ describe('SQLite cache and reads', () => {
       mutateCache(root, database => {
         database.enableDefensive(false)
         database.exec(`
-          CREATE TEMP TABLE saved_search AS SELECT id, text FROM record_search;
+          CREATE TEMP TABLE saved_search AS SELECT id, text, preview FROM record_search;
           DROP TABLE record_search;
           ${fixture.definition};
-          INSERT INTO record_search(id, text) SELECT id, text FROM saved_search;
+          INSERT INTO record_search(id, text, preview) SELECT id, text, preview FROM saved_search;
         `)
       })
 
@@ -6130,13 +6236,14 @@ describe('SQLite cache and reads', () => {
     mutateCache(validRoot, database => {
       database.enableDefensive(false)
       database.exec(`
-        CREATE TEMP TABLE saved_search AS SELECT id, text FROM record_search;
+        CREATE TEMP TABLE saved_search AS SELECT id, text, preview FROM record_search;
         DROP TABLE record_search;
         create virtual table "record_search" using FTS5(
           "id" unindexed,
-          "text"
+          "text",
+          "preview"
         );
-        INSERT INTO record_search(id, text) SELECT id, text FROM saved_search;
+        INSERT INTO record_search(id, text, preview) SELECT id, text, preview FROM saved_search;
       `)
     })
     assert.deepEqual(functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root: validRoot }), {
@@ -7519,8 +7626,8 @@ describe('SQLite cache and reads', () => {
               UNION ALL
               SELECT value + 1 FROM generated WHERE value < 1001
             )
-            INSERT INTO record_search(id, text)
-            SELECT printf('overflow-%04d', value), 'overflow search text'
+            INSERT INTO record_search(id, text, preview)
+            SELECT printf('overflow-%04d', value), 'overflow search text', 'overflow preview'
             FROM generated;
           `)
         },
@@ -7532,6 +7639,20 @@ describe('SQLite cache and reads', () => {
           database.prepare('UPDATE record_search SET text = CAST(zeroblob(?) AS TEXT)').run(6_316_033)
         },
         name: 'oversized FTS text containing NUL',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.prepare('UPDATE record_search SET preview = CAST(zeroblob(?) AS TEXT)').run(1025)
+        },
+        name: 'oversized preview containing NUL',
+      },
+      {
+        expectedRows: 1,
+        mutate: (database: DatabaseSync) => {
+          database.prepare('UPDATE record_search SET preview = ?').run(Buffer.from('untrusted'))
+        },
+        name: 'non-text preview',
       },
       {
         expectedRows: 1,
@@ -7550,8 +7671,8 @@ describe('SQLite cache and reads', () => {
               UNION ALL
               SELECT value + 1 FROM generated WHERE value < 12
             )
-            INSERT INTO record_search(id, text)
-            SELECT printf('cache-record-%02d', value), CAST(zeroblob(6242305) AS TEXT)
+            INSERT INTO record_search(id, text, preview)
+            SELECT printf('cache-record-%02d', value), CAST(zeroblob(6242305) AS TEXT), 'bounded preview'
             FROM generated;
           `)
         },
@@ -7626,6 +7747,7 @@ describe('SQLite cache and reads', () => {
     addCacheRecord(root)
     mutateCache(root, database => {
       database.prepare("UPDATE record_search SET text = replace(hex(zeroblob(?)), '00', 'x')").run(6_316_032)
+      database.prepare('UPDATE record_search SET preview = ?').run('é'.repeat(512))
       database
         .prepare("UPDATE metadata SET value = replace(hex(zeroblob(?)), '00', 'x') WHERE key = 'packageVersion'")
         .run(1_048_576)
@@ -7988,7 +8110,11 @@ describe('SQLite cache and reads', () => {
       },
       {
         mutate: (database: DatabaseSync, id: string) => {
-          database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)').run(id, 'duplicate search row')
+          database
+            .prepare(
+              'INSERT INTO record_search(id, text, preview) SELECT id, text, preview FROM record_search WHERE id = ?',
+            )
+            .run(id)
         },
         name: 'duplicate ID',
       },
@@ -8014,6 +8140,37 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('compares preview bytes exactly before serving a recovered search result', () => {
+    const root = createRoot()
+    const record = api.addRecord({
+      id: 'preview-integrity',
+      kind: 'context',
+      payload: { summary: '�' },
+      root,
+      source: 'agent',
+      subject: 'cache.preview',
+    })
+    const expected = Buffer.from('context\ncache.preview\nagent\n�')
+    let rebuilds = 0
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      rebuilds += 1
+    }
+    for (const bytes of [
+      Buffer.from('forged preview'),
+      Buffer.concat([expected.subarray(0, -3), Buffer.from([0x80])]),
+    ]) {
+      mutateCache(root, database => {
+        database.prepare('UPDATE record_search SET preview = CAST(? AS TEXT)').run(bytes)
+      })
+      assert.equal(api.searchCompactRecords({ query: 'context', root })[0]?.id, record.id)
+      mutateCache(root, database => {
+        const row = database.prepare('SELECT CAST(preview AS BLOB) AS bytes FROM record_search').get()
+        assert.deepEqual(Buffer.from(row?.bytes as Uint8Array), expected)
+      })
+    }
+    assert.equal(rebuilds, 2)
+  })
+
   test('binds every same-count FTS projection to exactly one cached record ID', () => {
     const cases = [
       {
@@ -8026,7 +8183,11 @@ describe('SQLite cache and reads', () => {
       {
         mutate: (database: DatabaseSync, first: { id: string; text: string }, second: { id: string; text: string }) => {
           database.prepare('DELETE FROM record_search WHERE id = ?').run(second.id)
-          database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)').run(first.id, first.text)
+          database
+            .prepare(
+              'INSERT INTO record_search(id, text, preview) SELECT id, text, preview FROM record_search WHERE id = ?',
+            )
+            .run(first.id)
         },
         name: 'duplicate first ID with second ID missing',
       },
