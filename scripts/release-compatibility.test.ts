@@ -1121,6 +1121,39 @@ await import(${JSON.stringify(pathToFileURL(resolve(import.meta.dirname, 'bounde
     assert.equal(expectedCandidateCliHelp(oracleHelp), candidateHelp)
     assert.notEqual(expectedCandidateCliHelp(oracleHelp), `${candidateHelp}candidate-only\n`)
   })
+
+  test('allows bounded search presentation changes while preserving every other public value', () => {
+    const row = { id: 'same', rank: -1, snippet: 'historical payload fragment', summary: 'Same summary' }
+    const surface = (result: unknown) => ({
+      gather: { searches: [{ query: 'same', results: [result] }] },
+      searchCompact: [result],
+      show: { payload: { rank: 1, snippet: 'canonical content' } },
+    })
+    const oracle = surface(row)
+    const candidate = surface({ ...row, rank: -2, snippet: '[Same] summary' })
+    assert.doesNotThrow(() => assertStablePublicSurface(oracle, candidate, 'Candidate', true))
+    assert.throws(() => assertStablePublicSurface(oracle, candidate, 'Downgrade'))
+    for (const changed of [
+      { ...row, id: 'invented' },
+      { ...row, summary: 'changed' },
+      { ...row, extra: true },
+      { ...row, rank: 'wrong type' },
+      { ...row, rank: Number.POSITIVE_INFINITY },
+      { ...row, snippet: '' },
+      { ...row, snippet: 'é'.repeat(551) },
+      { id: row.id, snippet: row.snippet, summary: row.summary },
+    ]) {
+      assert.throws(() => assertStablePublicSurface(oracle, surface(changed), 'Candidate', true))
+    }
+    assert.throws(() =>
+      assertStablePublicSurface(
+        oracle,
+        { ...candidate, show: { payload: { rank: 2, snippet: 'canonical content' } } },
+        'Candidate',
+        true,
+      ),
+    )
+  })
 })
 
 describe('release compatibility process fixture', () => {
@@ -1146,7 +1179,7 @@ describe('release compatibility process fixture', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
       const candidateDigests = packageTarballDigests(candidate.tarball)
       writeFileSync(resolve(oracle.packageRoot, 'dist', 'index.mjs'), 'throw new Error("unpacked oracle executed")\n')
@@ -1200,8 +1233,8 @@ describe('release compatibility process fixture', () => {
       assert.deepEqual(report.candidate.digests, candidateDigests)
       assert.equal(report.oracle.version, '0.2.0')
       assert.equal(report.candidate.version, '0.3.0')
-      assert.deepEqual(report.upgrade.schemas, { after: '2', before: '1' })
-      assert.deepEqual(report.downgrade.schemas, { after: '1', before: '2' })
+      assert.deepEqual(report.upgrade.schemas, { after: '3', before: '1' })
+      assert.deepEqual(report.downgrade.schemas, { after: '1', before: '3' })
       assert.equal(report.upgrade.durableState, 'identical')
       assert.equal(report.downgrade.durableState, 'identical')
       assert.deepEqual(report.upgrade.resultLimits.api, expectedCandidateLimits)
@@ -1374,7 +1407,7 @@ describe('release compatibility process fixture', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
 
       assert.throws(() =>
@@ -1406,7 +1439,7 @@ describe('release compatibility process fixture', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
 
       assert.throws(
@@ -1445,7 +1478,7 @@ describe('release compatibility process fixture', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.1', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.1', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
 
       assert.throws(
@@ -1488,7 +1521,7 @@ describe('release compatibility process fixture group B', () => {
       try {
         mkdirSync(fixtureRoot)
         const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-        const candidate = buildStandInTarball(temporaryRoot, behaviour, '2')
+        const candidate = buildStandInTarball(temporaryRoot, behaviour, '3')
         const oracleDigests = packageTarballDigests(oracle.tarball)
 
         assert.throws(() =>
@@ -1519,7 +1552,7 @@ describe('release compatibility process fixture group B', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-hostile-added-path', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-hostile-added-path', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
 
       assert.throws(() =>
@@ -1553,7 +1586,7 @@ describe('release compatibility process fixture group B', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-shape-drift', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-shape-drift', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
 
       assert.throws(
@@ -1587,7 +1620,7 @@ describe('release compatibility process fixture group C', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-budget-drift', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-budget-drift', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
 
       assert.throws(
@@ -1619,7 +1652,7 @@ describe('release compatibility process fixture group C', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-coverage-drift', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-coverage-drift', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
 
       assert.throws(
@@ -1651,7 +1684,7 @@ describe('release compatibility process fixture group C', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-forged-witness', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-forged-witness', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
 
       assert.throws(
@@ -1683,7 +1716,7 @@ describe('release compatibility process fixture group C', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-forged-export-only', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-forged-export-only', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
 
       assert.doesNotThrow(() =>
@@ -1719,7 +1752,7 @@ describe('release compatibility process fixture group A preloads', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0-environment-witness', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-environment-witness', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-environment-witness', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
       writeFileSync(preload, `require('node:fs').appendFileSync(${JSON.stringify(marker)}, 'loaded\\n')\n`)
       process.env.NODE_OPTIONS = `--require=${preload}`
@@ -1763,7 +1796,7 @@ describe('release compatibility process fixture group A preloads', () => {
     try {
       mkdirSync(fixtureRoot)
       const oracle = buildStandInTarball(temporaryRoot, '0.2.0', '1')
-      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-environment-mutation', '2')
+      const candidate = buildStandInTarball(temporaryRoot, '0.3.0-environment-mutation', '3')
       const oracleDigests = packageTarballDigests(oracle.tarball)
 
       assert.doesNotThrow(() =>

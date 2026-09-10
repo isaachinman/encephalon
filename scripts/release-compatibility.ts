@@ -163,8 +163,41 @@ const publicSurfaceDifferencePaths = (expected: unknown, actual: unknown, path =
   return [path]
 }
 
-export const assertStablePublicSurface = (expected: unknown, actual: unknown, label: string) => {
-  if (!isDeepStrictEqual(expected, actual)) {
+const normaliseSearchPresentation = (value: unknown, bounded: boolean, path = '$'): unknown => {
+  if (/^\$\.(?:searchCompact\[\d+\]|gather\.searches\[\d+\]\.results\[\d+\])\.(?:rank|snippet)$/u.test(path)) {
+    if (path.endsWith('.rank') && typeof value === 'number' && Number.isFinite(value)) {
+      return 0
+    }
+    if (
+      path.endsWith('.snippet') &&
+      typeof value === 'string' &&
+      value.length > 0 &&
+      (!bounded || Buffer.byteLength(value) <= 1100)
+    ) {
+      return ''
+    }
+    throw new Error('The compatibility search presentation has an invalid type or bound.')
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => normaliseSearchPresentation(item, bounded, `${path}[${index}]`))
+  }
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, normaliseSearchPresentation(item, bounded, `${path}.${key}`)]),
+    )
+  }
+  return value
+}
+
+export const assertStablePublicSurface = (
+  expected: unknown,
+  actual: unknown,
+  label: string,
+  boundedSearchPresentation = false,
+) => {
+  const stableExpected = boundedSearchPresentation ? normaliseSearchPresentation(expected, false) : expected
+  const stableActual = boundedSearchPresentation ? normaliseSearchPresentation(actual, true) : actual
+  if (!isDeepStrictEqual(stableExpected, stableActual)) {
     const differences = publicSurfaceDifferencePaths(expected, actual).slice(0, 32)
     throw new Error(
       `${label} does not exactly preserve the published public surface. Differences: ${differences.join(', ')}.`,
@@ -191,7 +224,7 @@ const publicSurfaceWithHelp = (value: unknown, label: string) => {
 const assertCandidateCliSurface = (oracle: unknown, candidate: unknown) => {
   const expected = publicSurfaceWithHelp(oracle, 'The published oracle')
   const actual = publicSurfaceWithHelp(candidate, 'The candidate')
-  assertStablePublicSurface(expected.surface, actual.surface, 'The candidate CLI')
+  assertStablePublicSurface(expected.surface, actual.surface, 'The candidate CLI', true)
   if (actual.help !== expectedCandidateCliHelp(expected.help)) {
     throw new Error('The candidate CLI does not exactly preserve the published public surface. Differences: $.help.')
   }
@@ -1357,12 +1390,12 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     assertLimitReport(upgradeApi.limits, candidateResultLimitMaximums, 'The candidate API phase')
     const upgradeCli = runCandidateCliSurface(fixtureRoot, candidateImport.version, redactions)
     const upgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, 'candidate', redactions)
-    assertStablePublicSurface(initial.surface, upgradeApi.surface, 'The candidate API')
+    assertStablePublicSurface(initial.surface, upgradeApi.surface, 'The candidate API', true)
     assertCandidateCliSurface(oracleCliSurface, upgradeCli.surface)
     assertCandidateIndependentBudgets(upgradeIndependentBudgets)
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
-    if (upgradeApi.schemaBefore !== '1' || upgradeApi.schemaAfter !== '2') {
-      throw new Error('The candidate package did not rebuild cache schema 1 as schema 2.')
+    if (upgradeApi.schemaBefore !== '1' || upgradeApi.schemaAfter !== '3') {
+      throw new Error('The candidate package did not rebuild cache schema 1 as schema 3.')
     }
 
     options.hooks?.beforeOracleDowngrade?.(oracle.path)
@@ -1388,8 +1421,8 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       'The downgraded oracle independent budget evidence',
     )
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
-    if (downgradeApi.schemaBefore !== '2' || downgradeApi.schemaAfter !== '1') {
-      throw new Error('The published oracle did not rebuild cache schema 2 as schema 1 after downgrade.')
+    if (downgradeApi.schemaBefore !== '3' || downgradeApi.schemaAfter !== '1') {
+      throw new Error('The published oracle did not rebuild cache schema 3 as schema 1 after downgrade.')
     }
     if (initialImport.version !== initial.version || downgradeImport.version !== initial.version) {
       throw new Error('The published oracle process did not execute the installed oracle package version.')

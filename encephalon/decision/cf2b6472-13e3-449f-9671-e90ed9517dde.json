@@ -1,0 +1,21 @@
+{
+  "createdAt": "2026-09-10T09:13:04.638Z",
+  "id": "cf2b6472-13e3-449f-9671-e90ed9517dde",
+  "kind": "decision",
+  "payload": {
+    "summary": "Search snippets use a bounded contiguous metadata and summary prefix while the complete body retains all searchable terms.",
+    "rationale": [
+      "Joining summary directly to searchText across omitted payload JSON can invent underscore phrase matches. The preview therefore ends before payload JSON and does not include searchText.",
+      "Normalise before the 1024-byte cap and truncate at an ASCII separator, preserving UTF-8 and complete tokens.",
+      "Equal FTS column weights reinforce preview occurrences and change document-length normalisation; full and compact paths share the same ranking and deterministic tie-breakers."
+    ],
+    "consequences": [
+      "Payload-only and searchText-only matches return a nonempty bounded fallback preview.",
+      "Disposable schema 3 rebuilds earlier FTS layouts and verifies both derived columns byte-for-byte.",
+      "Retain explicit bm25: the hidden rank column showed no material improvement with the actual joined query and tie-breakers."
+    ]
+  },
+  "searchText": "search snippet bounded preview phrase underscore Unicode NFC FTS schema ranking payload",
+  "source": "agent",
+  "subject": "search.bounded-preview"
+}

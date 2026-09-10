@@ -64,8 +64,7 @@ import type {
   ShowRecordInput,
 } from './types.ts'
 
-const SCHEMA_VERSION = '2'
-const LEGACY_READ_SCHEMA_VERSION = '1'
+const SCHEMA_VERSION = '3'
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
 const MAX_GATHER_SEARCHES = OPERATION_BUDGETS.gatherSearches.maximum
 const MAX_GATHER_SHOWS = OPERATION_BUDGETS.gatherShows.maximum
@@ -83,6 +82,8 @@ const MAX_CACHE_SEARCH_DOCUMENT_BYTES =
 const MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES =
   MAX_CACHE_RECORD_JSON_BYTES * MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR * MAX_NFC_UTF8_EXPANSION_FACTOR
 const MAX_CACHE_FTS_ID_BYTES = CANONICAL_BUDGETS.records * 255
+const MAX_CACHE_SEARCH_PREVIEW_BYTES = 1024
+const MAX_CACHE_SEARCH_PREVIEW_AGGREGATE_BYTES = CANONICAL_BUDGETS.records * MAX_CACHE_SEARCH_PREVIEW_BYTES
 const METADATA_KEYS = [
   'artifactPaths',
   'manifest',
@@ -92,7 +93,6 @@ const METADATA_KEYS = [
   'repositoryRealpath',
   'schemaVersion',
 ] as const
-const LEGACY_METADATA_KEYS = METADATA_KEYS.filter(key => key !== 'recordFingerprint')
 const MAX_CACHE_METADATA_AGGREGATE_BYTES = METADATA_KEYS.length * MAX_CACHE_METADATA_BYTES
 
 type SQLiteModule = {
@@ -259,7 +259,7 @@ const RECORDS_INDEX_DEFINITIONS = RECORDS_INDEXES.map(
       .join(', ')})`,
 ).join(';\n')
 
-const RECORD_SEARCH_DEFINITION = 'fts5(id UNINDEXED, text)'
+const RECORD_SEARCH_DEFINITION = 'fts5(id UNINDEXED, text, preview)'
 
 const schemaTokenPattern =
   /\s+|--[^\r\n]*|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[(?:\]\]|[^\]])*\]|[A-Za-z_][A-Za-z0-9_]*|\d+|[(),]|\S/g
@@ -795,7 +795,7 @@ const assertCacheSchemaUnchecked = (database: DatabaseSync) => {
   ) {
     throw new CacheSchemaMismatch('The record_search cache table is not an FTS5 table.')
   }
-  assertTableColumns(database, 'record_search', ['id', 'text'])
+  assertTableColumns(database, 'record_search', ['id', 'text', 'preview'])
 }
 
 const assertCacheSchema = (database: DatabaseSync) => {
@@ -1171,8 +1171,7 @@ const readMetadata = (database: DatabaseSync): Metadata | undefined => {
     values.set(row.key, row.value)
   }
   const schemaVersion = values.get('schemaVersion')
-  const expectedKeys = schemaVersion === LEGACY_READ_SCHEMA_VERSION ? LEGACY_METADATA_KEYS : METADATA_KEYS
-  if (values.size !== expectedKeys.length || expectedKeys.some(key => values.get(key) === undefined)) {
+  if (values.size !== METADATA_KEYS.length || METADATA_KEYS.some(key => values.get(key) === undefined)) {
     throw new CacheSchemaMismatch('The cache metadata key set is incomplete.')
   }
   const artifactPathsValue = values.get('artifactPaths')
@@ -1334,7 +1333,10 @@ const assertCacheContentConsistent = (
   const expectedSearchRows = new Map(
     records.map(({ record }) => [
       Buffer.from(record.id, 'utf8').toString('hex'),
-      Buffer.from(searchDocumentForRecord(record), 'utf8'),
+      {
+        preview: Buffer.from(searchPreviewForRecord(record), 'utf8'),
+        text: Buffer.from(searchDocumentForRecord(record), 'utf8'),
+      },
     ]),
   )
   const searchProbe = readIntegrityProbe(
@@ -1343,19 +1345,21 @@ const assertCacheContentConsistent = (
       .prepare(
         `SELECT
           COUNT(*) AS row_count,
-          CASE WHEN TOTAL(id_bytes) > ?1 OR TOTAL(text_bytes) > ?2
+          CASE WHEN TOTAL(id_bytes) > ?1 OR TOTAL(text_bytes) > ?2 OR TOTAL(preview_bytes) > ?6
             THEN 1 ELSE 0 END AS exceeds_aggregate_bytes,
           CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
           CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value
         FROM (
           SELECT
-            CASE WHEN typeof(id) = 'text' AND typeof(text) = 'text'
+            CASE WHEN typeof(id) = 'text' AND typeof(text) = 'text' AND typeof(preview) = 'text'
                  THEN 0 ELSE 1 END AS invalid_type,
             CASE WHEN typeof(id) = 'text' AND length(CAST(id AS BLOB)) <= ?3
                        AND typeof(text) = 'text' AND length(CAST(text AS BLOB)) <= ?4
+                       AND typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= ?7
                  THEN 0 ELSE 1 END AS oversized,
             CASE WHEN typeof(id) = 'text' THEN length(CAST(id AS BLOB)) ELSE 0 END AS id_bytes,
-            CASE WHEN typeof(text) = 'text' THEN length(CAST(text AS BLOB)) ELSE 0 END AS text_bytes
+            CASE WHEN typeof(text) = 'text' THEN length(CAST(text AS BLOB)) ELSE 0 END AS text_bytes,
+            CASE WHEN typeof(preview) = 'text' THEN length(CAST(preview AS BLOB)) ELSE 0 END AS preview_bytes
           FROM record_search
           LIMIT ?5
         )`,
@@ -1366,6 +1370,8 @@ const assertCacheContentConsistent = (
         255,
         MAX_CACHE_SEARCH_DOCUMENT_BYTES,
         maximumRows,
+        MAX_CACHE_SEARCH_PREVIEW_AGGREGATE_BYTES,
+        MAX_CACHE_SEARCH_PREVIEW_BYTES,
       ) as CacheIntegrityProbe | undefined,
     maximumRows,
   )
@@ -1380,15 +1386,26 @@ const assertCacheContentConsistent = (
   }
   cacheReadTestHooks.beforeIntegrityTextRead?.('record-search')
   const searchRows = database
-    .prepare('SELECT CAST(id AS BLOB) AS id_bytes, CAST(text AS BLOB) AS text_bytes FROM record_search LIMIT ?')
-    .iterate(maximumRows) as Iterable<{ id_bytes?: unknown; text_bytes?: unknown }>
+    .prepare(`SELECT CAST(id AS BLOB) AS id_bytes, CAST(text AS BLOB) AS text_bytes,
+      CAST(preview AS BLOB) AS preview_bytes FROM record_search LIMIT ?`)
+    .iterate(maximumRows) as Iterable<{ id_bytes?: unknown; text_bytes?: unknown; preview_bytes?: unknown }>
   for (const row of searchRows) {
-    if (!(row.id_bytes instanceof Uint8Array && row.text_bytes instanceof Uint8Array)) {
+    if (
+      !(
+        row.id_bytes instanceof Uint8Array &&
+        row.text_bytes instanceof Uint8Array &&
+        row.preview_bytes instanceof Uint8Array
+      )
+    ) {
       throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
     }
     const idBytes = Buffer.from(row.id_bytes)
     const expected = expectedSearchRows.get(idBytes.toString('hex'))
-    if (expected === undefined || !expected.equals(Buffer.from(row.text_bytes))) {
+    if (
+      expected === undefined ||
+      !expected.text.equals(Buffer.from(row.text_bytes)) ||
+      !expected.preview.equals(Buffer.from(row.preview_bytes))
+    ) {
       throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
     }
     expectedSearchRows.delete(idBytes.toString('hex'))
@@ -1446,22 +1463,15 @@ const metadataMatchesSnapshot = (
   database: DatabaseSync,
   metadata: Metadata | undefined,
   snapshot: ValidatedRecordCacheSnapshot,
-  allowLegacyRead: boolean,
 ): metadata is Metadata => {
   assertCacheScope(root, metadata)
   const artifactPaths = snapshot.artifacts.map(artifact => artifact.path)
   if (metadata?.schemaVersion === SCHEMA_VERSION && metadata.recordFingerprint !== snapshot.recordFingerprint) {
     throw new CacheSchemaMismatch('The cache metadata does not match the canonical record corpus.')
   }
-  const compatibleSchema =
-    metadata?.schemaVersion === SCHEMA_VERSION
-      ? true
-      : allowLegacyRead &&
-        metadata?.schemaVersion === LEGACY_READ_SCHEMA_VERSION &&
-        metadata.recordFingerprint === undefined
   const fresh =
     metadata !== undefined &&
-    compatibleSchema &&
+    metadata.schemaVersion === SCHEMA_VERSION &&
     metadata.manifest === snapshot.manifest &&
     metadata.recordsIndexed === snapshot.records.length &&
     JSON.stringify(metadata.artifactPaths) === JSON.stringify(artifactPaths)
@@ -1484,6 +1494,22 @@ const searchDocumentForRecord = (record: BrainRecord) =>
       .filter((value): value is string => typeof value === 'string' && value.length > 0)
       .join('\n'),
   )
+
+const searchPreviewForRecord = (record: BrainRecord) => {
+  const preview = normalizeSearchText(
+    [record.kind, record.subject, record.source, summaryForRecord(record)]
+      .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      .join('\n'),
+  )
+  const bytes = Buffer.from(preview, 'utf8')
+  if (bytes.length > MAX_CACHE_SEARCH_PREVIEW_BYTES) {
+    // Keep a contiguous body prefix. ASCII separators cannot split UTF-8 or create a partial FTS token.
+    const prefix = bytes.subarray(0, MAX_CACHE_SEARCH_PREVIEW_BYTES)
+    const separator = Math.max(prefix.lastIndexOf(0x20), prefix.lastIndexOf(0x0a))
+    return prefix.subarray(0, separator).toString('utf8')
+  }
+  return preview
+}
 
 const projectedCacheRecord = (record: BrainRecord): BrainRecord => ({
   ...projectParsedRecordFile(record),
@@ -1638,7 +1664,7 @@ const writeCacheSnapshot = (
         INSERT INTO records(id, kind, subject, source, created_at, path, active, summary, record_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
-      const insertSearch = database.prepare('INSERT INTO record_search(id, text) VALUES (?, ?)')
+      const insertSearch = database.prepare('INSERT INTO record_search(id, text, preview) VALUES (?, ?, ?)')
       for (const record of snapshot.records) {
         const projected = projectedCacheRecord(record)
         insertRecord.run(
@@ -1652,7 +1678,7 @@ const writeCacheSnapshot = (
           summaryForRecord(projected),
           JSON.stringify(projected),
         )
-        insertSearch.run(projected.id, searchDocumentForRecord(projected))
+        insertSearch.run(projected.id, searchDocumentForRecord(projected), searchPreviewForRecord(projected))
       }
       writeMetadata(database, {
         artifactPaths,
@@ -1984,7 +2010,7 @@ const readFreshCacheResult = <Result>(
           snapshot.assertCurrent()
         }
         const metadata = readMetadata(database)
-        if (metadataMatchesSnapshot(root, database, metadata, snapshot, completion.kind === 'read')) {
+        if (metadataMatchesSnapshot(root, database, metadata, snapshot)) {
           cacheReadInstrumentation.afterIntegrityValidation?.()
           cacheReadTestHooks.afterCanonicalCacheEqualityValidation?.()
           const result = (() => {
@@ -2386,7 +2412,7 @@ const createCompactSearchReader = (database: DatabaseSync, input: SearchStatemen
       records.path,
       records.summary,
       bm25(record_search) AS rank,
-      snippet(record_search, 1, '[', ']', '...', 16) AS snippet
+      snippet(record_search, 2, '[', ']', '...', 16) AS snippet
     FROM record_search
     JOIN records ON records.id = record_search.id
     WHERE ${conditions.join(' AND ')}
