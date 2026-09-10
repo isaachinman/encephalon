@@ -2,6 +2,7 @@ import { type BigIntStats, lstatSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
+import { isDeepStrictEqual } from 'node:util'
 import {
   parseCompactSearchRecordsInput,
   parseFullSearchRecordsInput,
@@ -39,17 +40,20 @@ import { manifestEntryMetadataFrom, sameStableEntryMetadata } from './filesystem
 import { PACKAGE_VERSION } from './generated/version.ts'
 import { withOperationLock } from './lock.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
+import { ordinalStringCompare } from './order.ts'
 import { recordCorpusFingerprint } from './record-corpus-fingerprint.ts'
+import { MAX_SEARCH_PREVIEW_BYTES } from './record-projection.ts'
 import {
   canonicalCacheManifest,
   canonicalRecordPath,
   type RecordReadHooks,
   readValidatedRecordSnapshotResolved,
+  type VerifiedCorpus,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import { createResponseByteBudget, type ResponseByteBudget } from './response-budget.ts'
-import { parseRecordFile, projectParsedRecordFile, validateArtifactPath } from './schema.ts'
-import { literalMatchQuery, MAX_NFC_UTF8_EXPANSION_FACTOR, normalizeSearchText } from './search-text.ts'
+import { parseRecordFile, validateArtifactPath } from './schema.ts'
+import { literalMatchQuery, MAX_NFC_UTF8_EXPANSION_FACTOR } from './search-text.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type {
   BrainRecord,
@@ -82,7 +86,7 @@ const MAX_CACHE_SEARCH_DOCUMENT_BYTES =
 const MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES =
   MAX_CACHE_RECORD_JSON_BYTES * MAX_CACHE_SEARCH_DOCUMENT_DUPLICATION_FACTOR * MAX_NFC_UTF8_EXPANSION_FACTOR
 const MAX_CACHE_FTS_ID_BYTES = CANONICAL_BUDGETS.records * 255
-const MAX_CACHE_SEARCH_PREVIEW_BYTES = 1024
+const MAX_CACHE_SEARCH_PREVIEW_BYTES = MAX_SEARCH_PREVIEW_BYTES
 const MAX_CACHE_SEARCH_PREVIEW_AGGREGATE_BYTES = CANONICAL_BUDGETS.records * MAX_CACHE_SEARCH_PREVIEW_BYTES
 const METADATA_KEYS = [
   'artifactPaths',
@@ -110,7 +114,7 @@ type Metadata = {
   packageVersion: string
   repositoryRealpath: string
   manifest: string
-  artifactPaths: string[]
+  artifactPaths: readonly string[]
   recordFingerprint?: string
   recordsIndexed: number
 }
@@ -1098,16 +1102,6 @@ const parseCachedRecord = (value: unknown): BrainRecord => {
   throw new CacheSchemaMismatch('Cached record JSON does not match the canonical record schema.')
 }
 
-const summaryForRecord = (record: BrainRecord) => {
-  if (record.payload !== null && !Array.isArray(record.payload) && typeof record.payload === 'object') {
-    const { summary } = record.payload
-    if (typeof summary === 'string' && summary.trim().length > 0) {
-      return summary.trim()
-    }
-  }
-  return null
-}
-
 const readMetadata = (database: DatabaseSync): Metadata | undefined => {
   const maximumRows = METADATA_KEYS.length + 1
   const maximumKeyBytes = Math.max(...METADATA_KEYS.map(key => Buffer.byteLength(key, 'utf8')))
@@ -1221,11 +1215,7 @@ const assertCacheScope = (root: string, metadata: Metadata | undefined) => {
   }
 }
 
-const assertCacheContentConsistent = (
-  database: DatabaseSync,
-  metadata: Metadata,
-  expectedRecordFingerprint?: string,
-) => {
+const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata, snapshot: VerifiedCorpus) => {
   const maximumRows = CANONICAL_BUDGETS.records + 1
   const recordsProbe = readIntegrityProbe(
     'records',
@@ -1307,8 +1297,15 @@ const assertCacheContentConsistent = (
     record: parseCachedRecord(row.record_json),
     row,
   }))
-  const superseded = new Set(records.flatMap(({ record }) => record.supersedes ?? []))
+  const superseded =
+    records.length === snapshot.records.length
+      ? snapshot.supersededIds
+      : new Set(records.flatMap(({ record }) => record.supersedes ?? []))
   for (const { record, row } of records) {
+    const canonical = snapshot.byId.get(record.id)
+    if (canonical === undefined || !isDeepStrictEqual(record, canonical)) {
+      throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
+    }
     const active = superseded.has(record.id) ? 0 : 1
     if (
       row.id !== record.id ||
@@ -1318,26 +1315,45 @@ const assertCacheContentConsistent = (
       row.created_at !== record.createdAt ||
       row.path !== record.path ||
       row.active !== active ||
-      row.summary !== summaryForRecord(record)
+      row.summary !== snapshot.recordFacts(canonical).projection.summary
     ) {
       throw new CacheSchemaMismatch('The cache record table does not match its canonical JSON.')
     }
   }
-  const recordFingerprint = recordCorpusFingerprint(records.map(({ record }) => record))
-  if (
-    (metadata.recordFingerprint !== undefined && recordFingerprint !== metadata.recordFingerprint) ||
-    (expectedRecordFingerprint !== undefined && recordFingerprint !== expectedRecordFingerprint)
-  ) {
+  // An existing writer cache can describe the accepted corpus before this operation's additions.
+  // Its rows must still match canonical records; hash that subset's accepted raw digests, never cached JSON.
+  const recordFingerprint =
+    records.length === snapshot.records.length
+      ? snapshot.recordFingerprint
+      : recordCorpusFingerprint(
+          records
+            .map(({ record }) => {
+              const canonical = snapshot.byId.get(record.id)
+              if (canonical !== undefined) {
+                return snapshot.recordFacts(canonical)
+              }
+              throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
+            })
+            .sort((first, second) => ordinalStringCompare(first.path, second.path)),
+        )
+  if (metadata.recordFingerprint !== recordFingerprint) {
     throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
   }
   const expectedSearchRows = new Map(
-    records.map(({ record }) => [
-      Buffer.from(record.id, 'utf8').toString('hex'),
-      {
-        preview: Buffer.from(searchPreviewForRecord(record), 'utf8'),
-        text: Buffer.from(searchDocumentForRecord(record), 'utf8'),
-      },
-    ]),
+    records.map(({ record }) => {
+      const canonical = snapshot.byId.get(record.id)
+      if (canonical !== undefined) {
+        const { projection } = snapshot.recordFacts(canonical)
+        return [
+          Buffer.from(record.id, 'utf8').toString('hex'),
+          {
+            preview: Buffer.from(projection.preview, 'utf8'),
+            text: Buffer.from(projection.text, 'utf8'),
+          },
+        ]
+      }
+      throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
+    }),
   )
   const searchProbe = readIntegrityProbe(
     'record-search',
@@ -1415,14 +1431,14 @@ const assertCacheContentConsistent = (
   }
 }
 
-const assertExistingCacheContentConsistent = (root: string, database: DatabaseSync): void => {
+const assertExistingCacheContentConsistent = (root: string, database: DatabaseSync, snapshot: VerifiedCorpus): void => {
   assertCacheSchema(database)
   const metadata = readMetadata(database)
   if (metadata === undefined) {
     throw new CacheSchemaMismatch('The cache metadata is incomplete.')
   }
   assertCacheScope(root, metadata)
-  assertCacheContentConsistent(database, metadata)
+  assertCacheContentConsistent(database, metadata, snapshot)
 }
 
 const assertEmptyCacheContent = (database: DatabaseSync): void => {
@@ -1440,9 +1456,13 @@ const assertEmptyCacheContent = (database: DatabaseSync): void => {
   }
 }
 
-const assertExistingCacheContentTransaction = (root: string, database: DatabaseSync): void => {
+const assertExistingCacheContentTransaction = (
+  root: string,
+  database: DatabaseSync,
+  snapshot: VerifiedCorpus,
+): void => {
   assertCacheTransaction(database, opened => {
-    assertExistingCacheContentConsistent(root, opened)
+    assertExistingCacheContentConsistent(root, opened, snapshot)
   })
 }
 
@@ -1450,13 +1470,7 @@ const assertEmptyCacheContentTransaction = (database: DatabaseSync): void => {
   assertCacheTransaction(database, assertEmptyCacheContent)
 }
 
-type ValidatedRecordCacheSnapshot = Readonly<{
-  artifacts: readonly ArtifactObservation[]
-  assertCurrent: () => void
-  manifest: string
-  recordFingerprint: string
-  records: readonly BrainRecord[]
-}>
+type ValidatedRecordCacheSnapshot = VerifiedCorpus
 
 const metadataMatchesSnapshot = (
   root: string,
@@ -1465,7 +1479,7 @@ const metadataMatchesSnapshot = (
   snapshot: ValidatedRecordCacheSnapshot,
 ): metadata is Metadata => {
   assertCacheScope(root, metadata)
-  const artifactPaths = snapshot.artifacts.map(artifact => artifact.path)
+  const { artifactPaths } = snapshot
   if (metadata?.schemaVersion === SCHEMA_VERSION && metadata.recordFingerprint !== snapshot.recordFingerprint) {
     throw new CacheSchemaMismatch('The cache metadata does not match the canonical record corpus.')
   }
@@ -1476,45 +1490,10 @@ const metadataMatchesSnapshot = (
     metadata.recordsIndexed === snapshot.records.length &&
     JSON.stringify(metadata.artifactPaths) === JSON.stringify(artifactPaths)
   if (fresh) {
-    assertCacheContentConsistent(database, metadata, snapshot.recordFingerprint)
+    assertCacheContentConsistent(database, metadata, snapshot)
   }
   return fresh
 }
-
-const searchDocumentForRecord = (record: BrainRecord) =>
-  normalizeSearchText(
-    [
-      record.kind,
-      record.subject,
-      record.source,
-      summaryForRecord(record),
-      JSON.stringify(record.payload),
-      record.searchText ?? '',
-    ]
-      .filter((value): value is string => typeof value === 'string' && value.length > 0)
-      .join('\n'),
-  )
-
-const searchPreviewForRecord = (record: BrainRecord) => {
-  const preview = normalizeSearchText(
-    [record.kind, record.subject, record.source, summaryForRecord(record)]
-      .filter((value): value is string => typeof value === 'string' && value.length > 0)
-      .join('\n'),
-  )
-  const bytes = Buffer.from(preview, 'utf8')
-  if (bytes.length > MAX_CACHE_SEARCH_PREVIEW_BYTES) {
-    // Keep a contiguous body prefix. ASCII separators cannot split UTF-8 or create a partial FTS token.
-    const prefix = bytes.subarray(0, MAX_CACHE_SEARCH_PREVIEW_BYTES)
-    const separator = Math.max(prefix.lastIndexOf(0x20), prefix.lastIndexOf(0x0a))
-    return prefix.subarray(0, separator).toString('utf8')
-  }
-  return preview
-}
-
-const projectedCacheRecord = (record: BrainRecord): BrainRecord => ({
-  ...projectParsedRecordFile(record),
-  path: record.path,
-})
 
 const writeMetadata = (database: DatabaseSync, metadata: CurrentMetadata) => {
   const statement = database.prepare('INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)')
@@ -1539,21 +1518,9 @@ type CompletedCacheRebuild = {
 }
 
 /** @internal */
-export type ValidatedMutationCacheSnapshot = Readonly<{
-  artifacts: readonly ArtifactObservation[]
-  assertCurrent: () => void
-  records: readonly BrainRecord[]
-  repositoryRealpath: string
-}>
+export type ValidatedMutationCacheSnapshot = VerifiedCorpus & Readonly<{ repositoryRealpath: string }>
 
-type CacheWriteSnapshot = Readonly<{
-  artifacts: readonly ArtifactObservation[]
-  assertCurrent: () => void
-  manifest: string
-  recordFingerprint: string
-  records: readonly BrainRecord[]
-  repositoryRealpath: string
-}>
+type CacheWriteSnapshot = ValidatedMutationCacheSnapshot
 
 type CacheSnapshotWrite =
   | { kind: 'committed'; rebuild: CompletedCacheRebuild }
@@ -1624,8 +1591,7 @@ const writeCacheSnapshot = (
   primary: CacheWriterPrimary,
   snapshot: CacheWriteSnapshot,
 ): CacheSnapshotWrite => {
-  const artifactPaths = snapshot.artifacts.map(artifact => artifact.path)
-  const superseded = new Set(snapshot.records.flatMap(record => record.supersedes ?? []))
+  const { artifactPaths } = snapshot
   try {
     assertCacheWriteSnapshotCurrent(snapshot)
   } catch (error) {
@@ -1635,7 +1601,7 @@ const writeCacheSnapshot = (
     throw error
   }
   const opened = openWriterDatabase(location, primary, openedDatabase => {
-    assertExistingCacheContentTransaction(root, openedDatabase)
+    assertExistingCacheContentTransaction(root, openedDatabase, snapshot)
   })
   const { acceptsEmptyContent, database, identity } = opened
   const retryPrimary: CacheWriterPrimary = (() => {
@@ -1656,7 +1622,7 @@ const writeCacheSnapshot = (
       if (acceptsEmptyContent) {
         assertEmptyCacheContent(database)
       } else {
-        assertExistingCacheContentConsistent(root, database)
+        assertExistingCacheContentConsistent(root, database, snapshot)
       }
       assertCacheWriteSnapshotCurrent(snapshot)
       database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
@@ -1666,7 +1632,8 @@ const writeCacheSnapshot = (
       `)
       const insertSearch = database.prepare('INSERT INTO record_search(id, text, preview) VALUES (?, ?, ?)')
       for (const record of snapshot.records) {
-        const projected = projectedCacheRecord(record)
+        const projected = record
+        const { projection } = snapshot.recordFacts(record)
         insertRecord.run(
           projected.id,
           projected.kind,
@@ -1674,11 +1641,11 @@ const writeCacheSnapshot = (
           projected.source,
           projected.createdAt,
           projected.path,
-          superseded.has(projected.id) ? 0 : 1,
-          summaryForRecord(projected),
-          JSON.stringify(projected),
+          snapshot.activeIds.has(projected.id) ? 1 : 0,
+          projection.summary,
+          JSON.stringify(record),
         )
-        insertSearch.run(projected.id, searchDocumentForRecord(projected), searchPreviewForRecord(projected))
+        insertSearch.run(projected.id, projection.text, projection.preview)
       }
       writeMetadata(database, {
         artifactPaths,
@@ -1740,6 +1707,11 @@ const rebuildCache = (
   root: string,
   location: CacheLocation = inspectCacheLocation(root),
   primary: CacheWriterPrimary = { kind: 'create-if-missing' },
+  readCorpus = () => {
+    const snapshot = readValidatedRecordSnapshotResolved(root, cacheReadTestHooks.recordReadHooks)
+    cacheReadTestHooks.afterCanonicalValidation?.()
+    return snapshot
+  },
 ): CompletedCacheRebuild => {
   const attempts = Array.from({ length: MAX_REPOSITORY_CHANGE_RETRIES }, (_, index) => index)
   let nextWriterPrimary = primary
@@ -1747,7 +1719,7 @@ const rebuildCache = (
   for (const attempt of attempts) {
     let snapshot: ValidatedRecordCacheSnapshot
     try {
-      snapshot = readValidatedRecordSnapshotResolved(root, cacheReadTestHooks.recordReadHooks)
+      snapshot = readCorpus()
     } catch (error) {
       const validationIssueCodes =
         error instanceof EncephalonError && error.code === 'VALIDATION_FAILED' && Array.isArray(error.details.errors)
@@ -1773,7 +1745,6 @@ const rebuildCache = (
       }
       continue
     }
-    cacheReadTestHooks.afterCanonicalValidation?.()
     const written = (() => {
       try {
         return writeCacheSnapshot(root, location, nextWriterPrimary, {
@@ -1806,9 +1777,29 @@ type CacheRebuilder = (root: string, location: CacheLocation, primary?: CacheWri
 
 const mutationCacheRebuilder = (snapshot: ValidatedMutationCacheSnapshot): CacheRebuilder => {
   let discarded = false
+  let replacement: VerifiedCorpus | undefined
+  const fallback: CacheRebuilder = (root, location, primary) =>
+    rebuildCache(root, location, primary, () => {
+      if (replacement !== undefined) {
+        try {
+          replacement.assertCurrent()
+        } catch (error) {
+          if (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED') {
+            replacement = undefined
+          } else {
+            throw error
+          }
+        }
+      }
+      if (replacement === undefined) {
+        replacement = readValidatedRecordSnapshotResolved(root, cacheReadTestHooks.recordReadHooks)
+        cacheReadTestHooks.afterCanonicalValidation?.()
+      }
+      return replacement
+    })
   return (root, location, primary = { kind: 'create-if-missing' }) => {
     if (discarded) {
-      return rebuildCache(root, location, primary)
+      return fallback(root, location, primary)
     }
     try {
       assertMutationSnapshotCurrent(root, location, snapshot)
@@ -1828,22 +1819,19 @@ const mutationCacheRebuilder = (snapshot: ValidatedMutationCacheSnapshot): Cache
         }
       }
       const written = writeCacheSnapshot(root, location, primary, {
-        artifacts: snapshot.artifacts,
+        ...snapshot,
         assertCurrent,
         manifest: manifest.value,
-        recordFingerprint: recordCorpusFingerprint(snapshot.records),
-        records: snapshot.records,
-        repositoryRealpath: snapshot.repositoryRealpath,
       })
       if (written.kind === 'committed') {
         return written.rebuild
       }
       discarded = true
-      return rebuildCache(root, location, written.retryPrimary)
+      return fallback(root, location, written.retryPrimary)
     } catch (error) {
       if (error instanceof MutationCacheSnapshotChanged) {
         discarded = true
-        return rebuildCache(root, location, primary)
+        return fallback(root, location, primary)
       }
       if (error instanceof CacheDatabaseCreationConflict && primary.kind === 'create-if-missing') {
         return fail('REPOSITORY_CHANGED', 'The Encephalon cache layout changed during the operation.', {

@@ -47,7 +47,6 @@ import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
-import { recordCorpusFingerprint } from '../src/record-corpus-fingerprint.ts'
 import { recordWriteTestHooks } from '../src/records.ts'
 import { repositoryTestHooks } from '../src/repository.ts'
 import { responseBudgetTestHooks } from '../src/response-budget.ts'
@@ -715,9 +714,8 @@ const overwriteCacheWithInternallyConsistentForgery = (
     database
       .prepare('INSERT INTO record_search(id, text, preview) VALUES (?, ?, ?)')
       .run(forged.id, forgedSearchDocument, [forged.kind, forged.subject, forged.source, forgedSummary].join('\n'))
-    database
-      .prepare("UPDATE metadata SET value = ? WHERE key = 'recordFingerprint'")
-      .run(recordCorpusFingerprint([forged]))
+    // Copy the canonical raw fingerprint unchanged: metadata equality must not conceal forged rows.
+
     database.exec('COMMIT')
   })
 }

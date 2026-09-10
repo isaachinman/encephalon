@@ -133,20 +133,17 @@ const wrapInitError = (error: unknown): EncephalonError => {
   }
 }
 
-const activeRecords = (records: readonly BrainRecord[]) => {
-  const superseded = new Set(records.flatMap(record => record.supersedes ?? []))
-  return records.filter(record => !superseded.has(record.id))
-}
-
-const baselineActions = (records: readonly BrainRecord[], baseline: AddRecordInput[], refresh: boolean) =>
+const baselineActions = (
+  activeHeads: (kind: string, subject: string) => readonly BrainRecord[],
+  baseline: AddRecordInput[],
+  refresh: boolean,
+) =>
   baseline.reduce<{
     additions: AddRecordInput[]
     conflicts: InitEncephalonResult['skippedConflicts']
   }>(
     (result, candidate) => {
-      const matching = activeRecords(records).filter(
-        record => record.kind === candidate.kind && record.subject === candidate.subject,
-      )
+      const matching = activeHeads(candidate.kind, candidate.subject)
       if (matching.length === 0) {
         return { ...result, additions: [...result.additions, candidate] }
       }
@@ -304,7 +301,7 @@ const initResolved = (
             planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
           const { actions: plannedActions, validatedAdditions } = (() => {
             try {
-              const nextActions = baselineActions(records, baseline, refresh)
+              const nextActions = baselineActions(planning.activeHeads, baseline, refresh)
               return {
                 actions: nextActions,
                 validatedAdditions: nextActions.additions.map(addition =>
@@ -323,7 +320,7 @@ const initResolved = (
               const validationPlans = validatedAdditions.map(addition =>
                 planRecordAddition(root, createRecordFile(addition, '2000-01-01T00:00:00.000Z')),
               )
-              const artifacts = (() => {
+              const validated = (() => {
                 try {
                   return planning.validateFinal(
                     [...records, ...validationPlans.map(plan => plan.record)],
@@ -356,21 +353,20 @@ const initResolved = (
                 planning.bytes + plans.reduce((total, plan) => total + Buffer.byteLength(plan.formatted), 0)
               if (mutationBytes <= MAX_CANONICAL_RECORD_BYTES) {
                 cacheSnapshot = Object.freeze({
-                  artifacts,
-                  assertCurrent: publicationAuthority.assertCurrent,
-                  records: Object.freeze([...records, ...attemptRecordsCreated]),
+                  ...publicationAuthority.verifiedCorpus(validated.index, validated.artifacts, [
+                    ...records,
+                    ...attemptRecordsCreated,
+                  ]),
                   repositoryRealpath: location.repository,
                 })
               }
               return publicationAuthority
             }
-            const artifacts = validateCurrentRecords()
+            const validated = validateCurrentRecords()
             const settledAuthority = planning.authority()
             if (!refresh) {
               cacheSnapshot = Object.freeze({
-                artifacts,
-                assertCurrent: settledAuthority.assertCurrent,
-                records: Object.freeze([...records]),
+                ...settledAuthority.verifiedCorpus(validated.index, validated.artifacts),
                 repositoryRealpath: location.repository,
               })
             }

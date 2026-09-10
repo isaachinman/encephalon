@@ -225,7 +225,7 @@ describe('hot scan performance regressions', () => {
       ).length,
       4,
     )
-    assert.equal(allowedWork.get('allowed-group-write'), 2, 'allowed group work exceeded active records')
+    assert.equal(allowedWork.get('allowed-group-write') ?? 0, 0, 'allowed heads must reuse the accepted active groups')
     assert.equal(allowedWork.get('allowed-id-write'), 2, 'allowed id work exceeded accepted active records')
   })
 

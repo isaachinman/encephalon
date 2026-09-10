@@ -140,6 +140,7 @@ type PayloadWorkItem =
     }
   | {
       action: 'exit'
+      output: object
       value: object
     }
 
@@ -344,7 +345,7 @@ const validateJsonValueAt = (
     seen.add(value)
     const normalizedValues = values as JsonValue[]
     const assigned = assignPayloadValue(target, normalizedValues)
-    stack.push({ action: 'exit', value })
+    stack.push({ action: 'exit', output: normalizedValues, value })
     for (let index = length - 1; index >= 0; index -= 1) {
       stack.push({
         action: 'enter',
@@ -421,7 +422,7 @@ const validateJsonValueAt = (
       seen.add(object)
       const normalizedResult = result as { [key: string]: JsonValue }
       const assigned = assignPayloadValue(target, normalizedResult)
-      stack.push({ action: 'exit', value: object })
+      stack.push({ action: 'exit', output: normalizedResult, value: object })
       for (let index = enumerableKeyCount - 1; index >= 0; index -= 1) {
         const key = keys[index]
         if (typeof key === 'string') {
@@ -443,7 +444,7 @@ const validateJsonValueAt = (
   return fail('INVALID_ARGUMENT', 'payload contains a value that is not JSON serializable.', { field: path })
 }
 
-export const validateJsonValue = (value: unknown, hooks: PayloadValidationHooks = {}) => {
+export const validateJsonValue = (value: unknown, hooks: PayloadValidationHooks = {}, immutable = false) => {
   const stack: PayloadWorkItem[] = [{ action: 'enter', depth: 0, path: 'payload', value }]
   const seen = new WeakSet<object>()
   const nodeCount = { value: 0 }
@@ -458,6 +459,9 @@ export const validateJsonValue = (value: unknown, hooks: PayloadValidationHooks 
       if (item !== undefined) {
         if (item.action === 'exit') {
           seen.delete(item.value)
+          if (immutable) {
+            Object.freeze(item.output)
+          }
         } else {
           const assigned = validateJsonValueAt(
             item.value,
@@ -638,7 +642,7 @@ export const projectParsedRecordFile = (record: BrainRecordFile): BrainRecordFil
   ...(record.supersedes === undefined ? {} : { supersedes: record.supersedes }),
 })
 
-export const parseRecordFile = (value: unknown): BrainRecordFile => {
+export const parseRecordFile = (value: unknown, immutable = false): BrainRecordFile => {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return fail('INVALID_ARGUMENT', 'Record JSON must contain an object.')
   }
@@ -654,7 +658,7 @@ export const parseRecordFile = (value: unknown): BrainRecordFile => {
     createdAt: validateTimestamp(object.createdAt),
     id,
     kind,
-    payload: validateJsonValue(object.payload),
+    payload: validateJsonValue(object.payload, {}, immutable),
     source: requiredText(object.source, 'source'),
     subject: requiredText(object.subject, 'subject'),
   }
@@ -671,6 +675,15 @@ export const parseRecordFile = (value: unknown): BrainRecordFile => {
   }
   if (object.supersedes !== undefined) {
     record.supersedes = validateSupersedes(object.supersedes)
+  }
+  if (immutable) {
+    if (record.artifacts !== undefined) {
+      Object.freeze(record.artifacts)
+    }
+    if (record.supersedes !== undefined) {
+      Object.freeze(record.supersedes)
+    }
+    return Object.freeze(projectParsedRecordFile(record))
   }
   return projectParsedRecordFile(record)
 }
