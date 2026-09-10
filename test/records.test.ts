@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import crypto, { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import fs, {
   chmodSync,
@@ -72,6 +72,7 @@ const mutableFs = fs as {
   closeSync: typeof fs.closeSync
   lstatSync: typeof fs.lstatSync
   openSync: typeof fs.openSync
+  readSync: typeof fs.readSync
 }
 const mutationRecordWriteTestHooks = recordWriteTestHooks as typeof recordWriteTestHooks & {
   readHooks?: RecordReadHooks | undefined
@@ -261,6 +262,78 @@ afterEach(() => {
 })
 
 describe('canonical records', () => {
+  test('reads and hashes accepted canonical bytes once across closing proofs', () => {
+    const root = realpathSync(createRoot())
+    prepareEmptyCanonicalDirectories(root)
+    writeCanonicalRecord(root, { id: 'read-once', payload: { text: 'evidence '.repeat(4096) } })
+    const path = join(root, 'encephalon', 'decision', 'read-once.json')
+    const expected = readFileSync(path)
+    const descriptors = new Set<number>()
+    const originalOpen = fs.openSync
+    const originalClose = fs.closeSync
+    const originalRead = fs.readSync
+    const originalUpdate = crypto.Hash.prototype.update
+    let bytesRead = 0
+    let hashes = 0
+
+    mutableFs.openSync = ((...arguments_: unknown[]) => {
+      const descriptor = Reflect.apply(originalOpen, fs, arguments_) as number
+      if (arguments_[0] === path) {
+        descriptors.add(descriptor)
+      }
+      return descriptor
+    }) as typeof fs.openSync
+    mutableFs.closeSync = (descriptor: number) => {
+      descriptors.delete(descriptor)
+      originalClose(descriptor)
+    }
+    mutableFs.readSync = ((...arguments_: unknown[]) => {
+      const read = Reflect.apply(originalRead, fs, arguments_) as number
+      if (descriptors.has(arguments_[0] as number)) {
+        bytesRead += read
+      }
+      return read
+    }) as typeof fs.readSync
+    crypto.Hash.prototype.update = function (this: crypto.Hash, ...arguments_: unknown[]) {
+      const [data] = arguments_
+      if (Buffer.isBuffer(data) && data.equals(expected)) {
+        hashes += 1
+      }
+      return Reflect.apply(originalUpdate, this, arguments_)
+    } as typeof originalUpdate
+    syncBuiltinESMExports()
+    try {
+      const snapshot = readValidatedRecordSnapshotResolved(root)
+      snapshot.assertCurrent()
+      snapshot.assertCurrent()
+      assert.equal(bytesRead, expected.byteLength)
+      assert.equal(hashes, 1)
+      assert.equal(descriptors.size, 0)
+      writeFileSync(path, Buffer.from(expected).fill(32, 0, 1))
+      assertErrorCode(snapshot.assertCurrent, 'REPOSITORY_CHANGED')
+      writeFileSync(path, expected)
+      bytesRead = 0
+      hashes = 0
+      api.addRecord({
+        id: 'read-once-added',
+        kind: 'decision',
+        payload: {},
+        root,
+        source: 'test',
+        subject: 'read.once.added',
+      })
+      assert.equal(bytesRead, expected.byteLength)
+      assert.equal(hashes, 1)
+      assert.equal(descriptors.size, 0)
+    } finally {
+      mutableFs.openSync = originalOpen
+      mutableFs.closeSync = originalClose
+      mutableFs.readSync = originalRead
+      crypto.Hash.prototype.update = originalUpdate
+      syncBuiltinESMExports()
+    }
+  })
+
   test('rebuilds add cache from one validated mutation snapshot', () => {
     const root = createRoot()
     prepareEmptyCanonicalDirectories(root)
@@ -2525,8 +2598,8 @@ describe('canonical records', () => {
     recordWriteTestHooks.fault = point => {
       if (point === 'during-hydration') {
         recordWriteTestHooks.fault = undefined
-        artifactInspectionTestHooks.fault = (artifactPoint, path) => {
-          if (artifactPoint === 'after-artifact-fstat' && path === artifact) {
+        artifactInspectionTestHooks.fault = artifactPoint => {
+          if (artifactPoint === 'before-closing-revalidation') {
             matchingArtifactInspections += 1
             throw Object.assign(new Error('Injected artifact I/O failure'), { code: 'EIO' })
           }
@@ -4966,7 +5039,7 @@ describe('canonical records', () => {
     assert.deepEqual(counts, { canonicalScans: 2, graphValidations: 2 })
   })
 
-  test('stable canonical snapshot retries a record changed during closing artifact validation', () => {
+  test('stable canonical snapshot retries a record changed during initial artifact verification', () => {
     const root = createRoot()
     const id = 'stable-record-during-artifact-validation'
     const artifact = `_artifacts/decision/${id}/evidence.txt`
@@ -4980,21 +5053,17 @@ describe('canonical records', () => {
       subject: 'stable.record-during-artifact-validation',
     })
     const counts = { canonicalScans: 0, graphValidations: 0 }
-    let artifactLstatCalls = 0
     let changed = false
 
     artifactInspectionTestHooks.fault = point => {
-      if (point === 'after-artifact-lstat') {
-        artifactLstatCalls += 1
-        if (artifactLstatCalls === 3) {
-          writeCanonicalRecord(root, {
-            artifacts: [artifact],
-            id,
-            payload: { summary: 'new' },
-            subject: 'stable.record-during-artifact-validation',
-          })
-          changed = true
-        }
+      if (point === 'before-final-directory-revalidation' && !changed) {
+        writeCanonicalRecord(root, {
+          artifacts: [artifact],
+          id,
+          payload: { summary: 'new' },
+          subject: 'stable.record-during-artifact-validation',
+        })
+        changed = true
       }
     }
 

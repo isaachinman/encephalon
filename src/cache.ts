@@ -12,7 +12,7 @@ import {
   parseRootInput,
   parseShowRecordInput,
 } from './api-input.ts'
-import { ArtifactChangedError, type ArtifactObservation, inspectArtifactFiles } from './artifact-inspection.ts'
+import { ArtifactChangedError, type ArtifactObservation } from './artifact-inspection.ts'
 import {
   type CacheDatabase,
   CacheDatabaseCreationConflict,
@@ -37,7 +37,7 @@ import {
   revalidateCanonicalDirectory,
 } from './canonical-layout.ts'
 import { EncephalonError, fail, failBudget, failWithCause, wrapIo } from './errors.ts'
-import { manifestEntryMetadataFrom, sameStableEntryMetadata } from './filesystem-entry.ts'
+import { manifestEntryMetadataFrom } from './filesystem-entry.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import { withOperationLock } from './lock.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
@@ -1625,32 +1625,11 @@ const assertCacheWriteSnapshotCurrent = (snapshot: CacheWriteSnapshot) => {
   }
 }
 
-const assertMutationSnapshotCurrent = (
-  root: string,
-  location: CacheLocation,
-  snapshot: ValidatedMutationCacheSnapshot,
-) => {
+const assertMutationSnapshotCurrent = (location: CacheLocation, snapshot: ValidatedMutationCacheSnapshot) => {
   if (location.repository !== snapshot.repositoryRealpath) {
     return mutationSnapshotChanged()
   }
   try {
-    snapshot.assertCurrent()
-    const results = inspectArtifactFiles(
-      resolve(root, 'encephalon'),
-      snapshot.artifacts.map(artifact => artifact.path),
-    )
-    const current = results.flatMap(result => (result.kind === 'stable' ? [result.observation] : []))
-    const sameArtifacts =
-      current.length === snapshot.artifacts.length &&
-      snapshot.artifacts.every(
-        (artifact, index) =>
-          artifact.path === current[index]?.path &&
-          current[index] !== undefined &&
-          sameStableEntryMetadata(artifact.metadata, current[index].metadata),
-      )
-    if (!sameArtifacts) {
-      return mutationSnapshotChanged()
-    }
     snapshot.assertCurrent()
   } catch (error) {
     if (
@@ -1881,15 +1860,15 @@ const mutationCacheRebuilder = (snapshot: ValidatedMutationCacheSnapshot): Cache
       return fallback(root, location, primary)
     }
     try {
-      assertMutationSnapshotCurrent(root, location, snapshot)
+      assertMutationSnapshotCurrent(location, snapshot)
       const manifest = boundedRepositoryManifestFromObservations(root, snapshot.artifacts)
       if (manifest.kind !== 'stable') {
         return mutationSnapshotChanged()
       }
-      assertMutationSnapshotCurrent(root, location, snapshot)
+      assertMutationSnapshotCurrent(location, snapshot)
       const assertCurrent = () => {
         try {
-          assertMutationSnapshotCurrent(root, location, snapshot)
+          assertMutationSnapshotCurrent(location, snapshot)
         } catch (error) {
           if (error instanceof MutationCacheSnapshotChanged) {
             return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')

@@ -18,6 +18,7 @@ export type ArtifactInspectionFault =
   | 'after-brain-lstat'
   | 'after-final-artifact-fstat'
   | 'before-ancestor-lstat'
+  | 'before-closing-revalidation'
   | 'before-final-directory-revalidation'
 
 export type ArtifactInspectionHooks = {
@@ -34,12 +35,7 @@ export type ArtifactObservation = Readonly<{
   path: string
 }>
 
-type ArtifactDirectoryEvidence = Readonly<{
-  canonicalMetadata: BigIntStats
-  canonicalPath: string
-  path: string
-  pathMetadata: BigIntStats
-}>
+type ArtifactDirectory = DirectoryWitness & Readonly<{ parent?: ArtifactDirectory }>
 
 type ArtifactInvalidReason =
   | 'ancestor-canonical-path'
@@ -53,7 +49,7 @@ type ArtifactInvalidReason =
 
 type ArtifactInvalidEvidence = Readonly<{
   entryMetadata?: BigIntStats
-  parent?: ArtifactDirectoryEvidence
+  path: string
   reason: ArtifactInvalidReason
 }>
 
@@ -68,17 +64,16 @@ export type ArtifactInspectionResult =
 
 type StableArtifactInspection = Extract<ArtifactInspectionResult, { kind: 'stable' }>
 
-const artifactResultDirectories = new WeakMap<object, readonly ArtifactDirectoryEvidence[]>()
-const invalidErrorDirectories = new WeakMap<ArtifactInvalidError, readonly ArtifactDirectoryEvidence[]>()
+export type ArtifactInspection = Readonly<{
+  assertCurrent: () => void
+  results: readonly ArtifactInspectionResult[]
+}>
 
 export class ArtifactInvalidError extends Error {
   readonly evidence: ArtifactInvalidEvidence
 
-  constructor(
-    message = 'Artifact must be an existing regular non-symlink file.',
-    evidence: ArtifactInvalidEvidence = Object.freeze({ reason: 'artifact-missing' }),
-  ) {
-    super(message)
+  constructor(evidence: ArtifactInvalidEvidence) {
+    super('Artifact must be an existing regular non-symlink file.')
     this.name = 'ArtifactInvalidError'
     this.evidence = evidence
   }
@@ -96,101 +91,29 @@ const nonBlockFlag = typeof constants.O_NONBLOCK === 'number' ? constants.O_NONB
 const noControllingTerminalFlag = typeof constants.O_NOCTTY === 'number' ? constants.O_NOCTTY : 0
 const artifactOpenFlags = constants.O_RDONLY | noFollowFlag | nonBlockFlag | noControllingTerminalFlag
 
-const directoryEvidence = (witness: DirectoryWitness): ArtifactDirectoryEvidence =>
-  Object.freeze({
-    canonicalMetadata: Object.freeze(witness.canonicalMetadata),
-    canonicalPath: witness.canonicalPath,
-    path: witness.path,
-    pathMetadata: Object.freeze(witness.pathMetadata),
-  })
-
-const directoryChainEvidence = (directories: readonly DirectoryWitness[]) =>
-  Object.freeze(directories.map(directoryEvidence))
-
-const retainResultDirectories = <Result extends ArtifactInspectionResult>(
-  result: Result,
-  directories: readonly DirectoryWitness[],
-) => {
-  artifactResultDirectories.set(result, directoryChainEvidence(directories))
-  return result
-}
-
 const invalidEvidence = (
   reason: ArtifactInvalidReason,
-  parent?: DirectoryWitness,
+  path: string,
   entryMetadata?: BigIntStats,
 ): ArtifactInvalidEvidence =>
   Object.freeze({
     ...(entryMetadata === undefined ? {} : { entryMetadata: Object.freeze(entryMetadata) }),
-    ...(parent === undefined ? {} : { parent: directoryEvidence(parent) }),
+    path,
     reason,
   })
-
-const sameDirectoryEvidence = (first: ArtifactDirectoryEvidence, second: ArtifactDirectoryEvidence) =>
-  first.path === second.path &&
-  first.canonicalPath === second.canonicalPath &&
-  sameStableEntryMetadata(first.pathMetadata, second.pathMetadata) &&
-  sameStableEntryMetadata(first.canonicalMetadata, second.canonicalMetadata)
-
-const sameOptionalDirectoryEvidence = (
-  first: ArtifactDirectoryEvidence | undefined,
-  second: ArtifactDirectoryEvidence | undefined,
-) => (first === undefined ? second === undefined : second !== undefined && sameDirectoryEvidence(first, second))
-
-const sameOptionalMetadata = (first: BigIntStats | undefined, second: BigIntStats | undefined) =>
-  first === undefined ? second === undefined : second !== undefined && sameStableEntryMetadata(first, second)
-
-const sameDirectoryChain = (
-  first: readonly ArtifactDirectoryEvidence[] | undefined,
-  second: readonly ArtifactDirectoryEvidence[] | undefined,
-) => {
-  const firstDirectories = first ?? []
-  const secondDirectories = second ?? []
-  return (
-    firstDirectories.length === secondDirectories.length &&
-    firstDirectories.every((directory, index) => {
-      const secondDirectory = secondDirectories[index]
-      return secondDirectory !== undefined && sameDirectoryEvidence(directory, secondDirectory)
-    })
-  )
-}
-
-const sameInvalidEvidence = (first: ArtifactInvalidEvidence, second: ArtifactInvalidEvidence) =>
-  first.reason === second.reason &&
-  sameOptionalDirectoryEvidence(first.parent, second.parent) &&
-  sameOptionalMetadata(first.entryMetadata, second.entryMetadata)
-
-const artifactInspectionPath = (result: ArtifactInspectionResult) =>
-  result.kind === 'stable' ? result.observation.path : result.path
-
-export const sameArtifactInspectionResult = (first: ArtifactInspectionResult, second: ArtifactInspectionResult) =>
-  artifactInspectionPath(first) === artifactInspectionPath(second) &&
-  sameDirectoryChain(artifactResultDirectories.get(first), artifactResultDirectories.get(second)) &&
-  (first.kind === 'stable'
-    ? second.kind === 'stable' && sameStableEntryMetadata(first.observation.metadata, second.observation.metadata)
-    : second.kind === 'invalid' &&
-      first.error.name === second.error.name &&
-      first.error.message === second.error.message &&
-      sameInvalidEvidence(first.evidence, second.evidence))
 
 const changed = (): never => {
   throw new ArtifactChangedError()
 }
 
-const invalid = (evidence: ArtifactInvalidEvidence, directories: readonly DirectoryWitness[] = []): never => {
-  const error = new ArtifactInvalidError(undefined, evidence)
-  invalidErrorDirectories.set(error, directoryChainEvidence(directories))
-  throw error
+const invalid = (evidence: ArtifactInvalidEvidence): never => {
+  throw new ArtifactInvalidError(evidence)
 }
 
-const invalidResult = (
-  path: string,
-  evidence: ArtifactInvalidEvidence,
-  directories: readonly DirectoryWitness[] = [],
-) => {
-  const error = new ArtifactInvalidError(undefined, evidence)
+const invalidResult = (path: string, evidence: ArtifactInvalidEvidence) => {
+  const error = new ArtifactInvalidError(evidence)
   const result = Object.freeze({ error, evidence, kind: 'invalid' as const, path })
-  return retainResultDirectories(result, directories)
+  return result
 }
 
 const isReplacementError = (error: unknown) => {
@@ -209,16 +132,19 @@ const revalidateDirectories = (directories: readonly DirectoryWitness[]) => {
   }
 }
 
+const revalidateAncestorChain = (directory: ArtifactDirectory): undefined => {
+  if (directory.parent !== undefined) {
+    revalidateAncestorChain(directory.parent)
+  }
+  revalidateDirectories([directory])
+}
+
 const captureAncestor = (
-  directories: readonly DirectoryWitness[],
+  parent: ArtifactDirectory,
   segment: string,
   artifact: string,
   hooks: ArtifactInspectionHooks,
 ) => {
-  const parent = directories.at(-1)
-  if (parent === undefined) {
-    return changed()
-  }
   const path = resolve(parent.canonicalPath, segment)
   try {
     revalidateDirectoryWitness(parent)
@@ -226,7 +152,7 @@ const captureAncestor = (
     const metadata = lstatSync(path, { bigint: true })
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
       revalidateDirectoryWitness(parent)
-      return invalid(invalidEvidence('ancestor-type', parent, metadata), directories)
+      return invalid(invalidEvidence('ancestor-type', path, metadata))
     }
     hooks.fault?.('after-ancestor-lstat', artifact)
     const witness = captureDirectoryWitness(path, { allowLink: false })
@@ -236,13 +162,10 @@ const captureAncestor = (
     }
     if (witness.canonicalPath !== path) {
       revalidateDirectories([parent, witness])
-      return invalid(invalidEvidence('ancestor-canonical-path', parent, witness.pathMetadata), [
-        ...directories,
-        witness,
-      ])
+      return Object.freeze({ ...witness, parent })
     }
     revalidateDirectoryWitness(parent)
-    return witness
+    return Object.freeze({ ...witness, parent })
   } catch (error) {
     if (error instanceof ArtifactInvalidError) {
       throw error
@@ -250,7 +173,7 @@ const captureAncestor = (
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       try {
         revalidateDirectoryWitness(parent)
-        return invalid(invalidEvidence('ancestor-missing', parent), directories)
+        return invalid(invalidEvidence('ancestor-missing', path))
       } catch (revalidationError) {
         if (revalidationError instanceof DirectoryWitnessError || isReplacementError(revalidationError)) {
           return changed()
@@ -265,33 +188,47 @@ const captureAncestor = (
   }
 }
 
-const captureAncestors = (brain: DirectoryWitness, artifact: string, hooks: ArtifactInspectionHooks) =>
+const captureAncestors = (
+  brain: ArtifactDirectory,
+  artifact: string,
+  ancestors: Map<string, ArtifactDirectory | ArtifactInvalidError>,
+  hooks: ArtifactInspectionHooks,
+) =>
   artifact
     .split('/')
     .slice(0, -1)
-    .reduce<DirectoryWitness[]>(
-      (directories, segment) => {
-        const parent = directories.at(-1)
-        if (parent === undefined) {
-          return changed()
+    .reduce<ArtifactDirectory>((parent, segment) => {
+      const path = resolve(parent.canonicalPath, segment)
+      let witness = ancestors.get(path)
+      if (witness === undefined) {
+        try {
+          witness = captureAncestor(parent, segment, artifact, hooks)
+        } catch (error) {
+          if (error instanceof ArtifactInvalidError) {
+            witness = error
+          } else {
+            throw error
+          }
         }
-        return [...directories, captureAncestor(directories, segment, artifact, hooks)]
-      },
-      [brain],
-    )
+        ancestors.set(path, witness)
+      }
+      if (witness instanceof ArtifactInvalidError) {
+        throw witness
+      }
+      if (witness.canonicalPath !== path) {
+        return invalid(invalidEvidence('ancestor-canonical-path', path, witness.pathMetadata))
+      }
+      return witness
+    }, brain)
 
 const inspectFinalFile = (
-  directories: readonly DirectoryWitness[],
+  parent: ArtifactDirectory,
   artifact: string,
   hooks: ArtifactInspectionHooks,
 ): StableArtifactInspection => {
-  const parent = directories.at(-1)
-  if (parent === undefined) {
-    return changed()
-  }
   const name = artifact.split('/').at(-1)
   if (name === undefined || name.length === 0) {
-    return invalid(invalidEvidence('artifact-name', parent), directories)
+    return invalid(invalidEvidence('artifact-name', parent.canonicalPath, parent.canonicalMetadata))
   }
   const path = resolve(parent.canonicalPath, name)
   let pathMetadata: BigIntStats
@@ -299,14 +236,14 @@ const inspectFinalFile = (
     pathMetadata = lstatSync(path, { bigint: true })
   } catch (error) {
     if (isReplacementError(error)) {
-      revalidateDirectories(directories)
-      return invalid(invalidEvidence('artifact-missing', parent), directories)
+      revalidateDirectories([parent])
+      return invalid(invalidEvidence('artifact-missing', path))
     }
     throw error
   }
   if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink()) {
-    revalidateDirectories(directories)
-    return invalid(invalidEvidence('artifact-type', parent, pathMetadata), directories)
+    revalidateDirectories([parent])
+    return invalid(invalidEvidence('artifact-type', path, pathMetadata))
   }
   hooks.fault?.('after-artifact-lstat', artifact)
 
@@ -329,7 +266,7 @@ const inspectFinalFile = (
     if (!current.isFile() || current.isSymbolicLink() || !sameStableEntryMetadata(pathMetadata, current)) {
       return changed()
     }
-    revalidateDirectories(directories)
+    revalidateAncestorChain(parent)
     throw error
   }
   let observation: ArtifactObservation | undefined
@@ -353,7 +290,7 @@ const inspectFinalFile = (
       return changed()
     }
     hooks.fault?.('before-final-directory-revalidation', artifact)
-    revalidateDirectories(directories)
+    revalidateDirectories([parent])
     const acceptedMetadata = fstatSync(descriptor, { bigint: true })
     const acceptedPathMetadata = lstatSync(path, { bigint: true })
     if (
@@ -391,14 +328,33 @@ const inspectFinalFile = (
   if (observation === undefined) {
     return changed()
   }
-  return retainResultDirectories(Object.freeze({ kind: 'stable' as const, observation }), directories)
+  return Object.freeze({ kind: 'stable' as const, observation })
+}
+
+const assertEntryCurrent = (path: string, expected?: BigIntStats) => {
+  let current: BigIntStats | undefined
+  try {
+    current = lstatSync(path, { bigint: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      if (isReplacementError(error)) {
+        return changed()
+      }
+      throw error
+    }
+  }
+  const same =
+    expected === undefined ? current === undefined : current !== undefined && sameStableEntryMetadata(expected, current)
+  if (!same) {
+    changed()
+  }
 }
 
 export const inspectArtifactFiles = (
   brainDirectory: string,
   artifacts: readonly string[],
   hooks: ArtifactInspectionHooks = {},
-): readonly ArtifactInspectionResult[] => {
+): ArtifactInspection => {
   const effectiveHooks: ArtifactInspectionHooks = {
     close: hooks.close ?? artifactInspectionTestHooks.close,
     fault: hooks.fault ?? artifactInspectionTestHooks.fault,
@@ -409,17 +365,23 @@ export const inspectArtifactFiles = (
     brainMetadata = lstatSync(brainDirectory, { bigint: true })
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      const evidence = invalidEvidence('brain-missing')
-      return Object.freeze(artifacts.map(path => invalidResult(path, evidence)))
+      const evidence = invalidEvidence('brain-missing', brainDirectory)
+      return Object.freeze({
+        assertCurrent: () => assertEntryCurrent(brainDirectory),
+        results: Object.freeze(artifacts.map(path => invalidResult(path, evidence))),
+      })
     }
     throw error
   }
   if (!brainMetadata.isDirectory() || brainMetadata.isSymbolicLink()) {
-    const evidence = invalidEvidence('brain-type', undefined, brainMetadata)
-    return Object.freeze(artifacts.map(path => invalidResult(path, evidence)))
+    const evidence = invalidEvidence('brain-type', brainDirectory, brainMetadata)
+    return Object.freeze({
+      assertCurrent: () => assertEntryCurrent(brainDirectory, brainMetadata),
+      results: Object.freeze(artifacts.map(path => invalidResult(path, evidence))),
+    })
   }
   effectiveHooks.fault?.('after-brain-lstat', '')
-  let brain: DirectoryWitness
+  let brain: ArtifactDirectory
   try {
     brain = captureDirectoryWitness(brainDirectory, { allowLink: false })
     if (!sameStableEntryMetadata(brainMetadata, brain.pathMetadata)) {
@@ -431,9 +393,28 @@ export const inspectArtifactFiles = (
     }
     throw error
   }
+  const ancestors = new Map<string, ArtifactDirectory | ArtifactInvalidError>([[brainDirectory, brain]])
+  const entries = new Map<string, BigIntStats | undefined>()
+  const retainEntry = (path: string, metadata: BigIntStats | undefined) => {
+    if (entries.has(path)) {
+      const previous = entries.get(path)
+      const same =
+        previous === undefined
+          ? metadata === undefined
+          : metadata !== undefined && sameStableEntryMetadata(previous, metadata)
+      if (!same) {
+        changed()
+      }
+    } else {
+      entries.set(path, metadata)
+    }
+  }
   const inspectArtifact = (artifact: string) => {
     try {
-      return inspectFinalFile(captureAncestors(brain, artifact, effectiveHooks), artifact, effectiveHooks)
+      const parent = captureAncestors(brain, artifact, ancestors, effectiveHooks)
+      const result = inspectFinalFile(parent, artifact, effectiveHooks)
+      retainEntry(resolve(parent.canonicalPath, artifact.split('/').at(-1) ?? ''), result.observation.metadata)
+      return result
     } catch (error) {
       if (error instanceof ArtifactInvalidError) {
         const result = Object.freeze({
@@ -442,24 +423,27 @@ export const inspectArtifactFiles = (
           kind: 'invalid' as const,
           path: artifact,
         })
-        const directories = invalidErrorDirectories.get(error)
-        if (directories !== undefined) {
-          artifactResultDirectories.set(result, directories)
-        }
+        retainEntry(error.evidence.path, error.evidence.entryMetadata)
         return result
       }
       throw error
     }
   }
-  const results = artifacts.map(inspectArtifact)
-  results.reduce<undefined>((verified, result) => {
-    const path = result.kind === 'stable' ? result.observation.path : result.path
-    const verification = inspectArtifact(path)
-    if (!sameArtifactInspectionResult(result, verification)) {
-      changed()
-    }
-    return verified
-  }, undefined)
-  revalidateDirectories([brain])
-  return Object.freeze(results)
+  const uniqueResults = new Map([...new Set(artifacts)].map(path => [path, inspectArtifact(path)]))
+  const directories = [...ancestors.values()].filter(
+    (value): value is ArtifactDirectory => !(value instanceof ArtifactInvalidError),
+  )
+  const closingDirectories = directories.toReversed()
+  const assertCurrent = () => {
+    ;(hooks.fault ?? artifactInspectionTestHooks.fault)?.('before-closing-revalidation', '')
+    revalidateDirectories(directories)
+    entries.forEach((metadata, path) => {
+      assertEntryCurrent(path, metadata)
+    })
+    revalidateDirectories(closingDirectories)
+  }
+  return Object.freeze({
+    assertCurrent,
+    results: Object.freeze(artifacts.map(path => uniqueResults.get(path) ?? changed())),
+  })
 }
