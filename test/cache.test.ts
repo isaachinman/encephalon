@@ -7501,6 +7501,178 @@ describe('SQLite cache and reads', () => {
     }
   })
 
+  test('finishes strict row comparisons before advancing the SQLite iterator', () => {
+    const root = createRoot()
+    addCacheRecord(root)
+    api.addRecord({
+      id: 'cache-record-second',
+      kind: 'context',
+      payload: { summary: 'Second cache record' },
+      root,
+      source: 'agent',
+      subject: 'cache.validation.second',
+    })
+    const counts = { records: 0, search: 0 }
+    const { iterate } = StatementSync.prototype
+    const observed = mock.method(
+      StatementSync.prototype,
+      'iterate',
+      function* observedRows(this: StatementSync, ...parameters: Parameters<typeof iterate>) {
+        for (const row of iterate.apply(this, parameters)) {
+          const recordRow = Object.hasOwn(row, 'id') && Object.hasOwn(row, 'active')
+          const searchRow = Object.hasOwn(row, 'id_bytes')
+          if (recordRow || searchRow) {
+            counts[recordRow ? 'records' : 'search'] += 1
+            const { proxy, revoke } = Proxy.revocable(row, {})
+            try {
+              yield proxy
+            } finally {
+              revoke()
+            }
+          } else {
+            yield row
+          }
+        }
+      },
+    )
+
+    try {
+      assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 2 })
+      assert.deepEqual(counts, { records: 2, search: 2 })
+    } finally {
+      observed.mock.restore()
+    }
+  })
+
+  test('recovers corrupt FTS postings even when their stored projection remains intact', () => {
+    const root = createRoot()
+    const expected = addCacheRecord(root)
+    mutateCache(root, database => {
+      const stored = database.prepare('SELECT text FROM record_search').get()
+      assert.ok(typeof stored?.text === 'string')
+      database.prepare('UPDATE record_search SET text = ?').run('wrongpostingmarker')
+      database.enableDefensive(false)
+      database.prepare('UPDATE record_search_content SET c1 = ?').run(stored.text)
+    })
+    let rebuilds = 0
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      rebuilds += 1
+    }
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
+    assert.equal(rebuilds, 1)
+    assert.deepEqual(api.searchRecords({ query: 'corruption', root }), [expected])
+  })
+
+  test('rejects oversized posting blocks and auxiliary values before native FTS validation', () => {
+    for (const mutation of [
+      'UPDATE record_search_data SET block = zeroblob(1052673) WHERE id > 10',
+      "UPDATE record_search_data SET block = replace(hex(zeroblob(1052673)), '00', 'x') WHERE id > 10",
+      'UPDATE record_search_docsize SET sz = zeroblob(1052673)',
+      "INSERT INTO record_search_config(k, v) VALUES ('private-padding', replace(hex(zeroblob(1052673)), '00', 'x'))",
+    ]) {
+      const root = createRoot()
+      addCacheRecord(root)
+      mutateCache(root, database => {
+        database.enableDefensive(false)
+        database.exec(mutation)
+      })
+      let recovered = false
+      let nativeChecksBeforeRecovery = 0
+      cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+        recovered = true
+      }
+      const { prepare } = DatabaseSync.prototype
+      const observed = mock.method(
+        DatabaseSync.prototype,
+        'prepare',
+        function observe(this: DatabaseSync, sql: string) {
+          if (!recovered && sql.includes('pragma_integrity_check')) {
+            nativeChecksBeforeRecovery += 1
+          }
+          return prepare.call(this, sql)
+        },
+      )
+
+      try {
+        assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
+        assert.equal(nativeChecksBeforeRecovery, 0)
+      } finally {
+        observed.mock.restore()
+      }
+    }
+  })
+
+  test('accepts reordered cached JSON with equivalent signed-zero values without rebuilding', () => {
+    const root = createRoot()
+    const expected = api.addRecord({
+      confidence: 0,
+      id: 'cached-json-normalisation',
+      kind: 'context',
+      payload: { numbers: [0, { zero: 0 }], summary: 'Numeric cache equivalence' },
+      root,
+      source: 'agent',
+      subject: 'cache.normalisation',
+    })
+    mutateCache(root, database => {
+      const row = database.prepare('SELECT record_json FROM records').get()
+      assert.ok(typeof row?.record_json === 'string')
+      const parsed = JSON.parse(row.record_json) as Record<string, unknown>
+      const reordered = Object.fromEntries(Object.entries(parsed).reverse())
+      const encoded = JSON.stringify(reordered).replaceAll('":0', '":-0').replace('[0,', '[-0,')
+      database.prepare('UPDATE records SET record_json = ?').run(encoded)
+    })
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+    assert.deepEqual(api.listRecords({ root }), [expected])
+  })
+
+  test('rejects invalid cached JSON and scalar bytes that decode to canonical replacement characters', () => {
+    for (const column of ['record_json', 'subject']) {
+      const root = createRoot()
+      const expected = api.addRecord({
+        id: 'cached-record-encoding',
+        kind: 'context',
+        payload: { marker: '�' },
+        root,
+        source: 'agent',
+        subject: 'cache.�',
+      })
+      mutateCache(root, database => {
+        const row = database.prepare(`SELECT CAST(${column} AS BLOB) AS bytes FROM records`).get()
+        assert.ok(row?.bytes instanceof Uint8Array)
+        const bytes = Buffer.from(row.bytes)
+        const replacement = Buffer.from('�', 'utf8')
+        const offset = bytes.indexOf(replacement)
+        assert.notEqual(offset, -1)
+        const invalid = Buffer.concat([
+          bytes.subarray(0, offset),
+          Buffer.from([0x80]),
+          bytes.subarray(offset + replacement.length),
+        ])
+        database.prepare(`UPDATE records SET ${column} = CAST(? AS TEXT)`).run(invalid)
+      })
+
+      assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 }, column)
+      assert.deepEqual(api.listRecords({ root }), [expected], column)
+    }
+  })
+
+  test('keeps rejecting canonical scalar text that cannot round-trip through SQLite UTF-8', () => {
+    const root = createRoot()
+    api.addRecord({
+      id: 'unpaired-scalar',
+      kind: 'context',
+      payload: { summary: 'Unpaired scalar encoding' },
+      root,
+      source: 'agent',
+      subject: 'cache.\ud800',
+    })
+
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 1 })
+    assert.throws(() => api.listRecords({ root }), { code: 'INTERNAL_ERROR' })
+  })
+
   test('bounds cached record validation before transferring untrusted rows', () => {
     const cases = [
       {

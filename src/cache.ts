@@ -1,3 +1,4 @@
+import { isUtf8 } from 'node:buffer'
 import { type BigIntStats, lstatSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
@@ -40,9 +41,8 @@ import { manifestEntryMetadataFrom, sameStableEntryMetadata } from './filesystem
 import { PACKAGE_VERSION } from './generated/version.ts'
 import { withOperationLock } from './lock.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
-import { ordinalStringCompare } from './order.ts'
 import { recordCorpusFingerprint } from './record-corpus-fingerprint.ts'
-import { MAX_SEARCH_PREVIEW_BYTES } from './record-projection.ts'
+import { MAX_SEARCH_PREVIEW_BYTES, searchDocumentForRecord, searchPreviewForRecord } from './record-projection.ts'
 import {
   canonicalCacheManifest,
   canonicalRecordPath,
@@ -88,6 +88,9 @@ const MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES =
 const MAX_CACHE_FTS_ID_BYTES = CANONICAL_BUDGETS.records * 255
 const MAX_CACHE_SEARCH_PREVIEW_BYTES = MAX_SEARCH_PREVIEW_BYTES
 const MAX_CACHE_SEARCH_PREVIEW_AGGREGATE_BYTES = CANONICAL_BUDGETS.records * MAX_CACHE_SEARCH_PREVIEW_BYTES
+const MAX_CACHE_SEARCH_INDEX_BYTES = MAX_CACHE_SEARCH_DOCUMENT_AGGREGATE_BYTES * 2
+// The writer uses FTS5's default ~4 KiB pages. Allow 1 KiB packing plus per-record tails.
+const MAX_CACHE_SEARCH_INDEX_ROWS = Math.ceil(MAX_CACHE_SEARCH_INDEX_BYTES / 1024) + CANONICAL_BUDGETS.records
 const METADATA_KEYS = [
   'artifactPaths',
   'manifest',
@@ -1215,6 +1218,60 @@ const assertCacheScope = (root: string, metadata: Metadata | undefined) => {
   }
 }
 
+function* cachedRecordWitnesses(snapshot: VerifiedCorpus, members: ReadonlyMap<string, 0 | 1>) {
+  for (const record of snapshot.recordsByPath) {
+    if (members.has(record.id)) {
+      yield snapshot.recordFacts(record)
+    }
+  }
+}
+
+const assertSearchIndexBounded = (database: DatabaseSync) => {
+  const tables = [
+    {
+      maximumRows: MAX_CACHE_SEARCH_INDEX_ROWS,
+      sql: `SELECT typeof(id) = 'integer' AND typeof(block) = 'blob' AS valid,
+        octet_length(block) AS bytes FROM record_search_data LIMIT ?`,
+    },
+    {
+      maximumRows: MAX_CACHE_SEARCH_INDEX_ROWS,
+      sql: `SELECT typeof(segid) = 'integer' AND typeof(pgno) = 'integer'
+          AND typeof(term) = 'blob' AS valid,
+        octet_length(term) AS bytes FROM record_search_idx LIMIT ?`,
+    },
+    {
+      maximumRows: CANONICAL_BUDGETS.records,
+      sql: `SELECT typeof(id) = 'integer' AND typeof(sz) = 'blob' AS valid,
+        octet_length(sz) AS bytes FROM record_search_docsize LIMIT ?`,
+    },
+    {
+      maximumRows: CANONICAL_BUDGETS.records,
+      sql: `SELECT typeof(k) = 'text' AND typeof(v) IN ('integer', 'text') AS valid,
+        octet_length(k) + octet_length(v) AS bytes FROM record_search_config LIMIT ?`,
+    },
+  ]
+  let totalBytes = 0
+  for (const { sql, maximumRows } of tables) {
+    let rows = 0
+    const sizes = database.prepare(sql).iterate(maximumRows + 1) as Iterable<{ bytes?: unknown; valid?: unknown }>
+    for (const row of sizes) {
+      rows += 1
+      if (
+        rows > maximumRows ||
+        row.valid !== 1 ||
+        typeof row.bytes !== 'number' ||
+        !Number.isSafeInteger(row.bytes) ||
+        row.bytes < 0 ||
+        row.bytes > MAX_CACHE_RECORD_BYTES ||
+        row.bytes > MAX_CACHE_SEARCH_INDEX_BYTES - totalBytes
+      ) {
+        throw new CacheSchemaMismatch('The cache search index exceeds its storage bounds.')
+      }
+      totalBytes += row.bytes
+    }
+  }
+}
+
 const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata, snapshot: VerifiedCorpus) => {
   const maximumRows = CANONICAL_BUDGETS.records + 1
   const recordsProbe = readIntegrityProbe(
@@ -1280,81 +1337,86 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
   }
   cacheReadTestHooks.beforeIntegrityTextRead?.('records')
   const recordRows = database
-    .prepare('SELECT id, kind, subject, source, created_at, path, active, summary, record_json FROM records LIMIT ?')
-    .iterate(maximumRows) as Iterable<
-    RecordRow & {
-      active?: unknown
-      created_at?: unknown
-      id?: unknown
-      kind?: unknown
-      path?: unknown
-      source?: unknown
-      subject?: unknown
-      summary?: unknown
-    }
-  >
-  const records = Array.from(recordRows, row => ({
-    record: parseCachedRecord(row.record_json),
-    row,
-  }))
-  const superseded =
-    records.length === snapshot.records.length
-      ? snapshot.supersededIds
-      : new Set(records.flatMap(({ record }) => record.supersedes ?? []))
-  for (const { record, row } of records) {
-    const canonical = snapshot.byId.get(record.id)
-    if (canonical === undefined || !isDeepStrictEqual(record, canonical)) {
+    .prepare('SELECT id, active FROM records ORDER BY id COLLATE BINARY LIMIT ?')
+    .iterate(maximumRows) as Iterable<{
+    active?: unknown
+    id?: unknown
+  }>
+  // One bounded identity/active-bit map also tracks unmatched FTS rows; it never retains documents.
+  const members = new Map<string, 0 | 1>()
+  const subsetSuperseded = recordsProbe.rows === snapshot.records.length ? undefined : new Set<string>()
+  const representation = database.prepare(`SELECT
+    CASE WHEN CAST(record_json AS BLOB) = CAST(?1 AS BLOB) THEN NULL
+      ELSE CAST(record_json AS BLOB) END AS mismatch_bytes,
+    CAST(id AS BLOB) = CAST(?2 AS BLOB) AND CAST(kind AS BLOB) = CAST(?3 AS BLOB)
+      AND CAST(subject AS BLOB) = CAST(?4 AS BLOB) AND CAST(source AS BLOB) = CAST(?5 AS BLOB)
+      AND CAST(created_at AS BLOB) = CAST(?6 AS BLOB) AND CAST(path AS BLOB) = CAST(?7 AS BLOB)
+      AND (CAST(summary AS BLOB) IS CAST(?8 AS BLOB)) AS projection_matches
+    FROM records WHERE id = ?2`)
+  for (const row of recordRows) {
+    const canonical = typeof row.id === 'string' ? snapshot.byId.get(row.id) : undefined
+    if (canonical === undefined || members.has(canonical.id)) {
       throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
     }
-    const active = superseded.has(record.id) ? 0 : 1
+    // The writer's exact representation needs no transfer or parse. Preserve structural and
+    // normalisation compatibility for other encodings with the existing bounded parser.
+    const { summary } = snapshot.recordFacts(canonical).projection
+    const encoded = representation.get(
+      JSON.stringify(canonical),
+      canonical.id,
+      canonical.kind,
+      canonical.subject,
+      canonical.source,
+      canonical.createdAt,
+      canonical.path,
+      summary,
+    ) as { mismatch_bytes?: unknown; projection_matches?: unknown } | undefined
     if (
-      row.id !== record.id ||
-      row.kind !== record.kind ||
-      row.subject !== record.subject ||
-      row.source !== record.source ||
-      row.created_at !== record.createdAt ||
-      row.path !== record.path ||
-      row.active !== active ||
-      row.summary !== snapshot.recordFacts(canonical).projection.summary
+      encoded === undefined ||
+      (encoded.mismatch_bytes !== null &&
+        !(
+          encoded.mismatch_bytes instanceof Uint8Array &&
+          isUtf8(encoded.mismatch_bytes) &&
+          isDeepStrictEqual(parseCachedRecord(Buffer.from(encoded.mismatch_bytes).toString('utf8')), canonical)
+        ))
+    ) {
+      throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
+    }
+    // SQL bindings replace lone surrogates; byte equality must not relax the old scalar string equality.
+    if (
+      encoded.projection_matches !== 1 ||
+      !canonical.source.isWellFormed() ||
+      !canonical.subject.isWellFormed() ||
+      (summary !== null && !summary.isWellFormed()) ||
+      (row.active !== 0 && row.active !== 1)
     ) {
       throw new CacheSchemaMismatch('The cache record table does not match its canonical JSON.')
     }
+    members.set(canonical.id, row.active)
+    if (subsetSuperseded !== undefined) {
+      for (const id of canonical.supersedes ?? []) {
+        subsetSuperseded.add(id)
+      }
+    }
   }
-  // An existing writer cache can describe the accepted corpus before this operation's additions.
-  // Its rows must still match canonical records; hash that subset's accepted raw digests, never cached JSON.
-  const recordFingerprint =
-    records.length === snapshot.records.length
-      ? snapshot.recordFingerprint
-      : recordCorpusFingerprint(
-          records
-            .map(({ record }) => {
-              const canonical = snapshot.byId.get(record.id)
-              if (canonical !== undefined) {
-                return snapshot.recordFacts(canonical)
-              }
-              throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
-            })
-            .sort((first, second) => ordinalStringCompare(first.path, second.path)),
-        )
-  if (metadata.recordFingerprint !== recordFingerprint) {
+  if (members.size !== recordsProbe.rows) {
     throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
   }
-  const expectedSearchRows = new Map(
-    records.map(({ record }) => {
-      const canonical = snapshot.byId.get(record.id)
-      if (canonical !== undefined) {
-        const { projection } = snapshot.recordFacts(canonical)
-        return [
-          Buffer.from(record.id, 'utf8').toString('hex'),
-          {
-            preview: Buffer.from(projection.preview, 'utf8'),
-            text: Buffer.from(projection.text, 'utf8'),
-          },
-        ]
-      }
-      throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
-    }),
-  )
+  const superseded = subsetSuperseded ?? snapshot.supersededIds
+  for (const [id, active] of members) {
+    if (active !== (superseded.has(id) ? 0 : 1)) {
+      throw new CacheSchemaMismatch('The cache record table does not match its canonical JSON.')
+    }
+  }
+  // A writer can replace a proper predecessor subset, but its active bits and raw witnesses
+  // must describe that subset. Full reads separately require complete snapshot metadata.
+  const fingerprint =
+    subsetSuperseded === undefined
+      ? snapshot.recordFingerprint
+      : recordCorpusFingerprint(cachedRecordWitnesses(snapshot, members))
+  if (metadata.recordFingerprint !== fingerprint) {
+    throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
+  }
   const searchProbe = readIntegrityProbe(
     'record-search',
     database
@@ -1400,33 +1462,50 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
   ) {
     throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
   }
-  cacheReadTestHooks.beforeIntegrityTextRead?.('record-search')
-  const searchRows = database
-    .prepare(`SELECT CAST(id AS BLOB) AS id_bytes, CAST(text AS BLOB) AS text_bytes,
-      CAST(preview AS BLOB) AS preview_bytes FROM record_search LIMIT ?`)
-    .iterate(maximumRows) as Iterable<{ id_bytes?: unknown; text_bytes?: unknown; preview_bytes?: unknown }>
-  for (const row of searchRows) {
-    if (
-      !(
-        row.id_bytes instanceof Uint8Array &&
-        row.text_bytes instanceof Uint8Array &&
-        row.preview_bytes instanceof Uint8Array
-      )
-    ) {
-      throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
-    }
-    const idBytes = Buffer.from(row.id_bytes)
-    const expected = expectedSearchRows.get(idBytes.toString('hex'))
-    if (
-      expected === undefined ||
-      !expected.text.equals(Buffer.from(row.text_bytes)) ||
-      !expected.preview.equals(Buffer.from(row.preview_bytes))
-    ) {
-      throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
-    }
-    expectedSearchRows.delete(idBytes.toString('hex'))
+  assertSearchIndexBounded(database)
+  const integrity = database
+    .prepare("SELECT integrity_check = 'ok' AS valid FROM pragma_integrity_check('record_search') LIMIT 1")
+    .get() as { valid?: unknown } | undefined
+  if (integrity?.valid !== 1) {
+    throw new CacheSchemaMismatch('The cache search index is inconsistent.')
   }
-  if (expectedSearchRows.size !== 0) {
+  cacheReadTestHooks.beforeIntegrityTextRead?.('record-search')
+  // Sort keys only: including full FTS documents here would retain them in SQLite's sorter.
+  const searchKeys = database.prepare(`SELECT rowid AS search_rowid, CAST(id AS BLOB) AS id_bytes
+    FROM record_search ORDER BY CAST(id AS BLOB), rowid LIMIT ?`)
+  searchKeys.setReadBigInts(true)
+  const searchRows = searchKeys.iterate(maximumRows) as Iterable<{
+    id_bytes?: unknown
+    search_rowid?: unknown
+  }>
+  const searchContent = database.prepare(`SELECT
+      CAST(id AS BLOB) = CAST(? AS BLOB) AND CAST(text AS BLOB) = CAST(? AS BLOB)
+        AND CAST(preview AS BLOB) = CAST(? AS BLOB) AS matches
+    FROM record_search WHERE rowid = ?`)
+  let searchRowsRead = 0
+  for (const row of searchRows) {
+    if (!(row.id_bytes instanceof Uint8Array) || typeof row.search_rowid !== 'bigint') {
+      throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
+    }
+    const id = Buffer.from(row.id_bytes).toString('utf8')
+    const canonical = snapshot.byId.get(id)
+    if (canonical === undefined || !members.has(id) || Buffer.compare(row.id_bytes, Buffer.from(id, 'utf8')) !== 0) {
+      throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
+    }
+    const { summary } = snapshot.recordFacts(canonical).projection
+    const content = searchContent.get(
+      id,
+      searchDocumentForRecord(canonical, summary),
+      searchPreviewForRecord(canonical, summary),
+      row.search_rowid,
+    ) as { matches?: unknown } | undefined
+    if (content?.matches !== 1) {
+      throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
+    }
+    members.delete(id)
+    searchRowsRead += 1
+  }
+  if (searchRowsRead !== searchProbe.rows || members.size !== 0) {
     throw new CacheSchemaMismatch('The cache record and search tables are inconsistent.')
   }
 }

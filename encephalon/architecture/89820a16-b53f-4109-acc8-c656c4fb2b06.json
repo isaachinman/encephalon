@@ -1,0 +1,30 @@
+{
+  "createdAt": "2026-09-10T12:13:59.909Z",
+  "id": "89820a16-b53f-4109-acc8-c656c4fb2b06",
+  "kind": "architecture",
+  "payload": {
+    "summary": "Share one immutable operation-local VerifiedCorpus and stream strict cache equivalence for each accepted canonical generation.",
+    "authority": [
+      "Reuse ID, case-path, supersession, active-head and artifact indexes across validation, planning and cache operations.",
+      "Bind relative canonical paths to accepted raw SHA-256 witnesses with the domain-separated version-2 fingerprint; do not recursively hash normalised payloads.",
+      "Freeze owned payloads during parser exit actions, preserve mutable independent public results, and capture fixed publication evidence for committed assertions."
+    ],
+    "cache": [
+      "Fresh reads require complete canonical equality in the same verified read transaction as the query, even when cached metadata copies the canonical fingerprint.",
+      "Stream ID-ordered record comparisons and key-only FTS rowid lookups. Retain bounded membership and active bits, never a second parsed corpus or expected-document buffer map.",
+      "Compare scalar and FTS bytes inside SQLite. Exact writer JSON avoids a second parse; alternate valid UTF-8 representations retain existing structural and signed-zero normalisation semantics.",
+      "Compute strict-validation body and preview projections without populating corpus-wide memoised strings; ordinary projection consumers retain their existing memoisation.",
+      "Bound posting and auxiliary shadow row counts, per-value bytes and aggregate storage before native read-only FTS integrity checking; native integrity supplements exact canonical projection identity.",
+      "Writer predecessors may be validated canonical subsets: check their own active flags and fingerprint their accepted member witnesses in existing canonical path order before replacement.",
+      "Reuse a replacement corpus during disposable recovery only after its generation assertion succeeds."
+    ],
+    "scope": [
+      "Keep existing filesystem proof passes, graph/error budgets, numeric-first SQL admission, schema 3 and independent mutable public results.",
+      "Recover incompatible disposable caches through the existing locked quarantine/rebuild path; no new metadata fields, global cache or public exports."
+    ]
+  },
+  "searchText": "verified corpus strict streaming raw digest fingerprint cache predecessor subset native FTS integrity bounds MAR-2787",
+  "source": "agent",
+  "subject": "canonical.verified-corpus",
+  "supersedes": ["1228daeb-c260-4542-b798-9d828ce95cd9"]
+}
