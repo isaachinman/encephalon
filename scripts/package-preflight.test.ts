@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { test } from 'node:test'
 import { spawnNpmCommand } from './npm-command.ts'
+import { restorePackageCandidate } from './package-candidate.ts'
 import * as packagePreflightAuthority from './package-preflight.ts'
 import { preflightExactPackageArtifact } from './package-preflight.ts'
 
@@ -129,6 +130,33 @@ test('accepts one exact fixed artifact pair and returns a private reviewed snaps
       sha256: preflight.metadata.sha256,
       sha512: preflight.metadata.sha512,
     })
+  } finally {
+    rmSync(fixture.temporaryRoot, { force: true, recursive: true })
+  }
+})
+
+test('restores exact producer bytes into an absent build directory while preserving the selected artifact', () => {
+  const fixture = createFixture()
+  try {
+    const originalTarball = readFileSync(fixture.tarball)
+    const originalCli = readFileSync(resolve(fixture.root, 'dist/cli.mjs'))
+    const sha256 = createHash('sha256').update(originalTarball).digest('hex')
+    rmSync(resolve(fixture.root, 'dist'), { recursive: true })
+    assert.throws(() => restorePackageCandidate(fixture.root, '0'.repeat(64)), /producer.*digest/)
+    assert.equal(existsSync(resolve(fixture.root, 'dist')), false)
+    const substituted = Buffer.from(originalTarball)
+    substituted[4] = (substituted[4] ?? 0) ^ 1
+    writeFileSync(fixture.tarball, substituted)
+    writeMetadata(fixture.root, fixture.tarball)
+    assert.throws(() => restorePackageCandidate(fixture.root, sha256), /producer.*digest/)
+    assert.equal(existsSync(resolve(fixture.root, 'dist')), false)
+    writeFileSync(fixture.tarball, originalTarball)
+    writeMetadata(fixture.root, fixture.tarball)
+    const restored = restorePackageCandidate(fixture.root, sha256)
+    assert.equal(restored.sha256, sha256)
+    assert.deepEqual(readFileSync(resolve(fixture.root, 'dist/cli.mjs')), originalCli)
+    assert.deepEqual(readFileSync(fixture.tarball), originalTarball)
+    assert.throws(() => restorePackageCandidate(fixture.root, sha256), /exist/)
   } finally {
     rmSync(fixture.temporaryRoot, { force: true, recursive: true })
   }

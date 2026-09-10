@@ -59,6 +59,20 @@ const tarEntry = (path: string, mode: number, content: Buffer, type = '0') => {
 }
 
 describe('package tarball authority', () => {
+  test('derives the candidate filename from a safe release version', () => {
+    const filename = (
+      packageTarballAuthority as typeof packageTarballAuthority & {
+        packageArtifactFilename?: (version: unknown) => string
+      }
+    ).packageArtifactFilename
+    assert.equal(typeof filename, 'function')
+    assert.equal(filename?.('0.4.0'), 'encephalon-0.4.0.tgz')
+    assert.equal(filename?.('1.2.3-rc.1+build.2'), 'encephalon-1.2.3-rc.1+build.2.tgz')
+    for (const version of ['../0.4.0', '0.4.0\nother=value', '', undefined]) {
+      assert.throws(() => filename?.(version), /version/)
+    }
+  })
+
   test('parses package-check creation, retention, and supplied-tarball modes', () => {
     const fixtureDirectory = mkdtempSync(resolve(root, 'scripts', '.package-tarball-parser-'))
     const tarball = resolve(fixtureDirectory, 'encephalon-0.3.0.tgz')

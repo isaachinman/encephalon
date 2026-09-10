@@ -53,97 +53,103 @@ test('ignores secrets-shaped ordinary text outside GitHub Actions expressions', 
   }
 })
 
-test('parallel CI retains complete verification and exact-package release gates', () => {
+test('CI gates one candidate behind source checks and retains complete selected verification', () => {
   const workflow = readFileSync(resolve(root, '.github/workflows/ci.yml'), 'utf8')
+  const jobSource = workflow.split('\njobs:\n')[1] ?? ''
   const jobs = Object.fromEntries(
-    [...workflow.matchAll(/^ {2}([a-z-]+):\n([\s\S]*?)(?=^ {2}[a-z-]+:\n|$(?![\s\S]))/gm)].map(match => [
-      match[1],
-      match[2] ?? '',
-    ]),
+    [...jobSource.matchAll(/^ {2}([a-z-]+):\n([\s\S]*?)(?=^ {2}[a-z-]+:\n|$(?![\s\S]))/gm)].map(
+      match => [match[1] ?? '', match[2] ?? ''] as const,
+    ),
   )
   assert.match(workflow, /permissions:\n {2}contents: read\n/)
   assert.equal(workflowContainsSecretsContext(workflow), false)
-  assert.doesNotMatch(workflow, /NODE_AUTH_TOKEN|NPM_TOKEN|registry-url|pull_request_target|continue-on-error/)
-  assert.match(workflow, /types: \[opened, reopened, synchronize\]/)
+  assert.doesNotMatch(
+    workflow,
+    /NODE_AUTH_TOKEN|NPM_TOKEN|registry-url|pull_request_target|continue-on-error|run: npm publish/,
+  )
+  assert.match(workflow, /types: \[opened, reopened, synchronize, labeled, unlabeled\]/)
+  assert.match(workflow, /workflow_dispatch:/)
+  assert.match(workflow, /schedule:/)
   assert.match(workflow, /cancel-in-progress: true/)
   for (const action of workflow.matchAll(/uses: ([^\s]+)/g)) {
     assert.match(action[1] ?? '', /^[^@]+@[a-f0-9]{40}$/)
   }
-  for (const name of [
-    'correctness',
-    'tooling',
-    'benchmark-smoke',
-    'performance',
-    'verify',
-    'package',
-    'candidate',
-    'release-checks',
-    'release',
-  ]) {
-    const job = jobs[name]
-    assert.ok(job, name)
-    assert.match(job, /timeout-minutes: [1-9]\n/)
-    assert.doesNotMatch(job, /permissions:/)
+  for (const [name, job] of Object.entries(jobs)) {
+    assert.match(job, /timeout-minutes: [1-9]\n/, name)
+    assert.doesNotMatch(job, /permissions:/, name)
+    if (job.includes('bun install')) {
+      assert.ok(job.indexOf('check-generated-version.ts') < job.indexOf('setup-bun@'), name)
+      assert.match(job, /bun install --frozen-lockfile --ignore-scripts/)
+    }
     if (job.includes('actions/checkout@')) {
       assert.match(job, /persist-credentials: false/)
       assert.match(job, /ref: \$\{\{ github.event.pull_request.head.sha \|\| github.sha \}\}/)
     }
   }
-  const correctness = jobs.correctness ?? ''
-  assert.match(correctness, /context: ubuntu-latest/)
-  assert.match(correctness, /context: macos-latest/)
-  assert.match(correctness, /context: windows-latest/)
-  assert.match(correctness, /context: ubuntu-current/)
+  assert.equal([...workflow.matchAll(/run: bun run build/g)].length, 1)
+  assert.equal([...workflow.matchAll(/--retain-tarball/g)].length, 1)
+  assert.match(jobs.package ?? '', /needs: \[source, tooling, selection\]/)
+  assert.match(jobs.source ?? '', /node: 24.15.0/)
+  assert.match(jobs.source ?? '', /node: 26/)
+  assert.match(jobs.source ?? '', /run: bun run test/)
+  assert.match(jobs.source ?? '', /existsSync\("dist"\)/)
   assert.match(jobs.tooling ?? '', /bun run typecheck/)
   assert.match(jobs.tooling ?? '', /bun run lint/)
   assert.match(jobs.tooling ?? '', /bun run test:tooling/)
-  assert.match(jobs.tooling ?? '', /runs-on: ubuntu-latest/)
-  assert.doesNotMatch(correctness, /bun run typecheck|bun run lint|test:tooling/)
-  assert.doesNotMatch(correctness, /bun run benchmark:check/)
-  assert.match(jobs['benchmark-smoke'] ?? '', /bun run benchmark:check/)
-  assert.doesNotMatch(jobs['benchmark-smoke'] ?? '', /needs:/)
-  assert.match(correctness, /node scripts\/test-ci.ts.*matrix.group.*runtime/)
-  assert.match(correctness, /context: windows-latest\n\s+os: windows-latest\n\s+node: 24.15.0\n\s+group: runtime-core/)
-  assert.match(correctness, /context: windows-cache\n\s+os: windows-latest\n\s+node: 24.15.0\n\s+group: cache/)
-  const performance = jobs.performance ?? ''
-  assert.match(performance, /runs-on: ubuntu-24.04-arm/)
-  assert.match(performance, /fetch-depth: 0/)
-  assert.match(performance, /node scripts\/benchmark-compare.ts.*20.*matrix.shard/)
+  assert.match(jobs.platform ?? '', /os: windows-latest/)
+  assert.match(jobs.platform ?? '', /os: macos-latest/)
+  assert.match(jobs.platform ?? '', /group: platform-core/)
+  assert.match(jobs.platform ?? '', /group: cache/)
+  assert.match(jobs.platform ?? '', /CI_CHANGED_TESTS:/)
+  assert.match(jobs.history ?? '', /if: needs.selection.outputs.historyTools == 'true'/)
+  assert.match(jobs.history ?? '', /bun run test:history/)
+  assert.match(jobs['release-checks'] ?? '', /needs: \[package, selection\]/)
+  assert.match(jobs['release-checks'] ?? '', /if: needs.selection.outputs.compatibility == 'true'/)
+  assert.match(jobs['release-checks'] ?? '', /check-release-compatibility.ts "\$CANDIDATE_TARBALL"/)
+  assert.match(jobs['release-checks'] ?? '', /check-publish.ts "\$CANDIDATE_TARBALL"/)
+  for (const name of ['candidate', 'release-checks', 'benchmark-smoke']) {
+    const job = jobs[name] ?? ''
+    assert.match(job, /artifact-ids: \$\{\{ needs.package.outputs.artifact \}\}/)
+    assert.match(job, /CANDIDATE_SHA256: \$\{\{ needs.package.outputs.sha256 \}\}/)
+    assert.match(job, /check-package-metadata.ts --restore/)
+    assert.doesNotMatch(job, /bun run build|--retain-tarball|npm pack|npm install/)
+  }
+  assert.match(jobs.package ?? '', /artifact: \$\{\{ steps.artifact.outputs.artifact-id \}\}/)
+  assert.match(jobs.package ?? '', /check-worktree-clean.ts --allow-package-artifacts/)
+  assert.doesNotMatch(workflow, /encephalon-0\.3\.0\.tgz/)
+  assert.match(jobs.performance ?? '', /runs-on: ubuntu-24.04-arm/)
+  assert.match(jobs.performance ?? '', /node scripts\/benchmark-compare.ts.*20.*matrix.shard/)
   assert.match(
-    performance,
+    jobs.performance ?? '',
     /shard: \[large-gather, large-payload, large-maximum, large-preparation, large-reads, large-validation\]/,
   )
-  assert.match(performance, /name: performance-\$\{\{ github.run_attempt \}\}-\$\{\{ matrix.shard \}\}/)
-  assert.match(jobs.verify ?? '', /needs: \[correctness, tooling, benchmark-smoke, performance\]/)
   assert.match(jobs.verify ?? '', /node scripts\/benchmark-aggregate.ts/)
-  assert.match(jobs.verify ?? '', /pattern: performance-\*/)
-  assert.match(performance, /if-no-files-found: error/)
+  assert.match(jobs.verify ?? '', /context: \[ubuntu-latest, macos-latest, windows-latest, ubuntu-current\]/)
+  assert.match(jobs.release ?? '', /needs: \[candidate, release-checks, verify, history, selection, package\]/)
+  assert.match(
+    jobs.release ?? '',
+    /history.result !== \(selection.outputs.historyTools === "true" \? "success" : "skipped"\)/,
+  )
   for (const name of ['verify', 'release']) {
     assert.match(jobs[name] ?? '', /if: always\(\)/)
     assert.match(jobs[name] ?? '', /every\(job => job.result === "success"\)/)
   }
-  const packageJob = jobs.package ?? ''
-  assert.doesNotMatch(packageJob, /needs:|bun run test/)
-  assert.match(packageJob, /bun run build/)
-  assert.match(packageJob, /check-package.ts --retain-tarball package-artifacts/)
-  assert.match(packageJob, /check-worktree-clean.ts --allow-package-artifacts/)
-  assert.match(packageJob, /name: encephalon-npm-package-\$\{\{ github.run_attempt \}\}/)
-  assert.match(packageJob, /artifact: \$\{\{ steps.artifact.outputs.name \}\}/)
-  for (const name of ['candidate', 'release-checks']) {
-    const job = jobs[name] ?? ''
-    assert.match(job, /needs: package/)
-    assert.match(job, /actions\/download-artifact@/)
-    assert.match(job, /name: \$\{\{ needs.package.outputs.artifact \}\}/)
-    assert.match(job, /check-package-metadata.ts/)
-    assert.match(job, /check-package.ts --tarball package-artifacts\/encephalon-0.3.0.tgz/)
-    assert.doesNotMatch(job, /--retain-tarball|npm pack|npm install/)
+})
+
+test('trusted retention only copies an artifact from a successfully completed main CI run', () => {
+  const workflow = readFileSync(resolve(root, '.github/workflows/promote-candidate.yml'), 'utf8')
+  assert.match(workflow, /workflow_run:/)
+  assert.match(workflow, /types: \[completed\]/)
+  assert.match(workflow, /conclusion == 'success'/)
+  assert.match(workflow, /head_branch == 'main'/)
+  assert.match(workflow, /head_repository.full_name == github.repository/)
+  assert.match(workflow, /path == '.github\/workflows\/ci.yml'/)
+  assert.match(workflow, /\["push", "schedule", "workflow_dispatch"\]/)
+  assert.match(workflow, /name: verified-candidate-\$\{\{ github.event.workflow_run.run_attempt \}\}/)
+  assert.match(workflow, /run-id: \$\{\{ github.event.workflow_run.id \}\}/)
+  assert.match(workflow, /name: trusted-main-\$\{\{ github.event.workflow_run.head_sha \}\}/)
+  assert.doesNotMatch(workflow, /checkout|\brun:|secrets|write|pull_request_target/)
+  for (const action of workflow.matchAll(/uses: ([^\s]+)/g)) {
+    assert.match(action[1] ?? '', /^[^@]+@[a-f0-9]{40}$/)
   }
-  assert.match(jobs.candidate ?? '', /node: 24.15.0/)
-  assert.match(jobs.candidate ?? '', /node: 26/)
-  assert.match(jobs.candidate ?? '', /os: windows-latest/)
-  assert.match(jobs.candidate ?? '', /os: macos-latest/)
-  assert.match(jobs['release-checks'] ?? '', /check-release-compatibility.ts package-artifacts\/encephalon-0.3.0.tgz/)
-  assert.match(jobs['release-checks'] ?? '', /check-publish.ts package-artifacts\/encephalon-0.3.0.tgz/)
-  assert.match(jobs.release ?? '', /needs: \[candidate, release-checks, verify\]/)
-  assert.doesNotMatch(workflow, /run: npm publish/)
 })

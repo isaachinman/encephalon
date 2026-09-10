@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-09-10T22:09:53.085Z",
+  "id": "a7071db8-2daa-414b-b8ae-eee786983cb1",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Build one exact candidate after source gates, carry producer identity to every consumer, and promote trusted main bytes only after CI completes successfully.",
+    "gates": [
+      "Run the direct generated-version check before frozen script-disabled dependency installation. Complete Linux minimum/current source tests, lint, types and cheap tool checks before one explicit build and candidate pack; check tracked/untracked cleanliness around the build and require an absent package-artifacts directory.",
+      "Derive the tarball filename from the validated package version. Retain the atomic tarball/sidecar pair with size, SHA-1, SHA-256, SHA-512, integrity, source commit and relative path. Consumers download the original immutable producer artifact ID, verify its independently recorded SHA-256 and source metadata, restore only its reviewed dist files into an absent directory, and reuse strict package preflight without rebuilding or repacking.",
+      "Run the pinned published encephalon@0.3.0 oracle through schema 2 to 4 to 2, preserving public contracts and durable state. Every main candidate gets this proof; relevant production/public/persisted/package/release PR changes require it. Release labels, manual main runs and weekly main schedules force compatibility and historical release-tool regression. Unknown paths and failed selection cannot permit a skip.",
+      "Only a completed successful same-repository main CI run can promote the final verified pair through the code-free workflow_run copy. Bind trusted artifacts to source SHA, originating run and attempt. Cancelled/failed runs cannot promote, and consumer-only reruns reuse the original producer identity.",
+      "Before release, require current-main identity, Greptile 5/5, all selected gates and byte equality with the reviewed PR tarball. Record full digests and validate the exact tarball-only npm publish dry run."
+    ],
+    "publication": "Manual maintainer action only after final explicit approval: publish the reviewed tarball bytes. Agents never publish, rebuild for publication or publish a directory."
+  },
+  "searchText": "MAR-2794 CI exact candidate immutable artifact producer digest restore dist published 0.3 compatibility main promotion cancellation rerun release manual publication",
+  "source": "codex",
+  "subject": "release.npm-exact-artifact",
+  "supersedes": ["5df2c829-7319-404f-b75d-e21090e39216"]
+}

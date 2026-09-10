@@ -2,7 +2,7 @@ import { PACKAGE_DECLARATION_CONSUMER_SOURCE } from './package-declaration-consu
 import { RELEASE_CONTRACT_PROBE_SOURCE } from './release-contracts.ts'
 
 export const API_PROBE_SOURCE = `
-import { lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
@@ -16,67 +16,6 @@ const api = await import(packageEntry)
 const manifest = JSON.parse(readFileSync(resolve(root, 'node_modules', 'encephalon', 'package.json'), 'utf8'))
 const fail = stage => { throw Object.assign(new Error(stage), { stage }) }
 const assert = (condition, stage) => { if (!condition) fail(stage) }
-const boundedFixtureRootNames = () => {
-  const directory = opendirSync(root)
-  try {
-    const names = []
-    while (names.length <= 32) {
-      const entry = directory.readSync()
-      if (entry === null) return names
-      names.push(entry.name)
-    }
-    fail('initialise-instruction-backup-root-bound')
-  } finally {
-    directory.closeSync()
-  }
-}
-const sameStableBackup = (expected, actual) =>
-  actual !== undefined &&
-  expected.dev === actual.dev &&
-  expected.ino === actual.ino &&
-  expected.mode === actual.mode &&
-  expected.nlink === actual.nlink &&
-  expected.size === actual.size &&
-  expected.mtimeNs === actual.mtimeNs &&
-  expected.ctimeNs === actual.ctimeNs &&
-  expected.birthtimeNs === actual.birthtimeNs
-const cleanupPublishedOracleInstructionBackups = () => {
-  const expected = new Map([
-    ['AGENTS.md', 'oracle agents predecessor\\n'],
-    ['CLAUDE.md', 'oracle claude predecessor\\n'],
-  ])
-  const backupPattern = /^[.](AGENTS[.]md|CLAUDE[.]md)[.][0-9]+[.][0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}[.]backup$/u
-  const backups = boundedFixtureRootNames().filter(name => backupPattern.test(name))
-  assert(backups.length === expected.size, 'initialise-instruction-backup-count')
-  backups.forEach(name => {
-    const filename = backupPattern.exec(name)?.[1]
-    const expectedBytes = filename === undefined ? undefined : expected.get(filename)
-    const path = resolve(root, name)
-    const before = lstatSync(path, { bigint: true })
-    assert(
-      expectedBytes !== undefined &&
-        before.isFile() &&
-        !before.isSymbolicLink() &&
-        before.nlink === 1n &&
-        before.size === 26n &&
-        realpathSync.native(path) === resolve(realpathSync.native(root), name),
-      'initialise-instruction-backup-identity',
-    )
-    const bytes = readFileSync(path, 'utf8')
-    const after = lstatSync(path, { bigint: true, throwIfNoEntry: false })
-    assert(
-      bytes === expectedBytes && sameStableBackup(before, after),
-      'initialise-instruction-backup-stability',
-    )
-    unlinkSync(path)
-    assert(
-      lstatSync(path, { throwIfNoEntry: false }) === undefined,
-      'initialise-instruction-backup-cleanup',
-    )
-    expected.delete(filename)
-  })
-  assert(expected.size === 0, 'initialise-instruction-backup-completeness')
-}
 const at = (stage, action) => {
   try {
     return action()
@@ -124,9 +63,7 @@ const operations = {
   searchCompact: limit => api.searchCompactRecords({ includeSuperseded: true, limit, query: 'compatibility-marker', root }),
 }
 const resultLimits = () => {
-  const maximums = phase === 'upgrade'
-    ? { gather: 1000, list: 1000, search: 1000, searchCompact: 1000 }
-    : { gather: 100, list: 50, search: 50, searchCompact: 100 }
+  const maximums = { gather: 1000, list: 1000, search: 1000, searchCompact: 1000 }
   return Object.fromEntries(resultLimitOperations.map(operation => [operation.name, resultLimitCases.reduce((outcome, limit) => {
     const name = operation.name
     const budget = operation.budget
@@ -142,20 +79,16 @@ const resultLimits = () => {
     }
     assert(failure instanceof api.EncephalonError, 'api-limit-error-type-' + name + '-' + limit)
     assert(failure.code === 'INVALID_ARGUMENT', 'api-limit-error-code-' + name + '-' + limit)
-    if (phase !== 'upgrade' && limit === 1001) {
-      assert(failure.details?.field === 'limit', 'api-limit-parser-field-' + name + '-' + limit)
-    } else {
-      assert(failure.details?.budget === budget, 'api-limit-error-budget-' + name + '-' + limit)
-      assert(failure.details?.field === 'limit', 'api-limit-error-field-' + name + '-' + limit)
-      assert(failure.details?.maximum === maximums[name], 'api-limit-error-maximum-' + name + '-' + limit)
-    }
+    assert(failure.details?.budget === budget, 'api-limit-error-budget-' + name + '-' + limit)
+    assert(failure.details?.field === 'limit', 'api-limit-error-field-' + name + '-' + limit)
+    assert(failure.details?.maximum === maximums[name], 'api-limit-error-maximum-' + name + '-' + limit)
     return { ...outcome, rejected: [...outcome.rejected, limit] }
   }, { accepted: [], rejected: [] })]))
 }
 const readCompatibilityState = () => {
   const validation = api.validateRecords({ root })
   assert(validation.valid === true, 'api-validate')
-  const listed = api.listRecords({ includeSuperseded: true, limit: phase === 'upgrade' ? 1000 : 50, root })
+  const listed = api.listRecords({ includeSuperseded: true, limit: 1000, root })
   assert(listed.some(record => record.id === 'compatibility-base'), 'api-list-base')
   assertRecord(api.showRecord({ id: 'compatibility-base', root }), 'compatibility-base', 'api-show-base')
   assert(api.searchRecords({ includeSuperseded: true, query: 'compatibility-marker', root }).length > 0, 'api-search')
@@ -215,7 +148,6 @@ const publicSurface = () => {
 }
 const initialise = () => {
   at('initialise-init', () => api.initEncephalon({ root }))
-  cleanupPublishedOracleInstructionBackups()
   const artifact = resolve(root, 'encephalon', '_artifacts', 'decision', 'compatibility-base', 'evidence.txt')
   mkdirSync(resolve(artifact, '..'), { recursive: true })
   writeFileSync(artifact, 'oracle artifact evidence\\n')

@@ -1,0 +1,15 @@
+{
+  "createdAt": "2026-09-10T22:10:16.715Z",
+  "id": "484fcdc6-215a-4a83-83c3-9156acfe039d",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Prepare releases using the current release.npm-exact-artifact workflow: one version-derived candidate, published 0.3 compatibility and post-completion main promotion.",
+    "authority": "a7071db8-2daa-414b-b8ae-eee786983cb1",
+    "verification": "The full local suite remains available through test:all after an explicit build. CI selects complementary source, platform, package and historical release-tool coverage, while preserving all common benchmark samples and exact tarball checks.",
+    "publication": "Only the maintainer may publish the reviewed tarball after explicit final approval, green current main and reviewed-PR byte equality. Agents never publish."
+  },
+  "searchText": "MAR-2794 release preparation version derived exact artifact published 0.3 oracle CI full local tests manual handoff",
+  "source": "codex",
+  "subject": "workflow.release-prepare",
+  "supersedes": ["9eae5ef0-50c6-4af1-8c10-bd97d4a22dad"]
+}

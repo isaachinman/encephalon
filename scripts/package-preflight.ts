@@ -6,6 +6,7 @@ import { assertPublicDeclarations, reviewedRuntimePaths } from './package-graph.
 import {
   type PackageArtifactMetadata,
   type PackageTarballSnapshot,
+  packageArtifactFilename,
   packageArtifactMetadataPath,
   readPackageTarEntries,
   snapshotPackageTarball,
@@ -244,7 +245,7 @@ export const preflightExactPackageArtifact = (
   }>,
 ): ExactPackagePreflight => {
   const identity = packageIdentity(options.root)
-  const expectedTarball = resolve(options.root, 'package-artifacts', `encephalon-${identity.packageVersion}.tgz`)
+  const expectedTarball = resolve(options.root, 'package-artifacts', packageArtifactFilename(identity.packageVersion))
   const tarballPath = resolve(options.tarballPath ?? expectedTarball)
   const expectedMetadataPath = `${expectedTarball}.metadata.json`
   const artifactDirectory = resolve(options.root, 'package-artifacts')
