@@ -133,6 +133,7 @@ const packageFixturePaths = [
   'scripts/package-declaration-consumer.ts',
   'scripts/npm-command.ts',
   'scripts/package-preflight.ts',
+  'scripts/package-graph.ts',
   'scripts/package-tarball.ts',
   'scripts/package-version.ts',
   'scripts/release-contracts.ts',
@@ -349,9 +350,11 @@ describe('package contract', () => {
 
   test('has a side-effect-free TypeScript API entrypoint', () => {
     assert.equal(existsSync(resolve(root, 'src/index.ts')), true)
-    const declarations = ['index.d.ts', 'baseline.d.ts', 'cache.d.ts', 'canonical-layout.d.ts', 'records.d.ts']
-      .map(file => readFileSync(resolve(root, 'dist', file), 'utf8'))
-      .join('\n')
+    assert.deepEqual(
+      readdirSync(resolve(root, 'dist')).filter(file => file.endsWith('.d.ts')),
+      ['index.d.ts'],
+    )
+    const declarations = readFileSync(resolve(root, 'dist', 'index.d.ts'), 'utf8')
     assert.doesNotMatch(
       declarations,
       /BaselineWork|RecordWork|WorkObserver|afterGatherSearchEvaluation|cacheReadTestHooks|onEntry|onWork|scanBaselineWithHooks|validateRecordsResolved/,
@@ -620,16 +623,6 @@ describe('package contract', () => {
       readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8'),
       /creation timestamps under the repository operation lock/,
     )
-    assert.doesNotMatch(readFileSync(resolve(root, 'dist', 'api-input.d.ts'), 'utf8'), /ValidatedAddRecordInput/)
-    assert.doesNotMatch(readFileSync(resolve(root, 'dist', 'errors.d.ts'), 'utf8'), /failBudget|operation-budgets/)
-    assert.doesNotMatch(
-      readFileSync(resolve(root, 'dist', 'cache-location.d.ts'), 'utf8'),
-      /CacheDatabaseCreationConflict/,
-    )
-    assert.doesNotMatch(
-      readFileSync(resolve(root, 'dist', 'operation-budgets.d.ts'), 'utf8'),
-      /OPERATION_BUDGETS|OperationBudgetKey/,
-    )
   })
 
   test('keeps installed command guidance aligned with root-install verification', () => {
@@ -730,6 +723,7 @@ import { readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { spawnNpmCommand as spawnRealNpmCommand } from './npm-command-real.ts'
 export const spawnNpmCommand = (arguments_, options) => {
   if (arguments_[0] === 'pack') throw new Error('supplied mode invoked npm pack')
+  if (arguments_[0] === 'install') {
   renameSync(process.env.ENCEPHALON_TEST_SUPPLIED_TARBALL, process.env.ENCEPHALON_TEST_SUPPLIED_TARBALL + '.original')
   writeFileSync(process.env.ENCEPHALON_TEST_SUPPLIED_TARBALL, 'replacement tarball bytes')
   const target = arguments_.at(-1)
@@ -737,6 +731,7 @@ export const spawnNpmCommand = (arguments_, options) => {
     sha256: createHash('sha256').update(readFileSync(target)).digest('hex'),
     target,
   }))
+  }
   return spawnRealNpmCommand(arguments_, options)
 }
 `,
@@ -911,9 +906,14 @@ export const spawnNpmCommand = (arguments_, options) => {
   test('the packed API independently exercises every result-limit boundary', { timeout: 120_000 }, () => {
     const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-api-limit-matrix-')
     try {
-      const path = resolve(fixtureRoot, 'dist', 'index.mjs')
-      const source = readFileSync(path, 'utf8')
       const marker = 'const limit = value === undefined ? budget.default : value;'
+      const files = readdirSync(resolve(fixtureRoot, 'dist'))
+        .filter(file => file.endsWith('.mjs'))
+        .map(file => resolve(fixtureRoot, 'dist', file))
+        .filter(file => readFileSync(file, 'utf8').includes(marker))
+      assert.equal(files.length, 1)
+      const path = files[0] as string
+      const source = readFileSync(path, 'utf8')
       assert.equal(source.includes(marker), true)
       writeFileSync(
         path,
@@ -941,13 +941,13 @@ export const spawnNpmCommand = (arguments_, options) => {
     try {
       const path = resolve(fixtureRoot, 'dist', 'cli.mjs')
       const source = readFileSync(path, 'utf8')
-      const marker = 'const limit = value === undefined ? budget.default : value;'
+      const marker = 'const parsed = Number(value);'
       assert.equal(source.includes(marker), true)
       writeFileSync(
         path,
         source.replace(
           marker,
-          `${marker}\n  if (limit === 101) return failBudget(budgetKey, 'candidate-only CLI boundary drift');`,
+          `${marker}\n  if (parsed === 101) return failBudget(budgetName, 'candidate-only CLI boundary drift');`,
         ),
       )
 
@@ -967,7 +967,7 @@ export const spawnNpmCommand = (arguments_, options) => {
   test('uses every public declaration member and the complete error-code union', { timeout: 120_000 }, () => {
     const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-declaration-surface-')
     try {
-      const declarations = resolve(fixtureRoot, 'dist', 'types.d.ts')
+      const declarations = resolve(fixtureRoot, 'dist', 'index.d.ts')
       const source = readFileSync(declarations, 'utf8')
       assert.equal(source.includes('recordsChecked: number;'), true)
       writeFileSync(declarations, source.replace('recordsChecked: number;', 'recordCount: number;'))
@@ -993,7 +993,7 @@ export const spawnNpmCommand = (arguments_, options) => {
     const results = mutations.map(([from, to], index) => {
       const fixture = createPackageCheckFixture(`encephalon-package-optional-declaration-${index}-`)
       try {
-        const declarations = resolve(fixture.fixtureRoot, 'dist', 'types.d.ts')
+        const declarations = resolve(fixture.fixtureRoot, 'dist', 'index.d.ts')
         const source = readFileSync(declarations, 'utf8')
         assert.equal(source.includes(from), true)
         writeFileSync(declarations, source.replace(from, to))
@@ -1127,7 +1127,12 @@ export const spawnNpmCommand = (arguments_, options) => {
   })
 
   test('rejects unreviewed files from packaged source and generated output trees', { timeout: 30_000 }, () => {
-    const results = ['skills/encephalon/unreviewed.txt', 'dist/unreviewed.txt'].map(path => {
+    const results = [
+      'skills/encephalon/unreviewed.txt',
+      'dist/unreviewed.txt',
+      'dist/unused-abc123.mjs',
+      'dist/private.d.ts',
+    ].map(path => {
       const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-manifest-')
       try {
         writeFileSync(resolve(fixtureRoot, path), 'unreviewed package content\n')
@@ -1142,7 +1147,7 @@ export const spawnNpmCommand = (arguments_, options) => {
     })
     assert.deepEqual(
       results.map(result => result.status === 0),
-      [false, false],
+      [false, false, false, false],
     )
     for (const result of results) {
       assert.equal(result.stdout, '')
@@ -1150,10 +1155,10 @@ export const spawnNpmCommand = (arguments_, options) => {
     }
   })
 
-  test('rejects a missing declaration derived from reviewed TypeScript source', { timeout: 30_000 }, () => {
+  test('rejects a missing public declaration facade', { timeout: 30_000 }, () => {
     const { fixtureRoot, temporaryRoot } = createPackageCheckFixture('encephalon-package-missing-declaration-')
     try {
-      rmSync(resolve(fixtureRoot, 'dist', 'api-input.d.ts'))
+      rmSync(resolve(fixtureRoot, 'dist', 'index.d.ts'))
 
       const result = spawnSync(process.execPath, ['./scripts/check-package.ts'], {
         cwd: fixtureRoot,
@@ -1163,7 +1168,7 @@ export const spawnNpmCommand = (arguments_, options) => {
 
       assert.notEqual(result.status, 0)
       assert.equal(result.stdout, '')
-      assert.match(result.stderr, /reviewed package file manifest/)
+      assert.match(result.stderr, /Required package file dist\/index.d.ts is missing/)
     } finally {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }

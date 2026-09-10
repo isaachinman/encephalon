@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { type BigIntStats, existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { relative, resolve, sep } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
+import { assertPublicDeclarations, reviewedRuntimePaths } from './package-graph.ts'
 import {
   type PackageArtifactMetadata,
   type PackageTarballSnapshot,
@@ -16,9 +17,6 @@ export const REVIEWED_PACKAGE_FILES = Object.freeze([
   'dist',
   'skills',
   'assets/encephalon.png',
-  'docs/performance.md',
-  'docs/performance-baseline.json',
-  'docs/performance-budgets.json',
   'README.md',
   'LICENSE',
 ] as const)
@@ -181,12 +179,10 @@ export const validateReviewedPackageSnapshot = (root: string, snapshot: PackageT
     .filter(path => path.length > 0)
   const expectedPackagePaths = new Set([
     ...reviewedInputs.filter(path => allowedTrackedFiles.has(path) || path.startsWith('skills/')),
-    ...reviewedInputs
-      .filter(path => path.startsWith('src/') && path.endsWith('.ts') && !path.endsWith('.d.ts'))
-      .map(path => `dist/${path.slice('src/'.length, -'.ts'.length)}.d.ts`),
-    'dist/cli.mjs',
-    'dist/index.mjs',
+    ...reviewedRuntimePaths(root),
+    'dist/index.d.ts',
   ])
+  assertPublicDeclarations(root)
   const packedEntries = entries.map(entry => {
     if (entry.path.startsWith('package/') && entry.path.length > 'package/'.length) {
       return Object.freeze({ ...entry, path: entry.path.slice('package/'.length) })

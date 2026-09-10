@@ -1,0 +1,21 @@
+{
+  "createdAt": "2026-09-10T20:42:25.420Z",
+  "id": "95a33667-280c-4a9d-9c2c-ee93e78e1878",
+  "kind": "architecture",
+  "payload": {
+    "summary": "MAR-2793 shares one Node ESM API/CLI graph and publishes a standalone public declaration facade.",
+    "decisions": [
+      "The root API remains synchronous and statically imported; the private async CLI validates its own arguments before importing the selected existing implementation module, with imports awaited inside the existing sanitised error boundary.",
+      "Bun 1.3.1 transpiles TypeScript and Rollup assembles shared ESM chunks without minification. Cache and records share a chunk because their existing mutual dependency must not form an inter-chunk cycle. All chunks remain directly in dist, preserving executing-package discovery.",
+      "TypeScript 7 remains the typecheck and declaration authority. Rollup's declaration plugin bundles the temporary emitted declarations using its documented development-only TypeScript 6 API compatibility package; only dist/index.d.ts is published.",
+      "Package checks follow actual static and literal dynamic imports from the two supported entries; all referenced files must be contained and present, Node built-ins are the only externals, and stray outputs/private declarations are rejected. The existing exact tarball byte/mode and metadata checks remain authoritative.",
+      "Maintainer performance documents remain in Git and are excluded from npm. Build inventories identify source contributions without introducing another persistent manifest authority."
+    ],
+    "verification": [
+      "Fresh-process CLI loader guards reject filesystem, SQLite, crypto and child-process loading for help/version and invalid options.",
+      "Packed API, every CLI command, complete public type consumer, import containment and deterministic clean build gates remain required."
+    ]
+  },
+  "source": "codex",
+  "subject": "build.shared-esm"
+}

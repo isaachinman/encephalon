@@ -1,21 +1,8 @@
 #!/usr/bin/env node
 
 import { parseArgs } from 'node:util'
-import { cliErrorResponse, fail, failBudget } from './errors.ts'
+import { cliErrorResponse, EncephalonError, fail, failBudget } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
-import {
-  addRecord,
-  EncephalonError,
-  gatherRecords,
-  hydrate,
-  initEncephalon,
-  listRecords,
-  prepare,
-  searchCompactRecords,
-  searchRecords,
-  showRecord,
-  validateRecords,
-} from './index.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
 import type { JsonValue } from './types.ts'
 
@@ -25,7 +12,7 @@ Commands:
   init [--refresh-baseline] [--remove]
   add [--id <id>] --kind <kind> --subject <subject> --source <source> --data <json>
       [--confidence <0..1>] [--text <text>] [--supersedes <id> ...] [--artifact <path> ...]
-      Accepts at most ${OPERATION_BUDGETS.supersessionEdges.maximum.toLocaleString('en-GB')} supersession targets.
+      Accepts at most ${String(OPERATION_BUDGETS.supersessionEdges.maximum).replace(/\B(?=(\d{3})+(?!\d))/g, ',')} supersession targets.
   prepare
   hydrate
   validate
@@ -245,7 +232,7 @@ const parsePayload = (value: string) => {
 
 const rootInput = (root: string | undefined): { root?: string } => (root === undefined ? {} : { root })
 
-const dispatch = (arguments_: string[]): CommandResult => {
+const dispatch = async (arguments_: string[]): Promise<CommandResult> => {
   if (arguments_.length === 1 && (arguments_[0] === '--help' || arguments_[0] === '-h')) {
     return { format: 'text', value: HELP }
   }
@@ -271,6 +258,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
         flags: ['refresh-baseline', 'remove'],
       })
       noPositionals(options)
+      const { initEncephalon } = await import('./init.ts')
       return {
         value: initEncephalon({
           ...root,
@@ -302,6 +290,8 @@ const dispatch = (arguments_: string[]): CommandResult => {
       const confidence = confidenceValue === undefined ? undefined : Number(confidenceValue)
       const id = one(options, 'id')
       const searchText = one(options, 'text')
+      const payload = parsePayload(requiredData)
+      const { addRecord } = await import('./records.ts')
       return {
         value: addRecord({
           ...root,
@@ -312,7 +302,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
           ...(confidence === undefined ? {} : { confidence }),
           ...(supersedes.length === 0 ? {} : { supersedes }),
           ...(many(options, 'artifact').length === 0 ? {} : { artifacts: many(options, 'artifact') }),
-          payload: parsePayload(requiredData),
+          payload,
           ...(searchText === undefined ? {} : { searchText }),
         }),
       }
@@ -320,16 +310,19 @@ const dispatch = (arguments_: string[]): CommandResult => {
     case 'prepare': {
       const options = parseOptions(commandArguments)
       noPositionals(options)
+      const { prepare } = await import('./cache.ts')
       return { value: prepare(root) }
     }
     case 'hydrate': {
       const options = parseOptions(commandArguments)
       noPositionals(options)
+      const { hydrate } = await import('./cache.ts')
       return { value: hydrate(root) }
     }
     case 'validate': {
       const options = parseOptions(commandArguments)
       noPositionals(options)
+      const { validateRecords } = await import('./records.ts')
       const value = validateRecords(root)
       return { value, ...(value.valid ? {} : { exitCode: 2 }) }
     }
@@ -342,6 +335,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
       const kind = one(options, 'kind')
       const subject = one(options, 'subject')
       const limit = parseLimit(one(options, 'limit'), 'fullResultLimit')
+      const { listRecords } = await import('./cache.ts')
       return {
         value: listRecords({
           ...root,
@@ -361,6 +355,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
       if (id === undefined || options.positionals.length > (one(options, 'id') === undefined ? 1 : 0)) {
         invalid('show requires exactly one record id.')
       }
+      const { showRecord } = await import('./cache.ts')
       return {
         value: showRecord({
           ...root,
@@ -388,6 +383,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
         includeSuperseded: options.flags.has('include-superseded'),
         ...(limit === undefined ? {} : { limit }),
       }
+      const { searchCompactRecords, searchRecords } = await import('./cache.ts')
       return {
         value: compact ? searchCompactRecords(input) : searchRecords(input),
       }
@@ -405,6 +401,7 @@ const dispatch = (arguments_: string[]): CommandResult => {
       const shows = many(options, 'show')
       const kind = one(options, 'kind')
       const limit = parseLimit(one(options, 'limit'), 'compactResultLimit')
+      const { gatherRecords } = await import('./cache.ts')
       return {
         value: gatherRecords({
           ...root,
@@ -426,9 +423,9 @@ const writeJson = (stream: NodeJS.WriteStream, value: unknown) => {
   stream.write(`${JSON.stringify(value)}\n`)
 }
 
-export const runCli = (arguments_: string[] = process.argv.slice(2)) => {
+export const runCli = async (arguments_: string[] = process.argv.slice(2)) => {
   try {
-    const result = dispatch(arguments_)
+    const result = await dispatch(arguments_)
     if (result.format === 'text' && typeof result.value === 'string') {
       process.stdout.write(result.value)
     } else {
@@ -452,4 +449,4 @@ export const runCli = (arguments_: string[] = process.argv.slice(2)) => {
   }
 }
 
-process.exitCode = runCli()
+process.exitCode = await runCli()

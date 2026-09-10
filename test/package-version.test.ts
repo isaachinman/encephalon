@@ -20,6 +20,7 @@ const createCheckFixture = () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), 'encephalon-package-version-check-'))
   mkdirSync(resolve(temporaryRoot, 'src', 'generated'), { recursive: true })
   cpSync(resolve(root, 'scripts'), resolve(temporaryRoot, 'scripts'), { recursive: true })
+  symlinkSync(resolve(root, 'node_modules'), resolve(temporaryRoot, 'node_modules'), 'junction')
   writeFileSync(resolve(temporaryRoot, 'package.json'), '{"type":"module","version":"0.2.0"}\n', 'utf8')
   return temporaryRoot
 }
