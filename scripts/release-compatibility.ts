@@ -1394,8 +1394,8 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     assertCandidateCliSurface(oracleCliSurface, upgradeCli.surface)
     assertCandidateIndependentBudgets(upgradeIndependentBudgets)
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
-    if (upgradeApi.schemaBefore !== '1' || upgradeApi.schemaAfter !== '3') {
-      throw new Error('The candidate package did not rebuild cache schema 1 as schema 3.')
+    if (upgradeApi.schemaBefore !== '1' || upgradeApi.schemaAfter !== '4') {
+      throw new Error('The candidate package did not rebuild cache schema 1 as schema 4.')
     }
 
     options.hooks?.beforeOracleDowngrade?.(oracle.path)
@@ -1421,8 +1421,8 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       'The downgraded oracle independent budget evidence',
     )
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
-    if (downgradeApi.schemaBefore !== '3' || downgradeApi.schemaAfter !== '1') {
-      throw new Error('The published oracle did not rebuild cache schema 3 as schema 1 after downgrade.')
+    if (downgradeApi.schemaBefore !== '4' || downgradeApi.schemaAfter !== '1') {
+      throw new Error('The published oracle did not rebuild cache schema 4 as schema 1 after downgrade.')
     }
     if (initialImport.version !== initial.version || downgradeImport.version !== initial.version) {
       throw new Error('The published oracle process did not execute the installed oracle package version.')
