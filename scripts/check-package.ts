@@ -272,7 +272,8 @@ try {
   if (
     !/^Usage: encephalon/m.test(help) ||
     helpFragments.some(fragment => !help.includes(fragment)) ||
-    cli(['--version']) !== `${packageVersion}\n`
+    cli(['--version']) !== `${packageVersion}\n` ||
+    runNpm(['exec', '--offline', '--', 'encephalon', '--version'], consumer) !== `${packageVersion}\n`
   ) {
     throw new Error('The packed Node-only CLI help/version contract failed.')
   }

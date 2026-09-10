@@ -55,6 +55,41 @@ const committedBaselineIds = (root: string) =>
   })
 
 describe('command-line interface', () => {
+  test('keeps trivial commands and invalid options outside the filesystem and SQLite graph', () => {
+    const root = createRoot()
+    const guard = `import { registerHooks } from 'node:module'
+registerHooks({ load(url, context, nextLoad) {
+  if (['node:fs', 'node:fs/promises', 'node:sqlite', 'node:child_process', 'node:crypto'].includes(url)) {
+    throw new Error('Unexpected command runtime evaluation: ' + url)
+  }
+  return nextLoad(url, context)
+} })`
+    const cases = [
+      { arguments: ['--version'], status: 0 },
+      { arguments: ['--root', root, '--help'], status: 0 },
+      { arguments: ['--root='], status: 2 },
+      ...['init', 'add', 'prepare', 'hydrate', 'validate', 'list', 'show', 'search', 'gather'].map(command => ({
+        arguments: [command, '--unknown'],
+        status: 2,
+      })),
+      {
+        arguments: ['add', '--kind=decision', '--subject=build', '--source=test', '--data={invalid'],
+        status: 2,
+      },
+    ]
+    for (const entry of cases) {
+      const result = spawnSync(
+        process.execPath,
+        ['--import', `data:text/javascript,${encodeURIComponent(guard)}`, cliPath, ...entry.arguments],
+        { cwd: root, encoding: 'utf8' },
+      )
+      assert.equal(result.status, entry.status, `${entry.arguments.join(' ')}\n${result.stderr}`)
+      if (entry.status === 2) {
+        assert.equal(errorJson(result).error.code, 'INVALID_ARGUMENT')
+      }
+    }
+  })
+
   test('projects safe partial init progress and reruns without duplicate state', () => {
     const root = createRoot()
     const cacheDatabase = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')

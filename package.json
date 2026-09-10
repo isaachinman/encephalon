@@ -39,9 +39,6 @@
     "dist",
     "skills",
     "assets/encephalon.png",
-    "docs/performance.md",
-    "docs/performance-baseline.json",
-    "docs/performance-budgets.json",
     "README.md",
     "LICENSE"
   ],
@@ -65,6 +62,9 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.6",
     "@types/node": "24.13.3",
+    "@typescript/typescript6": "6.0.2",
+    "rollup": "4.63.1",
+    "rollup-plugin-dts": "6.5.1",
     "typescript": "7.0.2",
     "ultracite": "7.10.1"
   }
