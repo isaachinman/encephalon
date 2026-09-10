@@ -48,7 +48,7 @@ import {
   type VerifiedCorpus,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
-import { createResponseByteBudget, type ResponseByteBudget } from './response-budget.ts'
+import { createResponseByteBudget, logicalResponseBytes, type ResponseByteBudget } from './response-budget.ts'
 import { validateArtifactPath } from './schema.ts'
 import { literalMatchQuery, MAX_NFC_UTF8_EXPANSION_FACTOR } from './search-text.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
@@ -1907,14 +1907,17 @@ const createCompactSearchReader = (
   cacheReadTestHooks.onCompactSearchPrepare?.(source)
   const statement = database.prepare(source)
   return (query: string, match: string) => {
-    if (match.length === 0) {
-      return []
+    if (match.length > 0) {
+      let bytes = 0
+      const records = Array.from(statement.iterate(match, ...kindParameters, limit) as Iterable<CompactRow>, row => {
+        const record = compactRecordFromRow(row, corpus)
+        bytes += budget.chargeAndMeasure(record)
+        return record
+      })
+      cacheReadTestHooks.afterCompactSearchRead?.(query)
+      return { bytes, records }
     }
-    const records = Array.from(statement.iterate(match, ...kindParameters, limit) as Iterable<CompactRow>, row =>
-      budget.charge(compactRecordFromRow(row, corpus)),
-    )
-    cacheReadTestHooks.afterCompactSearchRead?.(query)
-    return records
+    return { bytes: 0, records: [] }
   }
 }
 
@@ -1939,7 +1942,7 @@ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRec
     return withPreparedDatabase(parsed, (database, corpus) => {
       const budget = createResponseByteBudget('compactResponseBytes')
       budget.charge([])
-      return createCompactSearchReader(database, corpus, parsed, budget)(parsed.query, match)
+      return createCompactSearchReader(database, corpus, parsed, budget)(parsed.query, match).records
     })
   }
   resolveRepository(parsed)
@@ -1954,7 +1957,7 @@ const createShowReader = (database: DatabaseSync, corpus: VerifiedCorpus, includ
   return (id: string) => {
     const row = statement.get(id) as RecordRow | undefined
     cacheReadTestHooks.afterShowRead?.(id)
-    return row === undefined ? null : structuredClone(canonicalRecordFromRow(row, corpus))
+    return row === undefined ? null : canonicalRecordFromRow(row, corpus)
   }
 }
 
@@ -1984,38 +1987,43 @@ const readGatherFromDatabase = (
   budget.charge({ hydrated, records: [], searches: [] })
   const showRecordForId = shows.length === 0 ? () => null : createShowReader(database, corpus, input.includeSuperseded)
   const searchCompactRecordsForQuery =
-    searches.length === 0 ? () => [] : createCompactSearchReader(database, corpus, input, budget)
-  const shownRecords = new Map<string, BrainRecord | null>()
-  const searchResults = new Map<string, readonly CompactBrainRecord[]>()
+    searches.length === 0
+      ? () => ({ bytes: 0, records: [] })
+      : createCompactSearchReader(database, corpus, input, budget)
+  const shownRecords = new Map<string, Readonly<{ bytes: number; record: BrainRecord | null }>>()
+  const searchResults = new Map<string, Readonly<{ bytes: number; result: GatherResult['searches'][number] }>>()
   const memoizedShowRecordForId = (id: string) => {
-    if (shownRecords.has(id)) {
-      const record = shownRecords.get(id) ?? null
-      return record === null ? null : structuredClone(record)
+    const cached = shownRecords.get(id)
+    if (cached !== undefined) {
+      return cached
     }
     const record = showRecordForId(id)
-    shownRecords.set(id, record)
-    return record
+    const measured = { bytes: logicalResponseBytes({ id, record }), record }
+    shownRecords.set(id, measured)
+    return measured
   }
-  const memoizedCompactRecordsForQuery = (search: LiteralSearch) => {
-    if (searchResults.has(search.query)) {
-      return (searchResults.get(search.query) ?? []).map(record => budget.charge({ ...record }))
+  const memoizedSearchForQuery = (search: LiteralSearch) => {
+    const cached = searchResults.get(search.query)
+    if (cached !== undefined) {
+      budget.chargeBytes(cached.bytes)
+      return { ...cached.result, results: cached.result.results.map(record => ({ ...record })) }
     }
-    const records = searchCompactRecordsForQuery(search.query, search.match)
+    const envelope = { kind: input.kind ?? null, query: search.query, results: [] }
+    const envelopeBytes = budget.chargeAndMeasure(envelope)
+    const { bytes, records } = searchCompactRecordsForQuery(search.query, search.match)
     cacheReadTestHooks.afterGatherSearchEvaluation?.(search.query)
-    searchResults.set(search.query, records)
-    return records
+    const result = { ...envelope, results: records }
+    searchResults.set(search.query, { bytes: envelopeBytes + bytes, result })
+    return result
   }
   return {
     hydrated,
-    records: shows.map(id => budget.charge({ id, record: memoizedShowRecordForId(id) })),
-    searches: searches.map(search => {
-      const envelope = budget.charge({
-        kind: input.kind ?? null,
-        query: search.query,
-        results: [],
-      })
-      return { ...envelope, results: memoizedCompactRecordsForQuery(search) }
+    records: shows.map(id => {
+      const { bytes, record } = memoizedShowRecordForId(id)
+      budget.chargeBytes(bytes)
+      return { id, record: record === null ? null : structuredClone(record) }
     }),
+    searches: searches.map(memoizedSearchForQuery),
   }
 }
 

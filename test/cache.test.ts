@@ -4371,18 +4371,24 @@ describe('SQLite cache and reads', () => {
     }
 
     const gatherRecords = functionFromApi<(input: Record<string, unknown>) => Record<string, unknown>>('gatherRecords')
-    assertBudgetError(
-      () =>
-        gatherRecords({
-          root,
-          shows: Array.from({ length: 5 }, () => 'large-response-0'),
-        }),
-      {
-        budget: 'gatherResponseBytes',
-        field: 'response',
-        maximum: 4 * 1024 * 1024,
-      },
-    )
+    const gatherCloning = mock.method(globalThis, 'structuredClone')
+    try {
+      assertBudgetError(
+        () =>
+          gatherRecords({
+            root,
+            shows: Array.from({ length: 5 }, () => 'large-response-0'),
+          }),
+        {
+          budget: 'gatherResponseBytes',
+          field: 'response',
+          maximum: 4 * 1024 * 1024,
+        },
+      )
+      assert.equal(gatherCloning.mock.callCount(), 4, 'the rejected duplicate must not clone its record')
+    } finally {
+      gatherCloning.mock.restore()
+    }
     const gathered = gatherRecords({ limit: 5, root, searches: ['response budget marker'] }) as {
       searches: Array<{ results: unknown[] }>
     }
@@ -4511,6 +4517,55 @@ describe('SQLite cache and reads', () => {
       budgetKey: 'gatherResponseBytes',
       value: { kind: null, query, results: [] },
     })
+  })
+
+  test('rejects a complete duplicate search before copying any of its rows', () => {
+    const root = createRoot()
+    const query = 'duplicate search allocation'
+    const ids = ['duplicate-large-a', 'duplicate-large-b', 'duplicate-large-c']
+    for (const id of ids) {
+      api.addRecord({
+        id,
+        kind: 'context',
+        payload: { summary: 'x '.repeat(300 * 1024) },
+        root,
+        source: 'agent',
+        subject: `${query}.${id}`,
+      })
+    }
+    const observed = new Set<string>()
+    let copiedRows = 0
+    responseBudgetTestHooks.afterCharge = (budgetKey, value) => {
+      if (
+        budgetKey === 'gatherResponseBytes' &&
+        value !== null &&
+        typeof value === 'object' &&
+        'snippet' in value &&
+        'id' in value &&
+        typeof value.id === 'string' &&
+        'summary' in value &&
+        typeof value.summary === 'string' &&
+        !observed.has(value.id)
+      ) {
+        observed.add(value.id)
+        const { summary } = value
+        Object.defineProperty(value, 'summary', {
+          enumerable: true,
+          get: () => {
+            copiedRows += 1
+            return summary
+          },
+        })
+      }
+    }
+
+    assertBudgetError(() => api.gatherRecords({ limit: 3, root, searches: [query, query, query] }), {
+      budget: 'gatherResponseBytes',
+      field: 'response',
+      maximum: 4 * 1024 * 1024,
+    })
+    assert.deepEqual([...observed].sort(), ids)
+    assert.equal(copiedRows, 3, 'only the accepted duplicate may copy the three original rows')
   })
 
   test('shares one 4 MiB gather response budget across complete repeated results', () => {

@@ -9,6 +9,7 @@ export type ResponseBudgetKey = Extract<keyof typeof OPERATION_BUDGETS, `${strin
 /** @internal */
 export type ResponseByteBudget = {
   charge: <Value>(value: Value) => Value
+  chargeAndMeasure: (value: unknown) => number
   chargeBytes: (bytes: number) => void
 }
 
@@ -60,11 +61,17 @@ export const createResponseByteBudget = (budgetKey: ResponseBudgetKey): Response
     return failBudget(budgetKey, message)
   }
 
-  const charge = <Value>(value: Value) => {
-    chargeBytes(logicalResponseBytes(value))
+  const chargeAndMeasure = (value: unknown) => {
+    const bytes = logicalResponseBytes(value)
+    chargeBytes(bytes)
     responseBudgetTestHooks.afterCharge?.(budgetKey, value)
+    return bytes
+  }
+
+  const charge = <Value>(value: Value) => {
+    chargeAndMeasure(value)
     return value
   }
 
-  return Object.freeze({ charge, chargeBytes })
+  return Object.freeze({ charge, chargeAndMeasure, chargeBytes })
 }
