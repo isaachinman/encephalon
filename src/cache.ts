@@ -831,6 +831,12 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
   ) {
     throw new CacheSchemaMismatch('The cache record table does not match its metadata.')
   }
+  const recordsIntegrity = database
+    .prepare("SELECT integrity_check = 'ok' AS valid FROM pragma_integrity_check('records') LIMIT 1")
+    .get()
+  if (recordsIntegrity?.valid !== 1) {
+    throw new CacheSchemaMismatch('The cache record indexes are inconsistent.')
+  }
   cacheReadTestHooks.beforeIntegrityTextRead?.('records')
   const recordKeys = database.prepare(
     'SELECT rowid, CAST(id AS BLOB) AS id_bytes, active FROM records ORDER BY id LIMIT ?',

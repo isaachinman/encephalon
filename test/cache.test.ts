@@ -7474,6 +7474,34 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(api.searchRecords({ query: 'corruption', root }), [expected])
   })
 
+  test('recovers a missing ordering-index entry while canonical rows and FTS remain intact', () => {
+    const root = createRoot()
+    const expected = addCacheRecord(root)
+    const before = logicalCacheProjection(root)
+    mutateCache(root, database => {
+      database.enableDefensive(false)
+      database.exec(`
+        CREATE TABLE empty_projection(active INTEGER, created_at TEXT, id TEXT);
+        CREATE INDEX empty_order ON empty_projection(active, created_at DESC, id DESC);
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_schema SET rootpage = (SELECT rootpage FROM sqlite_schema WHERE name = 'empty_order')
+          WHERE name = 'records_active_order';
+        DELETE FROM sqlite_schema WHERE name IN ('empty_projection', 'empty_order');
+        PRAGMA writable_schema = OFF;
+      `)
+    })
+    assert.deepEqual(logicalCacheProjection(root), before)
+    let quarantines = 0
+    cacheLocationTestHooks.beforeQuarantineRename = path => {
+      if (basename(path) === 'brain.sqlite') {
+        quarantines += 1
+      }
+    }
+    assert.deepEqual(api.listRecords({ root }), [expected])
+    assert.equal(quarantines, 1)
+    assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 1 })
+  })
+
   test('rejects oversized posting blocks and auxiliary values before native FTS validation', () => {
     for (const mutation of [
       'UPDATE record_search_data SET block = zeroblob(1052673) WHERE id > 10',
@@ -7497,7 +7525,7 @@ describe('SQLite cache and reads', () => {
         DatabaseSync.prototype,
         'prepare',
         function observe(this: DatabaseSync, sql: string) {
-          if (!recovered && sql.includes('pragma_integrity_check')) {
+          if (!recovered && sql.includes("pragma_integrity_check('record_search')")) {
             nativeChecksBeforeRecovery += 1
           }
           return prepare.call(this, sql)
