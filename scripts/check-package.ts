@@ -170,7 +170,18 @@ try {
     throw new Error('The supplied package bytes changed after metadata verification.')
   }
   const tarball = snapshot.path
-  validateReviewedPackageSnapshot(root, snapshot)
+  const reviewedPackage = validateReviewedPackageSnapshot(root, snapshot)
+  const observerRemnant = reviewedPackage.entries.find(
+    entry =>
+      entry.path.includes('work-observer') ||
+      (/\.(?:mjs|d\.ts)$/.test(entry.path) &&
+        /\b(?:observedArray|observedMap|observedSet|observeWork|reportWork|rethrowWorkObserverError|WorkObserver|WorkObserverError|RecordWork|BaselineWork|PayloadValidationWork|PayloadValidationHooks|PayloadValidationObservers|onWork|onEntry)\b|["'](?:active-group-read|active-group-write|active-issue-read|active-issue-write|allowed-id-write|canonical-entry|cycle-edge|duplicate-issue-read|duplicate-issue-write|duplicate-record|edge-validation|superseded-edge|payload-output-container|payload-retained-value|top-level-fact-write|top-level-entry|workflow-entry)["']/.test(
+          entry.content.toString('utf8'),
+        )),
+  )
+  if (observerRemnant !== undefined) {
+    throw new Error(`The packed package contains collection work instrumentation in ${observerRemnant.path}.`)
+  }
 
   const consumer = resolve(temporaryDirectory, 'consumer')
   mkdirSync(resolve(consumer, '.git'), { recursive: true })

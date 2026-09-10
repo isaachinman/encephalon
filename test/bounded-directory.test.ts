@@ -33,16 +33,12 @@ describe('bounded directory reader', () => {
 
   test('stops at the exact limit without probing for EOF', () => {
     const fixture = readerFor([{ name: 'first' }, { name: 'second' }])
-    let observed = 0
 
-    assert.deepEqual(
-      readBoundedDirectoryEntries(fixture.reader, 2, () => {
-        observed += 1
-      }),
-      { entries: [{ name: 'first' }, { name: 'second' }], exhausted: false },
-    )
+    assert.deepEqual(readBoundedDirectoryEntries(fixture.reader, 2), {
+      entries: [{ name: 'first' }, { name: 'second' }],
+      exhausted: false,
+    })
     assert.deepEqual(fixture.state(), { closes: 0, reads: 2 })
-    assert.equal(observed, 2)
   })
 
   test('reports exhaustion only after observing EOF', () => {

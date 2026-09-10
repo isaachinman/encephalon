@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-09-10T19:54:23.256Z",
+  "id": "ef447bf4-daae-4bdc-8c4c-0f23f64c7800",
+  "kind": "architecture",
+  "payload": {
+    "summary": "MAR-2792 removes collection work observers from the production runtime; bounded-work evidence belongs at algorithm phases or external test seams.",
+    "decisions": [
+      "Use native arrays, maps and sets. Do not reintroduce work-observer, operation labels, per-entry callbacks or observer exception translation.",
+      "Keep invocation-local canonical scan and graph phase hooks plus narrowly timed filesystem/artifact fault injection. The before-record-lstat fault and afterArtifactValidation checkpoint preserve disappearance and stale-artifact retry coverage.",
+      "Count graph target reads through test-owned supersedes arrays passed to the existing internal assertRecordGraph seam; precompute fixture bytes before wrapping. Exactly 1000 admitted edges require three linear walks; 1001 edges fail before any target reads.",
+      "Observe real baseline directory opens and injected bounded readers. Existing cache and gather phase, query and response-budget checks remain complementary.",
+      "Measure temporary payload-value retention inside the late descriptor trap, before rejection releases the buffer, using fresh unshared descriptor values and a values-only unbounded control. Post-rejection heap alone misses discarded excess allocation.",
+      "The packed-package check rejects observer modules, symbols and exact quoted collection-operation labels in JavaScript and declarations."
+    ],
+    "verification": "Targeted tests pass. Temporary extra graph traversal, repeated baseline directory enumeration, duplicated strict cache validation and uncapped payload-value retention each fail their behavioural guard; restored controls pass. Full CI and performance evidence must be checked on the reviewed head."
+  },
+  "source": "codex",
+  "subject": "runtime.performance-evidence"
+}

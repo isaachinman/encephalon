@@ -4,8 +4,8 @@ const PROPERTY_COUNT = 100_000
 const [, , mode] = process.argv
 const bounded = mode === 'bounded'
 
-if (!(bounded || mode === 'descriptor-map')) {
-  throw new Error('Expected bounded or descriptor-map mode.')
+if (!(bounded || mode === 'retained-values')) {
+  throw new Error('Expected bounded or retained-values mode.')
 }
 
 const assertInvalidPayload = (operation: () => unknown) => {
@@ -30,10 +30,27 @@ for (let index = 0; index < PROPERTY_COUNT; index += 1) {
 }
 
 const work = { descriptors: 0, ownKeys: 0 }
+const garbageCollect = (globalThis as typeof globalThis & { gc?: () => void }).gc
+if (garbageCollect === undefined) {
+  throw new Error('The allocation fixture requires --expose-gc.')
+}
+let initialHeapBytes = 0
+let retainedHeapBytes = 0
 const payload = new Proxy(target, {
   getOwnPropertyDescriptor: (object, key) => {
     work.descriptors += 1
-    return Reflect.getOwnPropertyDescriptor(object, key)
+    // Both snapshots occur after key enumeration and before rejection can release the values buffer.
+    if (work.descriptors === 1 || work.descriptors === PROPERTY_COUNT) {
+      garbageCollect()
+      const heapBytes = process.memoryUsage().heapUsed
+      if (work.descriptors === 1) {
+        initialHeapBytes = heapBytes
+      } else {
+        retainedHeapBytes = Math.max(0, heapBytes - initialHeapBytes)
+      }
+    }
+    // Fresh descriptor values have no owner outside validation, making excess retention observable.
+    return { ...Reflect.getOwnPropertyDescriptor(object, key), value: new Array(32).fill(null) }
   },
   ownKeys: object => {
     work.ownKeys += 1
@@ -59,10 +76,7 @@ Object.getOwnPropertyDescriptors = ((value: object) => {
   return originalGetOwnPropertyDescriptors(value)
 }) as typeof Object.getOwnPropertyDescriptors
 
-const garbageCollect = (globalThis as typeof globalThis & { gc?: () => void }).gc
-garbageCollect?.()
-const beforeHeapUsedBytes = process.memoryUsage().heapUsed
-let retainedDescriptors: PropertyDescriptorMap | undefined
+const retainedValues: unknown[] = []
 
 try {
   if (bounded) {
@@ -70,25 +84,22 @@ try {
     assertInvalidPayload(() => validateJsonValue(payload))
     assertInvalidPayload(() => validateJsonValue(oversizedArray))
   } else {
-    retainedDescriptors = Object.getOwnPropertyDescriptors(payload)
-    Object.getOwnPropertyDescriptors(oversizedArray)
+    for (const key of Reflect.ownKeys(payload)) {
+      retainedValues.push(Reflect.getOwnPropertyDescriptor(payload, key)?.value)
+    }
   }
 } finally {
   Object.getOwnPropertyDescriptors = originalGetOwnPropertyDescriptors
 }
 
-garbageCollect?.()
-const afterHeapUsedBytes = process.memoryUsage().heapUsed
-const retainedDescriptorCount = retainedDescriptors === undefined ? 0 : Reflect.ownKeys(retainedDescriptors).length
-
 process.stdout.write(
   `${JSON.stringify({
     descriptorMapCalls,
-    heapGrowthBytes: Math.max(0, afterHeapUsedBytes - beforeHeapUsedBytes),
     mode,
     oversizedArrayWork,
     propertyCount: PROPERTY_COUNT,
-    retainedDescriptorCount,
+    retainedHeapBytes,
+    retainedValueCount: retainedValues.length,
     work,
   })}\n`,
 )

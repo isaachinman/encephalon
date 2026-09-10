@@ -67,7 +67,7 @@ Every warmup and measured operation runs in a fresh Node child. The standalone b
 
 Results are committed in [performance-baseline.json](./performance-baseline.json). CI ceilings live in [performance-budgets.json](./performance-budgets.json), select explicit p95 total-time or maximum cache statistics, and reject incompatible or incomplete budget schemas before creating a benchmark repository.
 
-Correctness tests enforce deterministic output and bounded work counts for canonical scans, supersession graphs, and baseline accumulation. They use per-invocation internal observers and never inspect production source spelling. One isolated test also compares retained heap allocation against descriptor-map controls for payload validation; `benchmark:check` and the stable full-profile evidence own configured product wall-clock and cache-size ceilings, while isolated RSS remains diagnostic unless a budget explicitly selects it.
+Correctness tests enforce deterministic output and bounded work through narrow scan/graph/cache phase hooks, test-owned graph inputs, and injected directory readers. Baseline tests observe actual directory opens. One isolated payload fixture samples live temporary-value retention during descriptor collection against a values-only unbounded control. These guards do not inspect production source spelling or require production collection wrappers. `benchmark:check` and the stable full-profile evidence own configured product wall-clock and cache-size ceilings, while isolated RSS remains diagnostic unless a budget explicitly selects it.
 
 ## Stable baseline
 

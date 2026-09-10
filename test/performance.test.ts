@@ -5,7 +5,7 @@ import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { afterEach, describe, mock, test } from 'node:test'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
-import { addRecordResolved, assertRecordGraph, readRecordsResolved, validateRecordsResolved } from '../src/records.ts'
+import { addRecordResolved, readRecordsResolved, validateRecordsResolved } from '../src/records.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -52,109 +52,38 @@ const writeRecord = (
 }
 
 describe('hot scan performance regressions', () => {
-  test('avoids descriptor-map allocation before payload budgets', () => {
-    const run = (mode: 'bounded' | 'descriptor-map') =>
+  test('bounds retained payload values before rejecting wide objects', () => {
+    const run = (mode: 'bounded' | 'retained-values') =>
       JSON.parse(
         execFileSync(process.execPath, ['--expose-gc', payloadValidationWorkFixture, mode], {
           encoding: 'utf8',
         }),
       ) as {
         descriptorMapCalls: number
-        heapGrowthBytes: number
         mode: string
         oversizedArrayWork: { descriptors: string[]; ownKeys: number }
         propertyCount: number
-        retainedDescriptorCount: number
+        retainedHeapBytes: number
+        retainedValueCount: number
         work: { descriptors: number; ownKeys: number }
       }
 
     const bounded = run('bounded')
-    const descriptorMap = run('descriptor-map')
+    const unbounded = run('retained-values')
 
     assert.equal(bounded.descriptorMapCalls, 0)
     assert.deepEqual(bounded.work, { descriptors: bounded.propertyCount, ownKeys: 1 })
     assert.deepEqual(bounded.oversizedArrayWork, { descriptors: ['length'], ownKeys: 0 })
-    assert.equal(descriptorMap.descriptorMapCalls, 2)
-    assert.deepEqual(descriptorMap.work, {
-      descriptors: descriptorMap.propertyCount,
+    assert.equal(unbounded.descriptorMapCalls, 0)
+    assert.deepEqual(unbounded.work, {
+      descriptors: unbounded.propertyCount,
       ownKeys: 1,
     })
-    assert.deepEqual(descriptorMap.oversizedArrayWork, { descriptors: ['length'], ownKeys: 1 })
-    assert.equal(bounded.retainedDescriptorCount, 0)
-    assert.equal(descriptorMap.retainedDescriptorCount, descriptorMap.propertyCount)
-    assert.ok(descriptorMap.heapGrowthBytes > bounded.heapGrowthBytes + descriptorMap.propertyCount * 32)
+    assert.equal(unbounded.retainedValueCount, unbounded.propertyCount)
+    assert.ok(unbounded.retainedHeapBytes > bounded.retainedHeapBytes + unbounded.propertyCount * 128)
   })
 
-  test('leaves returned baseline results free of instrumentation wrappers', () => {
-    const root = createRoot()
-    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'sample-project' }))
-
-    assert.doesNotThrow(() => structuredClone(scanBaseline(root)))
-    assert.doesNotThrow(() =>
-      structuredClone(
-        scanBaselineWithHooks(root, {
-          onWork: () => undefined,
-        }),
-      ),
-    )
-  })
-
-  test('propagates internal work observer failures unchanged', () => {
-    const baselineRoot = createRoot()
-    writeFileSync(join(baselineRoot, 'package.json'), JSON.stringify({ name: 'sample-project' }))
-    const baselineFailure = new Error('baseline observer failed')
-
-    assert.throws(
-      () =>
-        scanBaselineWithHooks(baselineRoot, {
-          onWork: () => {
-            throw baselineFailure
-          },
-        }),
-      error => error === baselineFailure,
-    )
-
-    const recordsRoot = createRoot()
-    writeRecord(recordsRoot, {
-      createdAt: '2026-08-08T00:00:00.000Z',
-      id: 'observed-record',
-    })
-    const recordFailure = new Error('record observer failed')
-
-    assert.throws(
-      () =>
-        validateRecordsResolved(recordsRoot, {
-          hooks: {
-            onWork: () => {
-              throw recordFailure
-            },
-          },
-        }),
-      error => error === recordFailure,
-    )
-    assert.throws(
-      () =>
-        readRecordsResolved(recordsRoot, {
-          onWork: () => {
-            throw recordFailure
-          },
-        }),
-      error => error === recordFailure,
-    )
-
-    const records = readRecordsResolved(recordsRoot)
-    assert.throws(
-      () =>
-        assertRecordGraph(recordsRoot, records, 'Observed records are invalid.', {
-          onWork: () => {
-            throw recordFailure
-          },
-        }),
-      error => error === recordFailure,
-    )
-  })
-
-  test('bounds validation work while preserving dense-history issue order', () => {
+  test('preserves dense-history issue order and allowed active heads', () => {
     const root = createRoot()
     writeRecord(root, {
       createdAt: '2026-08-08T00:00:00.000Z',
@@ -176,12 +105,7 @@ describe('hot scan performance regressions', () => {
       supersedes: ['history-001'],
     })
 
-    const validationWork = new Map<string, number>()
-    const result = validateRecordsResolved(root, {
-      hooks: {
-        onWork: operation => validationWork.set(operation, (validationWork.get(operation) ?? 0) + 1),
-      },
-    })
+    const result = validateRecordsResolved(root)
 
     assert.deepEqual(result, {
       errors: [
@@ -203,56 +127,10 @@ describe('hot scan performance regressions', () => {
       valid: false,
     })
 
-    assert.deepEqual(Object.fromEntries(validationWork), {
-      'active-group-read': 2,
-      'active-group-write': 2,
-      'active-issue-read': 2,
-      'active-issue-write': 2,
-      'canonical-entry': 4,
-      'cycle-edge': 3,
-      'duplicate-record': 4,
-      'edge-validation': 3,
-      'superseded-edge': 3,
-    })
-
-    const allowedWork = new Map<string, number>()
     assert.equal(
-      readRecordsResolved(
-        root,
-        {
-          onWork: operation => allowedWork.set(operation, (allowedWork.get(operation) ?? 0) + 1),
-        },
-        [{ kind: 'context', source: 'test', subject: 'dense.history' }],
-      ).length,
+      readRecordsResolved(root, {}, [{ kind: 'context', source: 'test', subject: 'dense.history' }]).length,
       4,
     )
-    assert.equal(allowedWork.get('allowed-group-write') ?? 0, 0, 'allowed heads must reuse the accepted active groups')
-    assert.equal(allowedWork.get('allowed-id-write'), 2, 'allowed id work exceeded accepted active records')
-  })
-
-  test('counts duplicate issue accumulator work from collection operations', () => {
-    const root = createRoot()
-    writeRecord(root, {
-      createdAt: '2026-08-08T00:00:00.000Z',
-      id: 'duplicate-record',
-      kind: 'context',
-    })
-    writeRecord(root, {
-      createdAt: '2026-08-08T00:00:01.000Z',
-      id: 'duplicate-record',
-      kind: 'decision',
-    })
-
-    const work = new Map<string, number>()
-    const result = validateRecordsResolved(root, {
-      hooks: {
-        onWork: operation => work.set(operation, (work.get(operation) ?? 0) + 1),
-      },
-    })
-
-    assert.equal(result.errors[0]?.code, 'DUPLICATE_RECORD_ID')
-    assert.equal(work.get('duplicate-issue-read'), 1)
-    assert.equal(work.get('duplicate-issue-write'), 1)
   })
 
   test('stable canonical snapshot work is one scan and graph pass for 0, 100, and 1,000 records', () => {
@@ -264,7 +142,7 @@ describe('hot scan performance regressions', () => {
           id: `stable-work-${index.toString().padStart(4, '0')}`,
         }),
       )
-      const work = { canonicalEntries: 0, canonicalScans: 0, graphValidations: 0 }
+      const work = { canonicalScans: 0, graphValidations: 0 }
 
       const result = validateRecordsResolved(root, {
         hooks: {
@@ -274,17 +152,11 @@ describe('hot scan performance regressions', () => {
           graphValidation: () => {
             work.graphValidations += 1
           },
-          onWork: operation => {
-            if (operation === 'canonical-entry') {
-              work.canonicalEntries += 1
-            }
-          },
         },
       })
 
       assert.equal(result.recordsChecked, recordCount)
       assert.deepEqual(work, {
-        canonicalEntries: recordCount,
         canonicalScans: 1,
         graphValidations: 1,
       })
@@ -304,7 +176,7 @@ describe('hot scan performance regressions', () => {
           ...(index === 0 ? {} : { supersedes: [`stable-add-${(index - 1).toString().padStart(4, '0')}`] }),
         }),
       )
-      const work = { canonicalEntries: 0, canonicalScans: 0, graphValidations: 0 }
+      const work = { canonicalScans: 0, graphValidations: 0 }
       const add = () =>
         addRecordResolved(
           root,
@@ -327,11 +199,6 @@ describe('hot scan performance regressions', () => {
               graphValidation: () => {
                 work.graphValidations += 1
               },
-              onWork: operation => {
-                if (operation === 'canonical-entry') {
-                  work.canonicalEntries += 1
-                }
-              },
             },
           },
         )
@@ -345,7 +212,6 @@ describe('hot scan performance regressions', () => {
         })
       }
       assert.deepEqual(work, {
-        canonicalEntries: recordCount,
         canonicalScans: 1,
         graphValidations: 1,
       })
@@ -364,7 +230,7 @@ describe('hot scan performance regressions', () => {
       )
       const firstRecordPath = join(root, 'encephalon', 'context', 'retry-work-0000.json')
       const firstRecordMetadata = recordCount === 0 ? undefined : statSync(firstRecordPath)
-      const work = { canonicalEntries: 0, canonicalScans: 0, graphValidations: 0 }
+      const work = { canonicalScans: 0, graphValidations: 0 }
 
       const result = validateRecordsResolved(root, {
         hooks: {
@@ -385,17 +251,11 @@ describe('hot scan performance regressions', () => {
               }
             }
           },
-          onWork: operation => {
-            if (operation === 'canonical-entry') {
-              work.canonicalEntries += 1
-            }
-          },
         },
       })
 
       assert.equal(result.recordsChecked, recordCount)
       assert.deepEqual(work, {
-        canonicalEntries: recordCount * 2,
         canonicalScans: 2,
         graphValidations: 2,
       })
@@ -433,12 +293,10 @@ describe('hot scan performance regressions', () => {
         }
       }
       let attempts = 0
-      const work = new Map<string, number>()
       const observed = scanBaselineWithHooks(root, {
         afterBaselineSources: () => {
           attempts += 1
         },
-        onWork: operation => work.set(operation, (work.get(operation) ?? 0) + 1),
       })
 
       assert.equal(attempts, 1)
@@ -471,11 +329,6 @@ describe('hot scan performance regressions', () => {
           },
         ],
       )
-      assert.deepEqual(Object.fromEntries(work), {
-        'top-level-entry': 6,
-        'top-level-fact-write': 4,
-        'workflow-entry': 1,
-      })
       assert.deepEqual(
         directoryReads.mock.calls.map(call => call.arguments[0]),
         [canonicalRoot, join(canonicalRoot, '.github', 'workflows')],
