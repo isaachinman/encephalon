@@ -4,6 +4,40 @@ Encephalon keeps canonical records in JSON and rebuilds a disposable SQLite/FTS 
 
 ## Commands
 
+For a local comparison, use two exact commits with the base contained in the candidate:
+
+```bash
+node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA /tmp/encephalon-comparison
+```
+
+The output directory must be new. The default command runs the complete comparison sequentially for local investigation. One Node executable measures both revisions, with two discarded warmups and twenty measured samples per operation. Each adjacent base/candidate pair alternates AB/BA; samples never overlap. Twenty samples give nearest-rank p95 its own position below the maximum. Do not run tests or builds concurrently on that machine. A fourth argument selects a fixed repetition count of at least three for diagnostics.
+
+CI partitions the complete corpus/operation matrix into twelve independent `ubuntu-24.04-arm` Linux jobs: `empty`, `empty-cold`, `small`, `small-cold`, `medium`, `medium-maximum`, `large-gather`, `large-payload`, `large-maximum`, `large-preparation`, `large-reads`, and `large-validation`. Each job runs every sample for its assigned operations against both revisions on the same runner. The dedicated `empty-cold` and `small-cold` shards measure only cold hydration with 100 samples per revision; every other operation and packed startup check retains twenty. All shards discard two warmups. This larger fixed sample count reduces the sensitivity of the tiny-case p95 estimate to two observations; it does not remove observations or change thresholds. No timing samples are pooled across machines or architectures. x64 Linux correctness remains covered separately. Reproduce one shard with:
+
+```bash
+node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA /tmp/large-gather 20 large-gather
+node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA /tmp/empty-cold 100 empty-cold
+node scripts/benchmark-compare.ts BASE_SHA CANDIDATE_SHA /tmp/small-cold 100 small-cold
+```
+
+Each revision prepares its own immutable fixture snapshots once. Short-lived revision-bound controllers restore a separate working fixture for each operation. An explicit allowlist of prepared read/validation operations reuses that fixture across fresh measurement workers; cold hydrate, unchanged prepare and stale prepare restore their required state before every sample. After a reusable worker exits, its empty WAL and transient shared-memory index are removed; a nonempty WAL fails the comparison. Canonical and database bytes remain stable. This measures warm filesystem/prepared state, not cold operating-system caches. The `empty` shard alone builds and packs pristine revisions before applying the common harness, and owns package sizes and packed startup checks; source-only shards avoid unnecessary package builds. All shards retain raw samples and their `base.json`, `candidate.json`, and `comparison.json`. The aggregate requires all twelve declared shards, exact revisions, common harness and fixture identities, the declared per-shard sample counts, and matching runtime settings; each shard retains its own runner and CPU identity. Every comparison must pass, including cache-byte comparisons repeated where a corpus spans shards.
+
+On Linux, fixture setup finishes with GNU `sync --file-system` before the measured worker starts. This drains setup writes once for reused fixtures and before each restored sample. The operation's own SQLite writes and filesystem synchronisation remain inside its wall-clock measurement.
+
+After downloading this workflow attempt's `performance-ATTEMPT-*` shard artifacts into separate directories, reproduce aggregation with:
+
+```bash
+node scripts/benchmark-aggregate.ts performance-reports BASE_SHA CANDIDATE_SHA ATTEMPT
+```
+
+The complete CI workflow must finish under ten minutes. Work runs in parallel with nine-minute job backstops and one-minute final gates; actual end-to-end duration must be verified rather than inferred from timeouts. Short Windows groups enter the runner queue after package construction so they do not delay the long performance and correctness jobs. All workflow actions are pinned to immutable commits. Windows compatibility fixtures run in three independent groups. Package and cache tests run separately from the remaining correctness tests. Windows benchmark tests are partitioned into prepared-session preservation, raw-report cleanup, CLI publication and remaining tests, with every test selected exactly once. The benchmark smoke check runs independently rather than following the Linux correctness suite. Platform correctness coverage remains complete. Package construction starts alongside verification, and consumers check identical retained package bytes in parallel. macOS and Windows have no required wall-clock performance thresholds.
+
+Every operation independently permits at most 15% median latency regression, 25% nearest-rank p95 latency regression, and 20% peak RSS regression. Cache bytes, emitted JavaScript bytes, declaration bytes, and packed archive bytes permit at most 10% regression. Equality passes. Zero-to-positive increases fail. Comparisons use unrounded samples, reject incomplete or incompatible evidence, and never adjust thresholds automatically. Reports identify both commits, the common harness hash, fixture hashes, runtime, architecture, CPU, sample configuration, raw samples, ranges, population variances, and each metric's values and differences. Peak RSS is the maximum worker-lifetime high-water mark across samples.
+
+The comparison requires empty, one-record, 100-record and 1,000-record cases. Named operations expose `largePayloadSearch`, `maximumPayloadSearch`, `payloadOnlySearch`, `missingSearch`, `listMaximum`, `validateArtifacts`, and `strictCacheValidation` alongside the existing operations. The 1,000-record mixed corpus references 100 distinct artifacts beneath their record-owned directories and shared ancestors. The two maximum-payload search cases replace the final small record with an exactly 1 MiB canonical record including 256 KiB of search text; the deep payload token appears only in payload data. Other operations retain the original mixed corpus so maximum-limit list remains within the independent response budget. The isolated strict-cache operation performs a one-result read and retains separate integrity/query timing and peak RSS.
+
+CLI startup runs `--help` and `--version` from each extracted package's declared executable, validates output, and measures complete process lifetime without npm/npx overhead. Package sizes come from those exact archives. All subprocesses retain independent hard timeouts; the existing absolute ceilings below remain generous runaway guards and do not constitute relative performance approval. “Cold hydrate” means an absent disposable application cache, not an artificially cold operating-system filesystem cache.
+
 Generate the committed stable baseline:
 
 ```bash
@@ -26,7 +60,7 @@ Repeated `--records` values create a `custom` profile. `--warmups`, `--repetitio
 
 Each non-empty deterministic corpus contains small records, large payloads, referenced artifacts, and a supersession chain. The benchmark measures cold hydrate, unchanged prepare, stale prepare, list, show, compact search, full search, and gather. Gather emits the public maxima of 64 shows drawn from two repeated exact IDs and 16 searches drawn from two repeated exact queries, so its measured work includes duplicate projection and response charging without repeating the SQLite reads. A zero-record corpus has no meaningful stale mutation, so `stalePrepare` is `null` for that case.
 
-Every warmup and measured operation runs in a fresh Node child after the parent restores the exact unprepared or prepared repository state. Because copying changes canonical filesystem metadata, the parent re-prepares every restored non-cold sample before measurement and applies the different-length stale mutation only afterward. Warmups are discarded. Measured samples retain execution order and report count, maximum, median, and nearest-rank p95. Read operations split their total into preparation/integrity, query/projection, and bounded return overhead; those unrounded per-sample phases add to the total. Summary values are rounded to three decimal places.
+Every warmup and measured operation runs in a fresh Node child. The standalone baseline controller restores the exact unprepared or prepared repository state before each child; the paired comparison reuses an operation's prepared working fixture. Because copying changes canonical filesystem metadata, controllers re-prepare restored non-cold fixtures before measurement and apply the different-length stale mutation only afterward. Both modes restore cold and stale samples independently. Warmups are discarded. Measured samples retain execution order and report count, maximum, median, and nearest-rank p95. Read operations split their total into preparation/integrity, query/projection, and bounded return overhead; those unrounded per-sample phases add to the total. Summary values are rounded to three decimal places.
 
 `peakRssBytes` is the isolated child's lifetime `process.resourceUsage().maxRSS`, converted from KiB to bytes. It includes Node and module startup but cannot inherit a previous benchmark operation's peak. `rssDeltaBytes` is the signed change in current RSS within that child and is diagnostic rather than budgeted.
 

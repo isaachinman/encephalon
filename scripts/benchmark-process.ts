@@ -1,5 +1,6 @@
 import { fork } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { terminateBenchmarkTree } from './benchmark-command.ts'
 import type { BenchmarkOperation, BenchmarkWorkerResult } from './benchmark-model.ts'
 
 type RunBenchmarkWorkerOptions = {
@@ -50,6 +51,7 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
   }
   const nonce = randomUUID()
   const child = fork(options.workerPath, [], {
+    detached: process.platform !== 'win32',
     env: { ...process.env, NODE_OPTIONS: undefined, NODE_PATH: undefined },
     execArgv: [],
     serialization: 'json',
@@ -58,21 +60,34 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
   let messages = 0
   let result: BenchmarkWorkerResult | undefined
   let standardOutputBytes = 0
+  let standardError = Buffer.alloc(0)
   let timedOut = false
   let aborted = false
   let childError: Error | undefined
   let sendError: Error | undefined
+  let cleanupFailed = false
+
+  const terminate = () => {
+    try {
+      terminateBenchmarkTree(child)
+    } catch {
+      cleanupFailed = true
+      child.kill('SIGKILL')
+    }
+  }
 
   const abort = () => {
     aborted = true
-    child.kill('SIGKILL')
+    terminate()
   }
   options.signal?.addEventListener('abort', abort, { once: true })
 
   child.stdout?.on('data', chunk => {
     standardOutputBytes = Math.min(maximumOutputBytes, standardOutputBytes + Buffer.byteLength(chunk as Buffer))
   })
-  child.stderr?.on('data', () => undefined)
+  child.stderr?.on('data', (chunk: Buffer) => {
+    standardError = Buffer.concat([standardError, chunk]).subarray(-maximumOutputBytes)
+  })
   child.on('message', value => {
     messages += 1
     if (messages === 1 && isValidWorkerResult(value, nonce)) {
@@ -91,7 +106,7 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
   })
   const timeout = setTimeout(() => {
     timedOut = true
-    child.kill('SIGKILL')
+    terminate()
   }, options.timeoutMilliseconds)
 
   try {
@@ -105,6 +120,9 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
       sendError = error instanceof Error ? error : new Error('Unknown IPC send failure.')
     }
     const closed = await close
+    if (cleanupFailed) {
+      throw new Error(`${workerContext(options)} process-tree cleanup failed.`)
+    }
     if (timedOut) {
       throw new Error(`${workerContext(options)} timed out after ${options.timeoutMilliseconds} ms.`)
     }
@@ -117,7 +135,10 @@ export const runBenchmarkWorker = async (options: RunBenchmarkWorkerOptions): Pr
     if (closed.code !== 0 || closed.signal !== null) {
       const exit = closed.signal === null ? `code ${String(closed.code)}` : `signal ${closed.signal}`
       const timing = messages === 0 ? 'before' : 'after'
-      throw new Error(`${workerContext(options)} exited with ${exit} ${timing} producing a result.`)
+      const diagnostic = standardError.toString('utf8').trim()
+      throw new Error(
+        `${workerContext(options)} exited with ${exit} ${timing} producing a result.${diagnostic ? ` ${diagnostic}` : ''}`,
+      )
     }
     if (messages > 1) {
       throw new Error(`${workerContext(options)} returned more than one worker result.`)

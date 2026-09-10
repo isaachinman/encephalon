@@ -2862,7 +2862,11 @@ describe('initialisation', () => {
       beforeTopLevelRevalidation: () => {
         attempts += 1
         if (attempts === 1) {
+          const before = statSync(root)
           writeFileSync(join(root, 'transient-top-level-entry'), '')
+          // Directory timestamp updates may be coalesced on Windows; force the rejected generation.
+          utimesSync(root, before.atime, new Date(before.mtimeMs + 1000))
+          assert.notEqual(statSync(root).mtimeMs, before.mtimeMs)
         }
       },
     })

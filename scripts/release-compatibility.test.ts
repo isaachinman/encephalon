@@ -953,6 +953,110 @@ try {
     }
   })
 
+  test('drains descendants missed by the first group signal before reporting timeout', {
+    skip: process.platform === 'win32' ? 'Exercises POSIX process-group signalling.' : false,
+  }, () => {
+    for (const stdio of ['ignore', 'inherit']) {
+      const directory = mkdtempSync(resolve(tmpdir(), 'encephalon-release-group-race-'))
+      const ready = resolve(directory, 'ready')
+      const release = resolve(directory, 'release')
+      const expired = resolve(directory, 'expired')
+      const sentinel = resolve(directory, 'late-mutation')
+      const descendant = resolve(directory, 'descendant.mjs')
+      const parent = resolve(directory, 'parent.mjs')
+      const wrapper = resolve(directory, 'wrapper.mjs')
+      try {
+        writeFileSync(
+          descendant,
+          `import { existsSync, writeFileSync } from 'node:fs'
+writeFileSync(${JSON.stringify(ready)}, String(process.pid))
+setInterval(() => {
+  if (existsSync(${JSON.stringify(release)})) {
+    writeFileSync(${JSON.stringify(sentinel)}, 'post-return mutation')
+    process.exit()
+  }
+}, 10)
+setTimeout(() => { writeFileSync(${JSON.stringify(expired)}, 'fixture expired'); process.exit(92) }, 5000)
+`,
+        )
+        writeFileSync(
+          parent,
+          `import { spawn } from 'node:child_process'
+spawn(process.execPath, [${JSON.stringify(descendant)}], { stdio: ${JSON.stringify(stdio)} })
+setInterval(() => {}, 1000)
+`,
+        )
+        writeFileSync(
+          wrapper,
+          `import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
+const kill = process.kill.bind(process)
+let missed = false
+process.kill = (pid, signal) => {
+  if (!missed && pid < 0 && signal === 'SIGKILL') {
+    assert.equal(existsSync(${JSON.stringify(ready)}), true, 'descendant must be live before the injected missed signal')
+    missed = true
+    return kill(-pid, signal)
+  }
+  return kill(pid, signal)
+}
+await import(${JSON.stringify(pathToFileURL(resolve(import.meta.dirname, 'bounded-process-supervisor.mjs')).href)})
+`,
+        )
+        const request = Buffer.from(
+          JSON.stringify({
+            arguments: [parent],
+            cwd: directory,
+            executable: process.execPath,
+            maximumOutputBytes: 4096,
+            timeoutMilliseconds: 1000,
+          }),
+        ).toString('base64url')
+        const result = spawnSync(process.execPath, [wrapper, request], {
+          encoding: 'utf8',
+          timeout: 8000,
+        })
+        assert.equal(result.status, 0, `${result.stdout}${result.stderr}${String(result.error ?? '')}`)
+        assert.equal(JSON.parse(result.stdout).timedOut, true)
+        assert.equal(existsSync(ready), true)
+        assert.equal(existsSync(expired), false)
+        writeFileSync(release, 'wrapper returned')
+        const observed = spawnSync(
+          process.execPath,
+          ['--input-type=module', '--eval', 'await new Promise(resolve => setTimeout(resolve, 400))'],
+          { timeout: 2000 },
+        )
+        assert.equal(observed.status, 0)
+        assert.equal(existsSync(sentinel), false, `${stdio}: descendant mutated after timeout returned`)
+        const processes = spawnSync('ps', ['-A', '-o', 'pid=,stat='], { encoding: 'utf8', timeout: 2000 })
+        assert.equal(processes.status, 0, processes.stderr)
+        const descendantPid = readFileSync(ready, 'utf8')
+        assert.equal(
+          processes.stdout
+            .trim()
+            .split('\n')
+            .some(line => {
+              const [pid, state] = line.trim().split(/\s+/)
+              return pid === descendantPid && !state?.startsWith('Z')
+            }),
+          false,
+          `${stdio}: descendant must be absent or zombie after return`,
+        )
+        assert.equal(existsSync(expired), false)
+      } finally {
+        // Failure cleanup happens only after the assertions; it cannot make the supervisor pass.
+        if (existsSync(ready)) {
+          try {
+            process.kill(Number(readFileSync(ready, 'utf8')), 'SIGKILL')
+          } catch (error) {
+            assert.equal((error as NodeJS.ErrnoException).code, 'ESRCH')
+          }
+        }
+        rmSync(directory, { force: true, recursive: true })
+      }
+    }
+  })
+
   test('applies explicit environments and output bounds to npm subprocesses', () => {
     const poisoned = spawnNpmCommand(['--version'], {
       cwd: resolve(import.meta.dirname, '..'),
@@ -1364,7 +1468,9 @@ describe('release compatibility process fixture', () => {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
+})
 
+describe('release compatibility process fixture group B', () => {
   test('rejects package self-rewrite, probe tamper, and unrelated per-phase side effects', {
     timeout: compatibilityRegressionTimeout,
   }, () => {
@@ -1470,7 +1576,9 @@ describe('release compatibility process fixture', () => {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
+})
 
+describe('release compatibility process fixture group C', () => {
   test('rejects candidate independent-budget drift that result-limit checks cannot observe', {
     timeout: compatibilityIntegrationTimeout,
   }, () => {
@@ -1596,7 +1704,9 @@ describe('release compatibility process fixture', () => {
       rmSync(temporaryRoot, { force: true, recursive: true })
     }
   })
+})
 
+describe('release compatibility process fixture group A preloads', () => {
   test('removes preload variables from npm and every installed-package child process', {
     timeout: compatibilityIntegrationTimeout,
   }, () => {

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import {
   chmodSync,
@@ -18,9 +19,12 @@ import { join } from 'node:path'
 import { describe, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
+  createBenchmarkSession,
   makePreparedRepositoryStale,
+  prepareBenchmarkSessionOperation,
   removeBenchmarkRoots,
   restoreBenchmarkSample,
+  reusablePreparedOperations,
   runBenchmark,
 } from '../scripts/benchmark.ts'
 import {
@@ -41,6 +45,72 @@ const realWorker = join(import.meta.dirname, '..', 'scripts', 'benchmark-worker.
 const realWorkerExitTimeoutMilliseconds = process.platform === 'win32' ? 10_000 : 5000
 const benchmarkScript = join(import.meta.dirname, '..', 'scripts', 'benchmark.ts')
 const privateRenameGuard = join(import.meta.dirname, 'fixtures', 'require-private-benchmark-rename.ts')
+
+test('prepared operation sessions reuse stable files while fresh workers preserve canonical and cache bytes', async () => {
+  const parent = mkdtempSync(join(tmpdir(), 'encephalon-prepared-session-test-'))
+  try {
+    const session = createBenchmarkSession(4, parent)
+    const snapshot = () => {
+      const canonical = join(session.sampleRoot, 'encephalon')
+      const cache = join(session.sampleRoot, 'node_modules', '.cache', 'encephalon')
+      const paths = [
+        ...readdirSync(canonical, { recursive: true, withFileTypes: true })
+          .filter(entry => entry.isFile())
+          .map(entry => join(entry.parentPath, entry.name)),
+        ...readdirSync(cache)
+          .filter(name => name.startsWith('brain.sqlite'))
+          .map(name => join(cache, name)),
+      ].sort()
+      return paths.map(path => {
+        const { ino, mtimeMs, mode } = statSync(path)
+        return { ino, mode, mtimeMs, path, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') }
+      })
+    }
+    for (const operation of reusablePreparedOperations) {
+      const templates = prepareBenchmarkSessionOperation(session, operation)
+      const before = snapshot()
+      for (const repetition of [1, 2]) {
+        // biome-ignore lint/performance/noAwaitInLoops: prove fresh workers preserve every allowlisted operation fixture.
+        const report = await runBenchmark(['--records', '4', '--warmups', '0', '--repetitions', '1'], {
+          operations: [operation],
+          templates,
+        })
+        const measured = report.cases[0]?.operations[operation]
+        assert.ok(measured)
+        assert.equal(measured.totalMs.count, 1, `${operation}:${repetition}`)
+        assert.deepEqual(snapshot(), before, `${operation}:${repetition}`)
+      }
+    }
+    const stale = prepareBenchmarkSessionOperation(session, 'stalePrepare')
+    assert.equal(stale.preparedOperation, undefined)
+  } finally {
+    rmSync(parent, { force: true, recursive: true })
+  }
+})
+
+test('reused benchmark snapshots preserve cold and stale preconditions across samples', async () => {
+  const parent = mkdtempSync(join(tmpdir(), 'encephalon-session-test-'))
+  try {
+    const templates = createBenchmarkSession(1, parent)
+    const record = join('encephalon', 'decision', 'chain-00000.json')
+    const preparedRecord = readFileSync(join(templates.prepared, record))
+    const database = join(templates.prepared, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+    const preparedDatabase = readFileSync(database)
+    for (const operation of ['coldHydrate', 'stalePrepare', 'unchangedPrepare', 'stalePrepare'] as const) {
+      // biome-ignore lint/performance/noAwaitInLoops: exercise repeated restoration of the same sample root.
+      const report = await runBenchmark(['--records', '1', '--warmups', '0', '--repetitions', '1'], {
+        operations: [operation],
+        templates,
+      })
+      assert.equal(report.cases[0]?.operations[operation]?.totalMs.count, 1)
+      assert.deepEqual(readFileSync(join(templates.prepared, record)), preparedRecord)
+      assert.deepEqual(readFileSync(database), preparedDatabase)
+      assert.deepEqual(readFileSync(join(templates.unprepared, record)), preparedRecord)
+    }
+  } finally {
+    rmSync(parent, { force: true, recursive: true })
+  }
+})
 
 const privateFileModesSupported = (() => {
   const root = mkdtempSync(join(tmpdir(), 'encephalon-private-mode-probe-'))
@@ -85,10 +155,17 @@ const operations = (
   compactSearch: null,
   fullSearch: null,
   gather: null,
+  largePayloadSearch: null,
   list: null,
+  listMaximum: null,
+  maximumPayloadSearch: null,
+  missingSearch: null,
+  payloadOnlySearch: null,
   show: null,
   stalePrepare: null,
+  strictCacheValidation: null,
   unchangedPrepare: null,
+  validateArtifacts: null,
   ...overrides,
 })
 
@@ -418,7 +495,7 @@ describe('isolated benchmark authority', () => {
         timeoutMilliseconds: 2000,
         workerPath: fixtureWorker,
       }),
-      /Benchmark fullSearch for 0 records exited with code 23 before producing a result\./,
+      /Benchmark fullSearch for 0 records exited with code 23 before producing a result\. fixture worker diagnostic/,
     )
     await assert.rejects(
       runBenchmarkWorker({
@@ -538,6 +615,17 @@ describe('isolated benchmark authority', () => {
       assert.equal(result.operations.stalePrepare, null)
       assert.equal(result.operations.coldHydrate?.totalMs.count, 1)
       assert.equal(result.operations.coldHydrate?.totalMs.samples.length, 1)
+      for (const operation of [
+        'largePayloadSearch',
+        'maximumPayloadSearch',
+        'payloadOnlySearch',
+        'missingSearch',
+        'listMaximum',
+        'validateArtifacts',
+        'strictCacheValidation',
+      ]) {
+        assert.equal(Reflect.get(result.operations, operation)?.totalMs.count, 1)
+      }
       assert.deepEqual(readdirSync(temporaryParent), [])
     } finally {
       rmSync(temporaryParent, { force: true, recursive: true })

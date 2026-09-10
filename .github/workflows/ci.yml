@@ -7,7 +7,7 @@ on:
   pull_request:
     branches:
       - main
-    types: [opened, reopened, synchronize, edited]
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: read
@@ -17,8 +17,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: verify (${{ matrix.context }})
+  correctness:
+    name: correctness (${{ matrix.context }})
+    timeout-minutes: 9
     strategy:
       fail-fast: false
       matrix:
@@ -37,44 +38,170 @@ jobs:
             node: 26
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24.15.0
       - run: node ./scripts/check-generated-version.ts
       - if: matrix.context == 'ubuntu-current'
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ matrix.node }}
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run typecheck
-      - run: bun run test
+      - run: bun run build
+      - run: node scripts/test-ci.ts ${{ matrix.context == 'windows-latest' && 'main' || 'all' }}
       - run: bun run lint
-      - run: bun run benchmark:check
 
-  package:
-    name: Build exact package candidate
-    needs: verify
+  benchmark-smoke:
+    name: Benchmark smoke checks
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24.15.0
-      - run: node ./scripts/check-generated-version.ts
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
-      - run: node ./scripts/check-worktree-clean.ts
-      - run: bun run test
+      - run: bun run build
+      - run: bun run benchmark:check
+
+  compatibility:
+    name: compatibility (windows-latest, ${{ matrix.group }})
+    # Admit the short Windows groups after the long jobs have entered the runner queue.
+    needs: package
+    timeout-minutes: 9
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [compatibility-a, compatibility-b, compatibility-c, package, benchmark, benchmark-sessions, benchmark-report, benchmark-cli, cache]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.1
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run build
+      - run: node scripts/test-ci.ts ${{ matrix.group }}
+
+  performance:
+    name: performance (${{ matrix.shard }})
+    timeout-minutes: 9
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [empty, empty-cold, small, small-cold, medium, medium-maximum, large-gather, large-payload, large-maximum, large-preparation, large-reads, large-validation]
+        include:
+          - shard: empty-cold
+            repetitions: 100
+          - shard: small-cold
+            repetitions: 100
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.15.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.1
+      - name: Compare matched operation samples
+        env:
+          BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports ${{ matrix.repetitions || 20 }} ${{ matrix.shard }}
+      - name: Retain performance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: performance-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: performance-reports
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    name: verify (${{ matrix.context }})
+    needs: [correctness, compatibility, benchmark-smoke, performance]
+    if: always()
+    timeout-minutes: 1
+    strategy:
+      matrix:
+        context: [ubuntu-latest, macos-latest, windows-latest, ubuntu-current]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every verification job to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: node -e 'if (!Object.values(JSON.parse(process.env.RESULTS)).every(job => job.result === "success")) process.exit(1)'
+      - if: matrix.context == 'ubuntu-latest'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - if: matrix.context == 'ubuntu-latest'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.15.0
+      - if: matrix.context == 'ubuntu-latest'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: performance-${{ github.run_attempt }}-*
+          path: performance-reports
+      - if: matrix.context == 'ubuntu-latest'
+        env:
+          BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node scripts/benchmark-aggregate.ts performance-reports "$BASE_COMMIT" "$CANDIDATE_COMMIT" ${{ github.run_attempt }}
+      - if: always() && matrix.context == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: comparison-${{ github.run_attempt }}
+          path: performance-reports/comparison.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  package:
+    name: Build exact package candidate
+    timeout-minutes: 9
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.15.0
+      - run: node ./scripts/check-generated-version.ts
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.1
+      - run: bun install --frozen-lockfile --ignore-scripts
       - run: node ./scripts/check-worktree-clean.ts
       - run: bun run build
       - run: node ./scripts/check-worktree-clean.ts
@@ -86,9 +213,9 @@ jobs:
       - run: node ./scripts/check-worktree-clean.ts --allow-package-artifacts
       - run: node ./scripts/check-package-metadata.ts
       - name: Upload exact package candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: encephalon-npm-package
+          name: encephalon-npm-package-${{ github.run_attempt }}
           path: |
             package-artifacts/encephalon-0.3.0.tgz
             package-artifacts/encephalon-0.3.0.tgz.metadata.json
@@ -98,6 +225,7 @@ jobs:
   candidate:
     name: candidate (Node ${{ matrix.node }})
     needs: package
+    timeout-minutes: 9
     strategy:
       fail-fast: false
       matrix:
@@ -106,25 +234,26 @@ jobs:
           - 26
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24.15.0
       - run: node ./scripts/check-generated-version.ts
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ matrix.node }}
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run build
       - run: node ./scripts/check-worktree-clean.ts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: encephalon-npm-package
+          name: encephalon-npm-package-${{ github.run_attempt }}
           path: package-artifacts
       - run: node ./scripts/check-package-metadata.ts
       - name: Recheck exact package candidate
@@ -133,27 +262,29 @@ jobs:
           NODE_PATH: ''
         run: node ./scripts/check-package.ts --tarball package-artifacts/encephalon-0.3.0.tgz
 
-  release:
-    name: Release-equivalent package gate
-    needs: candidate
+  release-checks:
+    name: Release-equivalent package checks
+    needs: package
+    timeout-minutes: 9
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24.15.0
       - run: node ./scripts/check-generated-version.ts
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run build
       - run: node ./scripts/check-worktree-clean.ts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: encephalon-npm-package
+          name: encephalon-npm-package-${{ github.run_attempt }}
           path: package-artifacts
       - run: node ./scripts/check-package-metadata.ts
       - name: Recheck exact package candidate
@@ -171,3 +302,14 @@ jobs:
           NODE_OPTIONS: ''
           NODE_PATH: ''
         run: node ./scripts/check-publish.ts package-artifacts/encephalon-0.3.0.tgz
+
+  release:
+    name: Release-equivalent package gate
+    needs: [candidate, release-checks, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: node -e 'if (!Object.values(JSON.parse(process.env.RESULTS)).every(job => job.result === "success")) process.exit(1)'

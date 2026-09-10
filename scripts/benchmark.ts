@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   closeSync,
   cpSync,
@@ -8,6 +9,7 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -19,7 +21,7 @@ import { cpus, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { hydrate, prepare } from '../src/index.ts'
-import { formatRecordFile } from '../src/schema.ts'
+import { formatRecordFile, MAX_RECORD_BYTES } from '../src/schema.ts'
 import type { BrainRecordFile } from '../src/types.ts'
 import {
   assertPerformanceBudget,
@@ -44,16 +46,21 @@ type CorpusFacts = {
   largePayloads: number
   records: number
   supersessionDepth: number
+  fixtureSha256?: string
+  maximumFixtureSha256?: string
 }
 
-type CaseTemplates = {
+export type CaseTemplates = {
   corpus: CorpusFacts
   prepared: string
+  preparedOperation?: BenchmarkOperation | undefined
   sampleRoot: string
   unprepared: string
 }
 
 type BenchmarkControllerOptions = {
+  operations?: readonly BenchmarkOperation[]
+  templates?: CaseTemplates
   afterTemporaryRepositoryAllocation?: ((phase: 'repository' | 'snapshot') => void) | undefined
   removeRoot?: ((path: string) => void) | undefined
   signal?: AbortSignal
@@ -62,6 +69,8 @@ type BenchmarkControllerOptions = {
 }
 
 type ResolvedBenchmarkControllerOptions = {
+  operations: readonly BenchmarkOperation[]
+  templates: CaseTemplates | undefined
   afterTemporaryRepositoryAllocation: ((phase: 'repository' | 'snapshot') => void) | undefined
   removeRoot: (path: string) => void
   signal: AbortSignal | undefined
@@ -188,6 +197,49 @@ const writeRecord = (root: string, record: BrainRecordFile) => {
 
 const largeText = (index: number) =>
   Array.from({ length: 96 }, (_, offset) => `large-payload-${index}-${offset}`).join(' ')
+
+const maximumRecord = (createdAt: string, id: string): BrainRecordFile => {
+  const payload = { body: '', deep: { marker: 'deepuniqueneedle' }, summary: 'Maximum preview' }
+  const record: BrainRecordFile = {
+    createdAt,
+    id,
+    kind: 'context',
+    payload,
+    searchText: `${'maximum preview '.repeat(17_477).slice(0, 256 * 1024 - 1)}x`,
+    source: 'benchmark',
+    subject: 'benchmark.maximum',
+  }
+  const remaining = MAX_RECORD_BYTES - Buffer.byteLength(formatRecordFile(record))
+  return {
+    ...record,
+    payload: {
+      ...payload,
+      body: 'x '.repeat(Math.ceil(remaining / 2)).slice(0, remaining),
+    },
+  }
+}
+
+const fixtureFingerprint = (root: string): string => {
+  const hash = createHash('sha256')
+  const visit = (relativePath: string) => {
+    for (const entry of readdirSync(join(root, relativePath), { withFileTypes: true }).sort(
+      (left, right) => Number(left.name > right.name) - Number(left.name < right.name),
+    )) {
+      const path = `${relativePath}/${entry.name}`
+      if (entry.isDirectory()) {
+        visit(path)
+      } else {
+        hash
+          .update(path)
+          .update('\0')
+          .update(readFileSync(join(root, path)))
+          .update('\0')
+      }
+    }
+  }
+  visit('encephalon')
+  return hash.digest('hex')
+}
 
 const createCorpus = (root: string, records: number): CorpusFacts => {
   if (records === 0) {
@@ -336,10 +388,20 @@ const createCaseTemplates = (
   let prepared: string | undefined
   try {
     const corpus = createCorpus(sampleRoot, records)
+    const fixtureSha256 = fixtureFingerprint(sampleRoot)
+    const maximumFixtureSha256 =
+      records >= 4
+        ? createHash('sha256')
+            .update(fixtureSha256)
+            .update(
+              formatRecordFile(maximumRecord(timestamp(records - 1), `small-${String(records - 1).padStart(5, '0')}`)),
+            )
+            .digest('hex')
+        : fixtureSha256
     unprepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation, removeRoot)
     hydrate({ root: sampleRoot })
     prepared = snapshotRepository(sampleRoot, temporaryParent, afterAllocation, removeRoot)
-    return { corpus, prepared, sampleRoot, unprepared }
+    return { corpus: { ...corpus, fixtureSha256, maximumFixtureSha256 }, prepared, sampleRoot, unprepared }
   } catch (error) {
     return completeBenchmarkCleanup<CaseTemplates>(
       { error, kind: 'failure' },
@@ -349,8 +411,53 @@ const createCaseTemplates = (
   }
 }
 
+export const createBenchmarkSession = (records: number, temporaryParent: string) =>
+  createCaseTemplates(records, temporaryParent, undefined, path => rmSync(path, { force: true, recursive: true }))
+
 const templateForOperation = (operation: BenchmarkOperation, templates: CaseTemplates) =>
   operation === 'coldHydrate' ? templates.unprepared : templates.prepared
+
+export const reusablePreparedOperations: readonly BenchmarkOperation[] = [
+  'list',
+  'show',
+  'compactSearch',
+  'fullSearch',
+  'gather',
+  'largePayloadSearch',
+  'maximumPayloadSearch',
+  'payloadOnlySearch',
+  'missingSearch',
+  'listMaximum',
+  'validateArtifacts',
+  'strictCacheValidation',
+]
+
+const prepareOperationSample = (operation: BenchmarkOperation, templates: CaseTemplates): void => {
+  restoreBenchmarkSample(templateForOperation(operation, templates), templates.sampleRoot, operation)
+  const { records } = templates.corpus
+  if (records >= 4 && (operation === 'maximumPayloadSearch' || operation === 'payloadOnlySearch')) {
+    writeRecord(
+      templates.sampleRoot,
+      maximumRecord(timestamp(records - 1), `small-${String(records - 1).padStart(5, '0')}`),
+    )
+    prepare({ root: templates.sampleRoot })
+  }
+  if (process.platform === 'linux') {
+    // Drain fixture setup on its filesystem before the fresh worker times the operation's own durability work.
+    execFileSync('sync', ['--file-system', templates.sampleRoot], { stdio: 'pipe', timeout: 30_000 })
+  }
+}
+
+export const prepareBenchmarkSessionOperation = (
+  templates: CaseTemplates,
+  operation: BenchmarkOperation,
+): CaseTemplates => {
+  if (reusablePreparedOperations.includes(operation)) {
+    prepareOperationSample(operation, templates)
+    return { ...templates, preparedOperation: operation }
+  }
+  return { ...templates, preparedOperation: undefined }
+}
 
 const runOperationSamples = async (
   operation: BenchmarkOperation,
@@ -364,7 +471,10 @@ const runOperationSamples = async (
       throw new Error(`Benchmark ${operation} for ${records} records was aborted.`)
     }
     const root = templates.sampleRoot
-    restoreBenchmarkSample(templateForOperation(operation, templates), root, operation)
+    const reuseSample = templates.preparedOperation === operation
+    if (!reuseSample) {
+      prepareOperationSample(operation, templates)
+    }
     let outcome: BenchmarkOutcome<BenchmarkSample>
     try {
       const result = await runBenchmarkWorker({
@@ -375,11 +485,20 @@ const runOperationSamples = async (
         timeoutMilliseconds: configuration.timeoutMilliseconds,
         workerPath: options.workerPath,
       })
+      if (reuseSample) {
+        const database = join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')
+        if (byteSize(`${database}-wal`) !== 0) {
+          throw new Error(`The ${operation} benchmark wrote reusable cache state.`)
+        }
+        // The worker has exited; discard only its empty WAL and transient shared-memory index.
+        rmSync(`${database}-wal`, { force: true })
+        rmSync(`${database}-shm`, { force: true })
+      }
       outcome = { kind: 'success', value: result.sample }
     } catch (error) {
       outcome = { error, kind: 'failure' }
     }
-    return completeBenchmarkCleanup(outcome, [root], options.removeRoot)
+    return completeBenchmarkCleanup(outcome, reuseSample ? [] : [root], options.removeRoot)
   })
   return summarizeSamples(samples)
 }
@@ -389,18 +508,20 @@ const runCase = async (
   configuration: BenchmarkArguments,
   options: ResolvedBenchmarkControllerOptions,
 ): Promise<BenchmarkCase> => {
-  const templates = createCaseTemplates(
-    records,
-    options.temporaryParent,
-    options.afterTemporaryRepositoryAllocation,
-    options.removeRoot,
-  )
+  const templates =
+    options.templates ??
+    createCaseTemplates(
+      records,
+      options.temporaryParent,
+      options.afterTemporaryRepositoryAllocation,
+      options.removeRoot,
+    )
   let outcome: { kind: 'success'; value: BenchmarkCase } | { error: unknown; kind: 'failure' }
   try {
     const operationEntries: Array<
       readonly [BenchmarkOperation, Awaited<ReturnType<typeof runOperationSamples>> | null]
     > = []
-    for (const operation of benchmarkOperations) {
+    for (const operation of options.operations) {
       const distributions =
         operation === 'stalePrepare' && records === 0
           ? null
@@ -419,9 +540,10 @@ const runCase = async (
   } catch (error) {
     outcome = { error, kind: 'failure' }
   }
+  const sampleRoots = templates.preparedOperation ? [] : [templates.sampleRoot]
   return completeBenchmarkCleanup(
     outcome,
-    [templates.prepared, templates.sampleRoot, templates.unprepared],
+    options.templates ? sampleRoots : [templates.prepared, templates.sampleRoot, templates.unprepared],
     options.removeRoot,
   )
 }
@@ -445,8 +567,10 @@ const runConfiguredBenchmark = async (
   const budget = loadBudget(configuration.budget, configuration.records)
   const options = {
     afterTemporaryRepositoryAllocation: controllerOptions.afterTemporaryRepositoryAllocation,
+    operations: controllerOptions.operations ?? benchmarkOperations,
     removeRoot: controllerOptions.removeRoot ?? (path => rmSync(path, { force: true, recursive: true })),
     signal: controllerOptions.signal,
+    templates: controllerOptions.templates,
     temporaryParent: controllerOptions.temporaryParent ?? tmpdir(),
     workerPath: controllerOptions.workerPath ?? defaultWorkerPath,
   }
