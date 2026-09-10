@@ -263,7 +263,7 @@ afterEach(() => {
 
 describe('canonical records', () => {
   test('reads and hashes accepted canonical bytes once across closing proofs', () => {
-    const root = realpathSync(createRoot())
+    const root = realpathSync.native(createRoot())
     prepareEmptyCanonicalDirectories(root)
     writeCanonicalRecord(root, { id: 'read-once', payload: { text: 'evidence '.repeat(4096) } })
     const path = join(root, 'encephalon', 'decision', 'read-once.json')
