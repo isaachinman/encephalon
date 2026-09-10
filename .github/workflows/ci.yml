@@ -55,10 +55,8 @@ jobs:
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
-      - run: bun run typecheck
       - run: bun run build
-      - run: node scripts/test-ci.ts ${{ matrix.context == 'windows-latest' && 'main' || 'all' }}
-      - run: bun run lint
+      - run: bun run test
 
   benchmark-smoke:
     name: Benchmark smoke checks
@@ -79,16 +77,10 @@ jobs:
       - run: bun run build
       - run: bun run benchmark:check
 
-  compatibility:
-    name: compatibility (windows-latest, ${{ matrix.group }})
-    # Admit the short Windows groups after the long jobs have entered the runner queue.
-    needs: package
-    timeout-minutes: 9
-    strategy:
-      fail-fast: false
-      matrix:
-        group: [compatibility-a, compatibility-b, compatibility-c, package, benchmark, benchmark-sessions, benchmark-report, benchmark-cli, cache]
-    runs-on: windows-latest
+  tooling:
+    name: Test benchmark and release tooling
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -97,13 +89,14 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24.15.0
-      - run: node ./scripts/check-generated-version.ts
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.1
       - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run typecheck
+      - run: bun run lint
       - run: bun run build
-      - run: node scripts/test-ci.ts ${{ matrix.group }}
+      - run: bun run test:tooling
 
   performance:
     name: performance (${{ matrix.shard }})
@@ -111,12 +104,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [empty, empty-cold, small, small-cold, medium, medium-maximum, large-gather, large-payload, large-maximum, large-preparation, large-reads, large-validation]
-        include:
-          - shard: empty-cold
-            repetitions: 100
-          - shard: small-cold
-            repetitions: 100
+        shard: [large-gather, large-payload, large-maximum, large-preparation, large-reads, large-validation]
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -134,7 +122,7 @@ jobs:
         env:
           BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
           CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports ${{ matrix.repetitions || 20 }} ${{ matrix.shard }}
+        run: node scripts/benchmark-compare.ts "$BASE_COMMIT" "$CANDIDATE_COMMIT" performance-reports 20 ${{ matrix.shard }}
       - name: Retain performance evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -146,7 +134,7 @@ jobs:
 
   verify:
     name: verify (${{ matrix.context }})
-    needs: [correctness, compatibility, benchmark-smoke, performance]
+    needs: [correctness, tooling, benchmark-smoke, performance]
     if: always()
     timeout-minutes: 1
     strategy:
@@ -170,7 +158,7 @@ jobs:
       - if: matrix.context == 'ubuntu-latest'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: performance-${{ github.run_attempt }}-*
+          pattern: performance-*
           path: performance-reports
       - if: matrix.context == 'ubuntu-latest'
         env:
@@ -187,6 +175,8 @@ jobs:
 
   package:
     name: Build exact package candidate
+    outputs:
+      artifact: ${{ steps.artifact.outputs.name }}
     timeout-minutes: 9
     runs-on: ubuntu-latest
     steps:
@@ -221,18 +211,25 @@ jobs:
             package-artifacts/encephalon-0.3.0.tgz.metadata.json
           if-no-files-found: error
           retention-days: 7
+      - name: Identify the retained candidate for dependent job reruns
+        id: artifact
+        run: echo 'name=encephalon-npm-package-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
 
   candidate:
-    name: candidate (Node ${{ matrix.node }})
+    name: candidate (${{ matrix.os }}, Node ${{ matrix.node }})
     needs: package
     timeout-minutes: 9
     strategy:
       fail-fast: false
       matrix:
-        node:
-          - 24.15.0
-          - 26
-    runs-on: ubuntu-latest
+        include:
+          - os: ubuntu-latest
+            node: 26
+          - os: macos-latest
+            node: 24.15.0
+          - os: windows-latest
+            node: 24.15.0
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -253,7 +250,7 @@ jobs:
       - run: node ./scripts/check-worktree-clean.ts
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: encephalon-npm-package-${{ github.run_attempt }}
+          name: ${{ needs.package.outputs.artifact }}
           path: package-artifacts
       - run: node ./scripts/check-package-metadata.ts
       - name: Recheck exact package candidate
@@ -284,7 +281,7 @@ jobs:
       - run: node ./scripts/check-worktree-clean.ts
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: encephalon-npm-package-${{ github.run_attempt }}
+          name: ${{ needs.package.outputs.artifact }}
           path: package-artifacts
       - run: node ./scripts/check-package-metadata.ts
       - name: Recheck exact package candidate

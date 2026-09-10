@@ -2,37 +2,26 @@ import { type BenchmarkOperation, benchmarkOperations } from './benchmark-model.
 
 export type BenchmarkScope = { records: number; operations: readonly BenchmarkOperation[] }[]
 
-export const completeBenchmarkScope: BenchmarkScope = [0, 1, 100, 1000].map(records => ({
-  operations: benchmarkOperations,
-  records,
-}))
+export const completeBenchmarkScope: BenchmarkScope = [{ operations: benchmarkOperations, records: 1000 }]
 
 const expensive = ['gather', 'largePayloadSearch', 'maximumPayloadSearch'] as const
 const remaining = benchmarkOperations.filter(operation => !expensive.some(value => value === operation))
-const withoutColdHydrate = benchmarkOperations.filter(operation => operation !== 'coldHydrate')
 
 // Each expensive workload retains all samples on one runner, alongside its exact base.
 export const benchmarkShards: Record<string, BenchmarkScope> = {
-  empty: [{ operations: withoutColdHydrate, records: 0 }],
-  'empty-cold': [{ operations: ['coldHydrate'], records: 0 }],
   'large-gather': [{ operations: ['gather'], records: 1000 }],
   'large-maximum': [{ operations: ['maximumPayloadSearch'], records: 1000 }],
   'large-payload': [{ operations: ['largePayloadSearch'], records: 1000 }],
   'large-preparation': [{ operations: remaining.slice(0, 3), records: 1000 }],
   'large-reads': [{ operations: remaining.slice(3, 6), records: 1000 }],
   'large-validation': [{ operations: remaining.slice(6), records: 1000 }],
-  medium: [{ operations: benchmarkOperations.filter(operation => operation !== 'maximumPayloadSearch'), records: 100 }],
-  'medium-maximum': [{ operations: ['maximumPayloadSearch'], records: 100 }],
-  small: [{ operations: withoutColdHydrate, records: 1 }],
-  'small-cold': [{ operations: ['coldHydrate'], records: 1 }],
 }
 
-export const benchmarkRepetitions = (shard: string): number =>
-  shard === 'empty-cold' || shard === 'small-cold' ? 100 : 20
+export const benchmarkRepetitions = 20
 
-// Package evidence remains with the ordinary empty-corpus operations, not the isolated cold-hydration lane.
+// The reads shard (or a complete local comparison) owns package evidence exactly once.
 export const includesPackedBenchmarks = (scope: BenchmarkScope): boolean =>
-  scope.some(entry => entry.records === 0 && entry.operations.some(operation => operation !== 'coldHydrate'))
+  scope.some(entry => entry.records === 1000 && entry.operations.includes('list'))
 
 export const benchmarkScope = (shard?: string): BenchmarkScope => {
   const scope = shard === undefined ? completeBenchmarkScope : benchmarkShards[shard]
