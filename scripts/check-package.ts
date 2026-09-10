@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -328,73 +329,106 @@ try {
   if (prepared.hydrated !== true || prepared.recordsIndexed !== 0) {
     throw new Error('The packed Node-only CLI prepare command returned an unexpected result.')
   }
-  const initialised = cliJson(['init', '--root', consumer]) as { recordsCreated?: unknown }
-  if (!Array.isArray(initialised.recordsCreated) || initialised.recordsCreated.length !== 3) {
-    throw new Error('The packed Node-only CLI init command returned an unexpected result.')
-  }
+  // The npm entry point is checked above; run documented argv with this Node on every OS.
+  const readme = readFileSync(resolve(consumer, 'node_modules', 'encephalon', 'README.md'), 'utf8')
+  const documentedLines = [...readme.matchAll(/```bash\n([\s\S]*?)\n```/gu)].flatMap(match =>
+    (match[1] ?? '').split('\n'),
+  )
+  assert.equal(documentedLines[0], 'npm install --save-dev encephalon')
+  // Installation above substitutes only the selected tarball for the registry package.
+  const results = documentedLines.slice(1).map(line => {
+    const prefix = 'npx --no-install encephalon '
+    assert.equal(line.startsWith(prefix), true, line)
+    const command = line.slice(prefix.length)
+    const tokens = command.match(/'[^'\r\n]*'|[^\s'"]+/gu) ?? []
+    assert.equal(tokens.join(' '), command, 'README examples require simple single-line shell arguments.')
+    return cliJson(tokens.map(token => (token.startsWith("'") ? token.slice(1, -1) : token)))
+  })
+  const [
+    initialised,
+    added,
+    searched,
+    shown,
+    listed,
+    gathered,
+    replacement,
+    history,
+    validated,
+    readmePrepared,
+    hydrated,
+    refreshed,
+    removed,
+  ] = results as Record<string, unknown>[]
+  assert.equal(results.length, 13)
+  assert.ok(initialised !== undefined && Array.isArray(initialised.recordsCreated))
+  assert.equal(initialised.recordsCreated.length, 3)
+  assert.equal(added?.id, 'auth-tokens')
+  assert.deepEqual(
+    (searched as unknown as Array<{ id: string }>).map(record => record.id),
+    ['auth-tokens'],
+  )
+  assert.equal(shown?.id, 'auth-tokens')
+  assert.deepEqual(
+    (listed as unknown as Array<{ id: string }>).map(record => record.id),
+    ['auth-tokens'],
+  )
+  assert.deepEqual(gathered?.records, [{ id: 'auth-tokens', record: shown }])
+  assert.ok(gathered !== undefined && Array.isArray(gathered.searches))
+  assert.deepEqual(
+    (gathered.searches as Array<{ results: Array<{ id: string }> }>).map(search =>
+      search.results.map(record => record.id),
+    ),
+    [['auth-tokens'], ['auth-tokens']],
+  )
+  assert.deepEqual(replacement?.supersedes, ['auth-tokens'])
+  assert.deepEqual(
+    new Set((history as unknown as Array<{ id: string }>).map(record => record.id)),
+    new Set(['auth-tokens', 'auth-tokens-v2']),
+  )
+  assert.equal(validated?.valid, true)
+  assert.deepEqual(readmePrepared, { hydrated: false, recordsIndexed: 5 })
+  assert.deepEqual(hydrated, { recordsIndexed: 5 })
+  assert.deepEqual(refreshed?.recordsCreated, [])
+  assert.deepEqual(removed?.instructionFiles, [
+    { action: 'removed', file: 'AGENTS.md' },
+    { action: 'removed', file: 'CLAUDE.md' },
+  ])
+
+  const apiExamples = [...readme.matchAll(/```javascript\n([\s\S]*?)\n```/gu)]
+  assert.equal(apiExamples.length, 1)
+  const apiExample = resolve(consumer, 'readme-example.mjs')
+  writeFileSync(
+    apiExample,
+    apiExamples[0]?.[1] +
+      "\nimport assert from 'node:assert/strict';\nassert.deepEqual(decisions.map(record => record.id), ['auth-tokens-v2']);\n",
+  )
+  runClean([process.execPath, apiExample], consumer)
+
   const acceptedResultLimits = RESULT_LIMIT_CASES.filter(limit => limit <= 1000)
   const acceptedLimitResults = packedResultLimitCases.flatMap(limitCase =>
     acceptedResultLimits.map(limit => cliJson(limitCase.accepted(limit))),
   )
-  if (acceptedLimitResults.length !== packedResultLimitCases.length * acceptedResultLimits.length) {
-    throw new Error('The packed CLI accepted result-limit matrix did not execute every case.')
-  }
-  const added = cliJson([
+  assert.equal(acceptedLimitResults.length, packedResultLimitCases.length * acceptedResultLimits.length)
+  cliJson([
     'add',
-    '--root',
-    consumer,
     '--id',
-    'packed-cli-record',
+    'packed-unicode',
     '--kind',
     'decision',
     '--subject',
-    'packed.cli',
+    'packed.unicode',
     '--source',
     'package-contract',
     '--data',
-    '{"summary":"Packed CLI record"}',
+    '{}',
     '--text',
-    'packed-contract-marker Ελληνικά'.normalize('NFD'),
-  ]) as { id?: unknown }
-  if (added.id !== 'packed-cli-record') {
-    throw new Error('The packed Node-only CLI add command returned an unexpected result.')
-  }
-  const hydrated = cliJson(['hydrate', '--root', consumer]) as { recordsIndexed?: unknown }
-  if (hydrated.recordsIndexed !== 4) {
-    throw new Error('The packed Node-only CLI hydrate command returned an unexpected result.')
-  }
-  const validated = cliJson(['validate', '--root', consumer]) as { valid?: unknown }
-  if (validated.valid !== true) {
-    throw new Error('The packed Node-only CLI validate command returned an unexpected result.')
-  }
-  const listed = cliJson(['list', '--root', consumer, '--include-superseded', '--limit=10']) as unknown[]
-  if (!listed.some(record => (record as { id?: unknown }).id === 'packed-cli-record')) {
-    throw new Error('The packed Node-only CLI list command returned an unexpected result.')
-  }
-  const shown = cliJson(['show', '--root', consumer, '--id', 'packed-cli-record']) as { id?: unknown }
-  if (shown.id !== 'packed-cli-record') {
-    throw new Error('The packed Node-only CLI show command returned an unexpected result.')
-  }
-  const searched = cliJson(['search', '--root', consumer, '--compact', '--', 'packed-contract-marker']) as unknown[]
-  if (!searched.some(record => (record as { id?: unknown }).id === 'packed-cli-record')) {
-    throw new Error('The packed Node-only CLI search command returned an unexpected result.')
-  }
-  const unicodeSearched = cliJson(['search', '--root', consumer, '--compact', '--', 'Ελληνικά']) as unknown[]
-  if (!unicodeSearched.some(record => (record as { id?: unknown }).id === 'packed-cli-record')) {
-    throw new Error('The packed Node-only CLI Unicode search command returned an unexpected result.')
-  }
-  const gathered = cliJson([
-    'gather',
-    '--root',
-    consumer,
-    '--search',
-    'packed-contract-marker',
-    '--show',
-    'packed-cli-record',
-  ]) as { records?: unknown; searches?: unknown }
-  if (!(Array.isArray(gathered.records) && Array.isArray(gathered.searches))) {
-    throw new Error('The packed Node-only CLI gather command returned an unexpected result.')
-  }
+    'Ελληνικά'.normalize('NFD'),
+  ])
+  const unicodeSearched = cliJson(['search', '--compact', '--', 'Ελληνικά']) as Array<{ id: string }>
+  assert.deepEqual(
+    unicodeSearched.map(record => record.id),
+    ['packed-unicode'],
+  )
   process.stderr.write(`${JSON.stringify(snapshot.digests)}\n`)
   if (retainedTarballDirectory !== undefined) {
     const retained = retainPackageArtifact(snapshot, {
