@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, test } from 'node:test'
+import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import { spawnNpmCommand } from './npm-command.ts'
 import { packageTarballDigests } from './package-tarball.ts'
 import { runReleaseCompatibility } from './release-compatibility.ts'
@@ -450,7 +451,8 @@ export declare const gatherRecords: (input?: GatherInput) => GatherResult
 `
 
 const buildStandInTarball = (root: string, version: string, schemaVersion: string, mutationTarget?: string) => {
-  const packageVersion = version.startsWith('0.3.0-') ? '0.3.0' : version
+  const fixtureVersion = version.startsWith('0.3.0-') ? '0.3.0' : version
+  const packageVersion = schemaVersion === '4' && fixtureVersion === '0.3.0' ? PACKAGE_VERSION : fixtureVersion
   const packageRoot = resolve(root, `package-${version}-${schemaVersion}`)
   const tarballDirectory = resolve(root, `tarballs-${version}-${schemaVersion}`)
   mkdirSync(resolve(packageRoot, 'dist'), { recursive: true })
@@ -561,7 +563,7 @@ describe('release compatibility process fixture', () => {
       assert.deepEqual(report.oracle.digests, oracleDigests)
       assert.deepEqual(report.candidate.digests, candidateDigests)
       assert.equal(report.oracle.version, '0.3.0')
-      assert.equal(report.candidate.version, '0.3.0')
+      assert.equal(report.candidate.version, PACKAGE_VERSION)
       assert.deepEqual(report.upgrade.schemas, { after: '4', before: '2' })
       assert.deepEqual(report.downgrade.schemas, { after: '2', before: '4' })
       assert.equal(report.upgrade.durableState, 'identical')

@@ -5,6 +5,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, write
 import { tmpdir } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { test } from 'node:test'
+import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import { spawnNpmCommand } from './npm-command.ts'
 import { restorePackageCandidate } from './package-candidate.ts'
 import * as packagePreflightAuthority from './package-preflight.ts'
@@ -55,12 +56,12 @@ const writeMetadata = (
   const metadata = {
     bytes: bytes.length,
     integrity: `sha512-${sha512.copy().digest('base64')}`,
-    packageVersion: overrides.packageVersion ?? '0.3.0',
+    packageVersion: overrides.packageVersion ?? PACKAGE_VERSION,
     sha1: createHash('sha1').update(bytes).digest('hex'),
     sha256: overrides.sha256 ?? createHash('sha256').update(bytes).digest('hex'),
     sha512: sha512.digest('hex'),
     sourceCommit: overrides.sourceCommit ?? runGit(root, ['rev-parse', 'HEAD']),
-    tarball: 'package-artifacts/encephalon-0.3.0.tgz',
+    tarball: `package-artifacts/encephalon-${PACKAGE_VERSION}.tgz`,
   }
   writeFileSync(`${tarball}.metadata.json`, `${JSON.stringify(metadata, null, 2)}\n`)
 }
@@ -103,8 +104,8 @@ const createFixture = (
   )
   assert.equal(packed.status, 0, `${packed.stdout}${packed.stderr}`)
   const [pack] = JSON.parse(packed.stdout ?? '') as Array<{ filename?: unknown }>
-  assert.equal(pack?.filename, 'encephalon-0.3.0.tgz')
-  const tarball = resolve(artifactDirectory, 'encephalon-0.3.0.tgz')
+  assert.equal(pack?.filename, `encephalon-${PACKAGE_VERSION}.tgz`)
+  const tarball = resolve(artifactDirectory, `encephalon-${PACKAGE_VERSION}.tgz`)
   writeMetadata(root, tarball, metadataOverrides)
   const snapshotDirectory = resolve(temporaryRoot, 'snapshot')
   mkdirSync(snapshotDirectory)
@@ -120,7 +121,7 @@ test('accepts one exact fixed artifact pair and returns a private reviewed snaps
       tarballPath: fixture.tarball,
     })
 
-    assert.equal(preflight.metadata.packageVersion, '0.3.0')
+    assert.equal(preflight.metadata.packageVersion, PACKAGE_VERSION)
     assert.equal(preflight.metadata.sourceCommit, runGit(fixture.root, ['rev-parse', 'HEAD']))
     assert.notEqual(preflight.snapshot.path, fixture.tarball)
     assert.deepEqual(preflight.snapshot.digests, {

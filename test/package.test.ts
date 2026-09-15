@@ -22,7 +22,7 @@ import { spawnNpmCommand } from '../scripts/npm-command.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
-const releaseVersion = '0.3.0'
+const releaseVersion = '0.4.0'
 const metadataPath = (tarball: string) => `${tarball}.metadata.json`
 
 const gitHead = (repositoryRoot: string) => {
@@ -369,7 +369,7 @@ describe('package contract', () => {
     assert.equal(generated.includes(`PACKAGE_VERSION = ${JSON.stringify(PACKAGE_VERSION)}`), true)
   })
 
-  test('reports the 0.3.0 release version from source, built, and packed API and CLI surfaces', {
+  test('reports the 0.4.0 release version from source, built, and packed API and CLI surfaces', {
     timeout: 75_000,
   }, () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {
