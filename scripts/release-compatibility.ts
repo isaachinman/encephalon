@@ -1,6 +1,8 @@
+import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
+  cpSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -37,6 +39,15 @@ import {
   IMPORT_PROBE_SOURCE,
 } from './release-compatibility-probes.ts'
 import { normalisePublicValue, RESULT_LIMIT_CASES, RESULT_LIMIT_OPERATIONS } from './release-contracts.ts'
+import {
+  assertBaselineAppendOnly,
+  assertRestoredInstructions,
+  EVOLUTION_PROBE_SOURCE,
+  EVOLUTION_USER_INSTRUCTIONS,
+  type EvolutionProbeResult,
+  restoreLegacyCache,
+  snapshotLegacyCache,
+} from './release-evolution.ts'
 
 export {
   assertDurableSnapshotsEqual,
@@ -377,6 +388,15 @@ export type ReleaseCompatibilityReport = Readonly<{
     version: string
   }>
   downgrade: PhaseReport
+  evolution: Readonly<{
+    cacheInputs: readonly ['valid', 'stale', 'corrupt']
+    createdBaselineRecords: number
+    durableState: 'append-only'
+    instructions: 'original-bytes-and-absence-restored'
+    legacyBaseline: 'published-language-and-file-count-fields-preserved'
+    payloadOnlySnippet: string
+    schemas: readonly ['2', '4', '2']
+  }> | null
   oracle: Readonly<{
     digests: PackageTarballDigests
     independentBudgets: IndependentBudgetReport
@@ -730,11 +750,13 @@ const writeProbeFiles = (probeDirectory: string, fixtureRoot: string) => {
   const apiProbe = resolve(probeDirectory, 'api-probe.mjs')
   const budgetProbe = resolve(probeDirectory, 'budget-probe.mjs')
   const importProbe = resolve(probeDirectory, 'import-probe.mjs')
+  const evolutionProbe = resolve(probeDirectory, 'evolution-probe.mjs')
   const declarationConsumer = resolve(probeDirectory, 'consumer.ts')
   const declarationConfiguration = resolve(probeDirectory, 'tsconfig.json')
   writeFileSync(apiProbe, API_PROBE_SOURCE)
   writeFileSync(budgetProbe, BUDGET_PROBE_SOURCE)
   writeFileSync(importProbe, IMPORT_PROBE_SOURCE)
+  writeFileSync(evolutionProbe, EVOLUTION_PROBE_SOURCE)
   writeFileSync(declarationConsumer, DECLARATION_CONSUMER_SOURCE)
   writeFileSync(
     declarationConfiguration,
@@ -758,10 +780,17 @@ const writeProbeFiles = (probeDirectory: string, fixtureRoot: string) => {
     )}\n`,
   )
   const witness = captureTrustedProbeWitness(probeDirectory)
-  for (const path of [apiProbe, budgetProbe, importProbe, declarationConsumer, declarationConfiguration]) {
+  for (const path of [
+    apiProbe,
+    budgetProbe,
+    importProbe,
+    evolutionProbe,
+    declarationConsumer,
+    declarationConfiguration,
+  ]) {
     trustedProbeWitnesses.set(path, witness)
   }
-  return { apiProbe, budgetProbe, declarationConfiguration, importProbe }
+  return { apiProbe, budgetProbe, declarationConfiguration, evolutionProbe, importProbe }
 }
 
 const assertTrustedProbe = (path: string) => {
@@ -1277,9 +1306,11 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
   const trustedRoot = mkdtempSync(resolve(tmpdir(), 'encephalon-release-trusted-'))
   const trustedDirectories = Object.freeze({
     candidate: resolve(trustedRoot, 'candidate'),
+    evolution: resolve(trustedRoot, 'evolution'),
     installCandidate: resolve(trustedRoot, 'install-candidate'),
     installDowngrade: resolve(trustedRoot, 'install-downgrade'),
     installOracle: resolve(trustedRoot, 'install-oracle'),
+    legacyCaches: resolve(trustedRoot, 'legacy-caches'),
     npmCache: resolve(trustedRoot, 'npm-cache'),
     oracleDownload: resolve(trustedRoot, 'oracle-download'),
     oracleSnapshot: resolve(trustedRoot, 'oracle-snapshot'),
@@ -1305,6 +1336,37 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     )
     initialiseFixtureRepository(fixtureRoot)
     const probes = writeProbeFiles(trustedDirectories.probes, fixtureRoot)
+    const evolutionRoot = trustedDirectories.evolution
+    const staleCache = resolve(trustedDirectories.legacyCaches, 'stale.sqlite')
+    const validCache = resolve(trustedDirectories.legacyCaches, 'valid.sqlite')
+    const publishedOracle = options.oracle === undefined
+    const copyEvolutionPackage = (artifact: VerifiedPackageArtifact) => {
+      assertInstalledPackage(fixtureRoot)
+      const installed = resolve(evolutionRoot, 'node_modules', 'encephalon')
+      rmSync(installed, { force: true, recursive: true })
+      cpSync(resolve(fixtureRoot, 'node_modules', 'encephalon'), installed, { recursive: true })
+      const witness = captureImportSnapshot(installed)
+      assertInstalledTreeMatchesArtifact(artifact, installed, witness)
+      installedPackageWitnesses.set(evolutionRoot, witness)
+      assertInstalledPackage(fixtureRoot)
+    }
+    const evolutionProbe = (phase: string): EvolutionProbeResult => {
+      const result = runTrustedProbe(
+        probes.evolutionProbe,
+        [phase, evolutionRoot, installedPackageEntry(evolutionRoot)],
+        {
+          cwd: evolutionRoot,
+          environment,
+          label: `The ${phase} published evolution probe`,
+          redactions: durableRedactions(captureDurableSnapshot(evolutionRoot)),
+        },
+      )
+      assert.equal(result.stderr, '')
+      return parseJson<EvolutionProbeResult>(result.stdout, 'The published evolution probe')
+    }
+    let evolution: ReleaseCompatibilityReport['evolution'] = null
+    let evolvedRecords: EvolutionProbeResult['records'] = []
+    let evolvedDurable: DurableSnapshot | undefined
     const predecessorRedactions = [
       Buffer.from('oracle agents predecessor\n'),
       Buffer.from('oracle claude predecessor\n'),
@@ -1319,6 +1381,18 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       predecessorRedactions,
       environment,
     )
+    if (publishedOracle) {
+      initialiseFixtureRepository(evolutionRoot)
+      writeFileSync(resolve(evolutionRoot, 'AGENTS.md'), EVOLUTION_USER_INSTRUCTIONS)
+      rmSync(resolve(evolutionRoot, 'CLAUDE.md'))
+      mkdirSync(resolve(evolutionRoot, 'src', 'nested'), { recursive: true })
+      writeFileSync(resolve(evolutionRoot, 'src', 'nested', 'example.ts'), 'export const example = true\n')
+      copyEvolutionPackage(oracle)
+      assert.equal(evolutionProbe('seed').schema, '2')
+      snapshotLegacyCache(evolutionRoot, staleCache)
+      assert.equal(evolutionProbe('initialise').schema, '2')
+      snapshotLegacyCache(evolutionRoot, validCache)
+    }
     const initialImport = runImportProbe(probes.importProbe, fixtureRoot, predecessorRedactions)
     runDeclarationProbe(probes.declarationConfiguration, fixtureRoot, predecessorRedactions)
     const initial = runApiProbe(probes.apiProbe, 'initialise', fixtureRoot, predecessorRedactions)
@@ -1363,6 +1437,57 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       throw new Error('The candidate package did not rebuild cache schema 2 as schema 4.')
     }
 
+    if (publishedOracle) {
+      copyEvolutionPackage(candidate)
+      const original = captureImportSnapshot(evolutionRoot)
+      const states = (['valid', 'stale', 'corrupt'] as const).map(state => {
+        restoreLegacyCache(evolutionRoot, state === 'stale' ? staleCache : validCache)
+        if (state === 'corrupt') {
+          writeFileSync(
+            resolve(evolutionRoot, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'),
+            'invalid old SQLite database',
+          )
+        }
+        const result = runFixturePhase(evolutionRoot, () => evolutionProbe('read'))
+        assertDurableSnapshotsEqual(original, captureImportSnapshot(evolutionRoot))
+        return result
+      })
+      assert.deepEqual(states[1], states[0])
+      assert.deepEqual(states[2], states[0])
+      const beforeRefresh = captureImportSnapshot(evolutionRoot)
+      const refreshed = evolutionProbe('refresh')
+      assertBaselineAppendOnly(
+        beforeRefresh,
+        captureImportSnapshot(evolutionRoot),
+        states[0]?.records ?? [],
+        refreshed.created,
+      )
+      const beforeRemove = captureImportSnapshot(evolutionRoot)
+      const removed = evolutionProbe('remove')
+      assertDurableSnapshotsEqualExcept(
+        beforeRemove,
+        captureImportSnapshot(evolutionRoot),
+        change =>
+          (change.path === 'AGENTS.md' && (change.kind === 'bytes' || change.kind === 'identity')) ||
+          (change.path === 'CLAUDE.md' && change.kind === 'removed') ||
+          (change.kind === 'links' && (change.path === '.' || change.path === '@witness:.')),
+      )
+      assertRestoredInstructions(evolutionRoot)
+      assert.equal(removed.schema, '4')
+      assert.deepEqual(removed.records, refreshed.records)
+      evolvedRecords = removed.records
+      evolvedDurable = captureDurableSnapshot(evolutionRoot)
+      evolution = Object.freeze({
+        cacheInputs: ['valid', 'stale', 'corrupt'] as const,
+        createdBaselineRecords: refreshed.created.length,
+        durableState: 'append-only',
+        instructions: 'original-bytes-and-absence-restored',
+        legacyBaseline: 'published-language-and-file-count-fields-preserved',
+        payloadOnlySnippet: states[0]?.snippet ?? '',
+        schemas: ['2', '4', '2'] as const,
+      })
+    }
+
     options.hooks?.beforeOracleDowngrade?.(oracle.path)
     installPackage(
       fixtureRoot,
@@ -1393,6 +1518,15 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       throw new Error('The published oracle process did not execute the installed oracle package version.')
     }
 
+    if (publishedOracle) {
+      copyEvolutionPackage(oracle)
+      const downgraded = runFixturePhase(evolutionRoot, () => evolutionProbe('downgrade'))
+      assert.deepEqual(downgraded.records, evolvedRecords)
+      assert.ok(evolvedDurable !== undefined)
+      assertDurableSnapshotsEqual(evolvedDurable, captureDurableSnapshot(evolutionRoot))
+      assertRestoredInstructions(evolutionRoot)
+    }
+
     return Object.freeze({
       candidate: Object.freeze({ digests: candidate.digests, version: candidateImport.version }),
       downgrade: Object.freeze({
@@ -1405,6 +1539,7 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
           before: downgradeApi.schemaBefore,
         }),
       }),
+      evolution,
       oracle: Object.freeze({
         digests: oracle.digests,
         independentBudgets: oracleIndependentBudgets,
@@ -1424,6 +1559,7 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     })
   } finally {
     installedPackageWitnesses.delete(fixtureRoot)
+    installedPackageWitnesses.delete(trustedDirectories.evolution)
     if (fixtureWitness !== undefined) {
       disposeIsolatedRoot(fixtureWitness)
     }

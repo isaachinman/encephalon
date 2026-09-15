@@ -8,6 +8,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -16,8 +17,10 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
+import type { BrainRecord } from '../src/types.ts'
 import { captureIsolatedRoot, disposeIsolatedRoot } from './isolated-root.ts'
 import { spawnNpmCommand } from './npm-command.ts'
 import * as releaseCompatibilityAuthority from './release-compatibility.ts'
@@ -32,6 +35,13 @@ import {
   sanitizedCompatibilityEnvironment,
   verifyOracleTarball,
 } from './release-compatibility.ts'
+import {
+  assertBaselineAppendOnly,
+  assertRestoredInstructions,
+  EVOLUTION_USER_INSTRUCTIONS,
+  restoreLegacyCache,
+  snapshotLegacyCache,
+} from './release-evolution.ts'
 
 test('keeps installed package bytes authoritative when Windows cannot preserve archive modes', () => {
   const authority = releaseCompatibilityAuthority as typeof releaseCompatibilityAuthority & {
@@ -665,4 +675,100 @@ await import(${JSON.stringify(pathToFileURL(resolve(import.meta.dirname, 'bounde
       ),
     )
   })
+})
+
+test('allows only declared append-only baseline records during published evolution', () => {
+  for (const change of ['none', 'rewrite', 'delete', 'unrelated']) {
+    const directory = mkdtempSync(resolve(tmpdir(), 'encephalon-evolution-append-'))
+    try {
+      const previous: BrainRecord = {
+        createdAt: '2026-01-01T00:00:00.000Z',
+        id: 'old',
+        kind: 'context',
+        path: 'encephalon/context/old.json',
+        payload: { scannedRegularFiles: 1 },
+        source: 'encephalon:init',
+        subject: 'encephalon:init/repository-overview',
+      }
+      const created: BrainRecord = {
+        ...previous,
+        id: 'new',
+        path: 'encephalon/context/new.json',
+        payload: { sources: [] },
+        supersedes: ['old'],
+      }
+      const persist = (record: BrainRecord) => {
+        const { path, ...value } = record
+        writeFileSync(resolve(directory, path), JSON.stringify(value))
+      }
+      mkdirSync(resolve(directory, 'encephalon/context'), { recursive: true })
+      persist(previous)
+      const before = captureDurableSnapshot(directory)
+      persist(created)
+      if (change === 'rewrite') {
+        writeFileSync(resolve(directory, previous.path), '{}')
+      }
+      if (change === 'delete') {
+        rmSync(resolve(directory, previous.path))
+      }
+      if (change === 'unrelated') {
+        writeFileSync(resolve(directory, 'encephalon/context/unrelated.json'), '{}')
+      }
+      const verify = () => assertBaselineAppendOnly(before, captureDurableSnapshot(directory), [previous], [created])
+      if (change === 'none') {
+        verify()
+      } else {
+        assert.throws(verify)
+      }
+    } finally {
+      rmSync(directory, { force: true, recursive: true })
+    }
+  }
+})
+
+test('restores a self-contained old SQLite snapshot without candidate sidecars or lock state', () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'encephalon-evolution-cache-'))
+  try {
+    const cache = resolve(directory, 'node_modules/.cache/encephalon')
+    mkdirSync(cache, { recursive: true })
+    const path = resolve(cache, 'brain.sqlite')
+    const database = new DatabaseSync(path)
+    database.exec("PRAGMA journal_mode=WAL; CREATE TABLE evidence(value TEXT); INSERT INTO evidence VALUES ('oracle')")
+    database.close()
+    const snapshot = resolve(directory, 'old.sqlite')
+    snapshotLegacyCache(directory, snapshot)
+    const expected = readFileSync(snapshot)
+    for (const filename of ['brain.sqlite', 'brain.sqlite-wal', 'brain.sqlite-shm', 'operation-lock.sqlite']) {
+      writeFileSync(resolve(cache, filename), 'candidate state')
+    }
+    restoreLegacyCache(directory, snapshot)
+    assert.deepEqual(readdirSync(cache), ['brain.sqlite'])
+    assert.deepEqual(readFileSync(snapshot), expected)
+    const restored = new DatabaseSync(path, { readOnly: true })
+    try {
+      assert.equal(restored.prepare('SELECT value FROM evidence').get()?.value, 'oracle')
+    } finally {
+      restored.close()
+    }
+  } finally {
+    rmSync(directory, { force: true, recursive: true })
+  }
+})
+
+test('requires original CRLF bytes, missing final newline and original file absence after removal', () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'encephalon-evolution-instructions-'))
+  try {
+    const agents = resolve(directory, 'AGENTS.md')
+    writeFileSync(agents, EVOLUTION_USER_INSTRUCTIONS)
+    assertRestoredInstructions(directory)
+    for (const changed of [EVOLUTION_USER_INSTRUCTIONS.replaceAll('\r\n', '\n'), `${EVOLUTION_USER_INSTRUCTIONS}\n`]) {
+      writeFileSync(agents, changed)
+      assert.throws(() => assertRestoredInstructions(directory))
+    }
+    writeFileSync(agents, EVOLUTION_USER_INSTRUCTIONS)
+    writeFileSync(resolve(directory, 'CLAUDE.md'), '')
+    assert.throws(() => assertRestoredInstructions(directory))
+  } finally {
+    rmSync(directory, { force: true, recursive: true })
+  }
 })

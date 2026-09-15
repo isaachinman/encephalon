@@ -2,6 +2,27 @@
 
 All notable changes to Encephalon are documented here.
 
+## [0.4.0] - 2026-09-15
+
+### Changed
+
+- Reduce repeated canonical reads, validation passes and retained data during prepare, search and gather while preserving strict cache equivalence and bounded public operations.
+- Generate compact search snippets from bounded record metadata. Payload-only terms still match; their snippets use a deterministic metadata fallback instead of reproducing payload text. Compact ranking values may change.
+- Replace recursive source and language inventories with a shallow generated baseline covering package, package-manager, workspace, script, top-level and workflow facts. Existing baseline records remain valid; explicit refresh supersedes them append-only.
+- Reduce the disposable search cache and rebuild older caches automatically on first use. No canonical record or artifact migration is required. Sequential downgrade to 0.3.0 rebuilds the disposable cache; concurrent mixed-version writers are unsupported.
+- Share the API and CLI runtime and publish only public declarations. The synchronous API, Node.js 24.15.0 minimum and zero runtime dependencies remain unchanged; CLI help and version avoid loading repository runtime modules.
+- Reuse one verified package candidate across CI consumers and keep historical compatibility checks on release and public-contract paths. Regression budgets and cross-platform correctness checks remain enforced.
+
+### Fixed
+
+- Recheck recovery-directory identity after native realpath failures so concurrent cleanup on Windows invalidates a changed observation while preserving stable errors and ownership checks.
+
+### Verification and documentation
+
+- Verify upgrade and downgrade against the pinned, actual published 0.3.0 package, including public API/CLI/declarations, result limits, durable records, artifacts, managed instructions, old-cache recovery and legacy baseline refresh.
+- Keep the README focused on everyday usage and the contract on stable public boundaries; preserve historical designs and documentation as immutable Encephalon artifacts.
+- Retain exact reviewed package bytes through successful merged-main CI and trusted artifact promotion. npm publication remains a manual, tarball-only maintainer step.
+
 ## [0.3.0] - 2026-08-27
 
 ### Added
