@@ -1078,14 +1078,15 @@ const observeOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
   }
   const captured = entryIdentityFrom(initialMetadata)
   cacheLocationTestHooks.duringOwnedDirectoryInspection?.(path)
-  let actualRealpath: string
+  let actualRealpath: string | undefined
+  let realpathError: unknown
   try {
     actualRealpath = realpathSync.native(path)
   } catch (error) {
     if (missingPath(error)) {
       return { kind: 'changed' }
     }
-    throw error
+    realpathError = error
   }
   cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity?.(path)
   let finalMetadata: BigIntStats
@@ -1103,10 +1104,14 @@ const observeOwnedDirectoryPath = (location: CacheLocation, name: string): Cache
   if (!sameCacheEntryIdentity(captured, entryIdentityFrom(finalMetadata))) {
     return { kind: 'changed' }
   }
-  if (!samePath(actualRealpath, path)) {
-    return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
+  // Windows realpath can fail while a peer removes the directory; identity remains the authority.
+  if (actualRealpath !== undefined) {
+    if (!samePath(actualRealpath, path)) {
+      return invalidLayout(ownedDirectoryRelativePath(name), 'real-directory')
+    }
+    return { directory: { ...captured, name, path }, kind: 'stable' }
   }
-  return { directory: { ...captured, name, path }, kind: 'stable' }
+  throw realpathError
 }
 
 export const observeCacheOwnedDirectory = (location: CacheLocation, name: string) => {

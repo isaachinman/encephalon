@@ -1,0 +1,55 @@
+{
+  "artifacts": [
+    "_artifacts/context/3ae9fa5c-490d-4a55-b988-22609b49ba00/README.md",
+    "_artifacts/context/3ae9fa5c-490d-4a55-b988-22609b49ba00/docs/contract.md",
+    "_artifacts/context/3ae9fa5c-490d-4a55-b988-22609b49ba00/docs/implementation-plan.md",
+    "_artifacts/context/3ae9fa5c-490d-4a55-b988-22609b49ba00/docs/performance.md",
+    "_artifacts/context/3ae9fa5c-490d-4a55-b988-22609b49ba00/docs/performance-baseline.json"
+  ],
+  "createdAt": "2026-09-10T23:11:47.375Z",
+  "id": "3ae9fa5c-490d-4a55-b988-22609b49ba00",
+  "kind": "context",
+  "payload": {
+    "summary": "Historical documentation and benchmark evidence before the lean-runtime public-contract rewrite.",
+    "sourceCommit": "a60fbf4028f999189820d948da5904e55ec16b5b",
+    "documents": [
+      {
+        "path": "README.md",
+        "artifact": "_artifacts/context/3ae9fa5c-490d-4a55-b988-22609b49ba00/README.md",
+        "bytes": 35495,
+        "sha256": "eb82f7b9f5dd45c60726648a2c0d890c713737849e117b060be4ce52d9f1c99e"
+      },
+      {
+        "path": "docs/contract.md",
+        "artifact": "_artifacts/context/3ae9fa5c-490d-4a55-b988-22609b49ba00/docs/contract.md",
+        "bytes": 78898,
+        "sha256": "0f72a335b2429a36469ed7ee7f20666b0bb0685ad139f909db23d68b8e161343"
+      },
+      {
+        "path": "docs/implementation-plan.md",
+        "artifact": "_artifacts/context/3ae9fa5c-490d-4a55-b988-22609b49ba00/docs/implementation-plan.md",
+        "bytes": 69775,
+        "sha256": "f957dc18421ffcdca65008a85cf3710b8688fcb6fb861c765f1ef7b67de9169a"
+      },
+      {
+        "path": "docs/performance.md",
+        "artifact": "_artifacts/context/3ae9fa5c-490d-4a55-b988-22609b49ba00/docs/performance.md",
+        "bytes": 17765,
+        "sha256": "c6577b457b1c5c6e5d5628758033c62bc9ef2d91483a0cd541f505ff9c8ef35a"
+      },
+      {
+        "path": "docs/performance-baseline.json",
+        "artifact": "_artifacts/context/3ae9fa5c-490d-4a55-b988-22609b49ba00/docs/performance-baseline.json",
+        "bytes": 39053,
+        "sha256": "53af256dc35ece00dbc870005da5bfa20c7d417057b63bb8483fdb540da12981"
+      }
+    ],
+    "currentContract": "docs/contract.md",
+    "currentGuide": "README.md",
+    "currentPerformanceGuide": "docs/performance.md",
+    "provenance": "Archived byte-for-byte during MAR-2795. Original relative links, implementation details and historical measurements are retained as written; resolve historical paths against sourceCommit. These files are historical evidence, not the current contract."
+  },
+  "searchText": "historical documentation archive implementation plan README contract performance benchmark public guarantees lean runtime MAR-2795",
+  "source": "agent",
+  "subject": "repository.documentation-history"
+}

@@ -10112,38 +10112,62 @@ describe('SQLite cache and reads', () => {
     }
   })
 
-  test('reobserves changed recovery identities before rejecting a resolved path mismatch', () => {
-    for (const state of ['moved', 'replaced', 'stable']) {
-      const root = createRoot()
-      const location = inspectCacheLocation(root)
-      const path = join(location.directory, 'operation-lock.recovery')
-      const displacedPath = join(location.directory, 'displaced-recovery')
-      mkdirSync(path)
-      const nativeRealpath = realpathSync.native
-      const mocked = mock.method(realpathSync, 'native', (observedPath: string) => {
-        if (observedPath === path) {
-          mocked.mock.restore()
-          if (state !== 'stable') {
-            renameSync(path, displacedPath)
-            if (state === 'replaced') {
-              mkdirSync(path)
+  test('reobserves changed recovery identities before rejecting realpath failures', () => {
+    for (const resolution of ['mismatch', 'EBADF', 'EIO']) {
+      for (const state of ['moved', 'replaced', 'file', 'stable']) {
+        const root = createRoot()
+        const location = inspectCacheLocation(root)
+        const path = join(location.directory, 'operation-lock.recovery')
+        const displacedPath = join(location.directory, 'displaced-recovery')
+        mkdirSync(path)
+        const failure = Object.assign(new Error('Injected realpath failure'), { code: resolution })
+        const nativeRealpath = realpathSync.native
+        const mocked = mock.method(realpathSync, 'native', (observedPath: string) => {
+          if (observedPath === path) {
+            mocked.mock.restore()
+            if (state !== 'stable') {
+              renameSync(path, displacedPath)
+              if (state === 'replaced') {
+                mkdirSync(path)
+              } else if (state === 'file') {
+                writeFileSync(path, 'replacement')
+              }
             }
+            if (resolution === 'mismatch') {
+              return displacedPath
+            }
+            throw failure
           }
-          return displacedPath
+          return nativeRealpath(observedPath)
+        })
+        try {
+          if (state === 'stable' || state === 'file') {
+            if (resolution === 'mismatch' || state === 'file') {
+              assert.throws(() => observeCacheOwnedDirectory(location, 'operation-lock.recovery'), {
+                code: 'VALIDATION_FAILED',
+                details: {
+                  entry: 'node_modules/.cache/encephalon/operation-lock.recovery',
+                  invariant: 'real-directory',
+                },
+              })
+            } else {
+              assert.throws(
+                () => observeCacheOwnedDirectory(location, 'operation-lock.recovery'),
+                error => error === failure,
+              )
+            }
+          } else {
+            assert.deepEqual(
+              observeCacheOwnedDirectory(location, 'operation-lock.recovery'),
+              { kind: 'changed' },
+              state,
+            )
+            assert.equal(existsSync(displacedPath), true)
+            assert.equal(existsSync(path), state === 'replaced')
+          }
+        } finally {
+          mocked.mock.restore()
         }
-        return nativeRealpath(observedPath)
-      })
-      try {
-        if (state === 'stable') {
-          assert.throws(() => observeCacheOwnedDirectory(location, 'operation-lock.recovery'), {
-            code: 'VALIDATION_FAILED',
-            details: { entry: 'node_modules/.cache/encephalon/operation-lock.recovery', invariant: 'real-directory' },
-          })
-        } else {
-          assert.deepEqual(observeCacheOwnedDirectory(location, 'operation-lock.recovery'), { kind: 'changed' }, state)
-        }
-      } finally {
-        mocked.mock.restore()
       }
     }
   })
