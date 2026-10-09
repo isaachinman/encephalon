@@ -58,7 +58,7 @@ encephalon/
 
 Commit canonical records and referenced artifacts. Keep the disposable cache at `node_modules/.cache/encephalon/` out of Git. To attach an immutable supporting file, choose the record ID first, place the file under its matching `_artifacts/<kind>/<id>/` directory, then pass the brain-relative path with `add --artifact`. Encephalon validates the file; it does not copy arbitrary source files into the archive.
 
-After merging knowledge from another branch, run `validate`. If multiple active heads conflict, add a resolving record that supersedes them all. Never delete history to repair a conflict.
+After merging knowledge from another branch, run `validate`. If multiple active heads conflict, add a resolving record that supersedes them all. Until then, reads return every conflicting head as active and adds for other subjects still work. Never delete history to repair a conflict.
 
 ## Limits
 

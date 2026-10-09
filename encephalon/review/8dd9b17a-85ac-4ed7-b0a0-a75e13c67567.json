@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-10-09T11:01:01.110Z",
+  "id": "8dd9b17a-85ac-4ed7-b0a0-a75e13c67567",
+  "kind": "review",
+  "payload": {
+    "summary": "Greptile on PR #101 (MAR-2918): acceptance decisions that filter validation issues must use the untruncated issue list and be tested beyond the 100-issue report cap.",
+    "mistake": "The conflict-tolerant read path was correct, but no test proved that a blocking issue reported after 99 tolerated conflicts still blocks, or that 100 tolerated conflicts alone stay readable.",
+    "guidance": [
+      "Filter ValidatedRecordScan.issues, never the truncated ValidateResult.errors, when deciding whether an operation may proceed.",
+      "Truncate only the reported VALIDATION_FAILED details after filtering."
+    ],
+    "verification": [
+      "Cover acceptance filters with more than 99 tolerated issues plus a later blocking issue, and with the tolerated issues alone."
+    ]
+  },
+  "searchText": "validation truncation acceptance filter untruncated issues conflict tolerance Greptile",
+  "source": "agent",
+  "subject": "review.untruncated-acceptance-issues"
+}

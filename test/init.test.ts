@@ -1958,21 +1958,20 @@ describe('initialisation', () => {
   test('preserves the canonical-history error before baseline candidate errors', () => {
     const root = createRoot()
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'invalid-history' }))
-    for (const [index, id] of ['parallel-history-a', 'parallel-history-b'].entries()) {
-      writeRecordFile(root, {
-        createdAt: `2026-01-01T00:00:0${index}.000Z`,
-        id,
-        kind: 'decision',
-        payload: {},
-        source: 'test',
-        subject: 'parallel.history',
-      })
-    }
+    writeRecordFile(root, {
+      createdAt: '2026-01-01T00:00:00.000Z',
+      id: 'dangling-history',
+      kind: 'decision',
+      payload: {},
+      source: 'test',
+      subject: 'dangling.history',
+      supersedes: ['missing-history'],
+    })
     const [candidate] = scanBaseline(root)
     assert.ok(candidate)
     const candidateId = validateAddRecordInput({ ...candidate, root }).id
     writeRecordFile(root, {
-      createdAt: '2026-01-01T00:00:02.000Z',
+      createdAt: '2026-01-01T00:00:01.000Z',
       id: candidateId,
       kind: 'collision',
       payload: {},
@@ -1992,12 +1991,9 @@ describe('initialisation', () => {
         assert.equal(actual.message, 'Canonical records are invalid.')
         assert.deepEqual(actual.details?.errors, [
           {
-            code: 'MULTIPLE_ACTIVE_HEADS',
-            message: 'Multiple active records exist for decision/parallel.history.',
-          },
-          {
-            code: 'MULTIPLE_ACTIVE_HEADS',
-            message: 'Multiple active records exist for decision/parallel.history.',
+            code: 'MISSING_SUPERSEDES',
+            message: 'Record supersedes missing record missing-history.',
+            recordId: 'dangling-history',
           },
         ])
         return true
@@ -2014,16 +2010,15 @@ describe('initialisation', () => {
       join(root, 'package.json'),
       JSON.stringify({ name: 'invalid-baseline-input', packageManager: 'npm@10.0.0', scripts }),
     )
-    for (const [index, id] of ['invalid-input-history-a', 'invalid-input-history-b'].entries()) {
-      writeRecordFile(root, {
-        createdAt: `2026-01-01T00:00:0${index}.000Z`,
-        id,
-        kind: 'decision',
-        payload: {},
-        source: 'test',
-        subject: 'invalid.input-history',
-      })
-    }
+    writeRecordFile(root, {
+      createdAt: '2026-01-01T00:00:00.000Z',
+      id: 'invalid-input-history',
+      kind: 'decision',
+      payload: {},
+      source: 'test',
+      subject: 'invalid.input-history',
+      supersedes: ['missing-history'],
+    })
 
     assert.throws(
       () => api.initEncephalon({ root }),
@@ -2033,16 +2028,34 @@ describe('initialisation', () => {
         assert.equal(actual.message, 'Canonical records are invalid.')
         assert.deepEqual(actual.details?.errors, [
           {
-            code: 'MULTIPLE_ACTIVE_HEADS',
-            message: 'Multiple active records exist for decision/invalid.input-history.',
-          },
-          {
-            code: 'MULTIPLE_ACTIVE_HEADS',
-            message: 'Multiple active records exist for decision/invalid.input-history.',
+            code: 'MISSING_SUPERSEDES',
+            message: 'Record supersedes missing record missing-history.',
+            recordId: 'invalid-input-history',
           },
         ])
         return true
       },
+    )
+  })
+
+  test('initialises beside an unrelated subject with conflicting active heads', () => {
+    const root = createRoot()
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'conflicted-history' }))
+    for (const id of ['parallel-history-a', 'parallel-history-b']) {
+      writeRecordFile(root, {
+        createdAt: '2026-01-01T00:00:00.000Z',
+        id,
+        kind: 'decision',
+        payload: {},
+        source: 'test',
+        subject: 'parallel.history',
+      })
+    }
+
+    assert.notEqual(api.initEncephalon({ root }).recordsCreated.length, 0)
+    assert.deepEqual(
+      api.validateRecords({ root }).errors.map(error => error.recordId),
+      ['parallel-history-a', 'parallel-history-b'],
     )
   })
 
@@ -2437,24 +2450,24 @@ describe('initialisation', () => {
     ])
   })
 
-  test('refresh rejects mixed generated and human baseline heads without repairing them', () => {
+  test('refresh reports mixed generated and human baseline heads without repairing them', () => {
     const root = createRoot()
     api.initEncephalon({ root })
     const subject = 'encephalon:init/repository-overview'
-    cloneBaselineRecord(root, subject, 'human-parallel-overview', { source: 'human' })
+    const { cloned, original } = cloneBaselineRecord(root, subject, 'human-parallel-overview', { source: 'human' })
     const before = rawRecordFilesForSubject(root, 'context', subject).length
 
-    assert.throws(
-      () => api.initEncephalon({ refreshBaseline: true, root }),
-      (error: unknown) => {
-        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
-        return true
+    assert.deepEqual(api.initEncephalon({ refreshBaseline: true, root }).skippedConflicts, [
+      {
+        activeRecordIds: [cloned.id, original.id].sort(ordinalStringCompare),
+        kind: 'context',
+        subject,
       },
-    )
+    ])
     assert.equal(rawRecordFilesForSubject(root, 'context', subject).length, before)
   })
 
-  test('refresh rejects unrelated active-head conflicts while repairing no baseline subject', () => {
+  test('refresh leaves unrelated active-head conflicts for an explicit resolver', () => {
     const root = createRoot()
     api.initEncephalon({ root })
     api.addRecord({
@@ -2474,14 +2487,11 @@ describe('initialisation', () => {
       id: 'custom-head-two',
     })
 
-    assert.throws(
-      () => api.initEncephalon({ refreshBaseline: true, root }),
-      (error: unknown) => {
-        assert.equal((error as { code?: unknown }).code, 'VALIDATION_FAILED')
-        return true
-      },
+    assert.deepEqual(api.initEncephalon({ refreshBaseline: true, root }).recordsCreated, [])
+    assert.deepEqual(
+      api.validateRecords({ root }).errors.map(error => error.recordId),
+      ['custom-head-one', 'custom-head-two'],
     )
-    assert.equal(api.validateRecords({ root }).valid, false)
   })
 
   test('refresh rejects malformed supersession graphs while repairing no baseline subject', () => {
