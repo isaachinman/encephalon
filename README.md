@@ -84,6 +84,8 @@ For canonical validation failures, inspect the reported records or artifacts and
 
 Initialisation can commit some records or instruction changes before another step fails. Follow `details.initProgress.recoveryAction`: inspect committed work when requested, run `prepare` and `validate` after a cache failure, then repeat the **same init options**. If an add error reports `canonicalCommitted: true`, inspect its `recordId` and validate; do not blindly add it again. Only reported recovery paths are identified as belonging to that failed operation. See the contract for commit and recovery guarantees.
 
+To investigate an unexpected failure, rerun the command with `ENCEPHALON_DEBUG=1`. The CLI then prints the error's stack and cause chain to stderr after the usual JSON error. The output can include local paths, so review it before sharing it.
+
 Refresh generated facts after changing package tooling or top-level layout:
 
 ```bash

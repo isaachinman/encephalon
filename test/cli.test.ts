@@ -251,6 +251,46 @@ registerHooks({ load(url, context, nextLoad) {
     assert.equal(JSON.parse(retry.stderr).error.code, 'RECORD_EXISTS')
   })
 
+  test('appends an opt-in diagnostic with the error cause chain', () => {
+    const root = createRoot()
+    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'), {
+      recursive: true,
+    })
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        cliPath,
+        'add',
+        '--root',
+        root,
+        '--id',
+        'cli-debug',
+        '--kind',
+        'decision',
+        '--subject',
+        'debug.output',
+        '--source',
+        'agent',
+        '--data',
+        '{}',
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ENCEPHALON_DEBUG: '1' },
+      },
+    )
+
+    assert.equal(result.status, 2)
+    assert.equal(result.stdout, '')
+    const [json = '', ...diagnosticLines] = result.stderr.split('\n')
+    const diagnostic = diagnosticLines.join('\n')
+    assert.equal(JSON.parse(json).error.code, 'IO_ERROR')
+    assert.match(diagnostic, /^EncephalonError: Record cli-debug was committed/)
+    assert.match(diagnostic, /\[cause\]: EncephalonError: The Encephalon cache layout is unsafe\./)
+  })
+
   test('redacts operation-gate cleanup failure after a committed add', () => {
     const root = createRoot()
     const id = 'cli-operation-cleanup'

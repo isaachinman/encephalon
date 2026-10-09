@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { parseArgs } from 'node:util'
+import { inspect, parseArgs } from 'node:util'
 import { cliErrorResponse, EncephalonError, fail, failBudget } from './errors.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
@@ -29,7 +29,11 @@ Global options:
   --help, -h      Show help when this is the only remaining argv token (not per-command).
   --version, -v   Show the package version when this is the only remaining argv token.
   Values that start with '-' must use --name=value (for example --subject=-draft).
+
+Set ENCEPHALON_DEBUG=1 to print the error's stack and cause chain to stderr after a failure.
 `
+
+const DEBUG_CAUSE_DEPTH = 8
 
 type ParsedOptions = {
   values: Map<string, string[]>
@@ -423,6 +427,12 @@ const writeJson = (stream: NodeJS.WriteStream, value: unknown) => {
   stream.write(`${JSON.stringify(value)}\n`)
 }
 
+const writeDebugDiagnostic = (error: unknown) => {
+  if (process.env.ENCEPHALON_DEBUG === '1') {
+    process.stderr.write(`${inspect(error, { depth: DEBUG_CAUSE_DEPTH })}\n`)
+  }
+}
+
 export const runCli = async (arguments_: string[] = process.argv.slice(2)) => {
   try {
     const result = await dispatch(arguments_)
@@ -436,6 +446,7 @@ export const runCli = async (arguments_: string[] = process.argv.slice(2)) => {
     if (error instanceof EncephalonError) {
       const response = cliErrorResponse(error)
       writeJson(process.stderr, response.body)
+      writeDebugDiagnostic(error)
       return response.exitCode
     }
     writeJson(process.stderr, {
@@ -445,6 +456,7 @@ export const runCli = async (arguments_: string[] = process.argv.slice(2)) => {
         message: 'An unexpected internal error occurred.',
       },
     })
+    writeDebugDiagnostic(error)
     return 1
   }
 }
