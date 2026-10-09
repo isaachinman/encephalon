@@ -285,20 +285,13 @@ const initResolved = (
       hooks.baselineScan?.()
       const baseline = scanBaseline(root)
       const refresh = input.refreshBaseline === true
-      const allowedGeneratedHeads = refresh
-        ? baseline.map(candidate => ({
-            kind: candidate.kind,
-            source: 'encephalon:init',
-            subject: candidate.subject,
-          }))
-        : undefined
       const { actions, recordsCreated } = withRecordPlanningSnapshotRetryResolved(
         root,
         planning => {
           const { records } = planning
           assertCacheLocation(location)
           const validateCurrentRecords = () =>
-            planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes, allowedGeneratedHeads)
+            planning.validateFinal(records, 'Canonical records are invalid.', planning.bytes)
           const { actions: plannedActions, validatedAdditions } = (() => {
             try {
               const nextActions = baselineActions(planning.activeHeads, baseline, refresh)

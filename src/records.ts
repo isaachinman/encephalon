@@ -121,6 +121,7 @@ type ValidatedRecordScan = {
   index: RecordCorpusIndex
   artifactEvidence: ArtifactInspection | undefined
   artifacts: readonly ArtifactObservation[]
+  issues: readonly ValidationIssue[]
   result: ValidateResult
 }
 
@@ -268,12 +269,6 @@ type ValidateRecordsOptions = {
   hooks?: RecordReadHooks
 }
 
-type AllowedMultiHead = {
-  kind: string
-  source: string
-  subject: string
-}
-
 type RecordPlanningSnapshot = Readonly<{
   activeHeads: (kind: string, subject: string) => readonly BrainRecord[]
   authority: () => CanonicalPublicationAuthority
@@ -284,7 +279,6 @@ type RecordPlanningSnapshot = Readonly<{
     records: readonly BrainRecord[],
     message?: string,
     bytes?: number,
-    allowed?: readonly AllowedMultiHead[],
   ) => { artifacts: readonly ArtifactObservation[]; index: RecordCorpusIndex }
 }>
 
@@ -547,6 +541,13 @@ const issue = (code: string, message: string, path?: string, recordId?: string):
 })
 
 const corpusIssue = (code: string, message: string, path = 'encephalon') => issue(code, message, path)
+
+const validationErrorDetails = (errors: readonly ValidationIssue[]) =>
+  errors.map(({ code, message, recordId }) =>
+    recordId === undefined ? { code, message } : { code, message, recordId },
+  )
+
+const activeGroupKey = (record: Pick<BrainRecord, 'kind' | 'subject'>) => `${record.kind}\0${record.subject}`
 
 const directoryEntryLimitIssue = (path: string, maximum: number, entryKind = 'directory entries') =>
   corpusIssue('CORPUS_DIRECTORY_ENTRY_LIMIT', `${path} may contain at most ${maximum} ${entryKind}.`, path)
@@ -1270,7 +1271,7 @@ const indexRecordCorpus = (records: readonly BrainRecord[], artifacts = indexArt
     for (const record of records) {
       if (!superseded.has(record.id)) {
         active.add(record.id)
-        const key = `${record.kind}\0${record.subject}`
+        const key = activeGroupKey(record)
         const group = groups.get(key)
         if (group === undefined) {
           groups.set(key, [record])
@@ -1283,7 +1284,7 @@ const indexRecordCorpus = (records: readonly BrainRecord[], artifacts = indexArt
   return Object.freeze({
     activeGroups: Object.freeze([...groups.values()].map(group => Object.freeze(group))),
     activeHeads: (kind: string, subject: string): readonly BrainRecord[] =>
-      groups.get(`${kind}\0${subject}`) ?? Object.freeze([]),
+      groups.get(activeGroupKey({ kind, subject })) ?? Object.freeze([]),
     activeIds: Object.freeze({ has: (id: string) => active.has(id) }),
     ...artifacts,
     byCasePath: readonlyLookup(paths),
@@ -1520,6 +1521,7 @@ const validateScannedSnapshot = (
     artifactEvidence: artifactValidation.evidence,
     artifacts: artifactValidation.observations,
     index,
+    issues: collectedErrors,
     result: {
       errors,
       recordsChecked: scan.records.length,
@@ -1790,22 +1792,6 @@ const readStableCanonicalPlanningScan = (root: string, hooks: RecordReadHooks = 
     createCanonicalSnapshotRetryLedger(hooks.now),
   )
 
-const allowedMultiHeadRecordIds = (index: RecordCorpusIndex, allowed: readonly AllowedMultiHead[]) => {
-  const allowedKeys = new Set(allowed.map(candidate => `${candidate.kind}\0${candidate.subject}\0${candidate.source}`))
-  const ids = new Set<string>()
-  for (const group of index.activeGroups) {
-    if (
-      group.length > 1 &&
-      group.every(record => allowedKeys.has(`${record.kind}\0${record.subject}\0${record.source}`))
-    ) {
-      for (const record of group) {
-        ids.add(record.id)
-      }
-    }
-  }
-  return ids
-}
-
 /** @internal */
 export const validateRecordsResolved = (root: string, options: ValidateRecordsOptions = {}): ValidateResult => {
   try {
@@ -1823,30 +1809,27 @@ export const validateRecords = (input: RootInput = {}): ValidateResult => {
   return validateRecordsResolved(root)
 }
 
-const acceptValidatedRecordScan = (snapshot: StableCanonicalSnapshot, allowed?: AllowedMultiHead[]) => {
+// Conflicting heads stay readable; only an add to their kind and subject must resolve them.
+const blockingValidationIssues = (
+  validation: ValidatedRecordScan,
+  toleratesConflict: (record: BrainRecord) => boolean,
+) =>
+  validation.issues.filter(error => {
+    const record =
+      error.code === 'MULTIPLE_ACTIVE_HEADS' && error.recordId !== undefined
+        ? validation.index.byId.get(error.recordId)
+        : undefined
+    return record === undefined || !toleratesConflict(record)
+  })
+
+const failBlockingValidationIssues = (message: string, errors: ValidationIssue[]): never =>
+  fail('VALIDATION_FAILED', message, {
+    errors: validationErrorDetails(truncateValidationIssues(errors).errors),
+  })
+
+const acceptValidatedRecordScan = (snapshot: StableCanonicalSnapshot) => {
   const { scan, validation } = snapshot
-  const { result } = validation
-  if (allowed === undefined) {
-    if (result.valid) {
-      return {
-        artifactEvidence: validation.artifactEvidence,
-        artifacts: validation.artifacts,
-        index: validation.index,
-        scan,
-      }
-    }
-    return fail('VALIDATION_FAILED', 'Canonical records are invalid.', {
-      errors: result.errors.map(error => ({
-        code: error.code,
-        message: error.message,
-      })),
-    })
-  }
-  const allowedIds = allowedMultiHeadRecordIds(validation.index, allowed)
-  const blockingErrors = result.errors.filter(
-    error =>
-      !(error.code === 'MULTIPLE_ACTIVE_HEADS' && error.recordId !== undefined && allowedIds.has(error.recordId)),
-  )
+  const blockingErrors = blockingValidationIssues(validation, () => true)
   if (blockingErrors.length === 0) {
     return {
       artifactEvidence: validation.artifactEvidence,
@@ -1855,20 +1838,15 @@ const acceptValidatedRecordScan = (snapshot: StableCanonicalSnapshot, allowed?: 
       scan,
     }
   }
-  return fail('VALIDATION_FAILED', 'Canonical records are invalid.', {
-    errors: blockingErrors.map(error => ({
-      code: error.code,
-      message: error.message,
-    })),
-  })
+  return failBlockingValidationIssues('Canonical records are invalid.', blockingErrors)
 }
 
-const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
-  acceptValidatedRecordScan(readStableCanonicalSnapshot(root, hooks), allowed)
+const readRecordScanResolved = (root: string, hooks: RecordReadHooks = {}) =>
+  acceptValidatedRecordScan(readStableCanonicalSnapshot(root, hooks))
 
-const readRecordScanAttemptResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) => {
+const readRecordScanAttemptResolved = (root: string, hooks: RecordReadHooks = {}) => {
   try {
-    return acceptValidatedRecordScan(readCanonicalSnapshotAttempt(root, hooks), allowed)
+    return acceptValidatedRecordScan(readCanonicalSnapshotAttempt(root, hooks))
   } catch (error) {
     if (error instanceof CanonicalGenerationChanged) {
       return fail('REPOSITORY_CHANGED', 'The canonical repository changed during the operation.')
@@ -2213,7 +2191,6 @@ const recordPlanningSnapshot = (
     records: readonly BrainRecord[],
     message = 'Canonical records are invalid.',
     bytes?: number,
-    allowed?: readonly AllowedMultiHead[],
   ) => {
     const validation = validateScannedSnapshot(
       root,
@@ -2229,26 +2206,14 @@ const recordPlanningSnapshot = (
         : undefined,
     )
     assertCanonicalSnapshotCurrent(root, scan, validation.artifactEvidence, changed, hooks)
-    const blockingErrors = (() => {
-      if (allowed === undefined) {
-        return validation.result.errors
-      }
-      const allowedIds = allowedMultiHeadRecordIds(validation.index, allowed)
-      return validation.result.errors.filter(
-        error =>
-          !(error.code === 'MULTIPLE_ACTIVE_HEADS' && error.recordId !== undefined && allowedIds.has(error.recordId)),
-      )
-    })()
+    const existingRecords = new Set(scan.records)
+    const touchedGroups = new Set(records.filter(record => !existingRecords.has(record)).map(activeGroupKey))
+    const blockingErrors = blockingValidationIssues(validation, record => !touchedGroups.has(activeGroupKey(record)))
     if (blockingErrors.length === 0) {
       acceptedArtifactEvidence = validation.artifactEvidence
       return { artifacts: validation.artifacts, index: validation.index }
     }
-    return fail('VALIDATION_FAILED', message, {
-      errors: blockingErrors.map(error => ({
-        code: error.code,
-        message: error.message,
-      })),
-    })
+    return failBlockingValidationIssues(message, blockingErrors)
   }
   return Object.freeze({
     activeHeads,
@@ -2295,16 +2260,12 @@ export const withRecordPlanningSnapshotRetryResolved = <Result>(
 }
 
 /** @internal */
-export const readRecordsResolved = (root: string, hooks: RecordReadHooks = {}, allowed?: AllowedMultiHead[]) =>
-  readRecordScanResolved(root, hooks, allowed).index.records
+export const readRecordsResolved = (root: string, hooks: RecordReadHooks = {}) =>
+  readRecordScanResolved(root, hooks).index.records
 
 /** @internal */
-export const readValidatedRecordSnapshotResolved = (
-  root: string,
-  hooks: RecordReadHooks = {},
-  allowed?: AllowedMultiHead[],
-) => {
-  const validated = readRecordScanAttemptResolved(root, hooks, allowed)
+export const readValidatedRecordSnapshotResolved = (root: string, hooks: RecordReadHooks = {}) => {
+  const validated = readRecordScanAttemptResolved(root, hooks)
   const artifacts = Object.freeze([...validated.artifacts])
   const assertCurrent = () =>
     assertCanonicalSnapshotCurrent(
@@ -2321,10 +2282,9 @@ export const readValidatedRecordSnapshotResolved = (
 export const readRecordSnapshotResolved = (
   root: string,
   hooks: RecordReadHooks = {},
-  allowed?: AllowedMultiHead[],
   cacheLocation?: CacheLocation,
 ) => {
-  const { artifactEvidence, index, scan } = readRecordScanResolved(root, hooks, allowed)
+  const { artifactEvidence, index, scan } = readRecordScanResolved(root, hooks)
   if (scan.layout === undefined) {
     return fail('REPOSITORY_CHANGED', 'Canonical records changed after validation.')
   }
@@ -2345,10 +2305,6 @@ export const readRecordSnapshotResolved = (
 
 /** @internal */
 export const readRecords = (input: RootInput = {}) => readRecordsResolved(resolveRepository(input))
-
-/** @internal */
-export const readRecordsAllowingGeneratedMultiHeads = (input: RootInput, allowed: AllowedMultiHead[]) =>
-  readRecordsResolved(resolveRepository(input), {}, allowed)
 
 /** @internal */
 export const planRecordAddition = (root: string, recordFile: BrainRecordFile): PlannedRecord => {
@@ -2407,10 +2363,7 @@ export const assertRecordGraph = (
     return
   }
   return fail('VALIDATION_FAILED', message, {
-    errors: result.errors.map(error => ({
-      code: error.code,
-      message: error.message,
-    })),
+    errors: validationErrorDetails(result.errors),
   })
 }
 
@@ -2827,10 +2780,7 @@ const addRecordFileResolved = (
       if (planning.errors.length > 0) {
         return rethrowInvalidatedCandidateError(
           new EncephalonError('VALIDATION_FAILED', 'Existing canonical records are invalid.', {
-            errors: planning.errors.map(error => ({
-              code: error.code,
-              message: error.message,
-            })),
+            errors: validationErrorDetails(planning.errors),
           }),
           repositoryChanged,
         )

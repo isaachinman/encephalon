@@ -540,6 +540,7 @@ describe('canonical records', () => {
       createdAt: '9999-12-31T23:59:59.998Z',
       id: 'ceiling-invalid-history-b',
       subject: 'timestamp.invalid-history',
+      supersedes: ['ceiling-invalid-history-missing'],
     })
 
     assert.throws(
@@ -559,7 +560,7 @@ describe('canonical records', () => {
         }
         assert.equal(actual.code, 'VALIDATION_FAILED')
         assert.equal(
-          actual.details?.errors?.some(issue => issue.code === 'MULTIPLE_ACTIVE_HEADS'),
+          actual.details?.errors?.some(issue => issue.code === 'MISSING_SUPERSEDES'),
           true,
         )
         return true
@@ -2790,6 +2791,44 @@ describe('canonical records', () => {
     assert.equal(
       conflicted.errors.some(error => error.code === 'MULTIPLE_ACTIVE_HEADS'),
       true,
+    )
+
+    assert.deepEqual(
+      api.listRecords({ root, subject: 'api.style' }).map(record => record.id),
+      [second.id, 'record-c'],
+    )
+    assert.deepEqual(
+      api.searchRecords({ query: 'RPC', root }).map(record => record.id),
+      ['record-c'],
+    )
+    assert.equal(api.showRecord({ activeOnly: true, id: second.id, root })?.id, second.id)
+    assert.equal(
+      api.addRecord({ kind: 'decision', payload: {}, root, source: 'agent', subject: 'api.unrelated' }).subject,
+      'api.unrelated',
+    )
+    assert.throws(
+      () =>
+        api.addRecord({
+          id: 'record-partial',
+          kind: 'decision',
+          payload: { summary: 'GraphQL only' },
+          root,
+          source: 'agent',
+          subject: 'api.style',
+          supersedes: [second.id],
+        }),
+      (error: unknown) => {
+        assert.equal((error as api.EncephalonError).code, 'VALIDATION_FAILED')
+        assert.deepEqual(
+          (error as api.EncephalonError).details.errors,
+          ['record-c', 'record-partial'].map(recordId => ({
+            code: 'MULTIPLE_ACTIVE_HEADS',
+            message: 'Multiple active records exist for decision/api.style.',
+            recordId,
+          })),
+        )
+        return true
+      },
     )
 
     api.addRecord({
