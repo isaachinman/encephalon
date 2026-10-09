@@ -173,9 +173,20 @@ registerHooks({ load(url, context, nextLoad) {
     assert.equal(missing.status, 0)
     assert.equal(outputJson(missing), null)
 
+    const positionalShow = run(root, ['show', '--root', root, 'cli-decision'])
+    assert.equal(positionalShow.status, 0)
+    assert.equal((outputJson(positionalShow) as { id?: unknown }).id, 'cli-decision')
+
     const searched = run(root, ['search', '--root', root, 'nothing matches'])
     assert.equal(searched.status, 0)
     assert.deepEqual(outputJson(searched), [])
+
+    const unquoted = run(root, ['search', '--root', root, 'portable', 'output'])
+    assert.equal(unquoted.status, 0)
+    assert.deepEqual(
+      (outputJson(unquoted) as { id: string }[]).map(record => record.id),
+      ['cli-decision'],
+    )
   })
 
   test('emits expected failures as structured stderr JSON with exit status 2', () => {
@@ -224,10 +235,10 @@ registerHooks({ load(url, context, nextLoad) {
           path: 'encephalon/decision/cli-post-commit.json',
           postCommitPhase: 'cacheHydration',
           recordId: 'cli-post-commit',
-          recoveryAction: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+          recoveryAction: 'Do not retry this add. Run prepare to rebuild disposable cache state, then validate.',
         },
         message:
-          'Record cli-post-commit was committed, but the cacheHydration post-commit phase failed. Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+          'Record cli-post-commit was committed, but the cacheHydration post-commit phase failed. Do not retry this add. Run prepare to rebuild disposable cache state, then validate.',
       },
     })
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'cli-post-commit.json')), true)

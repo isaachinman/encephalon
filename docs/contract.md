@@ -99,11 +99,11 @@ encephalon [--root <path>] <command> [options]
 | `add` | Required `--kind`, `--subject`, `--source`, `--data <json>`; optional `--id`, `--confidence <0..1>`, `--text`, repeated `--supersedes <id>` and `--artifact <path>` |
 | `prepare`, `hydrate`, `validate` | No command options |
 | `list` | `--kind`, `--subject`, `--include-superseded`, `--limit <1..1000>` |
-| `show` | Required `--id`; optional `--active-only` |
-| `search` | One query argument; optional `--compact`, `--kind`, `--include-superseded`, `--limit <1..1000>` |
+| `show` | Required ID as `--id <id>` or one positional argument; optional `--active-only` |
+| `search` | Query arguments, joined with single spaces; optional `--compact`, `--kind`, `--include-superseded`, `--limit <1..1000>` |
 | `gather` | Repeated `--search <query>` and `--show <id>`; optional `--hydrate`, `--kind`, `--include-superseded`, `--limit <1..1000>` |
 
-`--root <path>` or `--root=<path>` is global and may occur once before the `--` terminator. `--help`/`-h` and `--version`/`-v` work only when they are the sole remaining argument after root extraction; they are not per-command flags. Quote a multi-word search into one argument. Use `--` before a query beginning with a dash, and `--name=value` for option values beginning with a dash. Unsupported commands/options, missing values, repeated non-repeatable options and unexpected positional arguments fail with `INVALID_ARGUMENT`. `--data` parses JSON; `--text` maps to `searchText`; `--artifact` maps to `artifacts`.
+`--root <path>` or `--root=<path>` is global and may occur once before the `--` terminator. `--help`/`-h` and `--version`/`-v` work only when they are the sole remaining argument after root extraction; they are not per-command flags. Several search query arguments are joined with single spaces, so a multi-word query may be quoted or not; quote it to preserve other whitespace. Use `--` before a query beginning with a dash, and `--name=value` for option values beginning with a dash. Unsupported commands/options, missing values, repeated non-repeatable options and unexpected positional arguments fail with `INVALID_ARGUMENT`. `--data` parses JSON; `--text` maps to `searchText`; `--artifact` maps to `artifacts`.
 
 Successful JSON commands write one JSON value to stdout and exit 0. Help/version write text. Expected user errors write `{ "error": { "code", "message", "details" } }` as one JSON value to stderr and exit 2. Internal errors exit 1 with a safe message. Canonical validation failures instead write `ValidateResult` to stdout and exit 2. CLI output omits stacks, raw causes and private absolute paths. JSON object property order is not a consumer contract.
 
