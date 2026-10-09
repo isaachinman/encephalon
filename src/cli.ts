@@ -29,8 +29,6 @@ Global options:
   --help, -h      Show help when this is the only remaining argv token (not per-command).
   --version, -v   Show the package version when this is the only remaining argv token.
   Values that start with '-' must use --name=value (for example --subject=-draft).
-
-Set ENCEPHALON_DEBUG=1 to print the error's stack and cause chain to stderr after a failure.
 `
 
 const DEBUG_CAUSE_DEPTH = 8
