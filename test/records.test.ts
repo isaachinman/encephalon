@@ -2843,6 +2843,45 @@ describe('canonical records', () => {
     assert.equal(api.validateRecords({ root }).valid, true)
   })
 
+  test('blocks on issues beyond the reported validation limit while tolerating conflicts', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 100 }, (_, position) => position)) {
+      writeCanonicalRecord(root, {
+        id: `conflict-head-${String(index).padStart(3, '0')}`,
+        subject: 'conflict.limit',
+      })
+    }
+    writeCanonicalRecord(root, {
+      artifacts: ['_artifacts/decision/missing-artifact/evidence.txt'],
+      id: 'missing-artifact',
+      subject: 'artifact.missing',
+    })
+
+    const validation = api.validateRecords({ root })
+    assert.equal(validation.truncated, true)
+    assert.equal(
+      validation.errors.some(error => error.code === 'INVALID_ARTIFACT'),
+      false,
+    )
+    for (const operation of [
+      () => api.listRecords({ root }),
+      () => api.addRecord({ kind: 'decision', payload: {}, root, source: 'agent', subject: 'unrelated.limit' }),
+    ]) {
+      assert.throws(operation, (error: unknown) => {
+        const errors = (error as api.EncephalonError).details.errors as { code: string; recordId?: string }[]
+        assert.equal((error as api.EncephalonError).code, 'VALIDATION_FAILED')
+        assert.deepEqual(
+          errors.map(issue => [issue.code, issue.recordId]),
+          [['INVALID_ARTIFACT', 'missing-artifact']],
+        )
+        return true
+      })
+    }
+
+    rmSync(join(root, 'encephalon', 'decision', 'missing-artifact.json'))
+    assert.equal(api.listRecords({ limit: 1000, root }).length, 100)
+  })
+
   test('bounds graph work for a corpus-limit supersession chain', () => {
     const root = createRoot()
     ;[1000, 1001].reduce<undefined>((verified, edgeCount) => {
