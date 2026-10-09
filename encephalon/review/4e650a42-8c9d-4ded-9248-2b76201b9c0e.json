@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-10-09T11:07:48.571Z",
+  "id": "4e650a42-8c9d-4ded-9248-2b76201b9c0e",
+  "kind": "review",
+  "payload": {
+    "summary": "Greptile and CI on PR #102 (MAR-2919): opt-in CLI output needs test isolation, coverage of both error branches and the exact opt-in value, and must not change published help text.",
+    "lessons": [
+      "CLI --help output is part of the published compatibility oracle; document new options or environment variables in the README and contract instead of changing help text.",
+      "Strip developer-exported debug variables in scripts/test-ci.ts so tests that parse stderr as one JSON value stay deterministic; diagnostic tests set the variable explicitly.",
+      "Test opt-in diagnostics on the unexpected-error branch as well as EncephalonError, and prove a non-exact value such as true leaves output unchanged.",
+      "Troubleshooting advice to rerun a command must defer to recovery actions when the failed command may already have committed work."
+    ],
+    "verification": [
+      "Run check:package and check:compatibility (or wait for the release-equivalent CI job) before pushing any CLI surface change."
+    ]
+  },
+  "searchText": "CLI debug diagnostics help text compatibility oracle test isolation environment Greptile",
+  "source": "agent",
+  "subject": "review.cli-debug-diagnostics"
+}
