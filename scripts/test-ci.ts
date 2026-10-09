@@ -13,7 +13,9 @@ if (!(Array.isArray(changed) && changed.every(path => typeof path === 'string'))
   throw new Error('CI_CHANGED_TESTS must contain the changed test paths.')
 }
 const files = selectTestFiles(group, discovered, changed)
-const result = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit' })
+// Tests opt in to CLI diagnostics explicitly; an exported developer setting must not change their stderr.
+const { ENCEPHALON_DEBUG: _debug, ...environment } = process.env
+const result = spawnSync(process.execPath, ['--test', ...files], { env: environment, stdio: 'inherit' })
 if (result.error) {
   throw result.error
 }

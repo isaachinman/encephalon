@@ -105,7 +105,7 @@ encephalon [--root <path>] <command> [options]
 
 `--root <path>` or `--root=<path>` is global and may occur once before the `--` terminator. `--help`/`-h` and `--version`/`-v` work only when they are the sole remaining argument after root extraction; they are not per-command flags. Quote a multi-word search into one argument. Use `--` before a query beginning with a dash, and `--name=value` for option values beginning with a dash. Unsupported commands/options, missing values, repeated non-repeatable options and unexpected positional arguments fail with `INVALID_ARGUMENT`. `--data` parses JSON; `--text` maps to `searchText`; `--artifact` maps to `artifacts`.
 
-Successful JSON commands write one JSON value to stdout and exit 0. Help/version write text. Expected user errors write `{ "error": { "code", "message", "details" } }` as one JSON value to stderr and exit 2. Internal errors exit 1 with a safe message. Canonical validation failures instead write `ValidateResult` to stdout and exit 2. CLI output omits stacks, raw causes and private absolute paths. JSON object property order is not a consumer contract.
+Successful JSON commands write one JSON value to stdout and exit 0. Help/version write text. Expected user errors write `{ "error": { "code", "message", "details" } }` as one JSON value to stderr and exit 2. Internal errors exit 1 with a safe message. Canonical validation failures instead write `ValidateResult` to stdout and exit 2. CLI output omits stacks, raw causes and private absolute paths. Setting the environment variable `ENCEPHALON_DEBUG=1` is the only exception: after a failure's JSON error, stderr also receives a plain-text inspection of the error, its stack and its cause chain, which can include local paths and internal detail. That diagnostic is for local troubleshooting and is not a consumer contract. JSON object property order is not a consumer contract.
 
 ## Search and ordering
 
@@ -297,7 +297,7 @@ Cache ancestors, databases, sidecars and lock/recovery entries require real cont
 | `IO_ERROR` | A recognised filesystem/SQLite environment failure prevented the operation. |
 | `INTERNAL_ERROR` | An unexpected internal failure; preserve evidence and report it. |
 
-Public messages and structured details are bounded. Budget errors omit rejected input content. Validation identifies only safe repository-relative paths and valid record IDs where appropriate; cache errors do not expose raw SQLite rows, schema text or parser excerpts through their public cause chain. Internal diagnostic causes for other subsystems can carry implementation information and must not be logged or serialised as a public response. CLI serialisation independently strips unsafe details and never prints a raw cause or stack.
+Public messages and structured details are bounded. Budget errors omit rejected input content. Validation identifies only safe repository-relative paths and valid record IDs where appropriate; cache errors do not expose raw SQLite rows, schema text or parser excerpts through their public cause chain. Internal diagnostic causes for other subsystems can carry implementation information and must not be logged or serialised as a public response. CLI serialisation independently strips unsafe details and never prints a raw cause or stack unless `ENCEPHALON_DEBUG=1` requests the local diagnostic described above.
 
 ## Compatibility and threat boundary
 
