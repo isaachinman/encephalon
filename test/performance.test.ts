@@ -83,7 +83,7 @@ describe('hot scan performance regressions', () => {
     assert.ok(unbounded.retainedHeapBytes > bounded.retainedHeapBytes + unbounded.propertyCount * 128)
   })
 
-  test('preserves dense-history issue order and allowed active heads', () => {
+  test('preserves dense-history issue order and readable conflicting heads', () => {
     const root = createRoot()
     writeRecord(root, {
       createdAt: '2026-08-08T00:00:00.000Z',
@@ -127,10 +127,7 @@ describe('hot scan performance regressions', () => {
       valid: false,
     })
 
-    assert.equal(
-      readRecordsResolved(root, {}, [{ kind: 'context', source: 'test', subject: 'dense.history' }]).length,
-      4,
-    )
+    assert.equal(readRecordsResolved(root).length, 4)
   })
 
   test('stable canonical snapshot work is one scan and graph pass for 0, 100, and 1,000 records', () => {

@@ -58,7 +58,7 @@ encephalon/
 
 Commit canonical records and referenced artifacts. Keep the disposable cache at `node_modules/.cache/encephalon/` out of Git. To attach an immutable supporting file, choose the record ID first, place the file under its matching `_artifacts/<kind>/<id>/` directory, then pass the brain-relative path with `add --artifact`. Encephalon validates the file; it does not copy arbitrary source files into the archive.
 
-After merging knowledge from another branch, run `validate`. If multiple active heads conflict, add a resolving record that supersedes them all. Never delete history to repair a conflict.
+After merging knowledge from another branch, run `validate`. If multiple active heads conflict, add a resolving record that supersedes them all. Until then, reads return every conflicting head as active and adds for other subjects still work. Never delete history to repair a conflict.
 
 ## Limits
 
@@ -83,6 +83,8 @@ npx --no-install encephalon hydrate
 For canonical validation failures, inspect the reported records or artifacts and reconcile the cause before rebuilding. For an unsafe cache layout, correct links, permissions or unexpected file types, then restart the process and retry. Do not blindly remove cache files while another process is using the repository; cache recovery never justifies deleting canonical records or artifacts.
 
 Initialisation can commit some records or instruction changes before another step fails. Follow `details.initProgress.recoveryAction`: inspect committed work when requested, run `prepare` and `validate` after a cache failure, then repeat the **same init options**. If an add error reports `canonicalCommitted: true`, inspect its `recordId` and validate; do not blindly add it again. Only reported recovery paths are identified as belonging to that failed operation. See the contract for commit and recovery guarantees.
+
+To investigate an unexpected failure, first follow any reported recovery action. Then, if repeating the command is safe, run it again with `ENCEPHALON_DEBUG=1`. Repeating a failed add that reported `canonicalCommitted: true`, for example, returns `RECORD_EXISTS` rather than the original cause. With the variable set, the CLI prints the error's stack and cause chain to stderr after the usual JSON error. The output can include local paths, so review it before sharing it.
 
 Refresh generated facts after changing package tooling or top-level layout:
 

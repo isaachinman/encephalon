@@ -1,0 +1,18 @@
+{
+  "createdAt": "2026-10-09T10:59:08.936Z",
+  "id": "ae4f07c3-3111-4329-8023-026e46eabcd8",
+  "kind": "decision",
+  "payload": {
+    "summary": "MAR-2919: ENCEPHALON_DEBUG=1 makes the CLI append util.inspect output (stack, details and cause chain, depth 8) to stderr after the JSON error.",
+    "rationale": [
+      "INTERNAL_ERROR deliberately hides causes in normal CLI output, which left bug reports with nothing actionable."
+    ],
+    "rules": [
+      "Default CLI output stays one safe JSON value; the diagnostic is opt-in, may include local paths and is not a consumer contract.",
+      "The library API never reads the variable or prints."
+    ]
+  },
+  "searchText": "ENCEPHALON_DEBUG debug diagnostics internal error cause chain stack stderr CLI",
+  "source": "agent",
+  "subject": "cli.debug-diagnostics"
+}
