@@ -1,0 +1,16 @@
+{
+  "createdAt": "2026-10-09T12:04:45.729Z",
+  "id": "97a331fa-21a9-4095-9002-54885a8b3511",
+  "kind": "review",
+  "payload": {
+    "summary": "Greptile on PR #105 (MAR-2922): when documenting that several CLI positionals form one search query, the dash rule must cover every query word, not only the first.",
+    "mistake": "The contract said to use -- before a query beginning with a dash, but node:util parseArgs also treats a later unquoted word such as -output as an option.",
+    "guidance": [
+      "Tell callers to put -- before the query whenever any query argument begins with a dash.",
+      "Back each documented CLI argument form with a behavioural CLI test."
+    ]
+  },
+  "searchText": "CLI search positional query dash terminator parseArgs documentation Greptile",
+  "source": "agent",
+  "subject": "review.cli-argument-documentation"
+}

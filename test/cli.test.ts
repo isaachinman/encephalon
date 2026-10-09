@@ -187,6 +187,13 @@ registerHooks({ load(url, context, nextLoad) {
       (outputJson(unquoted) as { id: string }[]).map(record => record.id),
       ['cli-decision'],
     )
+
+    const dashedWord = run(root, ['search', '--root', root, '--', 'portable', '-output'])
+    assert.equal(dashedWord.status, 0)
+    assert.deepEqual(
+      (outputJson(dashedWord) as { id: string }[]).map(record => record.id),
+      ['cli-decision'],
+    )
   })
 
   test('emits expected failures as structured stderr JSON with exit status 2', () => {
