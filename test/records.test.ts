@@ -14,6 +14,7 @@ import fs, {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs'
@@ -713,6 +714,30 @@ describe('canonical records', () => {
 
     assert.equal(outcome.committedError?.cause, firstFailure)
     assert.equal(outcome.committedErrorPhase, 'publicationVerification')
+  })
+
+  test('re-verifies a published record whose ctime changes before its descriptor closes', () => {
+    const root = createRoot()
+    const path = join(root, 'encephalon', 'decision', 'ctime-after-accept.json')
+    const alias = join(root, 'ctime-after-accept-alias.json')
+    recordWriteTestHooks.fault = point => {
+      if (point === 'after-publication-accept') {
+        linkSync(path, alias)
+        unlinkSync(alias)
+      }
+    }
+
+    const record = api.addRecord({
+      id: 'ctime-after-accept',
+      kind: 'decision',
+      payload: { summary: 'Windows updates ctime when the write handle closes' },
+      root,
+      source: 'agent',
+      subject: 'publication.ctime',
+    })
+
+    assert.equal(record.id, 'ctime-after-accept')
+    assert.equal(api.showRecord({ id: record.id, root })?.id, record.id)
   })
 
   test('record publication outcome still throws before canonical linking', () => {

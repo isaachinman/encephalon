@@ -2526,6 +2526,7 @@ const publishPlannedRecordInternal = (
   } catch (error) {
     capture('stagingCleanup', postCommitError(record, 'stagingCleanup', error))
   }
+  let accepted = false
   verify(() => {
     authority.acceptPublication(
       recordFile.kind,
@@ -2535,12 +2536,17 @@ const publishPlannedRecordInternal = (
       recordDigest(formatted),
       fstatSync(descriptor, { bigint: true }),
     )
+    accepted = true
     fault(hooks, 'after-publication-accept')
   })
   try {
     closeSync(descriptor)
   } catch (error) {
     capture('publicationVerification', postCommitError(record, 'publicationVerification', error))
+  }
+  if (accepted) {
+    // Closing the descriptor can update the record's ctime on Windows; re-verify the accepted bytes.
+    verify(() => authority.acceptStagingCleanup())
   }
   return {
     record,
