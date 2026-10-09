@@ -5069,6 +5069,7 @@ describe('canonical records', () => {
     const original = readFileSync(recordPath, 'utf8')
     const replacement = original.replace('Original', 'Mutated!')
     const originalMetadata = statSync(recordPath)
+    const originalCtimeNs = statSync(recordPath, { bigint: true }).ctimeNs
     const counts = { canonicalScans: 0, graphValidations: 0 }
 
     assert.notEqual(replacement, original)
@@ -5083,6 +5084,13 @@ describe('canonical records', () => {
         if (counts.graphValidations === 1) {
           writeFileSync(recordPath, replacement)
           utimesSync(recordPath, originalMetadata.atime, originalMetadata.mtime)
+          // Windows can repeat the setup ctime within one file-time tick; the rewrite is only observable once it changes.
+          const deadline = Date.now() + 1000
+          while (statSync(recordPath, { bigint: true }).ctimeNs === originalCtimeNs && Date.now() < deadline) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+            utimesSync(recordPath, originalMetadata.atime, originalMetadata.mtime)
+          }
+          assert.notEqual(statSync(recordPath, { bigint: true }).ctimeNs, originalCtimeNs)
           assert.equal(statSync(recordPath).mtimeMs, originalMetadata.mtimeMs)
         }
       },

@@ -1,30 +1,66 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { runBenchmarkCommand } from './benchmark-command.ts'
 
-test('benchmark timeout terminates descendants before they can outlive the failed operation', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'benchmark-tree-'))
-  const sentinel = join(root, 'survived')
-  const descendant = `setTimeout(() => {require('node:fs').writeFileSync(${JSON.stringify(sentinel)}, 'alive')}, 2000)`
+const processIsAlive = (pid: number) => {
   try {
-    await assert.rejects(
-      runBenchmarkCommand(
-        process.execPath,
-        [
-          '-e',
-          `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], {stdio: 'ignore', detached: true}); setInterval(() => {}, 1000)`,
-        ],
-        { cwd: root, timeoutMilliseconds: 1000 },
-      ),
-      /timed out/,
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+const waitUntil = async <Value>(read: () => Value | undefined, deadline: number): Promise<Value | undefined> => {
+  const value = read()
+  if (value !== undefined || performance.now() >= deadline) {
+    return value
+  }
+  await delay(20)
+  return waitUntil(read, deadline)
+}
+
+const waitFor = <Value>(read: () => Value | undefined, milliseconds: number) =>
+  waitUntil(read, performance.now() + milliseconds)
+
+test('benchmark termination stops descendants before they can outlive the failed operation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'benchmark-tree-'))
+  const pidPath = join(root, 'descendant.pid')
+  const controller = [
+    "const descendant = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio: 'ignore', detached: true})",
+    `require('node:fs').writeFileSync(${JSON.stringify(pidPath)}, descendant.pid + '\\n')`,
+    'setInterval(() => {}, 1000)',
+  ].join('; ')
+  const abort = new AbortController()
+  let descendantPid: number | undefined
+  try {
+    const rejected = assert.rejects(
+      runBenchmarkCommand(process.execPath, ['-e', controller], {
+        cwd: root,
+        signal: abort.signal,
+        timeoutMilliseconds: 60_000,
+      }),
+      /aborted/,
     )
-    await delay(1500)
-    assert.equal(existsSync(sentinel), false)
+    // Windows taskkill cannot pause a controller that is still spawning, so terminate once the descendant exists.
+    descendantPid = await waitFor(() => {
+      const contents = existsSync(pidPath) ? readFileSync(pidPath, 'utf8') : ''
+      return /^\d+\n$/.test(contents) ? Number(contents) : undefined
+    }, 30_000)
+    abort.abort()
+    await rejected
+    const pid = descendantPid
+    assert.ok(pid !== undefined)
+    assert.equal(await waitFor(() => (processIsAlive(pid) ? undefined : true), 5000), true)
   } finally {
+    abort.abort()
+    if (descendantPid !== undefined && processIsAlive(descendantPid)) {
+      process.kill(descendantPid, 'SIGKILL')
+    }
     rmSync(root, { force: true, recursive: true })
   }
 })
@@ -36,6 +72,13 @@ test('benchmark command reports elapsed startup and refuses unsuccessful or unbo
   })
   assert.equal(result.stdout, 'ready')
   assert.ok(result.elapsedMs > 0)
+  await assert.rejects(
+    runBenchmarkCommand(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      cwd: tmpdir(),
+      timeoutMilliseconds: 100,
+    }),
+    /timed out/,
+  )
   await assert.rejects(
     runBenchmarkCommand(
       process.execPath,
