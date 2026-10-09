@@ -291,6 +291,32 @@ registerHooks({ load(url, context, nextLoad) {
     assert.match(diagnostic, /\[cause\]: EncephalonError: The Encephalon cache layout is unsafe\./)
   })
 
+  test('appends diagnostics to unexpected errors only when ENCEPHALON_DEBUG is 1', () => {
+    const internalError = {
+      error: {
+        code: 'INTERNAL_ERROR',
+        details: {},
+        message: 'An unexpected internal error occurred.',
+      },
+    }
+    const runUnexpected = (debug: string) =>
+      spawnSync(process.execPath, [join(projectRoot, 'test', 'fixtures', 'cli-unexpected-error.ts'), '--version'], {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        env: { ...process.env, ENCEPHALON_DEBUG: debug },
+      })
+
+    const enabled = runUnexpected('1')
+    assert.equal(enabled.status, 1)
+    const [json = '', ...diagnosticLines] = enabled.stderr.split('\n')
+    assert.deepEqual(JSON.parse(json), internalError)
+    assert.match(diagnosticLines.join('\n'), /^TypeError: Injected stdout failure\./)
+
+    const disabled = runUnexpected('true')
+    assert.equal(disabled.status, 1)
+    assert.equal(disabled.stderr, `${JSON.stringify(internalError)}\n`)
+  })
+
   test('redacts operation-gate cleanup failure after a committed add', () => {
     const root = createRoot()
     const id = 'cli-operation-cleanup'
