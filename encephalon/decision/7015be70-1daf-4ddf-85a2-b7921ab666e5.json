@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-10-09T11:33:03.526Z",
+  "id": "7015be70-1daf-4ddf-85a2-b7921ab666e5",
+  "kind": "decision",
+  "payload": {
+    "summary": "MAR-2920: record publication is staged write, fsync, authority check, hard link, kind-directory fsync, staging unlink and authority acceptance; it no longer defends against directory replacement inside that sequence.",
+    "rationale": [
+      "The previous publication path carried about 300 lines of mutable state and directory witnesses to detect same-user processes replacing directories mid-write, which is out of proportion for a local repository tool.",
+      "Planning currentness, layout limits and acceptPreparation/acceptPublication stay in the canonical publication authority because cache hydration after an add depends on them."
+    ],
+    "rules": [
+      "Writers stage only while holding the operation lock, so the next holder removes every recognised staging entry after checking all of them; unrecognised names or types remove nothing.",
+      "Post-commit failures are captured per phase with the existing priority and never roll back the link.",
+      "Crash-quarantine staging names from earlier releases are still recognised and removed."
+    ]
+  },
+  "searchText": "record publication staging hard link fsync cleanup leftovers quarantine simplification MAR-2920",
+  "source": "agent",
+  "subject": "canonical.record-publication"
+}

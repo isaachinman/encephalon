@@ -232,7 +232,7 @@ Supported add `postCommitPhase` values are `publicationVerification`, `publicati
 
 Initialisation validates its generated batch before publishing. Before the first record commit it can replan; after the first it preserves the committed prefix and stops on a conflicting canonical change before further cache/instruction work. A later same-options call treats the prefix as history and creates only missing generated records.
 
-Staging cleanup is bounded and non-recursive. It inspects at most 1,001 direct entries to enforce the 1,000-entry bound, follows no symlinks and removes only recognised operation-owned stale files/aliases. Overflow, unrecognised types/names, late arrivals or identity changes preserve affected entries and report repository-relative inspect-and-retry guidance without exposing arbitrary names. Partial cleanup can remain visible after failure.
+Writers stage records only while holding the operation lock, so the next holder treats every staging entry as a leftover from an interrupted writer. Staging cleanup is bounded and non-recursive. It inspects at most 1,001 direct entries to enforce the 1,000-entry bound, follows no symlinks and checks every entry before removing any. It removes recognised writer files, their hard-link aliases and owned-name symlinks, including crash-quarantine names left by earlier releases. Overflow or an unrecognised name or type removes nothing and reports repository-relative inspect-and-retry guidance without exposing arbitrary names. Partial cleanup can remain visible after an I/O failure.
 
 ### Managed instruction publication
 
