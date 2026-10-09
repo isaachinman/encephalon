@@ -143,7 +143,6 @@ afterEach(() => {
   cacheLocationTestHooks.beforeCacheOwnerOpen = undefined
   cacheLocationTestHooks.beforeCacheLocationAssertion = undefined
   cacheLocationTestHooks.beforeLocationInspection = undefined
-  cacheLocationTestHooks.beforeOwnedDirectoryPromotionRename = undefined
   cacheLocationTestHooks.beforeOwnedDirectoryFinalIdentity = undefined
   cacheLocationTestHooks.beforeOwnerRecoveryFsync = undefined
   cacheLocationTestHooks.beforeQuarantineRename = undefined
@@ -3718,7 +3717,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(statSync(join(root, 'node_modules'), { bigint: true }).ino, before.ino)
   })
 
-  test('tolerates an operation lock that changes before gate acquisition', () => {
+  test('tolerates a legacy operation lock directory that changes during cleanup', () => {
     const root = createRoot()
     const location = inspectCacheLocation(root)
     const lockPath = join(location.directory, 'operation.lock')
@@ -10732,66 +10731,6 @@ describe('SQLite cache and reads', () => {
     } finally {
       await Promise.all([stopChild(first), stopChild(second)])
     }
-  })
-
-  test('serialises two contenders that both observed the same stale lock', async () => {
-    const root = createRoot()
-    const cachePath = join(root, 'node_modules', '.cache', 'encephalon')
-    const lockPath = join(cachePath, 'operation.lock')
-    const releasePath = join(root, 'release-contenders')
-    const activePath = join(root, 'active-contender')
-    const firstObserved = join(root, 'first-observed')
-    const secondObserved = join(root, 'second-observed')
-    const firstEntered = join(root, 'first-entered')
-    const secondEntered = join(root, 'second-entered')
-    const deadProcess = spawnSync(process.execPath, ['-e', ''])
-    const deadPid = deadProcess.pid
-    assert.equal(deadProcess.status, 0)
-    assert.ok(deadPid !== undefined)
-    mkdirSync(lockPath, { recursive: true })
-    writeFileSync(
-      join(lockPath, 'owner.json'),
-      `${JSON.stringify({
-        acquiredAt: '2026-08-06T10:00:00.000Z',
-        pid: deadPid,
-        token: 'dead-owner',
-      })}\n`,
-    )
-
-    const fixture = join(import.meta.dirname, 'fixtures', 'contend-for-stale-lock.ts')
-    const first = spawn(process.execPath, [fixture, root, firstObserved, releasePath, activePath, firstEntered, '0'], {
-      stdio: 'inherit',
-    })
-    const second = spawn(
-      process.execPath,
-      [fixture, root, secondObserved, releasePath, activePath, secondEntered, '75'],
-      { stdio: 'inherit' },
-    )
-
-    const deadline = Date.now() + 5000
-    while (
-      !(existsSync(firstObserved) && existsSync(secondObserved)) &&
-      first.exitCode === null &&
-      second.exitCode === null &&
-      Date.now() < deadline
-    ) {
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
-    }
-    assert.equal(existsSync(firstObserved), true)
-    assert.equal(existsSync(secondObserved), true)
-    writeFileSync(releasePath, 'release')
-
-    if (first.exitCode === null) {
-      await once(first, 'exit')
-    }
-    if (second.exitCode === null) {
-      await once(second, 'exit')
-    }
-    assert.equal(first.exitCode, 0)
-    assert.equal(second.exitCode, 0)
-    assert.equal(existsSync(firstEntered), true)
-    assert.equal(existsSync(secondEntered), true)
-    assert.equal(existsSync(join(cachePath, 'operation-lock.sqlite')), true)
   })
 
   test('keeps a persistent WAL operation gate exclusive until its holder releases', async () => {

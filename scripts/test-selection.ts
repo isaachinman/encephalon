@@ -25,7 +25,6 @@ const classification = {
   'test/init.test.ts': 'platform',
   'test/instructions.test.ts': 'platform',
   'test/literal-query.test.ts': 'source',
-  'test/lock-candidates.test.ts': 'platform',
   'test/npm-command.test.ts': 'platform',
   'test/npm-publish-conflict.test.ts': 'source',
   'test/order.test.ts': 'source',

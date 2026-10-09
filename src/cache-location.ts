@@ -156,7 +156,6 @@ type CacheLocationTestHooks = {
   beforeCacheOwnerOpen?: ((path: string) => void) | undefined
   beforeCacheLocationAssertion?: (() => void) | undefined
   beforeLocationInspection?: (() => void) | undefined
-  beforeOwnedDirectoryPromotionRename?: ((path: string) => void) | undefined
   beforeOwnedDirectoryFinalIdentity?: ((path: string) => void) | undefined
   beforeOwnerRecoveryFsync?: ((path: string) => void) | undefined
   beforeQuarantineRename?: ((path: string) => void) | undefined
@@ -1036,11 +1035,9 @@ export const quarantineCacheDatabase = (location: CacheLocation, database: Cache
   quarantineFile(location, database, true)
 }
 
-const safeOwnedDirectoryName = (name: string) =>
-  name === 'operation.lock' || name === 'operation-lock.recovery' || /^operation\.lock\.[0-9a-f-]{36}$/u.test(name)
+const safeOwnedDirectoryName = (name: string) => name === 'operation.lock' || name === 'operation-lock.recovery'
 
-const ownedDirectoryRelativePath = (name: string) =>
-  `node_modules/.cache/encephalon/${name.startsWith('operation.lock.') ? 'operation.lock' : name}`
+const ownedDirectoryRelativePath = (name: string) => `node_modules/.cache/encephalon/${name}`
 
 type CacheOwnedDirectoryObservation =
   | { kind: 'changed' }
@@ -1121,14 +1118,6 @@ export const observeCacheOwnedDirectory = (location: CacheLocation, name: string
   return observation
 }
 
-/** @internal */
-export const observeCacheOwnedDirectoryForMaintenance = (location: CacheLocation, name: string) => {
-  assertCacheLocation(location)
-  const observation = observeOwnedDirectoryPath(location, name)
-  assertCacheLocation(location)
-  return observation
-}
-
 export const inspectCacheOwnedDirectory = (location: CacheLocation, name: string) => {
   const observation = observeCacheOwnedDirectory(location, name)
   if (observation.kind === 'changed') {
@@ -1171,16 +1160,6 @@ export const cacheOwnedDirectoryMtimeMilliseconds = (location: CacheLocation, di
   return Number(metadata.mtimeMs)
 }
 
-/** @internal */
-export const cacheOwnedDirectoryMtimeNanoseconds = (location: CacheLocation, directory: CacheOwnedDirectory) => {
-  assertOwnedDirectory(location, directory)
-  const metadata = lstatSync(directory.path, { bigint: true })
-  if (!(metadata.isDirectory() && sameCacheEntryIdentity(directory, entryIdentityFrom(metadata)))) {
-    return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-metadata-identity')
-  }
-  return metadata.mtimeNs
-}
-
 const readDirectoryEntryNames = (path: string, maximum: number) => {
   const reader = opendirSync(path)
   let primaryError: unknown
@@ -1203,8 +1182,7 @@ const readDirectoryEntryNames = (path: string, maximum: number) => {
   return names as string[]
 }
 
-/** @internal */
-export const observeExactCacheOwnedDirectoryChildren = (
+const observeExactCacheOwnedDirectoryChildren = (
   location: CacheLocation,
   directory: CacheOwnedDirectory,
   maximum = 3,
@@ -1217,59 +1195,6 @@ export const observeExactCacheOwnedDirectoryChildren = (
 
 const sameChildSet = (first: readonly string[], second: readonly string[]) =>
   first.length === second.length && first.every((name, index) => name === second[index])
-
-export const promoteCacheOwnedDirectory = (
-  location: CacheLocation,
-  directory: CacheOwnedDirectory,
-  targetName: 'operation.lock',
-  options?:
-    | {
-        expectedChildren?: readonly string[] | undefined
-        expectedFiles?: { owner: CacheOwnedFileObservation; recoveryWitness: CacheOwnedFileObservation } | undefined
-        ownershipIsCurrent?: (() => boolean) | undefined
-      }
-    | undefined,
-) => {
-  assertOwnedDirectory(location, directory)
-  if (options?.expectedChildren !== undefined) {
-    const children = observeExactCacheOwnedDirectoryChildren(location, directory, options.expectedChildren.length + 1)
-    if (!sameChildSet(children, options.expectedChildren)) {
-      return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-child-set')
-    }
-  }
-  if (options?.expectedFiles !== undefined) {
-    assertExpectedOwnedFiles(location, directory, options.expectedFiles)
-  }
-  const targetObservation = observeCacheOwnedDirectory(location, targetName)
-  if (targetObservation.kind !== 'missing') {
-    return changedLayout(ownedDirectoryRelativePath(targetName), 'promotion-target-missing')
-  }
-  if (!(options?.ownershipIsCurrent?.() ?? true)) {
-    return changedLayout(ownedDirectoryRelativePath(directory.name), 'stable-owner-evidence')
-  }
-  const targetPath = resolve(location.directory, targetName)
-  cacheLocationTestHooks.beforeOwnedDirectoryPromotionRename?.(directory.path)
-  renameSync(directory.path, targetPath)
-  assertCacheLocation(location)
-  const promoted = observeCacheOwnedDirectory(location, targetName)
-  if (promoted.kind !== 'stable' || !sameCacheEntryIdentity(directory, promoted.directory)) {
-    return changedLayout(ownedDirectoryRelativePath(targetName), 'stable-promoted-identity')
-  }
-  if (options?.expectedChildren !== undefined) {
-    const children = observeExactCacheOwnedDirectoryChildren(
-      location,
-      promoted.directory,
-      options.expectedChildren.length + 1,
-    )
-    if (!sameChildSet(children, options.expectedChildren)) {
-      return changedLayout(ownedDirectoryRelativePath(targetName), 'stable-child-set')
-    }
-  }
-  if (options?.expectedFiles !== undefined) {
-    assertExpectedOwnedFiles(location, promoted.directory, options.expectedFiles)
-  }
-  return promoted.directory
-}
 
 export const writeCacheOwner = (location: CacheLocation, directory: CacheOwnedDirectory, contents: string) => {
   assertOwnedDirectory(location, directory)
