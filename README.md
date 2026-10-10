@@ -10,7 +10,7 @@ Use it for decisions, architecture, conventions and repeatable workflows that wo
 
 ## Install
 
-This README describes Encephalon 0.4.0. For earlier releases, use the documentation at the matching Git tag. The linked main-branch contract tracks current development.
+This README describes Encephalon 0.5.0. For earlier releases, use the documentation at the matching Git tag. The linked main-branch contract tracks current development.
 
 Use Node.js **24.15.0 or later** on Linux, macOS or Windows. Install at the Git repository root, using a package-manager layout that exposes `node_modules/encephalon` there. Workspace-local or ephemeral installations and Yarn Plug'n'Play are unsupported. The installed package has zero runtime dependencies, no installation lifecycle scripts and no Bun requirement.
 

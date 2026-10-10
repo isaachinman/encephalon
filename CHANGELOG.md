@@ -2,6 +2,28 @@
 
 All notable changes to Encephalon are documented here.
 
+## [0.5.0] - 2026-10-10
+
+### Added
+
+- `ENCEPHALON_DEBUG=1` makes the CLI print the error's stack, details and cause chain to stderr after the usual JSON error. Default output is unchanged, and the library API never reads the variable.
+
+### Changed
+
+- Keep reads, cache preparation, `init` and adds for other subjects working when a merge leaves one kind and subject with multiple active heads. `validate` still reports the conflict, an add to the conflicted subject must still supersede every head, and `VALIDATION_FAILED` details now include the conflicting `recordId` values.
+- `init --refresh-baseline` now reports mixed generated and human baseline heads in `skippedConflicts` instead of failing, and leaves unrelated conflicts for an explicit resolver.
+- Simplify canonical record publication to a staged write, hard link and directory flush, and remove staging leftovers with one bounded check-then-remove pass under the operation lock. Leftovers from earlier releases, including crash-quarantine names, are still removed.
+- Use the SQLite operation gate as the only operation lock and drop the `operation.lock` directory and its candidate maintenance. 0.3 and 0.4 take the same gate, so sequential upgrade and downgrade keep their exclusion; a leftover `operation.lock` directory is removed when found. Concurrent mixed-version writers remain unsupported.
+
+### Fixed
+
+- The recovery action for a failed cache rebuild after an add now says not to retry the add, which has already committed.
+
+### Verification and documentation
+
+- Document that several `search` query arguments are joined with single spaces (put `--` before the query when any argument begins with a dash) and that `show` accepts a positional ID.
+- Make Windows timing-dependent tests deterministic: process-tree termination waits for its descendant, and simulated concurrent changes stay observable regardless of file-time resolution, verified on a filesystem with 1-second file times.
+
 ## [0.4.0] - 2026-09-15
 
 ### Changed
