@@ -176,7 +176,7 @@ const assertCommittedRepositoryChange = (operation: () => unknown, path: string,
 }
 
 const postCommitRecoveryAction = {
-  cacheHydration: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+  cacheHydration: 'Do not retry this add. Run prepare to rebuild disposable cache state, then validate.',
   operationCleanup:
     'Run validate and inspect the canonical record before any retry; this record ID is already committed.',
   publicationFlush:
@@ -539,6 +539,7 @@ describe('canonical records', () => {
       createdAt: '9999-12-31T23:59:59.998Z',
       id: 'ceiling-invalid-history-b',
       subject: 'timestamp.invalid-history',
+      supersedes: ['ceiling-invalid-history-missing'],
     })
 
     assert.throws(
@@ -558,7 +559,7 @@ describe('canonical records', () => {
         }
         assert.equal(actual.code, 'VALIDATION_FAILED')
         assert.equal(
-          actual.details?.errors?.some(issue => issue.code === 'MULTIPLE_ACTIVE_HEADS'),
+          actual.details?.errors?.some(issue => issue.code === 'MISSING_SUPERSEDES'),
           true,
         )
         return true
@@ -2033,6 +2034,44 @@ describe('canonical records', () => {
       true,
     )
 
+    assert.deepEqual(
+      api.listRecords({ root, subject: 'api.style' }).map(record => record.id),
+      [second.id, 'record-c'],
+    )
+    assert.deepEqual(
+      api.searchRecords({ query: 'RPC', root }).map(record => record.id),
+      ['record-c'],
+    )
+    assert.equal(api.showRecord({ activeOnly: true, id: second.id, root })?.id, second.id)
+    assert.equal(
+      api.addRecord({ kind: 'decision', payload: {}, root, source: 'agent', subject: 'api.unrelated' }).subject,
+      'api.unrelated',
+    )
+    assert.throws(
+      () =>
+        api.addRecord({
+          id: 'record-partial',
+          kind: 'decision',
+          payload: { summary: 'GraphQL only' },
+          root,
+          source: 'agent',
+          subject: 'api.style',
+          supersedes: [second.id],
+        }),
+      (error: unknown) => {
+        assert.equal((error as api.EncephalonError).code, 'VALIDATION_FAILED')
+        assert.deepEqual(
+          (error as api.EncephalonError).details.errors,
+          ['record-c', 'record-partial'].map(recordId => ({
+            code: 'MULTIPLE_ACTIVE_HEADS',
+            message: 'Multiple active records exist for decision/api.style.',
+            recordId,
+          })),
+        )
+        return true
+      },
+    )
+
     api.addRecord({
       id: 'record-d',
       kind: 'decision',
@@ -2043,6 +2082,45 @@ describe('canonical records', () => {
       supersedes: [second.id, 'record-c'],
     })
     assert.equal(api.validateRecords({ root }).valid, true)
+  })
+
+  test('blocks on issues beyond the reported validation limit while tolerating conflicts', () => {
+    const root = createRoot()
+    for (const index of Array.from({ length: 100 }, (_, position) => position)) {
+      writeCanonicalRecord(root, {
+        id: `conflict-head-${String(index).padStart(3, '0')}`,
+        subject: 'conflict.limit',
+      })
+    }
+    writeCanonicalRecord(root, {
+      artifacts: ['_artifacts/decision/missing-artifact/evidence.txt'],
+      id: 'missing-artifact',
+      subject: 'artifact.missing',
+    })
+
+    const validation = api.validateRecords({ root })
+    assert.equal(validation.truncated, true)
+    assert.equal(
+      validation.errors.some(error => error.code === 'INVALID_ARTIFACT'),
+      false,
+    )
+    for (const operation of [
+      () => api.listRecords({ root }),
+      () => api.addRecord({ kind: 'decision', payload: {}, root, source: 'agent', subject: 'unrelated.limit' }),
+    ]) {
+      assert.throws(operation, (error: unknown) => {
+        const errors = (error as api.EncephalonError).details.errors as { code: string; recordId?: string }[]
+        assert.equal((error as api.EncephalonError).code, 'VALIDATION_FAILED')
+        assert.deepEqual(
+          errors.map(issue => [issue.code, issue.recordId]),
+          [['INVALID_ARTIFACT', 'missing-artifact']],
+        )
+        return true
+      })
+    }
+
+    rmSync(join(root, 'encephalon', 'decision', 'missing-artifact.json'))
+    assert.equal(api.listRecords({ limit: 1000, root }).length, 100)
   })
 
   test('bounds graph work for a corpus-limit supersession chain', () => {
@@ -4189,6 +4267,7 @@ describe('canonical records', () => {
     const original = readFileSync(recordPath, 'utf8')
     const replacement = original.replace('Original', 'Mutated!')
     const originalMetadata = statSync(recordPath)
+    const originalCtimeNs = statSync(recordPath, { bigint: true }).ctimeNs
     const counts = { canonicalScans: 0, graphValidations: 0 }
 
     assert.notEqual(replacement, original)
@@ -4203,6 +4282,13 @@ describe('canonical records', () => {
         if (counts.graphValidations === 1) {
           writeFileSync(recordPath, replacement)
           utimesSync(recordPath, originalMetadata.atime, originalMetadata.mtime)
+          // Windows can repeat the setup ctime within one file-time tick; the rewrite is only observable once it changes.
+          const deadline = Date.now() + 1000
+          while (statSync(recordPath, { bigint: true }).ctimeNs === originalCtimeNs && Date.now() < deadline) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+            utimesSync(recordPath, originalMetadata.atime, originalMetadata.mtime)
+          }
+          assert.notEqual(statSync(recordPath, { bigint: true }).ctimeNs, originalCtimeNs)
           assert.equal(statSync(recordPath).mtimeMs, originalMetadata.mtimeMs)
         }
       },

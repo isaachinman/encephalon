@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-10-09T10:54:09.347Z",
+  "id": "01e8c3ad-fb81-4e2f-b5a2-202fbd2b2624",
+  "kind": "decision",
+  "payload": {
+    "summary": "MAR-2918: multiple active heads for one kind/subject are reported by validate but do not block reads, cache preparation, init or adds to other groups.",
+    "rationale": [
+      "Canonical records live in Git, so parallel branches superseding the same head produce a routine merge conflict.",
+      "Blocking every operation on one conflicted subject disabled Encephalon for all agents until a manual resolver landed."
+    ],
+    "rules": [
+      "Reads accept a corpus whose only validation issues are MULTIPLE_ACTIVE_HEADS and expose every conflicting head as active.",
+      "Writes block MULTIPLE_ACTIVE_HEADS only for kind/subject groups that contain a candidate record, so a resolver must supersede every head of its group.",
+      "Blocking decisions use the untruncated issue list; VALIDATION_FAILED details include recordId where an issue has one."
+    ]
+  },
+  "searchText": "multiple active heads merge conflict supersede resolver reads unrelated adds init",
+  "source": "agent",
+  "subject": "canonical.active-head-conflicts"
+}
