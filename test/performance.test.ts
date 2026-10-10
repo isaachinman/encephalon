@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import fs, { mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import fs, { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { afterEach, describe, mock, test } from 'node:test'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
 import { addRecordResolved, readRecordsResolved, validateRecordsResolved } from '../src/records.ts'
-import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
+import { createTestRepository, ensureParent, removeTestRepository, restoreTimesWithNewCtime } from '../test/helpers.ts'
 
 const roots: string[] = []
 const payloadValidationWorkFixture = join(import.meta.dirname, 'fixtures', 'payload-validation-work.ts')
@@ -226,7 +226,7 @@ describe('hot scan performance regressions', () => {
         }),
       )
       const firstRecordPath = join(root, 'encephalon', 'context', 'retry-work-0000.json')
-      const firstRecordMetadata = recordCount === 0 ? undefined : statSync(firstRecordPath)
+      const firstRecordMetadata = recordCount === 0 ? undefined : statSync(firstRecordPath, { bigint: true })
       const work = { canonicalScans: 0, graphValidations: 0 }
 
       const result = validateRecordsResolved(root, {
@@ -244,7 +244,12 @@ describe('hot scan performance regressions', () => {
                 const replacement = original.replace('retry-work-0000', 'retry-work-xxxx')
                 assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(original))
                 writeFileSync(firstRecordPath, replacement)
-                utimesSync(firstRecordPath, firstRecordMetadata.atime, firstRecordMetadata.mtime)
+                restoreTimesWithNewCtime(
+                  firstRecordPath,
+                  firstRecordMetadata.atime,
+                  firstRecordMetadata.mtime,
+                  firstRecordMetadata.ctimeNs,
+                )
               }
             }
           },
