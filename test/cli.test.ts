@@ -173,9 +173,27 @@ registerHooks({ load(url, context, nextLoad) {
     assert.equal(missing.status, 0)
     assert.equal(outputJson(missing), null)
 
+    const positionalShow = run(root, ['show', '--root', root, 'cli-decision'])
+    assert.equal(positionalShow.status, 0)
+    assert.equal((outputJson(positionalShow) as { id?: unknown }).id, 'cli-decision')
+
     const searched = run(root, ['search', '--root', root, 'nothing matches'])
     assert.equal(searched.status, 0)
     assert.deepEqual(outputJson(searched), [])
+
+    const unquoted = run(root, ['search', '--root', root, 'portable', 'output'])
+    assert.equal(unquoted.status, 0)
+    assert.deepEqual(
+      (outputJson(unquoted) as { id: string }[]).map(record => record.id),
+      ['cli-decision'],
+    )
+
+    const dashedWord = run(root, ['search', '--root', root, '--', 'portable', '-output'])
+    assert.equal(dashedWord.status, 0)
+    assert.deepEqual(
+      (outputJson(dashedWord) as { id: string }[]).map(record => record.id),
+      ['cli-decision'],
+    )
   })
 
   test('emits expected failures as structured stderr JSON with exit status 2', () => {
@@ -224,10 +242,10 @@ registerHooks({ load(url, context, nextLoad) {
           path: 'encephalon/decision/cli-post-commit.json',
           postCommitPhase: 'cacheHydration',
           recordId: 'cli-post-commit',
-          recoveryAction: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+          recoveryAction: 'Do not retry this add. Run prepare to rebuild disposable cache state, then validate.',
         },
         message:
-          'Record cli-post-commit was committed, but the cacheHydration post-commit phase failed. Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+          'Record cli-post-commit was committed, but the cacheHydration post-commit phase failed. Do not retry this add. Run prepare to rebuild disposable cache state, then validate.',
       },
     })
     assert.equal(existsSync(join(root, 'encephalon', 'decision', 'cli-post-commit.json')), true)
@@ -249,6 +267,72 @@ registerHooks({ load(url, context, nextLoad) {
     ])
     assert.equal(retry.status, 2)
     assert.equal(JSON.parse(retry.stderr).error.code, 'RECORD_EXISTS')
+  })
+
+  test('appends an opt-in diagnostic with the error cause chain', () => {
+    const root = createRoot()
+    mkdirSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite'), {
+      recursive: true,
+    })
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        cliPath,
+        'add',
+        '--root',
+        root,
+        '--id',
+        'cli-debug',
+        '--kind',
+        'decision',
+        '--subject',
+        'debug.output',
+        '--source',
+        'agent',
+        '--data',
+        '{}',
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ENCEPHALON_DEBUG: '1' },
+      },
+    )
+
+    assert.equal(result.status, 2)
+    assert.equal(result.stdout, '')
+    const [json = '', ...diagnosticLines] = result.stderr.split('\n')
+    const diagnostic = diagnosticLines.join('\n')
+    assert.equal(JSON.parse(json).error.code, 'IO_ERROR')
+    assert.match(diagnostic, /^EncephalonError: Record cli-debug was committed/)
+    assert.match(diagnostic, /\[cause\]: EncephalonError: The Encephalon cache layout is unsafe\./)
+  })
+
+  test('appends diagnostics to unexpected errors only when ENCEPHALON_DEBUG is 1', () => {
+    const internalError = {
+      error: {
+        code: 'INTERNAL_ERROR',
+        details: {},
+        message: 'An unexpected internal error occurred.',
+      },
+    }
+    const runUnexpected = (debug: string) =>
+      spawnSync(process.execPath, [join(projectRoot, 'test', 'fixtures', 'cli-unexpected-error.ts'), '--version'], {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        env: { ...process.env, ENCEPHALON_DEBUG: debug },
+      })
+
+    const enabled = runUnexpected('1')
+    assert.equal(enabled.status, 1)
+    const [json = '', ...diagnosticLines] = enabled.stderr.split('\n')
+    assert.deepEqual(JSON.parse(json), internalError)
+    assert.match(diagnosticLines.join('\n'), /^TypeError: Injected stdout failure\./)
+
+    const disabled = runUnexpected('true')
+    assert.equal(disabled.status, 1)
+    assert.equal(disabled.stderr, `${JSON.stringify(internalError)}\n`)
   })
 
   test('redacts operation-gate cleanup failure after a committed add', () => {

@@ -1,0 +1,18 @@
+{
+  "createdAt": "2026-10-09T17:47:05.286Z",
+  "id": "72492e02-72bd-4477-8d0e-9bf7f3836a50",
+  "kind": "workflow",
+  "payload": {
+    "summary": "MAR-2926: Windows CI tests must not depend on process-creation or file-time timing; make each timing precondition explicit.",
+    "lessons": [
+      "taskkill /T snapshots the process tree before killing and cannot pause the parent, so trigger tree termination only after the descendant is known to exist and assert the descendant pid is gone rather than racing a sentinel timer.",
+      "Windows can report the same ctime for writes within one file-time tick; tests that rely on a ctime change must enforce and assert that change before exercising detection."
+    ],
+    "verification": [
+      "Main is protected by strict required checks, so a red main after a green PR means flakiness or admin bypass; reproduce from the failing job log and fix the precondition rather than rerunning."
+    ]
+  },
+  "searchText": "Windows CI flaky taskkill process tree ctime tick timing tests deterministic",
+  "source": "agent",
+  "subject": "workflow.windows-timing-tests"
+}
