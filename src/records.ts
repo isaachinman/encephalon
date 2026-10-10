@@ -286,7 +286,7 @@ type PostCommitPhase = 'cacheHydration' | 'publicationFlush' | 'publicationVerif
 type AddPostCommitPhase = PostCommitPhase | 'operationCleanup'
 
 const postCommitRecoveryAction = {
-  cacheHydration: 'Run prepare to rebuild disposable cache state, then validate before retrying this add.',
+  cacheHydration: 'Do not retry this add. Run prepare to rebuild disposable cache state, then validate.',
   operationCleanup:
     'Run validate and inspect the canonical record before any retry; this record ID is already committed.',
   publicationFlush:
