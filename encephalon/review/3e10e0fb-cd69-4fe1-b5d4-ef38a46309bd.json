@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-10-09T11:51:58.132Z",
+  "id": "3e10e0fb-cd69-4fe1-b5d4-ef38a46309bd",
+  "kind": "review",
+  "payload": {
+    "summary": "Windows CI on PR #103 (MAR-2920): closing a written record descriptor can change the record ctime on Windows, so publication must re-verify accepted observations after the close.",
+    "mistake": "The simplified publication accepted the new record metadata and then closed the descriptor without re-inspecting it, so every later currentness check on Windows saw a changed generation and adds/init reported REPOSITORY_CHANGED after commit.",
+    "guidance": [
+      "After acceptPublication and closeSync, call authority.acceptStagingCleanup() to re-verify observations that may differ only by ctime.",
+      "Simulate ctime-only changes portably by creating and removing an extra hard link to the record."
+    ],
+    "verification": [
+      "Keep the ctime-after-accept regression test in test/records.test.ts; Windows platform jobs remain the authority for close-time metadata behaviour."
+    ]
+  },
+  "searchText": "Windows ctime descriptor close publication acceptance re-verify observations hard link MAR-2920",
+  "source": "agent",
+  "subject": "review.publication-close-ctime"
+}
