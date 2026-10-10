@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-10-09T11:44:53.766Z",
+  "id": "de53b83a-87c8-48e4-9140-ae5f1550fea5",
+  "kind": "decision",
+  "payload": {
+    "summary": "MAR-2921: the operation lock is the BEGIN IMMEDIATE transaction on operation-lock.sqlite plus the short-lived operation-lock.recovery marker; the operation.lock directory, its candidates and candidate maintenance are removed.",
+    "rationale": [
+      "The SQLite gate was already authoritative and the operating system releases it when a holder exits; the directory lock duplicated it.",
+      "The recovery marker is kept because every gate opener takes it briefly, which is what makes automatic replacement of a corrupt gate safe (see review.lock-corrupt-gate-recovery)."
+    ],
+    "rules": [
+      "0.3.0 and 0.4.0 also take the same gate, so upgraded and older processes still exclude each other.",
+      "After acquiring the gate, a stable leftover operation.lock directory from an earlier release is quarantined; one that changes during observation is ignored rather than failing the operation.",
+      "Leftover operation.lock.<uuid> candidates from earlier releases are inert and are not enumerated."
+    ]
+  },
+  "searchText": "operation lock SQLite gate BEGIN IMMEDIATE recovery marker directory lock candidates removed MAR-2921",
+  "source": "agent",
+  "subject": "cache.operation-lock"
+}
