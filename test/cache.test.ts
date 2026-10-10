@@ -55,6 +55,7 @@ import {
   canRenameParentWithOpenChild,
   createTestRepository,
   ensureParent,
+  mutateObservably,
   removeTestRepository,
 } from '../test/helpers.ts'
 
@@ -531,7 +532,7 @@ test('retries transient artifact mutation and bounds persistent mutation as repo
     artifactInspectionTestHooks.fault = (point, path) => {
       if (point === 'after-artifact-fstat' && path === artifact && (persistent || mutations === 0)) {
         mutations += 1
-        writeFileSync(artifactPath, `<svg>mutation-${mutations}</svg>`)
+        mutateObservably(artifactPath, () => writeFileSync(artifactPath, `<svg>mutation-${mutations}</svg>`))
       }
     }
 
@@ -645,7 +646,7 @@ test('retries artifact mutation after canonical validation without committing a 
     cacheReadTestHooks.afterCanonicalValidation = () => {
       if (persistent || mutations === 0) {
         mutations += 1
-        writeFileSync(artifactPath, `<svg>mutation-${mutations}</svg>`)
+        mutateObservably(artifactPath, () => writeFileSync(artifactPath, `<svg>mutation-${mutations}</svg>`))
       }
     }
 
@@ -5043,7 +5044,7 @@ describe('SQLite cache and reads', () => {
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 1 })
     assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 1 })
 
-    writeFileSync(artifactPath, '<svg>two</svg>')
+    mutateObservably(artifactPath, () => writeFileSync(artifactPath, '<svg>two</svg>'))
     assert.deepEqual(prepare({ root }), { hydrated: true, recordsIndexed: 1 })
   })
 

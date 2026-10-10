@@ -64,7 +64,9 @@ import {
   canRenameParentWithOpenChild,
   createTestRepository,
   ensureParent,
+  mutateObservably,
   removeTestRepository,
+  restoreTimesWithNewCtime,
 } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -308,7 +310,7 @@ describe('canonical records', () => {
       assert.equal(bytesRead, expected.byteLength)
       assert.equal(hashes, 1)
       assert.equal(descriptors.size, 0)
-      writeFileSync(path, Buffer.from(expected).fill(32, 0, 1))
+      mutateObservably(path, () => writeFileSync(path, Buffer.from(expected).fill(32, 0, 1)))
       assertErrorCode(snapshot.assertCurrent, 'REPOSITORY_CHANGED')
       writeFileSync(path, expected)
       bytesRead = 0
@@ -630,7 +632,9 @@ describe('canonical records', () => {
     recordWriteTestHooks.fault = point => {
       if (point === 'after-scan-validation') {
         const existing = JSON.parse(readFileSync(existingPath, 'utf8')) as Record<string, unknown>
-        writeFileSync(existingPath, `${JSON.stringify({ ...existing, payload: { changed: true } }, null, 2)}\n`)
+        mutateObservably(existingPath, () =>
+          writeFileSync(existingPath, `${JSON.stringify({ ...existing, payload: { changed: true } }, null, 2)}\n`),
+        )
       }
     }
 
@@ -947,7 +951,7 @@ describe('canonical records', () => {
         artifactInspectionTestHooks.fault = (point, path) => {
           if (path === artifact && point === 'after-artifact-fstat') {
             if (entry.name === 'concurrent-change') {
-              writeFileSync(artifactPath, 'changed evidence')
+              mutateObservably(artifactPath, () => writeFileSync(artifactPath, 'changed evidence'))
             } else {
               throw Object.assign(new Error('simulated artifact I/O failure'), { code: 'EIO' })
             }
@@ -993,7 +997,7 @@ describe('canonical records', () => {
     })
     artifactInspectionTestHooks.fault = (point, path) => {
       if (point === 'after-artifact-fstat' && path === artifact) {
-        writeFileSync(artifactPath, 'mutated evidence with different metadata')
+        mutateObservably(artifactPath, () => writeFileSync(artifactPath, 'mutated evidence with different metadata'))
       }
     }
 
@@ -4281,14 +4285,7 @@ describe('canonical records', () => {
         counts.graphValidations += 1
         if (counts.graphValidations === 1) {
           writeFileSync(recordPath, replacement)
-          utimesSync(recordPath, originalMetadata.atime, originalMetadata.mtime)
-          // Windows can repeat the setup ctime within one file-time tick; the rewrite is only observable once it changes.
-          const deadline = Date.now() + 1000
-          while (statSync(recordPath, { bigint: true }).ctimeNs === originalCtimeNs && Date.now() < deadline) {
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
-            utimesSync(recordPath, originalMetadata.atime, originalMetadata.mtime)
-          }
-          assert.notEqual(statSync(recordPath, { bigint: true }).ctimeNs, originalCtimeNs)
+          restoreTimesWithNewCtime(recordPath, originalMetadata.atime, originalMetadata.mtime, originalCtimeNs)
           assert.equal(statSync(recordPath).mtimeMs, originalMetadata.mtimeMs)
         }
       },
@@ -4319,12 +4316,14 @@ describe('canonical records', () => {
 
     artifactInspectionTestHooks.fault = point => {
       if (point === 'before-final-directory-revalidation' && !changed) {
-        writeCanonicalRecord(root, {
-          artifacts: [artifact],
-          id,
-          payload: { summary: 'new' },
-          subject: 'stable.record-during-artifact-validation',
-        })
+        mutateObservably(join(root, 'encephalon', 'decision', `${id}.json`), () =>
+          writeCanonicalRecord(root, {
+            artifacts: [artifact],
+            id,
+            payload: { summary: 'new' },
+            subject: 'stable.record-during-artifact-validation',
+          }),
+        )
         changed = true
       }
     }
@@ -4371,7 +4370,7 @@ describe('canonical records', () => {
         if (point === 'before-record-open' && path === recordPath) {
           recordOpenCalls += 1
           if (recordOpenCalls === 2) {
-            writeFileSync(artifactPath, 'new evidence')
+            mutateObservably(artifactPath, () => writeFileSync(artifactPath, 'new evidence'))
             changed = true
           }
         }
@@ -4413,7 +4412,7 @@ describe('canonical records', () => {
               ? current.replace('VersionA', 'VersionB')
               : current.replace('VersionB', 'VersionA')
             assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(current))
-            writeFileSync(recordPath, replacement)
+            mutateObservably(recordPath, () => writeFileSync(recordPath, replacement))
           },
         }),
       (error: unknown) => {
@@ -5456,7 +5455,7 @@ describe('canonical records', () => {
     let changes = 0
     artifactInspectionTestHooks.fault = point => {
       if (point === 'after-artifact-lstat') {
-        writeFileSync(artifactPath, changes % 2 === 0 ? 'version-b' : 'version-a')
+        mutateObservably(artifactPath, () => writeFileSync(artifactPath, changes % 2 === 0 ? 'version-b' : 'version-a'))
         changes += 1
       }
     }
