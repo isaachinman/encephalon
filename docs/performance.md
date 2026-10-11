@@ -23,9 +23,9 @@ bun run check:package -- --retain-tarball package-artifacts
 Package checking packs once when no tarball is supplied and retains that exact candidate plus verified metadata. Subsequent checks consume the selected file without repacking:
 
 ```bash
-bun run check:package -- --tarball package-artifacts/encephalon-0.3.0.tgz
-bun run check:compatibility -- package-artifacts/encephalon-0.3.0.tgz
-bun run check:publish -- package-artifacts/encephalon-0.3.0.tgz
+bun run check:package -- --tarball package-artifacts/encephalon-0.5.0.tgz
+bun run check:compatibility -- package-artifacts/encephalon-0.5.0.tgz
+bun run check:publish -- package-artifacts/encephalon-0.5.0.tgz
 ```
 
 These filenames match the current development manifest; use the selected versioned filename after a version bump. Compatibility uses the actual pinned published 0.3.0 oracle, independently of the candidate version. `check:publish` is an exact-tarball **dry run**. Real npm publication is a manual maintainer action using the independently verified trusted-main tarball, with `--ignore-scripts`; never publish from a source directory or rebuild after selection.
