@@ -41,6 +41,7 @@ import {
   canRenameParentWithOpenChild,
   createTestRepository,
   ensureParent,
+  mutateObservably,
   removeTestRepository,
 } from '../test/helpers.ts'
 
@@ -1582,7 +1583,7 @@ describe('initialisation', () => {
     })
     artifactInspectionTestHooks.fault = (point, path) => {
       if (point === 'after-artifact-fstat' && path === artifact) {
-        writeFileSync(artifactPath, 'mutated evidence with different metadata')
+        mutateObservably(artifactPath, () => writeFileSync(artifactPath, 'mutated evidence with different metadata'))
       }
     }
 
@@ -2643,7 +2644,7 @@ describe('initialisation', () => {
       afterBaselineSources: () => {
         attempts += 1
         if (attempts === 1) {
-          renameSync(oldWorkflow, newWorkflow)
+          mutateObservably(dirname(oldWorkflow), () => renameSync(oldWorkflow, newWorkflow))
         }
       },
     })

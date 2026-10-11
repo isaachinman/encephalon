@@ -1,0 +1,20 @@
+{
+  "createdAt": "2026-10-10T10:06:26.372Z",
+  "id": "24c7041a-0e58-468a-a386-d54d15160b39",
+  "kind": "workflow",
+  "payload": {
+    "summary": "MAR-2926 and MAR-2929: tests must not depend on process-creation timing or file-time resolution; make every simulated concurrent change observable explicitly.",
+    "lessons": [
+      "taskkill /T snapshots the process tree before killing and cannot pause the parent, so trigger tree termination only after the descendant is known to exist and assert its pid is gone.",
+      "Windows can stamp writes within one clock tick identically and reports directory size 0, so same-size rewrites, repeated identical rewrites on retry, and directory entry removals or renames can be invisible to metadata checks.",
+      "Wrap every simulated concurrent change in mutateObservably(path, mutate) from test/helpers.ts, passing the parent directory for entry additions, removals and renames. Use restoreTimesWithNewCtime when a test deliberately restores mtime after rewriting."
+    ],
+    "verification": [
+      "Enumerate timestamp-dependent tests deterministically: run TMPDIR on an HFS+ disk image (hdiutil create -fs HFS+, 1-second file times) with bun run test:all, plus a throwaway run that ignores directory size in sameStableEntryMetadataExceptCtimeAndMode. Only the HFS+ NFD-locale, hard-link inode and Windows-skipped ctime-only tests may remain."
+    ]
+  },
+  "searchText": "Windows CI flaky taskkill file time resolution ctime tick directory size mutateObservably restoreTimesWithNewCtime HFS+ verification",
+  "source": "agent",
+  "subject": "workflow.windows-timing-tests",
+  "supersedes": ["72492e02-72bd-4477-8d0e-9bf7f3836a50"]
+}

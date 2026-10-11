@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { ArtifactChangedError, inspectArtifactFiles as inspectArtifactSnapshot } from '../src/artifact-inspection.ts'
+import { mutateObservably } from '../test/helpers.ts'
 
 const inspectArtifactFiles = (...arguments_: Parameters<typeof inspectArtifactSnapshot>) => {
   const inspection = inspectArtifactSnapshot(...arguments_)
@@ -273,10 +274,12 @@ test('rejects an observed ancestor that becomes a link or disappears before capt
         inspectArtifactFiles(brainDirectory, [artifact], {
           fault: point => {
             if (point === 'after-ancestor-lstat') {
-              renameSync(artifactsDirectory, captured)
-              if (mutation === 'link') {
-                symlinkSync(outside, artifactsDirectory, 'junction')
-              }
+              mutateObservably(brainDirectory, () => {
+                renameSync(artifactsDirectory, captured)
+                if (mutation === 'link') {
+                  symlinkSync(outside, artifactsDirectory, 'junction')
+                }
+              })
             }
           },
         }),
@@ -316,7 +319,7 @@ test('distinguishes a stable missing ancestor from concurrent ancestor removal',
       inspectArtifactFiles(changing.brainDirectory, [changing.artifact], {
         fault: point => {
           if (point === 'before-ancestor-lstat') {
-            rmSync(artifactsDirectory, { recursive: true })
+            mutateObservably(changing.brainDirectory, () => rmSync(artifactsDirectory, { recursive: true }))
           }
         },
       }),
