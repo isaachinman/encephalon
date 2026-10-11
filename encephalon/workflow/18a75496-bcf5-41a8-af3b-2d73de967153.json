@@ -1,0 +1,15 @@
+{
+  "createdAt": "2026-10-10T10:56:34.766Z",
+  "id": "18a75496-bcf5-41a8-af3b-2d73de967153",
+  "kind": "workflow",
+  "payload": {
+    "summary": "Format new Encephalon record JSON with Biome before committing; lint checks encephalon/ and multi-line single-item arrays fail it.",
+    "lessons": [
+      "encephalon add writes two-space JSON that can differ from Biome formatting, for example a one-item supersedes array split across lines.",
+      "Run bun x ultracite fix (or biome format --write on the new records) and then bun run lint after every encephalon add, not only before the code change."
+    ]
+  },
+  "searchText": "Encephalon record JSON format Biome ultracite lint supersedes array commit",
+  "source": "agent",
+  "subject": "workflow.format-encephalon-records"
+}
