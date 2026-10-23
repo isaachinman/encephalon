@@ -22,7 +22,7 @@ import { spawnNpmCommand } from '../scripts/npm-command.ts'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 
 const root = resolve(import.meta.dirname, '..')
-const releaseVersion = '0.5.0'
+const releaseVersion = '0.6.0'
 const metadataPath = (tarball: string) => `${tarball}.metadata.json`
 
 const gitHead = (repositoryRoot: string) => {
@@ -306,7 +306,7 @@ describe('package contract', () => {
     assert.equal(packageJson.name, 'encephalon')
     assert.equal(packageJson.version, PACKAGE_VERSION)
     assert.equal(packageJson.type, 'module')
-    assert.deepEqual(packageJson.engines, { node: '>=24.15.0' })
+    assert.deepEqual(packageJson.engines, { node: '>=24.22.1' })
     assert.deepEqual(packageJson.bin, { encephalon: 'dist/cli.mjs' })
     for (const field of Object.keys(forbiddenRuntimeDependencyValues)) {
       assert.equal(packageJson[field], undefined, field)
@@ -369,7 +369,7 @@ describe('package contract', () => {
     assert.equal(generated.includes(`PACKAGE_VERSION = ${JSON.stringify(PACKAGE_VERSION)}`), true)
   })
 
-  test('reports the 0.5.0 release version from source, built, and packed API and CLI surfaces', {
+  test('reports the 0.6.0 release version from source, built, and packed API and CLI surfaces', {
     timeout: 75_000,
   }, () => {
     const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8')) as {

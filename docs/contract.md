@@ -1,10 +1,10 @@
 # Encephalon public contract
 
-This is the normative reference for Encephalon 0.5.0. For earlier releases, use the contract at the matching Git tag. The [README](../README.md) is the practical guide; [performance and contributor checks](./performance.md) describe maintainer tooling. Historical designs are evidence, not additional public requirements. Update this contract with any intentional public behaviour change.
+This is the normative reference for Encephalon 0.6.0. For earlier releases, use the contract at the matching Git tag. The [README](../README.md) is the practical guide; [performance and contributor checks](./performance.md) describe maintainer tooling. Historical designs are evidence, not additional public requirements. Update this contract with any intentional public behaviour change.
 
 ## Runtime and repository
 
-Encephalon supports Node.js 24.15.0 and later on Linux, macOS and Windows. Its installed runtime is synchronous ESM with zero runtime dependencies and no installation lifecycle scripts. Bun is development tooling only. The package exposes the root import `encephalon`; internal subpaths are unsupported. Its CLI help and version do not load repository operations.
+Encephalon supports Node.js 24.22.1 and later on Linux, macOS and Windows. Its installed runtime is synchronous ESM with zero runtime dependencies and no installation lifecycle scripts. Bun is development tooling only. The package exposes the root import `encephalon`; internal subpaths are unsupported. Its CLI help and version do not load repository operations.
 
 Importing the API does not discover a repository, inspect or mutate the filesystem, or open SQLite. API calls return values and never print or exit. Encephalon performs no runtime network requests, telemetry, automatic Git operations, background work, semantic source analysis or credential discovery.
 

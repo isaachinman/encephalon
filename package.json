@@ -1,6 +1,6 @@
 {
   "name": "encephalon",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Repository-local, durable knowledge for coding agents",
   "keywords": [
     "agents",
@@ -22,9 +22,9 @@
   "type": "module",
   "sideEffects": false,
   "engines": {
-    "node": ">=24.15.0"
+    "node": ">=24.22.1"
   },
-  "packageManager": "bun@1.3.1",
+  "packageManager": "bun@1.4.4",
   "bin": {
     "encephalon": "dist/cli.mjs"
   },

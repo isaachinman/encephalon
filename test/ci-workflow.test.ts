@@ -89,7 +89,7 @@ test('CI gates one candidate behind source checks and retains complete selected 
   assert.equal([...workflow.matchAll(/run: bun run build/g)].length, 1)
   assert.equal([...workflow.matchAll(/--retain-tarball/g)].length, 1)
   assert.match(jobs.package ?? '', /needs: \[source, tooling, selection\]/)
-  assert.match(jobs.source ?? '', /node: 24.15.0/)
+  assert.match(jobs.source ?? '', /node: 24.22.1/)
   assert.match(jobs.source ?? '', /node: 26/)
   assert.match(jobs.source ?? '', /run: bun run test/)
   assert.match(jobs.source ?? '', /existsSync\("dist"\)/)

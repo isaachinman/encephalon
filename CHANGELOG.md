@@ -2,6 +2,13 @@
 
 All notable changes to Encephalon are documented here.
 
+## [0.6.0] - 2026-10-23
+
+### Changed
+
+- **Breaking:** Encephalon now requires Node.js 24.22.1 or later. Earlier Node.js 24 releases contain a Brotli decoder out-of-bounds write (CVE-2026-111497), so `engines` and the runtime check move from 24.15.0. On an older Node.js, Encephalon fails with `UNSUPPORTED_RUNTIME`.
+- Development uses Bun 1.4.4, and CI no longer runs on any Node.js release below 24.22.1.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added

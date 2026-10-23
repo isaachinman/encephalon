@@ -4,7 +4,7 @@ Canonical JSON and referenced artifacts are authoritative. SQLite is a disposabl
 
 ## Contributor checks
 
-Use the repository's pinned Bun for development and Node.js 24.15.0 or later for runtime checks. Build explicitly; tests never rebuild implicitly.
+Use the repository's pinned Bun for development and Node.js 24.22.1 or later for runtime checks. Build explicitly; tests never rebuild implicitly.
 
 ```bash
 bun install --frozen-lockfile

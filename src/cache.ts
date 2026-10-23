@@ -221,9 +221,9 @@ export const cacheReadInstrumentation: CacheReadInstrumentation = {}
 
 const loadSQLite = () => {
   if (sqliteModule === undefined) {
-    const [major = 0, minor = 0] = process.versions.node.split('.').map(Number)
-    if (major < 24 || (major === 24 && minor < 15)) {
-      return fail('UNSUPPORTED_RUNTIME', 'Encephalon requires Node.js 24.15.0 or newer.', {
+    const [major = 0, minor = 0, patch = 0] = process.versions.node.split('.').map(Number)
+    if (major < 24 || (major === 24 && (minor < 22 || (minor === 22 && patch < 1)))) {
+      return fail('UNSUPPORTED_RUNTIME', 'Encephalon requires Node.js 24.22.1 or newer.', {
         runtime: process.versions.node,
       })
     }
