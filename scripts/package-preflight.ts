@@ -95,7 +95,7 @@ export const assertReviewedManifest = (packageJson: PackageManifest) => {
     packageJson.name !== 'encephalon' ||
     packageJson.license !== 'MIT' ||
     packageJson.type !== 'module' ||
-    JSON.stringify(packageJson.engines) !== JSON.stringify({ node: '>=24.15.0' }) ||
+    JSON.stringify(packageJson.engines) !== JSON.stringify({ node: '>=24.22.1' }) ||
     JSON.stringify(packageJson.bin) !== JSON.stringify({ encephalon: 'dist/cli.mjs' }) ||
     JSON.stringify(packageJson.exports) !==
       JSON.stringify({
