@@ -50,7 +50,7 @@ jobs:
       matrix:
         include:
           - context: ubuntu-latest
-            node: 24.15.0
+            node: 24.22.1
           - context: ubuntu-current
             node: 26
     runs-on: ubuntu-latest
@@ -64,8 +64,8 @@ jobs:
         with:
           node-version: 24.22.1
       - run: node ./scripts/check-generated-version.ts
-      - if: matrix.context == 'ubuntu-current'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      # Source tests run on each matrix Node.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ matrix.node }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -252,10 +252,10 @@ jobs:
             node: 26
             group: package
           - os: macos-latest
-            node: 24.15.0
+            node: 24.22.1
             group: package-platform
           - os: windows-latest
-            node: 24.15.0
+            node: 24.22.1
             group: package-platform
     runs-on: ${{ matrix.os }}
     steps:
