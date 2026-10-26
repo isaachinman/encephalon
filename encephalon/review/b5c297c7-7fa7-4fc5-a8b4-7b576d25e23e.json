@@ -1,0 +1,15 @@
+{
+  "createdAt": "2026-10-26T13:32:16.224Z",
+  "id": "b5c297c7-7fa7-4fc5-a8b4-7b576d25e23e",
+  "kind": "review",
+  "payload": {
+    "summary": "Greptile on PR #110 (MAR-3007): a new validation output list needs its reporting ceiling documented under Bounds and test coverage alongside truncated blocking issues.",
+    "lessons": [
+      "When validation output gains another bounded list, update the contract Bounds row and truncation paragraph to state whether the 100-issue ceiling is shared or per list.",
+      "Options that reclassify validation issues must be tested with more than 100 issues mixed with a blocking error, proving the blocking issue survives and each list carries its own truncation marker."
+    ]
+  },
+  "searchText": "validate divergent heads warnings truncation ceiling contract bounds Greptile coverage",
+  "source": "agent",
+  "subject": "review.validate-divergent-heads"
+}
