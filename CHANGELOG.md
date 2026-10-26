@@ -2,7 +2,7 @@
 
 All notable changes to Encephalon are documented here.
 
-## [Unreleased]
+## [0.7.0] - 2026-10-26
 
 ### Added
 

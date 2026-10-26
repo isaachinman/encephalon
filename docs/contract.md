@@ -1,6 +1,6 @@
 # Encephalon public contract
 
-This is the normative reference for Encephalon 0.6.0. For earlier releases, use the contract at the matching Git tag. The [README](../README.md) is the practical guide; [performance and contributor checks](./performance.md) describe maintainer tooling. Historical designs are evidence, not additional public requirements. Update this contract with any intentional public behaviour change.
+This is the normative reference for Encephalon 0.7.0. For earlier releases, use the contract at the matching Git tag. The [README](../README.md) is the practical guide; [performance and contributor checks](./performance.md) describe maintainer tooling. Historical designs are evidence, not additional public requirements. Update this contract with any intentional public behaviour change.
 
 ## Runtime and repository
 
