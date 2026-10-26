@@ -2115,6 +2115,15 @@ describe('canonical records', () => {
       validation.errors.some(error => error.code === 'INVALID_ARTIFACT'),
       false,
     )
+    const tolerated = api.validateRecords({ allowDivergentHeads: true, root })
+    assert.equal(tolerated.valid, false)
+    assert.deepEqual(
+      tolerated.errors.map(issue => [issue.code, issue.recordId]),
+      [['INVALID_ARTIFACT', 'missing-artifact']],
+    )
+    assert.equal(tolerated.truncated, true)
+    assert.equal(tolerated.warnings?.length, 100)
+    assert.equal(tolerated.warnings?.at(-1)?.code, 'VALIDATION_ISSUES_TRUNCATED')
     for (const operation of [
       () => api.listRecords({ root }),
       () => api.addRecord({ kind: 'decision', payload: {}, root, source: 'agent', subject: 'unrelated.limit' }),
