@@ -2037,6 +2037,13 @@ describe('canonical records', () => {
       conflicted.errors.some(error => error.code === 'MULTIPLE_ACTIVE_HEADS'),
       true,
     )
+    const tolerated = api.validateRecords({ allowDivergentHeads: true, root })
+    assert.equal(tolerated.valid, true)
+    assert.deepEqual(tolerated.errors, [])
+    assert.deepEqual(
+      tolerated.warnings?.map(warning => [warning.code, warning.recordId]),
+      ['record-c', second.id].map(recordId => ['MULTIPLE_ACTIVE_HEADS', recordId]),
+    )
 
     assert.deepEqual(
       api.listRecords({ root, subject: 'api.style' }).map(record => record.id),

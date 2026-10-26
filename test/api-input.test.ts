@@ -10,6 +10,7 @@ import {
   parseListRecordsInput,
   parseRootInput,
   parseShowRecordInput,
+  parseValidateRecordsInput,
 } from '../src/api-input.ts'
 import { EncephalonError, failBudget } from '../src/errors.ts'
 import { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
@@ -54,6 +55,13 @@ const validRecordFile = () => ({
 const parserCases = [
   { envelope: 'root', field: 'root', name: 'root', parse: parseRootInput, value: {} },
   { envelope: 'listRecords', field: 'root', name: 'list', parse: parseListRecordsInput, value: {} },
+  {
+    envelope: 'validateRecords',
+    field: 'allowDivergentHeads',
+    name: 'validate',
+    parse: parseValidateRecordsInput,
+    value: {},
+  },
   { envelope: 'showRecord', field: 'id', name: 'show', parse: parseShowRecordInput, value: { id: 'record-1' } },
   {
     envelope: 'searchRecords',

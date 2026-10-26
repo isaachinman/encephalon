@@ -2,6 +2,12 @@
 
 All notable changes to Encephalon are documented here.
 
+## [Unreleased]
+
+### Added
+
+- `validate --allow-divergent-heads` (and `validateRecords({ allowDivergentHeads: true })`) reports multiple active heads for one kind and subject under a new `warnings` list instead of failing, so parallel pull requests that each supersede or start the same subject can merge without breaking validation. Every other issue still fails, and default output is unchanged.
+
 ## [0.6.0] - 2026-10-23
 
 ### Changed

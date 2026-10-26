@@ -60,6 +60,8 @@ Commit canonical records and referenced artifacts. Keep the disposable cache at 
 
 After merging knowledge from another branch, run `validate`. If multiple active heads conflict, add a resolving record that supersedes them all. Until then, reads return every conflicting head as active and adds for other subjects still work. Never delete history to repair a conflict.
 
+Parallel pull requests can each supersede, or each start, the same kind and subject. Git merges their separate record files without a conflict, leaving divergent heads. When several agents or contributors work at once, run `validate --allow-divergent-heads` in CI. Divergent heads are then reported under `warnings` and the command succeeds; every other validation issue still fails. The next add to that subject must supersede every head, so the divergence resolves when that knowledge next changes.
+
 ## Limits
 
 - List and search return 20 results by default; `--limit` accepts **1–1,000**.

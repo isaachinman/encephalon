@@ -438,6 +438,26 @@ registerHooks({ load(url, context, nextLoad) {
     assert.equal((outputJson(result) as { valid?: unknown }).valid, false)
   })
 
+  test('reports divergent heads as warnings only when allowed', () => {
+    const root = createRoot()
+    const path = join(root, 'encephalon', 'decision')
+    mkdirSync(path, { recursive: true })
+    for (const id of ['branch-a', 'branch-b']) {
+      writeFileSync(
+        join(path, `${id}.json`),
+        `${JSON.stringify({ createdAt: '2026-10-26T00:00:00.000Z', id, kind: 'decision', payload: {}, source: 'agent', subject: 'api.style' })}\n`,
+      )
+    }
+
+    assert.equal(run(root, ['validate', '--root', root]).status, 2)
+    const tolerated = run(root, ['validate', '--root', root, '--allow-divergent-heads'])
+    assert.equal(tolerated.status, 0)
+    assert.deepEqual(
+      (outputJson(tolerated) as { warnings: Array<{ recordId: string }> }).warnings.map(warning => warning.recordId),
+      ['branch-a', 'branch-b'],
+    )
+  })
+
   test('supports help and version without JSON framing', () => {
     const root = createRoot()
     const help = run(root, ['--help'])

@@ -16,7 +16,7 @@ import {
 } from 'node:fs'
 import { basename, join, relative, resolve } from 'node:path'
 import { TextDecoder } from 'node:util'
-import { parseAddRecordInput, parseRootInput } from './api-input.ts'
+import { parseAddRecordInput, parseValidateRecordsInput } from './api-input.ts'
 import {
   ArtifactChangedError,
   type ArtifactInspection,
@@ -76,6 +76,7 @@ import type {
   BrainRecord,
   BrainRecordFile,
   RootInput,
+  ValidateRecordsInput,
   ValidateResult,
   ValidationIssue,
 } from './types.ts'
@@ -249,6 +250,7 @@ type PlannedRecord = {
 }
 
 type ValidateRecordsOptions = {
+  allowDivergentHeads?: boolean
   hooks?: RecordReadHooks
 }
 
@@ -1399,6 +1401,24 @@ const truncateValidationIssues = (errors: ValidationIssue[]) => {
   }
 }
 
+// Divergent heads arise when parallel branches each supersede or start one kind/subject group.
+const validationResult = (
+  issues: readonly ValidationIssue[],
+  recordsChecked: number,
+  allowDivergentHeads = false,
+): ValidateResult => {
+  const isWarning = (candidate: ValidationIssue) => allowDivergentHeads && candidate.code === 'MULTIPLE_ACTIVE_HEADS'
+  const errors = truncateValidationIssues(issues.filter(candidate => !isWarning(candidate)))
+  const warnings = truncateValidationIssues(issues.filter(isWarning))
+  return {
+    errors: errors.errors,
+    recordsChecked,
+    truncated: errors.truncated || warnings.truncated,
+    valid: errors.errors.length === 0,
+    ...(allowDivergentHeads ? { warnings: warnings.errors } : {}),
+  }
+}
+
 const corpusBudgetIssues = (scan: RecordScan) => {
   const path = scan.records.at(-1)?.path ?? 'encephalon'
   return [
@@ -1460,18 +1480,12 @@ const validateScannedSnapshot = (
     ...supersessionIssues(index),
     ...artifactValidation.errors,
   ]
-  const { errors, truncated } = truncateValidationIssues(collectedErrors)
   return {
     artifactEvidence: artifactValidation.evidence,
     artifacts: artifactValidation.observations,
     index,
     issues: collectedErrors,
-    result: {
-      errors,
-      recordsChecked: scan.records.length,
-      truncated,
-      valid: errors.length === 0,
-    },
+    result: validationResult(collectedErrors, scan.records.length),
   }
 }
 
@@ -1739,7 +1753,10 @@ const readStableCanonicalPlanningScan = (root: string, hooks: RecordReadHooks = 
 /** @internal */
 export const validateRecordsResolved = (root: string, options: ValidateRecordsOptions = {}): ValidateResult => {
   try {
-    return readStableCanonicalSnapshot(root, options.hooks).validation.result
+    const { validation } = readStableCanonicalSnapshot(root, options.hooks)
+    return options.allowDivergentHeads
+      ? validationResult(validation.issues, validation.result.recordsChecked, true)
+      : validation.result
   } catch (error) {
     if (error instanceof EncephalonError) {
       throw error
@@ -1748,9 +1765,10 @@ export const validateRecordsResolved = (root: string, options: ValidateRecordsOp
   }
 }
 
-export const validateRecords = (input: RootInput = {}): ValidateResult => {
-  const root = resolveRepository(parseRootInput(input, 'validateRecords'))
-  return validateRecordsResolved(root)
+export const validateRecords = (input: ValidateRecordsInput = {}): ValidateResult => {
+  const { allowDivergentHeads, ...rootInput } = parseValidateRecordsInput(input)
+  const root = resolveRepository(rootInput)
+  return validateRecordsResolved(root, allowDivergentHeads === undefined ? {} : { allowDivergentHeads })
 }
 
 // Conflicting heads stay readable; only an add to their kind and subject must resolve them.
