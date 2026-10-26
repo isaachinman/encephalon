@@ -1,6 +1,6 @@
 # Encephalon public contract
 
-This is the normative reference for Encephalon 0.6.0. For earlier releases, use the contract at the matching Git tag. The [README](../README.md) is the practical guide; [performance and contributor checks](./performance.md) describe maintainer tooling. Historical designs are evidence, not additional public requirements. Update this contract with any intentional public behaviour change.
+This is the normative reference for Encephalon 0.7.0. For earlier releases, use the contract at the matching Git tag. The [README](../README.md) is the practical guide; [performance and contributor checks](./performance.md) describe maintainer tooling. Historical designs are evidence, not additional public requirements. Update this contract with any intentional public behaviour change.
 
 ## Runtime and repository
 
@@ -22,14 +22,14 @@ All input fields shown below are the complete supported surface. `root?: string`
 | `addRecord(input)` | `id?: string`, `kind: string`, `subject: string`, `source: string`, `payload: JsonValue`, `confidence?: number`, `supersedes?: string[]`, `artifacts?: string[]`, `searchText?: string` | Committed `BrainRecord` |
 | `prepare(input?)` | None | `{ hydrated: boolean, recordsIndexed: number }` |
 | `hydrate(input?)` | None | `{ recordsIndexed: number }` |
-| `validateRecords(input?)` | None | `ValidateResult` |
+| `validateRecords(input?)` | `allowDivergentHeads?: boolean` | `ValidateResult` |
 | `listRecords(input?)` | `kind?: string`, `subject?: string`, `includeSuperseded?: boolean`, `limit?: number` | `BrainRecord[]` |
 | `showRecord(input)` | `id: string`, `activeOnly?: boolean` | `BrainRecord` or `null` |
 | `searchRecords(input)` | `query: string`, `kind?: string`, `includeSuperseded?: boolean`, `limit?: number` | `BrainRecord[]` |
 | `searchCompactRecords(input)` | Same as `searchRecords` | `CompactBrainRecord[]` |
 | `gatherRecords(input)` | `searches?: string[]`, `shows?: string[]`, `kind?: string`, `includeSuperseded?: boolean`, `limit?: number`, `hydrate?: boolean` | `GatherResult` |
 
-`prepare` reuses an accepted fresh cache and sets `hydrated: false`, or rebuilds it and sets `hydrated: true`. `hydrate` forces a transactional rebuild. `recordsIndexed` counts the canonical records indexed, including superseded records. `validateRecords` validates canonical data and artifacts without accepting SQLite as authority. Invalid canonical data returns a validation result; repository, runtime and operational failures may throw.
+`prepare` reuses an accepted fresh cache and sets `hydrated: false`, or rebuilds it and sets `hydrated: true`. `hydrate` forces a transactional rebuild. `recordsIndexed` counts the canonical records indexed, including superseded records. `validateRecords` validates canonical data and artifacts without accepting SQLite as authority. Invalid canonical data returns a validation result; repository, runtime and operational failures may throw. With `allowDivergentHeads: true`, `MULTIPLE_ACTIVE_HEADS` issues move from `errors` to `warnings` and no longer make the result invalid; every other issue is unchanged. `warnings` is present only when that option is true and is bounded and truncated like `errors`; `truncated` is true when either list was truncated.
 
 ```typescript
 type CompactBrainRecord = {
@@ -77,11 +77,12 @@ type ValidateResult = {
   valid: boolean;
   recordsChecked: number;
   errors: ValidationIssue[];
+  warnings?: ValidationIssue[];
   truncated: boolean;
 };
 ```
 
-The package exports these types and `AddRecordInput`, `BrainRecord`, `BrainRecordFile`, `EncephalonErrorCode`, `GatherInput`, `HydrateResult`, `InitEncephalonInput`, `JsonPrimitive`, `JsonValue`, `ListRecordsInput`, `PrepareResult`, `RootInput`, `SearchRecordsInput` and `ShowRecordInput`. The packaged declarations are the authoritative machine-readable signatures.
+The package exports these types and `AddRecordInput`, `BrainRecord`, `BrainRecordFile`, `EncephalonErrorCode`, `GatherInput`, `HydrateResult`, `InitEncephalonInput`, `JsonPrimitive`, `JsonValue`, `ListRecordsInput`, `PrepareResult`, `RootInput`, `SearchRecordsInput`, `ShowRecordInput` and `ValidateRecordsInput`. The packaged declarations are the authoritative machine-readable signatures.
 
 Input envelopes accept ordinary cross-realm or null-prototype objects containing only allowed enumerable own data properties. Unknown keys, symbols, accessors, non-enumerable application fields, custom prototypes and unstable or failing reflection are invalid. Validation does not invoke getters or expose reflection-trap text. Optional fields set to `undefined` are treated as absent where allowed; `null` is not a substitute for an optional field.
 
@@ -97,7 +98,8 @@ encephalon [--root <path>] <command> [options]
 | --- | --- |
 | `init` | `--refresh-baseline`, `--remove` |
 | `add` | Required `--kind`, `--subject`, `--source`, `--data <json>`; optional `--id`, `--confidence <0..1>`, `--text`, repeated `--supersedes <id>` and `--artifact <path>` |
-| `prepare`, `hydrate`, `validate` | No command options |
+| `prepare`, `hydrate` | No command options |
+| `validate` | `--allow-divergent-heads` |
 | `list` | `--kind`, `--subject`, `--include-superseded`, `--limit <1..1000>` |
 | `show` | Required ID as `--id <id>` or one positional argument; optional `--active-only` |
 | `search` | Query arguments, joined with single spaces; optional `--compact`, `--kind`, `--include-superseded`, `--limit <1..1000>` |
@@ -151,7 +153,7 @@ Kinds match `[a-z][a-z0-9_-]{0,63}`. IDs match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}
 
 `confidence` is a finite number from 0 through 1; negative zero becomes positive zero. Payloads accept finite JSON primitives, dense arrays and plain or null-prototype objects. Cycles, sparse arrays, accessors, symbol keys, non-plain objects, non-finite numbers, unsupported values and failed reflection are invalid. Payload traversal never invokes getters; ordinary non-enumerable object data is not serialised. Shared non-cyclic input values are permitted, and negative-zero payload numbers are normalised. New records use two-space formatted JSON and a final newline within the record-byte limit; existing valid JSON bytes need not be rewritten into that spelling.
 
-Knowledge is append-only. A record is active if no record supersedes its ID. Every supersession target must exist, differ from the new record and have the same kind and subject; cycles are invalid. Multiple active heads for one kind/subject are a validation conflict that `validateRecords` reports. Reads, cache preparation, `init` and adds to other kind/subject groups continue and treat every conflicting head as active. An add to a conflicted group must supersede every active head of that group; otherwise it fails with `VALIDATION_FAILED`, whose `details.errors` entries carry the conflicting `recordId` values. Normal mutations never edit or delete existing records or artifacts.
+Knowledge is append-only. A record is active if no record supersedes its ID. Every supersession target must exist, differ from the new record and have the same kind and subject; cycles are invalid. Multiple active heads for one kind/subject are a validation conflict that `validateRecords` reports. They typically arise when parallel branches each supersede, or each start, the same group and Git merges the separate record files without a textual conflict. `allowDivergentHeads` reports such divergent heads as warnings instead, for repositories that merge parallel work before resolving it. Reads, cache preparation, `init` and adds to other kind/subject groups continue and treat every conflicting head as active. An add to a conflicted group must supersede every active head of that group; otherwise it fails with `VALIDATION_FAILED`, whose `details.errors` entries carry the conflicting `recordId` values. Normal mutations never edit or delete existing records or artifacts.
 
 Artifacts are existing immutable regular non-symlink files beneath `encephalon/_artifacts/<kind>/<id>/`. Stored paths begin `_artifacts/<kind>/<id>/`, relative to the brain directory. They use `/`, remain under their owning record and contain no empty, dot, parent, absolute, drive-prefixed or backslash segments. Segments must be NFC, fit portable byte/UTF-16 lengths, and contain no controls, Windows-reserved characters/names or trailing dots/spaces. Ancestors must be real contained directories; missing, linked, mismatched or non-regular referenced files are invalid. Detected replacement during inspection is a repository change, not a stable validation result. Encephalon references artifacts rather than importing arbitrary file contents into search.
 
@@ -179,10 +181,10 @@ Limits are independent and inclusive. `KiB`/`MiB` mean powers of 1,024. Counts i
 | Each kind directory | 1,000 entries |
 | Managed instruction file / inspected root package metadata | 1 MiB each |
 | Baseline root/workflow directory | 512 raw entries per source before filtering |
-| Validation output | At most 100 issues, including a truncation sentinel |
+| Validation output | At most 100 issues per list (`errors`, and `warnings` when present), each including a truncation sentinel |
 | Full, compact, complete gather response | Independent 4 MiB budgets |
 
-The canonical root-entry count includes `_artifacts` and `_staging`, but neither counts as a kind. Directory overflow reports one deterministic `CORPUS_DIRECTORY_ENTRY_LIMIT` issue for the containing repository-relative directory, without disclosing excess filenames. Validation returns deterministic bounded issues; when its reporting ceiling is reached, it retains at most 99 concrete issues, appends `VALIDATION_ISSUES_TRUNCATED`, and sets `truncated: true`.
+The canonical root-entry count includes `_artifacts` and `_staging`, but neither counts as a kind. Directory overflow reports one deterministic `CORPUS_DIRECTORY_ENTRY_LIMIT` issue for the containing repository-relative directory, without disclosing excess filenames. Validation returns deterministic bounded issues; the reporting ceiling applies separately to `errors` and `warnings`; a list that reaches it retains at most 99 concrete issues, appends `VALIDATION_ISSUES_TRUNCATED`, and sets `truncated: true`.
 
 Full list, show and full search charge `fullResponseBytes` by the accepted record JSON representation, including the returned runtime path, rather than by transport pretty-printing. Compact search charges `compactResponseBytes`; a complete gather charges `gatherResponseBytes`. Compact/gather logical accounting adds the UTF-8 bytes of every string value and object key, plus eight bytes for each number, boolean, null, array and object, recursively. Whitespace, escaping and property order do not change that charge. Gather includes its envelopes, hydration result, shown records/nulls and compact result arrays, charging duplicates each time.
 

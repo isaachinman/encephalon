@@ -1,0 +1,24 @@
+{
+  "createdAt": "2026-10-26T13:22:24.160Z",
+  "id": "0cdd6f0d-d5ab-4c00-b3db-a231a3ae96fe",
+  "kind": "decision",
+  "payload": {
+    "summary": "Multiple active heads for one kind/subject are reported by validate but do not block reads, cache preparation, init or adds to other groups; validate --allow-divergent-heads reports them as warnings instead of errors.",
+    "rationale": [
+      "Canonical records live in Git, so parallel branches superseding or starting the same subject merge cleanly into divergent heads.",
+      "Blocking every operation on one conflicted subject disabled Encephalon for all agents until a manual resolver landed.",
+      "Strict validate in CI broke main whenever parallel agent pull requests touched one subject, so repositories need an opt-in that keeps every other check strict."
+    ],
+    "rules": [
+      "Reads accept a corpus whose only validation issues are MULTIPLE_ACTIVE_HEADS and expose every conflicting head as active.",
+      "Writes block MULTIPLE_ACTIVE_HEADS only for kind/subject groups that contain a candidate record, so a resolver must supersede every head of its group.",
+      "Blocking decisions use the untruncated issue list; VALIDATION_FAILED details include recordId where an issue has one.",
+      "allowDivergentHeads moves only MULTIPLE_ACTIVE_HEADS into warnings; warnings is present only when the option is true, so default validate output stays byte-identical.",
+      "CLI --help must stay identical to the published release (release-compatibility check), so new flags are documented in the contract and README, not help."
+    ]
+  },
+  "searchText": "multiple active heads divergent heads parallel pull requests merge conflict supersede resolver validate allow-divergent-heads warnings",
+  "source": "agent",
+  "subject": "canonical.active-head-conflicts",
+  "supersedes": ["01e8c3ad-fb81-4e2f-b5a2-202fbd2b2624"]
+}

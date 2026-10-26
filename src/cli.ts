@@ -322,10 +322,10 @@ const dispatch = async (arguments_: string[]): Promise<CommandResult> => {
       return { value: hydrate(root) }
     }
     case 'validate': {
-      const options = parseOptions(commandArguments)
+      const options = parseOptions(commandArguments, { flags: ['allow-divergent-heads'] })
       noPositionals(options)
       const { validateRecords } = await import('./records.ts')
-      const value = validateRecords(root)
+      const value = validateRecords({ ...root, allowDivergentHeads: options.flags.has('allow-divergent-heads') })
       return { value, ...(value.valid ? {} : { exitCode: 2 }) }
     }
     case 'list': {

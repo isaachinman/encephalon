@@ -20,6 +20,7 @@ import type {
   RootInput,
   SearchRecordsInput,
   ShowRecordInput,
+  ValidateRecordsInput,
 } from './types.ts'
 
 /** @internal */
@@ -239,6 +240,9 @@ const GATHER_KEYS = new Set(
     shows: true,
   } satisfies Record<keyof GatherInput, true>),
 )
+const VALIDATE_KEYS = new Set(
+  Object.keys({ allowDivergentHeads: true, root: true } satisfies Record<keyof ValidateRecordsInput, true>),
+)
 const INIT_KEYS = new Set(
   Object.keys({ refreshBaseline: true, remove: true, root: true } satisfies Record<keyof InitEncephalonInput, true>),
 )
@@ -264,6 +268,15 @@ const rootProperties = (input: Record<string, unknown>): RootInput => {
 
 export const parseRootInput = (value: unknown = {}, name = 'root'): RootInput =>
   rootProperties(objectInput(value, name, ROOT_KEYS))
+
+export const parseValidateRecordsInput = (value: unknown = {}): ValidateRecordsInput => {
+  const input = objectInput(value, 'validateRecords', VALIDATE_KEYS)
+  const allowDivergentHeads = optionalBoolean(input.allowDivergentHeads, 'allowDivergentHeads')
+  return {
+    ...rootProperties(input),
+    ...(allowDivergentHeads === undefined ? {} : { allowDivergentHeads }),
+  }
+}
 
 export const parseListRecordsInput = (value: unknown = {}): ListRecordsInput => {
   const input = objectInput(value, 'listRecords', LIST_KEYS)

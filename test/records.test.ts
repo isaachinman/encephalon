@@ -2037,6 +2037,13 @@ describe('canonical records', () => {
       conflicted.errors.some(error => error.code === 'MULTIPLE_ACTIVE_HEADS'),
       true,
     )
+    const tolerated = api.validateRecords({ allowDivergentHeads: true, root })
+    assert.equal(tolerated.valid, true)
+    assert.deepEqual(tolerated.errors, [])
+    assert.deepEqual(
+      tolerated.warnings?.map(warning => [warning.code, warning.recordId]),
+      ['record-c', second.id].map(recordId => ['MULTIPLE_ACTIVE_HEADS', recordId]),
+    )
 
     assert.deepEqual(
       api.listRecords({ root, subject: 'api.style' }).map(record => record.id),
@@ -2108,6 +2115,15 @@ describe('canonical records', () => {
       validation.errors.some(error => error.code === 'INVALID_ARTIFACT'),
       false,
     )
+    const tolerated = api.validateRecords({ allowDivergentHeads: true, root })
+    assert.equal(tolerated.valid, false)
+    assert.deepEqual(
+      tolerated.errors.map(issue => [issue.code, issue.recordId]),
+      [['INVALID_ARTIFACT', 'missing-artifact']],
+    )
+    assert.equal(tolerated.truncated, true)
+    assert.equal(tolerated.warnings?.length, 100)
+    assert.equal(tolerated.warnings?.at(-1)?.code, 'VALIDATION_ISSUES_TRUNCATED')
     for (const operation of [
       () => api.listRecords({ root }),
       () => api.addRecord({ kind: 'decision', payload: {}, root, source: 'agent', subject: 'unrelated.limit' }),

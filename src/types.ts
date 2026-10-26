@@ -70,10 +70,15 @@ export type ValidationIssue = {
   recordId?: string
 }
 
+export type ValidateRecordsInput = RootInput & {
+  allowDivergentHeads?: boolean
+}
+
 export type ValidateResult = {
   valid: boolean
   recordsChecked: number
   errors: ValidationIssue[]
+  warnings?: ValidationIssue[]
   truncated: boolean
 }
 

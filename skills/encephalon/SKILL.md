@@ -35,7 +35,7 @@ Do not record routine edits, status updates, chat or log dumps, temporary debugg
 
 ## Preserve append-only history
 
-Search the intended subject first. If active knowledge changes, add a replacement that supersedes every active head for the same `kind` and `subject`; never rewrite or delete the earlier record.
+Search the intended subject first. If active knowledge changes, add a replacement that supersedes every active head for the same `kind` and `subject`; never rewrite or delete the earlier record. Several active heads usually mean parallel branches diverged, so reconcile their content in the replacement.
 
 ```bash
 npx --no-install encephalon search --compact "api authentication strategy"
@@ -65,4 +65,4 @@ Run:
 npx --no-install encephalon validate
 ```
 
-Resolve validation failures before presenting the related change. Mention the added or superseded record IDs in the handoff so the user can review them with the code.
+Resolve validation failures before presenting the related change. For `MULTIPLE_ACTIVE_HEADS`, add one record that supersedes every reported head and reconciles them. If the repository's own checks run `validate --allow-divergent-heads`, use the same flag; it reports divergent heads under `warnings`, which you should reconcile only when the task touches their subject. Mention the added or superseded record IDs in the handoff so the user can review them with the code.

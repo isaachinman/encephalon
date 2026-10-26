@@ -28,6 +28,7 @@ export type {
   RootInput,
   SearchRecordsInput,
   ShowRecordInput,
+  ValidateRecordsInput,
   ValidateResult,
   ValidationIssue,
 } from './types.ts'
