@@ -181,10 +181,10 @@ Limits are independent and inclusive. `KiB`/`MiB` mean powers of 1,024. Counts i
 | Each kind directory | 1,000 entries |
 | Managed instruction file / inspected root package metadata | 1 MiB each |
 | Baseline root/workflow directory | 512 raw entries per source before filtering |
-| Validation output | At most 100 issues, including a truncation sentinel |
+| Validation output | At most 100 issues per list (`errors`, and `warnings` when present), each including a truncation sentinel |
 | Full, compact, complete gather response | Independent 4 MiB budgets |
 
-The canonical root-entry count includes `_artifacts` and `_staging`, but neither counts as a kind. Directory overflow reports one deterministic `CORPUS_DIRECTORY_ENTRY_LIMIT` issue for the containing repository-relative directory, without disclosing excess filenames. Validation returns deterministic bounded issues; when its reporting ceiling is reached, it retains at most 99 concrete issues, appends `VALIDATION_ISSUES_TRUNCATED`, and sets `truncated: true`.
+The canonical root-entry count includes `_artifacts` and `_staging`, but neither counts as a kind. Directory overflow reports one deterministic `CORPUS_DIRECTORY_ENTRY_LIMIT` issue for the containing repository-relative directory, without disclosing excess filenames. Validation returns deterministic bounded issues; the reporting ceiling applies separately to `errors` and `warnings`; a list that reaches it retains at most 99 concrete issues, appends `VALIDATION_ISSUES_TRUNCATED`, and sets `truncated: true`.
 
 Full list, show and full search charge `fullResponseBytes` by the accepted record JSON representation, including the returned runtime path, rather than by transport pretty-printing. Compact search charges `compactResponseBytes`; a complete gather charges `gatherResponseBytes`. Compact/gather logical accounting adds the UTF-8 bytes of every string value and object key, plus eight bytes for each number, boolean, null, array and object, recursively. Whitespace, escaping and property order do not change that charge. Gather includes its envelopes, hydration result, shown records/nulls and compact result arrays, charging duplicates each time.
 
