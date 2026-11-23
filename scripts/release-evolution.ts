@@ -141,7 +141,7 @@ try {
     snippet = match(false)
   } else if (phase === 'read') {
     api.prepare({ root })
-    assert.equal(schema(), '4')
+    assert.equal(schema(), '5')
     snippet = match(true)
   } else if (phase === 'refresh') {
     const old = records()
@@ -155,7 +155,7 @@ try {
     api.initEncephalon({ root, remove: true })
   } else if (phase === 'downgrade') {
     schemaBefore = schema()
-    assert.equal(schemaBefore, '4')
+    assert.equal(schemaBefore, '5')
     api.prepare({ root })
     assert.equal(schema(), '2')
     snippet = match(false)

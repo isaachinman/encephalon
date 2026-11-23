@@ -39,17 +39,29 @@ import { manifestEntryMetadataFrom } from './filesystem-entry.ts'
 import { PACKAGE_VERSION } from './generated/version.ts'
 import { withOperationLock } from './lock.ts'
 import { OPERATION_BUDGETS } from './operation-budgets.ts'
+import { ordinalStringCompare } from './order.ts'
 import { recordCorpusFingerprint } from './record-corpus-fingerprint.ts'
-import { MAX_SEARCH_PREVIEW_BYTES, searchDocumentForRecord, searchPreviewForRecord } from './record-projection.ts'
+import {
+  MAX_SEARCH_PREVIEW_BYTES,
+  recordProjection,
+  searchDocumentForRecord,
+  searchPreviewForRecord,
+  summaryForRecord,
+} from './record-projection.ts'
 import {
   canonicalCacheManifest,
+  MAX_ARTIFACT_REFERENCES,
+  MAX_CANONICAL_RECORD_BYTES,
+  MAX_CANONICAL_RECORDS,
+  MAX_SUPERSESSION_EDGES,
   type RecordReadHooks,
+  readDigestVerifiedRecord,
   readValidatedRecordSnapshotResolved,
   type VerifiedCorpus,
 } from './records.ts'
 import { resolveRepository } from './repository.ts'
 import { createResponseByteBudget, logicalResponseBytes, type ResponseByteBudget } from './response-budget.ts'
-import { validateArtifactPath } from './schema.ts'
+import { validateArtifactPath, validateId, validateKind } from './schema.ts'
 import { literalMatchQuery, MAX_NFC_UTF8_EXPANSION_FACTOR } from './search-text.ts'
 import { classifySQLiteError } from './sqlite-error.ts'
 import type {
@@ -65,13 +77,19 @@ import type {
   ShowRecordInput,
 } from './types.ts'
 
-const SCHEMA_VERSION = '4'
+const SCHEMA_VERSION = '5'
 const CACHE_APPLICATION_ID = 0x45_4e_43_50
 const MAX_REPOSITORY_CHANGE_RETRIES = 3
 const MAX_GATHER_SEARCHES = OPERATION_BUDGETS.gatherSearches.maximum
 const MAX_GATHER_SHOWS = OPERATION_BUDGETS.gatherShows.maximum
 const SQLITE_BUSY_TIMEOUT_MILLISECONDS = 1000
 const MAX_CACHE_METADATA_BYTES = 1024 * 1024
+// The artifact path list is one JSON array: each path is at most 1 KiB, every byte may need a six-byte escape,
+// and each entry adds quotes and a separator.
+const MAX_CACHE_ARTIFACT_PATHS_BYTES = Math.max(
+  MAX_CACHE_METADATA_BYTES,
+  CANONICAL_BUDGETS.artifactReferences * (1024 * 6 + 3) + 2,
+)
 const MAX_CACHE_SCHEMA_BYTES = 4 * 1024
 // Search text contains canonical fields and the flattened payload, with NFC expansion.
 const MAX_CACHE_SEARCH_SOURCE_BYTES = CANONICAL_BUDGETS.recordBytes + 4096
@@ -96,7 +114,8 @@ const METADATA_KEYS = [
   'repositoryRealpath',
   'schemaVersion',
 ] as const
-const MAX_CACHE_METADATA_AGGREGATE_BYTES = METADATA_KEYS.length * MAX_CACHE_METADATA_BYTES
+const MAX_CACHE_METADATA_AGGREGATE_BYTES =
+  (METADATA_KEYS.length - 1) * MAX_CACHE_METADATA_BYTES + MAX_CACHE_ARTIFACT_PATHS_BYTES
 
 type SQLiteModule = {
   DatabaseSync: new (
@@ -154,15 +173,20 @@ type CacheIntegrityObservation = {
   rows: number
 }
 
-// These columns support identity joins, filtering and deterministic ordering. Full values,
-// paths and summaries belong to the operation's verified canonical corpus.
+// These columns support identity joins, filtering, deterministic ordering and the corpus budgets
+// that a trusted add checks (`bytes`, supersession `edges`, `artifacts` references). Full values
+// are read from canonical files and accepted only when their bytes still hash to `digest`. `racy`
+// marks files whose unchanged metadata cannot prove unchanged content, so trusted reads rehash them.
 const CACHE_SCHEMA = [
   'CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
   `CREATE TABLE records (rowid INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
     kind TEXT NOT NULL, subject TEXT NOT NULL, created_at TEXT NOT NULL,
-    active INTEGER NOT NULL CHECK (active IN (0, 1)))`,
+    active INTEGER NOT NULL CHECK (active IN (0, 1)), digest TEXT NOT NULL,
+    racy INTEGER NOT NULL CHECK (racy IN (0, 1)), bytes INTEGER NOT NULL,
+    edges INTEGER NOT NULL, artifacts INTEGER NOT NULL)`,
   'CREATE INDEX records_active_order ON records(active, created_at DESC, id DESC)',
   'CREATE INDEX records_kind_subject ON records(kind, subject)',
+  'CREATE INDEX records_racy ON records(racy) WHERE racy = 1',
   'CREATE VIRTUAL TABLE record_search USING fts5(text, preview)',
 ] as const
 
@@ -186,6 +210,8 @@ type CacheReadTestHooks = {
   onCompactSearchPrepare?: ((source: string) => void) | undefined
   onShowPrepare?: ((source: string) => void) | undefined
   recordReadHooks?: RecordReadHooks | undefined
+  /** Sends reads through full canonical validation, as `prepare` and stale reads do, to test forged caches. */
+  requireCanonicalCacheEquality?: boolean | undefined
 }
 
 type CacheReadInstrumentation = {
@@ -642,24 +668,27 @@ const readMetadata = (database: DatabaseSync): Metadata | undefined => {
           COUNT(*) AS row_count,
           CASE WHEN TOTAL(invalid_type) > 0 THEN 1 ELSE 0 END AS has_invalid_type,
           CASE WHEN TOTAL(oversized) > 0 THEN 1 ELSE 0 END AS has_oversized_value,
-          CASE WHEN TOTAL(value_bytes) > ? THEN 1 ELSE 0 END AS exceeds_aggregate_bytes
+          CASE WHEN TOTAL(value_bytes) > ?1 THEN 1 ELSE 0 END AS exceeds_aggregate_bytes
         FROM (
           SELECT
             CASE WHEN typeof(key) = 'text' AND typeof(value) = 'text' THEN 0 ELSE 1 END AS invalid_type,
-            CASE WHEN typeof(key) = 'text' AND length(CAST(key AS BLOB)) <= ?
-                       AND typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= ?
+            CASE WHEN typeof(key) = 'text' AND length(CAST(key AS BLOB)) <= ?2
+                       AND typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= maximum_value_bytes
                  THEN 0 ELSE 1 END AS oversized,
-            CASE WHEN typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= ?
+            CASE WHEN typeof(value) = 'text' AND length(CAST(value AS BLOB)) <= maximum_value_bytes
                  THEN length(CAST(value AS BLOB)) ELSE 0 END AS value_bytes
-          FROM metadata
-          LIMIT ?
+          FROM (
+            SELECT key, value, CASE WHEN key = 'artifactPaths' THEN ?4 ELSE ?3 END AS maximum_value_bytes
+            FROM metadata
+            LIMIT ?5
+          )
         )`,
       )
       .get(
         MAX_CACHE_METADATA_AGGREGATE_BYTES,
         maximumKeyBytes,
         MAX_CACHE_METADATA_BYTES,
-        MAX_CACHE_METADATA_BYTES,
+        MAX_CACHE_ARTIFACT_PATHS_BYTES,
         maximumRows,
       ) as CacheIntegrityProbe | undefined,
     maximumRows,
@@ -690,7 +719,10 @@ const readMetadata = (database: DatabaseSync): Metadata | undefined => {
     ) {
       throw new CacheSchemaMismatch('The cache metadata contains invalid keys or values.')
     }
-    assertCacheValueSize(row.value, MAX_CACHE_METADATA_BYTES)
+    assertCacheValueSize(
+      row.value,
+      row.key === 'artifactPaths' ? MAX_CACHE_ARTIFACT_PATHS_BYTES : MAX_CACHE_METADATA_BYTES,
+    )
     values.set(row.key, row.value)
   }
   const schemaVersion = values.get('schemaVersion')
@@ -703,12 +735,12 @@ const readMetadata = (database: DatabaseSync): Metadata | undefined => {
   if (artifactPathsValue === undefined || recordsIndexedValue === undefined) {
     throw new CacheSchemaMismatch('The cache metadata key set is incomplete.')
   }
-  const artifactPaths = parseCacheJson(artifactPathsValue, MAX_CACHE_METADATA_BYTES)
+  const artifactPaths = parseCacheJson(artifactPathsValue, MAX_CACHE_ARTIFACT_PATHS_BYTES)
   const recordsIndexed = /^(?:0|[1-9]\d*)$/.test(recordsIndexedValue) ? Number(recordsIndexedValue) : Number.NaN
   if (
     schemaVersion !== SCHEMA_VERSION ||
     !Array.isArray(artifactPaths) ||
-    artifactPaths.length > CANONICAL_BUDGETS.records ||
+    artifactPaths.length > CANONICAL_BUDGETS.artifactReferences ||
     (recordFingerprint !== undefined && !/^[0-9a-f]{64}$/u.test(recordFingerprint)) ||
     !Number.isSafeInteger(recordsIndexed) ||
     recordsIndexed < 0 ||
@@ -811,6 +843,9 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
       FROM (SELECT
         CASE WHEN typeof(id) = 'text' AND typeof(kind) = 'text' AND typeof(subject) = 'text'
           AND typeof(created_at) = 'text' AND typeof(active) = 'integer' AND active IN (0, 1)
+          AND typeof(digest) = 'text' AND octet_length(digest) = 64
+          AND typeof(racy) = 'integer' AND racy IN (0, 1) AND typeof(bytes) = 'integer'
+          AND typeof(edges) = 'integer' AND typeof(artifacts) = 'integer'
           THEN 0 ELSE 1 END AS invalid_type,
         CASE WHEN octet_length(id) <= 255 AND octet_length(kind) <= 255
           AND octet_length(subject) <= ?2 AND octet_length(created_at) <= ?2
@@ -852,7 +887,8 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
   const subsetSuperseded = recordsProbe.rows === snapshot.records.length ? undefined : new Set<string>()
   const representation = database.prepare(`SELECT
     CAST(id AS BLOB) = CAST(?1 AS BLOB) AND CAST(kind AS BLOB) = CAST(?2 AS BLOB)
-      AND CAST(subject AS BLOB) = CAST(?3 AS BLOB) AND CAST(created_at AS BLOB) = CAST(?4 AS BLOB) AS matches
+      AND CAST(subject AS BLOB) = CAST(?3 AS BLOB) AND CAST(created_at AS BLOB) = CAST(?4 AS BLOB)
+      AND CAST(digest AS BLOB) = CAST(?6 AS BLOB) AND bytes = ?7 AND edges = ?8 AND artifacts = ?9 AS matches
     FROM records WHERE rowid = ?5`)
   for (const row of recordRows) {
     const id = row.id_bytes instanceof Uint8Array ? Buffer.from(row.id_bytes).toString('utf8') : undefined
@@ -860,10 +896,20 @@ const assertCacheContentConsistent = (database: DatabaseSync, metadata: Metadata
     if (canonical === undefined || members.has(canonical.id) || typeof row.rowid !== 'bigint') {
       throw new CacheSchemaMismatch('The cache record table does not match the canonical record corpus.')
     }
-    const { summary } = snapshot.recordFacts(canonical).projection
+    const facts = snapshot.recordFacts(canonical)
+    const { summary } = facts.projection
     if (
-      representation.get(canonical.id, canonical.kind, canonical.subject, canonical.createdAt, row.rowid)?.matches !==
-        1 ||
+      representation.get(
+        canonical.id,
+        canonical.kind,
+        canonical.subject,
+        canonical.createdAt,
+        row.rowid,
+        facts.digest,
+        facts.bytes,
+        canonical.supersedes?.length ?? 0,
+        canonical.artifacts?.length ?? 0,
+      )?.matches !== 1 ||
       !canonical.subject.isWellFormed() ||
       !canonical.source.isWellFormed() ||
       (summary !== null && !summary.isWellFormed()) ||
@@ -1102,6 +1148,34 @@ const assertMutationSnapshotCurrent = (location: CacheLocation, snapshot: Valida
   }
 }
 
+type CachedRecordFacts = Readonly<{
+  bytes: number
+  digest: string
+  projection: Readonly<{ preview: string; text: string }>
+  racy: boolean
+}>
+
+const prepareRecordInsert = (database: DatabaseSync) => {
+  const insertRecord = database.prepare(`INSERT INTO records(id, kind, subject, created_at, active, digest, racy,
+    bytes, edges, artifacts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+  const insertSearch = database.prepare('INSERT INTO record_search(rowid, text, preview) VALUES (?, ?, ?)')
+  return (record: BrainRecord, facts: CachedRecordFacts, active: boolean) => {
+    const { lastInsertRowid } = insertRecord.run(
+      record.id,
+      record.kind,
+      record.subject,
+      record.createdAt,
+      active ? 1 : 0,
+      facts.digest,
+      facts.racy ? 1 : 0,
+      facts.bytes,
+      (record.supersedes ?? []).length,
+      (record.artifacts ?? []).length,
+    )
+    insertSearch.run(lastInsertRowid, facts.projection.text, facts.projection.preview)
+  }
+}
+
 const writeCacheSnapshot = (
   root: string,
   location: CacheLocation,
@@ -1143,19 +1217,10 @@ const writeCacheSnapshot = (
       }
       assertCacheWriteSnapshotCurrent(snapshot)
       database.exec('DELETE FROM record_search; DELETE FROM records; DELETE FROM metadata;')
-      const insertRecord = database.prepare(`INSERT INTO records(id, kind, subject, created_at, active)
-        VALUES (?, ?, ?, ?, ?)`)
-      const insertSearch = database.prepare('INSERT INTO record_search(rowid, text, preview) VALUES (?, ?, ?)')
+      const insertRecord = prepareRecordInsert(database)
       for (const record of snapshot.records) {
-        const { projection } = snapshot.recordFacts(record)
-        const { lastInsertRowid } = insertRecord.run(
-          record.id,
-          record.kind,
-          record.subject,
-          record.createdAt,
-          snapshot.activeIds.has(record.id) ? 1 : 0,
-        )
-        insertSearch.run(lastInsertRowid, projection.text, projection.preview)
+        const facts = snapshot.recordFacts(record)
+        insertRecord(record, facts, snapshot.activeIds.has(record.id))
       }
 
       writeMetadata(database, {
@@ -1487,9 +1552,365 @@ const runWithDisposableCacheRecovery = <Result>(
 
 type CachePreparationCompletion<Result> =
   | { kind: 'prepare' }
-  | { kind: 'read'; read: (database: DatabaseSync, corpus: VerifiedCorpus) => Result; state: CacheReadRecoveryState }
+  | {
+      kind: 'read'
+      read: (database: DatabaseSync, recordSource: RecordSource) => Result
+      state: CacheReadRecoveryState
+    }
 
 type FreshCacheResult<Result> = { kind: 'fresh'; result: Result } | { kind: 'stale' }
+
+/** The records a read may return, resolved by identity from a query's selected rows. */
+type RecordSource = Readonly<{
+  recordById: (id: string) => BrainRecord | undefined
+  summaryOf: (record: BrainRecord) => string | null
+}>
+
+const verifiedCorpusRecordSource = (corpus: VerifiedCorpus): RecordSource =>
+  Object.freeze({
+    recordById: (id: string) => corpus.byId.get(id),
+    summaryOf: (record: BrainRecord) => corpus.recordFacts(record).projection.summary,
+  })
+
+class TrustedReadUnavailable extends Error {}
+
+type SettledRacyRecord = Readonly<{ digest: string; id: string }>
+
+type TrustedReadSettlement = Readonly<{ manifest: string; records: readonly SettledRacyRecord[] }>
+
+/**
+ * Clears racy flags that a trusted read has just proven, so later reads stop rehashing those files. It is only an
+ * optimisation and never waits: a busy or failed write leaves the flags set for the next trusted read to verify.
+ * The operation lock is unnecessary because the update applies only while the cached manifest is the one the read
+ * proved; a concurrent writer either replaces every row afterwards or changes that manifest first.
+ */
+const settleRacyRecords = (location: CacheLocation, settlement: TrustedReadSettlement) => {
+  try {
+    const existing = inspectCacheDatabase(location, 'brain.sqlite')
+    if (existing === undefined) {
+      return
+    }
+    const { database } = openWriterDatabase(location, { database: existing, kind: 'expected-owned' }, () => {})
+    try {
+      database.exec('PRAGMA busy_timeout = 0; BEGIN IMMEDIATE')
+      const current = readMetadata(database)
+      if (current?.manifest === settlement.manifest) {
+        const settle = database.prepare('UPDATE records SET racy = 0 WHERE id = ? AND digest = ? AND racy = 1')
+        for (const { digest, id } of settlement.records) {
+          settle.run(id, digest)
+        }
+      }
+      database.exec('COMMIT')
+    } finally {
+      if (database.isTransaction) {
+        database.exec('ROLLBACK')
+      }
+      database.close()
+    }
+  } catch {
+    // See the function comment: a failed settlement costs one more verification, never a wrong read.
+  }
+}
+
+const createDigestVerifiedRecordSource = (root: string, database: DatabaseSync) => {
+  const lookup = database.prepare('SELECT kind, digest FROM records WHERE id = ?')
+  const accepted = new Map<string, BrainRecord>()
+  const load = (id: unknown, kind: unknown, digest: unknown) => {
+    if (typeof id !== 'string' || typeof kind !== 'string' || typeof digest !== 'string') {
+      throw new CacheSchemaMismatch('The cache contains an invalid record identity.')
+    }
+    try {
+      validateId(id)
+      validateKind(kind)
+    } catch (error) {
+      throw new CacheSchemaMismatch('The cache contains an invalid record identity.', { cause: error })
+    }
+    const verified = readDigestVerifiedRecord(root, kind, id, digest)
+    if (verified === undefined) {
+      throw new TrustedReadUnavailable()
+    }
+    const { record } = verified
+    if (record.id !== id || record.kind !== kind) {
+      throw new CacheSchemaMismatch('The cache record identity does not match its canonical file.')
+    }
+    const summary = summaryForRecord(record)
+    if (!(record.subject.isWellFormed() && record.source.isWellFormed() && (summary?.isWellFormed() ?? true))) {
+      // SQLite cannot store this text faithfully; full validation reports that consistently for every read.
+      throw new TrustedReadUnavailable()
+    }
+    accepted.set(id, record)
+    return { digest, id, racy: verified.racy, record }
+  }
+  return Object.freeze({
+    recordById: (id: string) => {
+      const known = accepted.get(id)
+      if (known !== undefined) {
+        return known
+      }
+      const row = lookup.get(id) as { digest?: unknown; kind?: unknown } | undefined
+      return row === undefined ? undefined : load(id, row.kind, row.digest).record
+    },
+    summaryOf: summaryForRecord,
+    /** Rehashes every racy record and returns those whose metadata alone now proves their content. */
+    verifyRacyRecords: (): SettledRacyRecord[] => {
+      const rows = database.prepare('SELECT id, kind, digest FROM records WHERE racy = 1').iterate() as Iterable<{
+        digest?: unknown
+        id?: unknown
+        kind?: unknown
+      }>
+      return Array.from(rows, row => load(row.id, row.kind, row.digest))
+        .filter(loaded => !loaded.racy)
+        .map(({ digest: settledDigest, id: settledId }) => ({ digest: settledDigest, id: settledId }))
+    },
+  })
+}
+
+const currentCanonicalManifest = (root: string, artifactPaths: readonly string[]) => {
+  const artifacts: ArtifactObservation[] = []
+  for (const path of artifactPaths) {
+    try {
+      artifacts.push({ metadata: lstatSync(resolve(root, 'encephalon', path), { bigint: true }), path })
+    } catch (error) {
+      const { code } = error as NodeJS.ErrnoException
+      if (code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR') {
+        return
+      }
+      throw error
+    }
+  }
+  const manifest = boundedRepositoryManifestFromObservations(root, artifacts)
+  return manifest.kind === 'stable' ? manifest.value : undefined
+}
+
+/**
+ * Answers a read from a cache whose recorded file metadata still matches every canonical record, directory and
+ * artifact, without reading the unselected records. `undefined` sends the read to full canonical validation.
+ */
+const readTrustedCacheResult = <Result>(
+  root: string,
+  database: DatabaseSync,
+  read: (database: DatabaseSync, recordSource: RecordSource) => Result,
+): Readonly<{ result: Result; settled?: TrustedReadSettlement }> | undefined => {
+  const metadata = readMetadata(database)
+  assertCacheScope(root, metadata)
+  if (
+    metadata?.recordFingerprint === undefined ||
+    currentCanonicalManifest(root, metadata.artifactPaths) !== metadata.manifest
+  ) {
+    return
+  }
+  const rows = database.prepare('SELECT COUNT(*) AS row_count FROM records').get() as { row_count?: unknown }
+  if (rows.row_count !== metadata.recordsIndexed) {
+    throw new CacheSchemaMismatch('The cache record table does not match its metadata.')
+  }
+  const records = createDigestVerifiedRecordSource(root, database)
+  try {
+    const settled = records.verifyRacyRecords()
+    cacheReadInstrumentation.afterIntegrityValidation?.()
+    cacheReadInstrumentation.beforeResultRead?.()
+    const result = read(database, records)
+    cacheReadInstrumentation.afterResultRead?.()
+    return settled.length === 0 ? { result } : { result, settled: { manifest: metadata.manifest, records: settled } }
+  } catch (error) {
+    if (error instanceof TrustedReadUnavailable) {
+      return
+    }
+    throw error
+  }
+}
+
+/** Cached evidence for one canonical record file, keyed by its repository-relative path. */
+type TrustedRecordEvidence = Readonly<{ digest: string; racy: boolean }>
+
+/** What a trusted add needs from the cache once it has proven the candidate valid against cached facts. */
+type TrustedAppendPlan = Readonly<{
+  artifactPaths: readonly string[]
+  latestCreatedAt: string | undefined
+  manifest: string
+  records: ReadonlyMap<string, TrustedRecordEvidence>
+  settled: readonly SettledRacyRecord[]
+}>
+
+const sameCaseInsensitivePath = (first: string, second: string) =>
+  first.normalize('NFC').toLowerCase() === second.normalize('NFC').toLowerCase()
+
+/**
+ * @internal
+ * Proves `candidate` would leave the canonical corpus valid using only a current cache: an unchanged manifest,
+ * rehashed racy records and cached graph and budget facts. `undefined` means full canonical planning must decide,
+ * which also reports every rejection with its usual error and recovers a corrupt or foreign cache.
+ */
+export const readTrustedAppendPlan = (
+  root: string,
+  location: CacheLocation,
+  candidate: BrainRecord,
+  candidateBytes: number,
+): TrustedAppendPlan | undefined => {
+  try {
+    return inspectCacheDatabase(location, 'brain.sqlite') === undefined
+      ? undefined
+      : readTrustedAppendPlanFromCache(root, location, candidate, candidateBytes)
+  } catch {}
+}
+
+const readTrustedAppendPlanFromCache = (
+  root: string,
+  location: CacheLocation,
+  candidate: BrainRecord,
+  candidateBytes: number,
+): TrustedAppendPlan | undefined =>
+  readVerifiedCacheTransaction(location, database => {
+    const metadata = readMetadata(database)
+    assertCacheScope(root, metadata)
+    if (
+      metadata?.recordFingerprint === undefined ||
+      currentCanonicalManifest(root, metadata.artifactPaths) !== metadata.manifest
+    ) {
+      return
+    }
+    let settled: readonly SettledRacyRecord[]
+    try {
+      settled = createDigestVerifiedRecordSource(root, database).verifyRacyRecords()
+    } catch (error) {
+      if (error instanceof TrustedReadUnavailable) {
+        return
+      }
+      throw error
+    }
+    const collision = database
+      .prepare('SELECT 1 AS found FROM records WHERE lower(kind) = lower(?) AND lower(id) = lower(?) LIMIT 1')
+      .get(candidate.kind, candidate.id)
+    if (collision !== undefined) {
+      return
+    }
+    const supersedes = candidate.supersedes ?? []
+    const target = database.prepare('SELECT kind, subject FROM records WHERE id = ?')
+    const validTargets = supersedes.every(id => {
+      const row = target.get(id) as { kind?: unknown; subject?: unknown } | undefined
+      return id !== candidate.id && row?.kind === candidate.kind && row.subject === candidate.subject
+    })
+    const heads = database
+      .prepare('SELECT id FROM records WHERE kind = ? AND subject = ? AND active = 1')
+      .all(candidate.kind, candidate.subject) as Array<{ id?: unknown }>
+    if (!(validTargets && heads.every(head => typeof head.id === 'string' && supersedes.includes(head.id)))) {
+      return
+    }
+    const totals = database
+      .prepare(`SELECT COUNT(*) AS records, TOTAL(bytes) AS bytes, TOTAL(edges) AS edges,
+        TOTAL(artifacts) AS artifacts, MAX(created_at) AS latest FROM records`)
+      .get() as { artifacts?: unknown; bytes?: unknown; edges?: unknown; latest?: unknown; records?: unknown }
+    const candidateArtifacts = candidate.artifacts ?? []
+    const withinBudgets =
+      totals.records === metadata.recordsIndexed &&
+      Number(totals.records) + 1 <= MAX_CANONICAL_RECORDS &&
+      Number(totals.bytes) + candidateBytes <= MAX_CANONICAL_RECORD_BYTES &&
+      Number(totals.edges) + supersedes.length <= MAX_SUPERSESSION_EDGES &&
+      Number(totals.artifacts) + candidateArtifacts.length <= MAX_ARTIFACT_REFERENCES
+    const artifactCollision = candidateArtifacts.some(artifact =>
+      metadata.artifactPaths.some(existing => existing !== artifact && sameCaseInsensitivePath(existing, artifact)),
+    )
+    if (!withinBudgets || artifactCollision || (totals.latest !== null && typeof totals.latest !== 'string')) {
+      return
+    }
+    const rows = database.prepare('SELECT kind, id, digest, racy FROM records').iterate() as Iterable<{
+      digest?: unknown
+      id?: unknown
+      kind?: unknown
+      racy?: unknown
+    }>
+    const records = new Map<string, TrustedRecordEvidence>()
+    for (const row of rows) {
+      if (typeof row.kind !== 'string' || typeof row.id !== 'string' || typeof row.digest !== 'string') {
+        throw new CacheSchemaMismatch('The cache contains an invalid record identity.')
+      }
+      records.set(`encephalon/${row.kind}/${row.id}.json`, { digest: row.digest, racy: row.racy !== 0 })
+    }
+    return Object.freeze({
+      artifactPaths: metadata.artifactPaths,
+      latestCreatedAt: totals.latest ?? undefined,
+      manifest: metadata.manifest,
+      records,
+      settled,
+    })
+  })
+
+/**
+ * @internal
+ * Adds one just-published record to a cache that still describes the corpus before it. `assertCurrent` must prove
+ * that nothing else changed, so the manifest written here never vouches for an unindexed edit. `false` means the
+ * caller must rebuild the cache instead.
+ */
+export const appendTrustedCacheRecord = (
+  root: string,
+  location: CacheLocation,
+  input: Readonly<{
+    artifactPaths: readonly string[]
+    assertCurrent: () => void
+    bytes: number
+    digest: string
+    expectedManifest: string
+    record: BrainRecord
+    /** Racy records the plan rehashed with settled timestamps; `assertCurrent` proves them unchanged since. */
+    settled: readonly SettledRacyRecord[]
+  }>,
+): boolean => {
+  const existing = inspectCacheDatabase(location, 'brain.sqlite')
+  if (existing === undefined) {
+    return false
+  }
+  const { database } = openWriterDatabase(location, { database: existing, kind: 'expected-owned' }, () => {})
+  try {
+    database.exec('BEGIN IMMEDIATE')
+    const metadata = readMetadata(database)
+    if (metadata?.recordFingerprint === undefined || metadata.manifest !== input.expectedManifest) {
+      return false
+    }
+    const { record } = input
+    prepareRecordInsert(database)(
+      record,
+      { bytes: input.bytes, digest: input.digest, projection: recordProjection(record), racy: true },
+      true,
+    )
+    const supersede = database.prepare('UPDATE records SET active = 0 WHERE id = ?')
+    for (const id of record.supersedes ?? []) {
+      supersede.run(id)
+    }
+    const witnesses = (
+      database.prepare('SELECT kind, id, digest FROM records').all() as Array<{
+        digest: string
+        id: string
+        kind: string
+      }>
+    )
+      .map(row => ({ digest: row.digest, path: `encephalon/${row.kind}/${row.id}.json` }))
+      .sort((first, second) => ordinalStringCompare(first.path, second.path))
+    const manifest = currentCanonicalManifest(root, input.artifactPaths)
+    if (manifest === undefined) {
+      return false
+    }
+    input.assertCurrent()
+    const settle = database.prepare('UPDATE records SET racy = 0 WHERE id = ? AND digest = ? AND racy = 1')
+    for (const { digest, id } of input.settled) {
+      settle.run(id, digest)
+    }
+    writeMetadata(database, {
+      artifactPaths: input.artifactPaths,
+      manifest,
+      packageVersion: PACKAGE_VERSION,
+      recordFingerprint: recordCorpusFingerprint(witnesses),
+      recordsIndexed: witnesses.length,
+      repositoryRealpath: metadata.repositoryRealpath,
+      schemaVersion: SCHEMA_VERSION,
+    })
+    database.exec('COMMIT')
+    return true
+  } finally {
+    if (database.isTransaction) {
+      database.exec('ROLLBACK')
+    }
+    database.close()
+  }
+}
 
 const readFreshCacheResult = <Result>(
   root: string,
@@ -1497,10 +1918,22 @@ const readFreshCacheResult = <Result>(
   completion: CachePreparationCompletion<Result>,
   expectedRebuild?: CompletedCacheRebuild,
 ): FreshCacheResult<PrepareResult | Result> => {
+  let settlement: TrustedReadSettlement | undefined
   try {
-    return readVerifiedCacheTransaction(
+    const completed = readVerifiedCacheTransaction(
       location,
-      database => {
+      (database): FreshCacheResult<PrepareResult | Result> => {
+        if (
+          completion.kind === 'read' &&
+          expectedRebuild === undefined &&
+          cacheReadTestHooks.requireCanonicalCacheEquality !== true
+        ) {
+          const trusted = readTrustedCacheResult(root, database, completion.read)
+          if (trusted !== undefined) {
+            settlement = trusted.settled
+            return { kind: 'fresh', result: trusted.result }
+          }
+        }
         const snapshot =
           expectedRebuild === undefined
             ? readValidatedRecordSnapshotResolved(root, cacheReadTestHooks.recordReadHooks)
@@ -1515,7 +1948,7 @@ const readFreshCacheResult = <Result>(
           const result = (() => {
             if (completion.kind === 'read') {
               cacheReadInstrumentation.beforeResultRead?.()
-              const read = completion.read(database, snapshot)
+              const read = completion.read(database, verifiedCorpusRecordSource(snapshot))
               cacheReadInstrumentation.afterResultRead?.()
               return read
             }
@@ -1528,6 +1961,10 @@ const readFreshCacheResult = <Result>(
       },
       expectedRebuild?.database,
     )
+    if (settlement !== undefined) {
+      settleRacyRecords(location, settlement)
+    }
+    return completed
   } catch (error) {
     if (expectedRebuild !== undefined && error instanceof CacheDatabaseCreationConflict) {
       return fail('REPOSITORY_CHANGED', 'The Encephalon cache generation changed after it was rebuilt.')
@@ -1547,7 +1984,7 @@ function requireFreshCacheResult<Result>(
   location: CacheLocation,
   completion: {
     kind: 'read'
-    read: (database: DatabaseSync, corpus: VerifiedCorpus) => Result
+    read: (database: DatabaseSync, recordSource: RecordSource) => Result
     state: CacheReadRecoveryState
   },
   expectedRebuild?: CompletedCacheRebuild,
@@ -1580,7 +2017,7 @@ function resolvePreparedCacheWithoutCorruptionRecovery<Result>(
   location: CacheLocation,
   completion: {
     kind: 'read'
-    read: (database: DatabaseSync, corpus: VerifiedCorpus) => Result
+    read: (database: DatabaseSync, recordSource: RecordSource) => Result
     state: CacheReadRecoveryState
   },
   lockMode?: CacheRecoveryLockMode,
@@ -1746,13 +2183,13 @@ const compactResultLimit = (value: unknown) => positiveLimit(value, 'compactResu
 const readFreshCache = <Result>(
   root: string,
   location: CacheLocation,
-  read: (database: DatabaseSync, corpus: VerifiedCorpus) => Result,
+  read: (database: DatabaseSync, recordSource: RecordSource) => Result,
   state: CacheReadRecoveryState,
 ) => requireFreshCacheResult(root, location, { kind: 'read', read, state }, state.rebuild)
 
 const withPreparedDatabase = <Result>(
   input: RootInput,
-  read: (database: DatabaseSync, corpus: VerifiedCorpus) => Result,
+  read: (database: DatabaseSync, recordSource: RecordSource) => Result,
 ) => {
   const root = resolveRepository(input)
   const readState: CacheReadRecoveryState = {}
@@ -1777,23 +2214,23 @@ const withPreparedDatabase = <Result>(
   }
 }
 
-const canonicalRecordFromRow = (row: RecordRow, corpus: VerifiedCorpus): BrainRecord => {
-  const record = typeof row.id === 'string' ? corpus.byId.get(row.id) : undefined
+const canonicalRecordFromRow = (row: RecordRow, recordSource: RecordSource): BrainRecord => {
+  const record = typeof row.id === 'string' ? recordSource.recordById(row.id) : undefined
   if (record !== undefined) {
     return record
   }
   throw new CacheSchemaMismatch('The cache returned an unknown canonical record identity.')
 }
 
-const materializeRecordRow = (row: RecordRow, corpus: VerifiedCorpus, budget: ResponseByteBudget) => {
-  const record = canonicalRecordFromRow(row, corpus)
+const materializeRecordRow = (row: RecordRow, recordSource: RecordSource, budget: ResponseByteBudget) => {
+  const record = canonicalRecordFromRow(row, recordSource)
   budget.chargeBytes(byteLength(JSON.stringify(record)))
   return structuredClone(record)
 }
 
-const materializeRecordRows = (rows: Iterable<RecordRow>, corpus: VerifiedCorpus) => {
+const materializeRecordRows = (rows: Iterable<RecordRow>, recordSource: RecordSource) => {
   const budget = createResponseByteBudget('fullResponseBytes')
-  return Array.from(rows, row => materializeRecordRow(row, corpus, budget))
+  return Array.from(rows, row => materializeRecordRow(row, recordSource, budget))
 }
 
 export const listRecords = (input: ListRecordsInput = {}): BrainRecord[] => {
@@ -1867,8 +2304,8 @@ const compactSnippet = (value: unknown) => {
   throw new CacheSchemaMismatch('Cached search snippet must be text.')
 }
 
-const compactRecordFromRow = (row: CompactRow, corpus: VerifiedCorpus): CompactBrainRecord => {
-  const record = canonicalRecordFromRow(row, corpus)
+const compactRecordFromRow = (row: CompactRow, recordSource: RecordSource): CompactBrainRecord => {
+  const record = canonicalRecordFromRow(row, recordSource)
   return {
     id: record.id,
     kind: record.kind,
@@ -1876,13 +2313,13 @@ const compactRecordFromRow = (row: CompactRow, corpus: VerifiedCorpus): CompactB
     rank: compactRank(row.rank),
     snippet: compactSnippet(row.snippet),
     subject: record.subject,
-    summary: corpus.recordFacts(record).projection.summary,
+    summary: recordSource.summaryOf(record),
   }
 }
 
 const createCompactSearchReader = (
   database: DatabaseSync,
-  corpus: VerifiedCorpus,
+  recordSource: RecordSource,
   input: SearchStatementInput,
   budget: ResponseByteBudget,
 ) => {
@@ -1909,13 +2346,13 @@ const createCompactSearchReader = (
   return (query: string, match: string) => {
     if (match.length > 0) {
       let bytes = 0
-      const records = Array.from(statement.iterate(match, ...kindParameters, limit) as Iterable<CompactRow>, row => {
-        const record = compactRecordFromRow(row, corpus)
+      const compact = Array.from(statement.iterate(match, ...kindParameters, limit) as Iterable<CompactRow>, row => {
+        const record = compactRecordFromRow(row, recordSource)
         bytes += budget.chargeAndMeasure(record)
         return record
       })
       cacheReadTestHooks.afterCompactSearchRead?.(query)
-      return { bytes, records }
+      return { bytes, records: compact }
     }
     return { bytes: 0, records: [] }
   }
@@ -1949,7 +2386,11 @@ export const searchCompactRecords = (input: SearchRecordsInput): CompactBrainRec
   return []
 }
 
-const createShowReader = (database: DatabaseSync, corpus: VerifiedCorpus, includeSuperseded: boolean | undefined) => {
+const createShowReader = (
+  database: DatabaseSync,
+  recordSource: RecordSource,
+  includeSuperseded: boolean | undefined,
+) => {
   const activeClause = includeSuperseded === true ? '' : ' AND active = 1'
   const source = `SELECT id FROM records WHERE id = ?${activeClause}`
   cacheReadTestHooks.onShowPrepare?.(source)
@@ -1957,7 +2398,7 @@ const createShowReader = (database: DatabaseSync, corpus: VerifiedCorpus, includ
   return (id: string) => {
     const row = statement.get(id) as RecordRow | undefined
     cacheReadTestHooks.afterShowRead?.(id)
-    return row === undefined ? null : canonicalRecordFromRow(row, corpus)
+    return row === undefined ? null : canonicalRecordFromRow(row, recordSource)
   }
 }
 
@@ -1977,7 +2418,7 @@ const assertGatherBudgets = (input: GatherInput): LiteralSearch[] => {
 
 const readGatherFromDatabase = (
   database: DatabaseSync,
-  corpus: VerifiedCorpus,
+  recordSource: RecordSource,
   input: GatherInput,
   hydrated: HydrateResult | null,
   searches: readonly LiteralSearch[],
@@ -1985,11 +2426,12 @@ const readGatherFromDatabase = (
   const shows = input.shows ?? []
   const budget = createResponseByteBudget('gatherResponseBytes')
   budget.charge({ hydrated, records: [], searches: [] })
-  const showRecordForId = shows.length === 0 ? () => null : createShowReader(database, corpus, input.includeSuperseded)
+  const showRecordForId =
+    shows.length === 0 ? () => null : createShowReader(database, recordSource, input.includeSuperseded)
   const searchCompactRecordsForQuery =
     searches.length === 0
       ? () => ({ bytes: 0, records: [] })
-      : createCompactSearchReader(database, corpus, input, budget)
+      : createCompactSearchReader(database, recordSource, input, budget)
   const shownRecords = new Map<string, Readonly<{ bytes: number; record: BrainRecord | null }>>()
   const searchResults = new Map<string, Readonly<{ bytes: number; result: GatherResult['searches'][number] }>>()
   const memoizedShowRecordForId = (id: string) => {

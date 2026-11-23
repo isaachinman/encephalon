@@ -2,6 +2,16 @@
 
 All notable changes to Encephalon are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- Reads no longer reread, hash and validate every canonical record. While the size, mtime and ctime of every record, kind directory and referenced artifact still match the cache generation, a read reads and digest-checks only the records it returns. At 10,000 records a `list` takes about 35 ms instead of about 1.1 s.
+- An add against a current cache validates the new record against cached graph and budget facts and appends one cache row, instead of rereading every record and rewriting the cache. At 10,000 records an add takes about 0.3 s instead of about 2.9 s. Any doubt falls back to full planning, so accepted and rejected inputs and their errors are unchanged.
+- **Breaking:** Ordinary reads no longer prove the search and ordering rows against canonical data. A cache changed without touching canonical files is detected by `prepare`, by a rebuild or when a returned record fails its digest check.
+- Raise the canonical corpus limits to 50,000 records, 128 MiB of record JSON, 50,000 entries per kind directory, 50,000 supersession edges and 10,000 artifact references. Result limits, the per-add `supersedes` limit and response budgets are unchanged. Releases up to 0.7.0 keep the old limits, so a corpus that grows past them cannot be read after a downgrade.
+- Disposable cache schema 5 stores each record's digest, size and graph counts. Older caches rebuild automatically.
+
 ## [0.7.0] - 2026-10-26
 
 ### Added

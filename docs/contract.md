@@ -174,11 +174,11 @@ Limits are independent and inclusive. `KiB`/`MiB` mean powers of 1,024. Counts i
 | Portable path component | 255 UTF-8 bytes and 255 UTF-16 code units |
 | Payload | 64 nested levels; 10,000 JSON nodes including containers, primitives and root |
 | One formatted canonical record | 1 MiB |
-| Canonical corpus | 1,000 records; 8 MiB aggregate record JSON |
-| Supersession | 1,000 targets per add and 1,000 edges across the corpus |
-| Artifacts | 256 references per record and 1,000 across the corpus |
+| Canonical corpus | 50,000 records; 128 MiB aggregate record JSON |
+| Supersession | 1,000 targets per add and 50,000 edges across the corpus |
+| Artifacts | 256 references per record and 10,000 across the corpus |
 | Canonical root | 1,002 entries and 1,000 kind directories |
-| Each kind directory | 1,000 entries |
+| Each kind directory | 50,000 entries |
 | Managed instruction file / inspected root package metadata | 1 MiB each |
 | Baseline root/workflow directory | 512 raw entries per source before filtering |
 | Validation output | At most 100 issues per list (`errors`, and `warnings` when present), each including a truncation sentinel |
@@ -272,7 +272,11 @@ For `rerun`, resolve the reported cause and repeat the same init options. For `i
 
 ### Disposable cache
 
-SQLite under `node_modules/.cache/encephalon/` is derived search/order infrastructure, never canonical truth. Full records come from accepted canonical JSON. Cache reads validate bounded schema/data/projection and FTS integrity against that accepted corpus, then return a result from one consistent database/canonical generation. Copied metadata cannot legitimise altered, missing, duplicate or orphaned rows or forged search state. No partially validated or mixed-generation result may escape.
+SQLite under `node_modules/.cache/encephalon/` is derived search/order infrastructure, never canonical truth. A cache generation is written only from an accepted, fully validated canonical corpus, or by appending one validated record to such a generation. It records the size, mtime and ctime of every canonical record, kind directory and referenced artifact, and each record's SHA-256 digest.
+
+A read trusts a generation only while every recorded observation is unchanged. It then reads only the records it returns and accepts each one only if its bytes still match the recorded digest. A record whose timestamps were within two seconds of the read that indexed it is rehashed on every read until a later read proves it, because unchanged metadata cannot prove unchanged content within one timestamp tick. Any changed observation, digest mismatch or text that SQLite cannot store faithfully sends the read to full validation. Full validation proves the bounded schema, data, projection and FTS integrity of the whole cache against the accepted canonical corpus, and rebuilds a stale or failed cache. `prepare`, rebuilds and recovery always use full validation. Ordinary reads do not re-prove search, ordering or index rows, so a cache altered without touching canonical files is detected by `prepare`, a rebuild or a failed digest check, not by every read. No partially validated or mixed-generation result may escape.
+
+An add against a trusted generation validates the new record against the cached identity, supersession, active-head and budget facts and the record's own artifacts. It publishes with the usual guarded link and appends one cache row, after proving that every recorded observation is still unchanged. Any other state, any failed check and any rejection use full canonical planning, so both paths accept and reject the same inputs with the same errors.
 
 Every list/show and non-empty search/gather prepares automatically. Missing, obsolete, malformed or recoverably corrupt cache state is rebuilt transactionally from canonical data. Existing incompatible caches are replaced through identity-bound recovery, not migrated into canonical authority. The first recoverable failure permits one recovery rebuild; a read retries against that exact rebuilt generation. A second failure is terminal. Canonical changes retain their bounded repository-change policy; a successor database is preserved rather than treated as the failed predecessor.
 
@@ -303,7 +307,7 @@ Public messages and structured details are bounded. Budget errors omit rejected 
 
 ## Compatibility and threat boundary
 
-Valid published 0.3 canonical records, artifacts and managed blocks remain readable. Existing historical JSON is not rewritten by upgrade, cache rebuilding or non-refresh init. Explicit refresh can append superseding generated records. The lean baseline omits nested source/language/file inventories; compact previews and relevance may change while complete payload/search-text matching remains supported. Public result limits, synchronous API, CLI protocol and canonical append-only guarantees remain intact.
+Valid published 0.3 canonical records, artifacts and managed blocks remain readable. Releases up to 0.7.0 accept at most 1,000 records, 8 MiB of record JSON, 1,000 entries per kind directory, 1,000 supersession edges and 1,000 artifact references; a corpus above any of those limits cannot be read after a downgrade to them. Existing historical JSON is not rewritten by upgrade, cache rebuilding or non-refresh init. Explicit refresh can append superseding generated records. The lean baseline omits nested source/language/file inventories; compact previews and relevance may change while complete payload/search-text matching remains supported. Public result limits, synchronous API, CLI protocol and canonical append-only guarantees remain intact.
 
 Disposable cache schema, SQL spelling, helper names, test hooks, recovery implementation and exact benchmark phase instrumentation are not public formats. An older runtime may rebuild its own disposable cache when reopening the same canonical repository; compatibility verification characterises upgrade and downgrade without changing canonical bytes. Numerical performance results depend on the machine and fixture; regression policy is in the performance guide, not a user latency promise.
 

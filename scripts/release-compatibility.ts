@@ -395,7 +395,7 @@ export type ReleaseCompatibilityReport = Readonly<{
     instructions: 'original-bytes-and-absence-restored'
     legacyBaseline: 'published-language-and-file-count-fields-preserved'
     payloadOnlySnippet: string
-    schemas: readonly ['2', '4', '2']
+    schemas: readonly ['2', '5', '2']
   }> | null
   oracle: Readonly<{
     digests: PackageTarballDigests
@@ -973,10 +973,10 @@ const commonCandidateBudgetEvidence = Object.freeze({
     budgetFailure('compactResponseBytes', 'response', 4 * 1024 * 1024, 'response may contain at most 4194304 bytes.'),
   ),
   corpusBytes: budgetBoundary(
-    validationFailure('CORPUS_BYTE_LIMIT', 'Canonical corpus may contain at most 8388608 bytes of record JSON.'),
+    validationFailure('CORPUS_BYTE_LIMIT', 'Canonical corpus may contain at most 134217728 bytes of record JSON.'),
   ),
   corpusRecords: budgetBoundary(
-    validationFailure('CORPUS_RECORD_LIMIT', 'Canonical corpus may contain at most 1000 records.'),
+    validationFailure('CORPUS_RECORD_LIMIT', 'Canonical corpus may contain at most 50000 records.'),
   ),
   fullResponseBytes: budgetBoundary(
     budgetFailure(
@@ -1036,13 +1036,13 @@ const candidateBudgetEvidence = Object.freeze({
     corpusArtifactReferences: budgetBoundary(
       validationBoundaryFailure(
         'CORPUS_ARTIFACT_LIMIT',
-        'Canonical corpus may contain at most 1000 artifact references.',
+        'Canonical corpus may contain at most 10000 artifact references.',
       ),
     ),
     corpusSupersessionEdges: budgetBoundary(
       validationBoundaryFailure(
         'CORPUS_SUPERSEDES_LIMIT',
-        'Canonical corpus may contain at most 1000 supersession edges.',
+        'Canonical corpus may contain at most 50000 supersession edges.',
       ),
     ),
     supersessionEdges: budgetBoundary(
@@ -1055,13 +1055,13 @@ const candidateBudgetEvidence = Object.freeze({
     corpusArtifactReferences: budgetBoundary(
       validationBoundaryFailure(
         'CORPUS_ARTIFACT_LIMIT',
-        'Canonical corpus may contain at most 1000 artifact references.',
+        'Canonical corpus may contain at most 10000 artifact references.',
       ),
     ),
     corpusSupersessionEdges: budgetBoundary(
       validationBoundaryFailure(
         'CORPUS_SUPERSEDES_LIMIT',
-        'Canonical corpus may contain at most 1000 supersession edges.',
+        'Canonical corpus may contain at most 50000 supersession edges.',
       ),
     ),
     supersessionEdges: budgetBoundary(
@@ -1433,8 +1433,8 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     assertStablePublicSurface(oracleCliSurface, upgradeCli.surface, 'The candidate CLI', true)
     assertCandidateIndependentBudgets(upgradeIndependentBudgets)
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
-    if (upgradeApi.schemaBefore !== '2' || upgradeApi.schemaAfter !== '4') {
-      throw new Error('The candidate package did not rebuild cache schema 2 as schema 4.')
+    if (upgradeApi.schemaBefore !== '2' || upgradeApi.schemaAfter !== '5') {
+      throw new Error('The candidate package did not rebuild cache schema 2 as schema 5.')
     }
 
     if (publishedOracle) {
@@ -1473,7 +1473,7 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
           (change.kind === 'links' && (change.path === '.' || change.path === '@witness:.')),
       )
       assertRestoredInstructions(evolutionRoot)
-      assert.equal(removed.schema, '4')
+      assert.equal(removed.schema, '5')
       assert.deepEqual(removed.records, refreshed.records)
       evolvedRecords = removed.records
       evolvedDurable = captureDurableSnapshot(evolutionRoot)
@@ -1484,7 +1484,7 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
         instructions: 'original-bytes-and-absence-restored',
         legacyBaseline: 'published-language-and-file-count-fields-preserved',
         payloadOnlySnippet: states[0]?.snippet ?? '',
-        schemas: ['2', '4', '2'] as const,
+        schemas: ['2', '5', '2'] as const,
       })
     }
 
@@ -1511,8 +1511,8 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       'The downgraded oracle independent budget evidence',
     )
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
-    if (downgradeApi.schemaBefore !== '4' || downgradeApi.schemaAfter !== '2') {
-      throw new Error('The published oracle did not rebuild cache schema 4 as schema 2 after downgrade.')
+    if (downgradeApi.schemaBefore !== '5' || downgradeApi.schemaAfter !== '2') {
+      throw new Error('The published oracle did not rebuild cache schema 5 as schema 2 after downgrade.')
     }
     if (initialImport.version !== initial.version || downgradeImport.version !== initial.version) {
       throw new Error('The published oracle process did not execute the installed oracle package version.')

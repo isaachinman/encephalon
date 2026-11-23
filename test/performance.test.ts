@@ -5,7 +5,12 @@ import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { afterEach, describe, mock, test } from 'node:test'
 import { scanBaseline, scanBaselineWithHooks } from '../src/baseline.ts'
-import { addRecordResolved, readRecordsResolved, validateRecordsResolved } from '../src/records.ts'
+import {
+  addRecordResolved,
+  MAX_CANONICAL_RECORDS,
+  readRecordsResolved,
+  validateRecordsResolved,
+} from '../src/records.ts'
 import { createTestRepository, ensureParent, removeTestRepository, restoreTimesWithNewCtime } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -161,16 +166,16 @@ describe('hot scan performance regressions', () => {
     }, undefined)
   })
 
-  test('stable add planning uses one pipeline through the 1,000-record boundary', () => {
-    ;[0, 100, 999, 1000].reduce<undefined>((verified, recordCount) => {
+  test('stable add planning uses one pipeline through the corpus record boundary', () => {
+    ;[0, 100, MAX_CANONICAL_RECORDS - 1, MAX_CANONICAL_RECORDS].reduce<undefined>((verified, recordCount) => {
       const root = createRoot()
       mkdirSync(join(root, 'encephalon', '_staging'), { recursive: true })
       mkdirSync(join(root, 'encephalon', 'context'), { recursive: true })
       Array.from({ length: recordCount }, (_, index) =>
         writeRecord(root, {
           createdAt: new Date(Date.UTC(2026, 0, 1) + index).toISOString(),
-          id: `stable-add-${index.toString().padStart(4, '0')}`,
-          ...(index === 0 ? {} : { supersedes: [`stable-add-${(index - 1).toString().padStart(4, '0')}`] }),
+          id: `stable-add-${index.toString().padStart(5, '0')}`,
+          ...(index === 0 ? {} : { supersedes: [`stable-add-${(index - 1).toString().padStart(5, '0')}`] }),
         }),
       )
       const work = { canonicalScans: 0, graphValidations: 0 }
@@ -185,7 +190,7 @@ describe('hot scan performance regressions', () => {
             subject: 'dense.history',
             ...(recordCount === 0
               ? {}
-              : { supersedes: [`stable-add-${(recordCount - 1).toString().padStart(4, '0')}`] }),
+              : { supersedes: [`stable-add-${(recordCount - 1).toString().padStart(5, '0')}`] }),
           },
           {
             hydrate: false,
@@ -200,7 +205,7 @@ describe('hot scan performance regressions', () => {
           },
         )
 
-      if (recordCount < 1000) {
+      if (recordCount < MAX_CANONICAL_RECORDS) {
         assert.equal(add().id, `stable-add-candidate-${recordCount}`)
       } else {
         assert.throws(add, (error: unknown) => {

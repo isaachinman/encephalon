@@ -35,8 +35,10 @@ import {
   addRecordResolved,
   assertCanonicalLayoutAdditions,
   assertRecordGraph,
+  MAX_ARTIFACT_REFERENCES,
   MAX_CANONICAL_RECORD_BYTES,
   MAX_CANONICAL_RECORDS,
+  MAX_SUPERSESSION_EDGES,
   nextRecordCreatedAt,
   planRecordAddition,
   projectedKindDirectoryOverflow,
@@ -1018,7 +1020,7 @@ describe('canonical records', () => {
 
   test('validates planned graph bytes without counting runtime paths', () => {
     const root = createRoot()
-    const plans = Array.from({ length: 8 }, (_, index) =>
+    const plans = Array.from({ length: MAX_CANONICAL_RECORD_BYTES / (1024 * 1024) }, (_, index) =>
       planRecordAddition(root, {
         createdAt: timestampAt(index),
         id: `planned-byte-accounting-${index}`,
@@ -2145,9 +2147,9 @@ describe('canonical records', () => {
 
   test('bounds graph work for a corpus-limit supersession chain', () => {
     const root = createRoot()
-    ;[1000, 1001].reduce<undefined>((verified, edgeCount) => {
-      const extraEdges = edgeCount === 1001 ? ['chain-0', 'chain-1'] : ['chain-0']
-      const records: BrainRecord[] = Array.from({ length: 1000 }, (_, index) => ({
+    ;[MAX_SUPERSESSION_EDGES, MAX_SUPERSESSION_EDGES + 1].reduce<undefined>((verified, edgeCount) => {
+      const extraEdges = edgeCount > MAX_SUPERSESSION_EDGES ? ['chain-0', 'chain-1'] : ['chain-0']
+      const records: BrainRecord[] = Array.from({ length: MAX_SUPERSESSION_EDGES }, (_, index) => ({
         createdAt: timestampAt(index),
         id: `chain-${index}`,
         kind: 'decision',
@@ -2155,7 +2157,10 @@ describe('canonical records', () => {
         payload: {},
         source: 'test',
         subject: 'bounded.chain',
-        supersedes: [...(index === 0 ? [] : [`chain-${index - 1}`]), ...(index === 999 ? extraEdges : [])],
+        supersedes: [
+          ...(index === 0 ? [] : [`chain-${index - 1}`]),
+          ...(index === MAX_SUPERSESSION_EDGES - 1 ? extraEdges : []),
+        ],
       }))
       // Charge the ordinary fixture before wrapping test-owned inputs, so reads count graph traversal only.
       const bytes = records.reduce((total, record) => total + Buffer.byteLength(formatRecordFile(record)), 0)
@@ -2172,7 +2177,7 @@ describe('canonical records', () => {
         }),
       }))
       const validate = () => assertRecordGraph(root, countedRecords, undefined, {}, bytes)
-      if (edgeCount === 1000) {
+      if (edgeCount === MAX_SUPERSESSION_EDGES) {
         assert.doesNotThrow(validate)
         assert.equal(edgeReads, 3 * edgeCount)
       } else {
@@ -2181,7 +2186,7 @@ describe('canonical records', () => {
           assert.deepEqual((error as api.EncephalonError).details.errors, [
             {
               code: 'CORPUS_SUPERSEDES_LIMIT',
-              message: 'Canonical corpus may contain at most 1000 supersession edges.',
+              message: `Canonical corpus may contain at most ${MAX_SUPERSESSION_EDGES} supersession edges.`,
             },
           ])
           return true
@@ -2194,8 +2199,8 @@ describe('canonical records', () => {
 
   test('preflights exact and overflowing planned kind directory entries', () => {
     const witnessedEntryCounts = new Map([
-      ['context', 998],
-      ['decision', 999],
+      ['context', MAX_CANONICAL_KIND_ENTRIES - 2],
+      ['decision', MAX_CANONICAL_KIND_ENTRIES - 1],
     ])
 
     assert.equal(projectedKindDirectoryOverflow(witnessedEntryCounts, ['decision']), null)
@@ -2208,21 +2213,24 @@ describe('canonical records', () => {
 
   test('reports corpus budget overflows deterministically', () => {
     const recordCountRoot = createRoot()
-    for (const index of Array.from({ length: 1001 }, (_, value) => value)) {
+    for (const index of Array.from({ length: MAX_CANONICAL_RECORDS + 1 }, (_, value) => value)) {
       writeCanonicalRecord(recordCountRoot, {
         createdAt: timestampAt(index),
         id: `count-${index}`,
-        ...(index === 1000 ? { kind: 'context' } : {}),
+        ...(index === MAX_CANONICAL_RECORDS ? { kind: 'context' } : {}),
         subject: `validation.count.${index}`,
       })
     }
     const recordCountResult = api.validateRecords({ root: recordCountRoot })
     assert.equal(recordCountResult.valid, false)
     assert.equal(recordCountResult.errors[0]?.code, 'CORPUS_RECORD_LIMIT')
-    assert.equal(recordCountResult.recordsChecked, 1000)
+    assert.equal(recordCountResult.recordsChecked, MAX_CANONICAL_RECORDS)
 
     const byteRoot = createRoot()
-    for (const index of Array.from({ length: 10 }, (_, value) => value)) {
+    for (const index of Array.from(
+      { length: Math.ceil(MAX_CANONICAL_RECORD_BYTES / (900 * 1024)) + 1 },
+      (_, value) => value,
+    )) {
       writeCanonicalRecord(byteRoot, {
         createdAt: timestampAt(index),
         id: `bytes-${index}`,
@@ -2235,12 +2243,17 @@ describe('canonical records', () => {
     assert.equal(byteResult.errors[0]?.code, 'CORPUS_BYTE_LIMIT')
 
     const edgeRoot = createRoot()
+    const edgesPerRecord = 1000
+    for (const recordIndex of Array.from({ length: MAX_SUPERSESSION_EDGES / edgesPerRecord }, (_, value) => value)) {
+      writeCanonicalRecord(edgeRoot, {
+        createdAt: timestampAt(recordIndex),
+        id: `edge-budget-${recordIndex}`,
+        subject: `validation.edges.${recordIndex}`,
+        supersedes: Array.from({ length: edgesPerRecord }, (_, index) => `missing-${recordIndex}-${index}`),
+      })
+    }
     writeCanonicalRecord(edgeRoot, {
-      id: 'edge-budget-at-maximum',
-      supersedes: Array.from({ length: 1000 }, (_, index) => `missing-${index}`),
-    })
-    writeCanonicalRecord(edgeRoot, {
-      createdAt: timestampAt(1),
+      createdAt: timestampAt(MAX_SUPERSESSION_EDGES / edgesPerRecord),
       id: 'edge-budget-overflow',
       supersedes: ['one-more-missing-edge'],
     })
@@ -2249,7 +2262,7 @@ describe('canonical records', () => {
     assert.equal(edgeResult.errors[0]?.code, 'CORPUS_SUPERSEDES_LIMIT')
 
     const artifactRoot = createRoot()
-    for (const recordIndex of Array.from({ length: 201 }, (_, value) => value)) {
+    for (const recordIndex of Array.from({ length: MAX_ARTIFACT_REFERENCES / 5 + 1 }, (_, value) => value)) {
       const id = `artifact-${recordIndex}`
       writeCanonicalRecord(artifactRoot, {
         artifacts: Array.from(
@@ -2310,9 +2323,9 @@ describe('canonical records', () => {
       mkdirSync(join(brainDirectory, `kind-${String(index).padStart(4, '0')}`))
     }
     writeCanonicalRecord(root, { id: 'first-boundary-record' })
-    for (const index of Array.from({ length: 999 }, (_, value) => value)) {
+    for (const index of Array.from({ length: MAX_CANONICAL_KIND_ENTRIES - 1 }, (_, value) => value)) {
       writeCanonicalRecord(root, {
-        id: `boundary-${String(index).padStart(4, '0')}`,
+        id: `boundary-${String(index).padStart(5, '0')}`,
         subject: `validation.boundary.${index}`,
       })
     }
@@ -2323,7 +2336,7 @@ describe('canonical records', () => {
     assert.deepEqual(overflow.errors, [
       {
         code: 'CORPUS_DIRECTORY_ENTRY_LIMIT',
-        message: 'encephalon/decision may contain at most 1000 directory entries.',
+        message: `encephalon/decision may contain at most ${MAX_CANONICAL_KIND_ENTRIES} directory entries.`,
         path: 'encephalon/decision',
       },
     ])
@@ -3174,12 +3187,13 @@ describe('canonical records', () => {
     )
     assert.equal(existsSync(join(countRoot, 'encephalon', 'decision', 'count-overflow.json')), false)
 
+    // Near-maximum records leave about 512 KiB of the corpus byte budget, which the candidate exceeds.
     const byteRoot = createRoot()
-    for (const index of Array.from({ length: 8 }, (_, value) => value)) {
+    for (const index of Array.from({ length: MAX_CANONICAL_RECORD_BYTES / (1024 * 1024) }, (_, value) => value)) {
       writeCanonicalRecord(byteRoot, {
         createdAt: timestampAt(index),
         id: `byte-existing-${index}`,
-        payload: { text: 'x'.repeat(1000 * 1024) },
+        payload: { text: 'x'.repeat(1020 * 1024) },
         subject: `validation.byte-existing.${index}`,
       })
     }
@@ -3190,7 +3204,7 @@ describe('canonical records', () => {
         api.addRecord({
           id: 'byte-overflow',
           kind: 'decision',
-          payload: { text: 'x'.repeat(300 * 1024) },
+          payload: { text: 'x'.repeat(600 * 1024) },
           root: byteRoot,
           source: 'test',
           subject: 'validation.byte-overflow',
@@ -4376,19 +4390,15 @@ describe('canonical records', () => {
     const recordPath = join(root, 'encephalon', 'decision', `${id}.json`)
     const counts = { canonicalScans: 0, graphValidations: 0 }
     let changed = false
-    let recordOpenCalls = 0
 
     const records = readRecordsResolved(root, {
       canonicalScan: () => {
         counts.canonicalScans += 1
       },
       fault: (point, path) => {
-        if (point === 'before-record-open' && path === recordPath) {
-          recordOpenCalls += 1
-          if (recordOpenCalls === 2) {
-            mutateObservably(artifactPath, () => writeFileSync(artifactPath, 'new evidence'))
-            changed = true
-          }
+        if (point === 'before-record-currentness-lstat' && path === recordPath && !changed) {
+          mutateObservably(artifactPath, () => writeFileSync(artifactPath, 'new evidence'))
+          changed = true
         }
       },
       graphValidation: () => {
@@ -4808,7 +4818,8 @@ describe('canonical records', () => {
 
     const aggregateRoot = createRoot()
     const payloadLength = MAX_RECORD_BYTES - 512
-    const largePaths = Array.from({ length: 8 }, (_, index) => {
+    const largeRecordCount = MAX_CANONICAL_RECORD_BYTES / (1024 * 1024)
+    const largePaths = Array.from({ length: largeRecordCount }, (_, index) => {
       const id = `aggregate${index}`
       writeCanonicalRecord(aggregateRoot, {
         createdAt: timestampAt(index),
@@ -4822,7 +4833,7 @@ describe('canonical records', () => {
     assert.equal(acceptedBytes < MAX_CANONICAL_RECORD_BYTES, true)
     const rejectedId = 'aggregate-rejected'
     writeCanonicalRecord(aggregateRoot, {
-      createdAt: timestampAt(8),
+      createdAt: timestampAt(largeRecordCount),
       id: rejectedId,
       payload: { text: 'y'.repeat(MAX_CANONICAL_RECORD_BYTES - acceptedBytes + 1024) },
       subject: 'overflow.aggregate.rejected',
@@ -4838,7 +4849,7 @@ describe('canonical records', () => {
           aggregateGraphValidations += 1
           if (aggregateGraphValidations === 1) {
             writeCanonicalRecord(aggregateRoot, {
-              createdAt: timestampAt(8),
+              createdAt: timestampAt(largeRecordCount),
               id: rejectedId,
               subject: 'overflow.aggregate.repaired',
             })
@@ -4848,14 +4859,15 @@ describe('canonical records', () => {
     })
 
     assert.equal(aggregateResult.valid, true)
-    assert.equal(aggregateResult.recordsChecked, 9)
+    assert.equal(aggregateResult.recordsChecked, largeRecordCount + 1)
     assert.equal(aggregateGraphValidations, 2)
   })
 
   test('charges aggregate bytes from the accepted descriptor generation after pathname growth', () => {
     const root = createRoot()
     const payloadLength = MAX_RECORD_BYTES - 512
-    const largePaths = Array.from({ length: 8 }, (_, index) => {
+    const largeRecordCount = MAX_CANONICAL_RECORD_BYTES / (1024 * 1024)
+    const largePaths = Array.from({ length: largeRecordCount }, (_, index) => {
       const id = `descriptor-bound${index}`
       writeCanonicalRecord(root, {
         createdAt: timestampAt(index),
@@ -4868,7 +4880,7 @@ describe('canonical records', () => {
     const acceptedBytes = largePaths.reduce((total, largePath) => total + statSync(largePath).size, 0)
     const id = 'zz-descriptor-growth'
     writeCanonicalRecord(root, {
-      createdAt: timestampAt(8),
+      createdAt: timestampAt(largeRecordCount),
       id,
       subject: 'descriptor.bound.growth',
     })
@@ -4887,7 +4899,7 @@ describe('canonical records', () => {
           if (point === 'after-record-lstat' && faultPath === path && !changed) {
             changed = true
             writeCanonicalRecord(root, {
-              createdAt: timestampAt(8),
+              createdAt: timestampAt(largeRecordCount),
               id,
               payload: { text: 'y'.repeat(growthPayload) },
               subject: 'descriptor.bound.growth',

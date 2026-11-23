@@ -1,0 +1,15 @@
+{
+  "createdAt": "2026-11-23T20:38:48.794Z",
+  "id": "3e34ce9d-f0f6-4df0-b5da-09d257f4a746",
+  "kind": "architecture",
+  "payload": {
+    "summary": "Verify ordinary SQLite record indexes, canonical rows and FTS during full cache validation, which prepare, rebuilds and recovery run.",
+    "problem": "An empty replacement rootpage for records_active_order can preserve exact owned schema, canonical rows, metadata and FTS while causing an indexed list query to omit a canonical record.",
+    "decision": "Full validation keeps pragma_integrity_check for records and its indexes, the bounded FTS native check and the exact canonical byte proof. Trusted reads skip them while the canonical manifest is unchanged; such a forgery is detected by prepare or a rebuild.",
+    "verification": "The missing-index-entry fixture runs with requireCanonicalCacheEquality and proves that one quarantine restores the canonical result."
+  },
+  "searchText": "pragma_integrity_check records index rootpage forgery full validation prepare trusted reads",
+  "source": "agent",
+  "subject": "cache.index-integrity",
+  "supersedes": ["59c66755-8eb0-4808-91cd-5ccc26bcbccc"]
+}

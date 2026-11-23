@@ -33,7 +33,7 @@ import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
 import { ordinalStringCompare } from '../src/order.ts'
-import { MAX_CANONICAL_RECORD_BYTES, type RecordWriteHooks } from '../src/records.ts'
+import { MAX_CANONICAL_RECORD_BYTES, MAX_CANONICAL_RECORDS, type RecordWriteHooks } from '../src/records.ts'
 import { validateAddRecordInput } from '../src/schema.ts'
 import { createOwnedStagingName } from '../src/staging.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
@@ -1513,8 +1513,8 @@ describe('initialisation', () => {
 
   test('preserves a stable batch-limit failure after a complete replan', () => {
     const root = createRoot()
-    for (const index of Array.from({ length: 997 }, (_, value) => value)) {
-      const suffix = String(index).padStart(4, '0')
+    for (const index of Array.from({ length: MAX_CANONICAL_RECORDS - 3 }, (_, value) => value)) {
+      const suffix = String(index).padStart(5, '0')
       writeRecordFile(root, {
         createdAt: '2026-01-01T00:00:00.000Z',
         id: `existing-init-record-${suffix}`,
@@ -2101,11 +2101,13 @@ describe('initialisation', () => {
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'actual-byte-overflow' }))
     const directory = join(root, 'encephalon', 'context')
     mkdirSync(directory, { recursive: true })
-    const bytesPerRecord = 1_048_500
-    for (const index of Array.from({ length: 8 }, (_, value) => value)) {
+    // Near-maximum padded records leave 640 bytes of the corpus byte budget, less than the baseline records need.
+    const paddingRecords = MAX_CANONICAL_RECORD_BYTES / 1_048_576
+    const bytesPerRecord = 1_048_571
+    for (const index of Array.from({ length: paddingRecords }, (_, value) => value)) {
       const id = `padding-${index}`
       const json = JSON.stringify({
-        createdAt: `2026-01-01T00:00:0${index}.000Z`,
+        createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
         id,
         kind: 'context',
         payload: {},
@@ -2115,7 +2117,7 @@ describe('initialisation', () => {
       assert.equal(Buffer.byteLength(json, 'utf8') < bytesPerRecord, true)
       writeFileSync(join(directory, `${id}.json`), `${json}${' '.repeat(bytesPerRecord - Buffer.byteLength(json))}`)
     }
-    assert.equal(bytesPerRecord * 8, MAX_CANONICAL_RECORD_BYTES - 608)
+    assert.equal(bytesPerRecord * paddingRecords, MAX_CANONICAL_RECORD_BYTES - 640)
     assert.equal(api.validateRecords({ root }).valid, true)
 
     assert.throws(

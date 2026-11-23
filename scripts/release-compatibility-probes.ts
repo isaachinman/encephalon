@@ -258,7 +258,12 @@ if (packagePhase === 'candidate') Object.getOwnPropertyDescriptors = observedGet
 const api = await import(packageEntry)
 if (packagePhase === 'candidate') Object.getOwnPropertyDescriptors = observedGetOwnPropertyDescriptors
 const cli = resolve(root, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
-const MAX_CANONICAL_BYTES = 8 * 1024 * 1024
+// The candidate raised the corpus ceilings; the published oracle keeps its own.
+const corpusLimits =
+  packagePhase === 'candidate'
+    ? { artifacts: 10_000, bytes: 128 * 1024 * 1024, edges: 50_000, records: 50_000 }
+    : { artifacts: 1000, bytes: 8 * 1024 * 1024, edges: 1000, records: 1000 }
+const MAX_CANONICAL_BYTES = corpusLimits.bytes
 const MAX_RECORD_BYTES = 1024 * 1024
 const fail = stage => { throw Object.assign(new Error(stage), { stage }) }
 const errorValue = error => {
@@ -569,8 +574,8 @@ if (packagePhase === 'candidate') {
 
 const existingCount = canonicalFiles().length
 const countKind = 'compatibilitybudgetcount'
-const countRecords = Array.from({ length: 1000 - existingCount }, (_, index) =>
-  recordValue(countKind, 'compatibility-count-' + String(index).padStart(4, '0'), index),
+const countRecords = Array.from({ length: corpusLimits.records - existingCount }, (_, index) =>
+  recordValue(countKind, 'compatibility-count-' + String(index).padStart(5, '0'), index),
 )
 const countEvidence = withRecords(countKind, countRecords, () => ({
   api: boundary(
@@ -614,45 +619,56 @@ cliReport.corpusBytes = byteEvidence.cli
 
 const aggregateSupersessionEvidence = (() => {
   const existingRecords = canonicalRecords()
-  const remainingEdges = 1000 - existingRecords.reduce(
+  const remainingEdges = corpusLimits.edges - existingRecords.reduce(
     (count, record) => count + (record.supersedes?.length ?? 0),
     0,
   )
   const kind = 'compatibilitybudgetsupersession'
   const recordCount = Math.ceil((remainingEdges + 4) / 2)
-  if (remainingEdges < 1 || recordCount > 1000 - existingRecords.length) {
+  if (remainingEdges < 1 || recordCount > corpusLimits.records - existingRecords.length) {
     fail('budget-corpus-supersession-fixture')
   }
   const records = Array.from({ length: recordCount }, (_, index) => ({
-    ...recordValue(kind, 'compatibility-supersession-' + String(index).padStart(4, '0'), index),
+    ...recordValue(kind, 'compatibility-supersession-' + String(index).padStart(5, '0'), index),
     subject: 'release.compatibility.aggregate-supersession',
-    ...(index === 0 ? {} : { supersedes: ['compatibility-supersession-' + String(index - 1).padStart(4, '0')] }),
+    ...(index === 0 ? {} : { supersedes: ['compatibility-supersession-' + String(index - 1).padStart(5, '0')] }),
   }))
-  const last = records.at(-1)
-  if (last === undefined) fail('budget-corpus-supersession-last')
   const chainEdges = records.length - 1
-  const additionalEdges = remainingEdges - chainEdges
+  let additionalEdges = remainingEdges - chainEdges
   if (additionalEdges < 0 || additionalEdges > records.length - 3) {
     fail('budget-corpus-supersession-capacity')
   }
-  const withinLast = {
-    ...last,
-    supersedes: [
-      ...(last.supersedes ?? []),
-      ...records.slice(0, additionalEdges).map(record => record.id),
-    ],
+  // One record may supersede at most 1,000 targets, so the extra edges spread over the newest records. Each extra
+  // edge points at one of the oldest records, which no chain edge of that record already names.
+  const maximumExtraEdgesPerRecord = 999
+  const withinRecords = [...records]
+  for (let index = withinRecords.length - 1; index > 0 && additionalEdges > 0; index -= 1) {
+    const count = Math.min(maximumExtraEdgesPerRecord, additionalEdges, index - 1)
+    const current = withinRecords[index]
+    if (current === undefined) fail('budget-corpus-supersession-record')
+    withinRecords[index] = {
+      ...current,
+      supersedes: [...(current.supersedes ?? []), ...records.slice(0, count).map(record => record.id)],
+    }
+    additionalEdges -= count
   }
-  const withinRecords = [...records.slice(0, -1), withinLast]
-  const overTarget = records[additionalEdges]
-  if (overTarget === undefined || withinLast.supersedes.includes(overTarget.id)) {
+  if (additionalEdges !== 0) fail('budget-corpus-supersession-distribution')
+  const overIndex = withinRecords.findIndex(
+    (record, index) => index > 1 && (record.supersedes?.length ?? 0) < maximumExtraEdgesPerRecord,
+  )
+  const overRecord = withinRecords[overIndex]
+  const overTarget = overRecord === undefined ? undefined : records.find(
+    (record, index) => index < overIndex - 1 && !(overRecord.supersedes ?? []).includes(record.id),
+  )
+  if (overRecord === undefined || overTarget === undefined) {
     fail('budget-corpus-supersession-over-target')
   }
   return withRecords(kind, withinRecords, () => {
     const apiWithin = apiValidationObservation()
     const cliWithin = cliValidationObservation()
     writeFileSync(
-      resolve(root, 'encephalon', kind, withinLast.id + '.json'),
-      formatted({ ...withinLast, supersedes: [...withinLast.supersedes, overTarget.id] }),
+      resolve(root, 'encephalon', kind, overRecord.id + '.json'),
+      formatted({ ...overRecord, supersedes: [...(overRecord.supersedes ?? []), overTarget.id] }),
     )
     return {
       api: { overLimit: apiValidationObservation(), withinLimit: apiWithin },
@@ -668,7 +684,7 @@ const aggregateArtifactEvidence = (() => {
     (count, record) => count + (record.artifacts?.length ?? 0),
     0,
   )
-  const remainingArtifacts = 1000 - existingArtifactCount
+  const remainingArtifacts = corpusLimits.artifacts - existingArtifactCount
   const kind = 'compatibilitybudgetartifacts'
   const artifactsPerRecord = 250
   const recordCount = Math.ceil(remainingArtifacts / artifactsPerRecord)
