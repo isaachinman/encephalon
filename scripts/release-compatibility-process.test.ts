@@ -17,7 +17,7 @@ import { describe, test } from 'node:test'
 import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import { spawnNpmCommand } from './npm-command.ts'
 import { packageTarballDigests } from './package-tarball.ts'
-import { runReleaseCompatibility } from './release-compatibility.ts'
+import { ORACLE_CORPUS_LIMITS, runReleaseCompatibility } from './release-compatibility.ts'
 
 const compatibilityIntegrationTimeout = process.platform === 'win32' ? 300_000 : 120_000
 const compatibilityRegressionTimeout = process.platform === 'win32' ? 360_000 : 180_000
@@ -526,6 +526,7 @@ describe('release compatibility process fixture', () => {
       )
 
       const report = runReleaseCompatibility({
+        candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
         candidateTarball: candidate.tarball,
         fixtureRoot,
         oracle: {
@@ -540,6 +541,7 @@ describe('release compatibility process fixture', () => {
       const repeatedFixtureRoot = resolve(temporaryRoot, 'repeated-repository')
       mkdirSync(repeatedFixtureRoot)
       const repeatedReport = runReleaseCompatibility({
+        candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
         candidateTarball: candidate.tarball,
         fixtureRoot: repeatedFixtureRoot,
         oracle: {
@@ -743,6 +745,7 @@ describe('release compatibility process fixture', () => {
 
       assert.throws(() =>
         runReleaseCompatibility({
+          candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
           candidateTarball: candidate.tarball,
           fixtureRoot,
           oracle: {
@@ -776,6 +779,7 @@ describe('release compatibility process fixture', () => {
       assert.throws(
         () =>
           runReleaseCompatibility({
+            candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
             candidateTarball: candidate.tarball,
             fixtureRoot,
             hooks: {
@@ -815,6 +819,7 @@ describe('release compatibility process fixture', () => {
       assert.throws(
         () =>
           runReleaseCompatibility({
+            candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
             candidateTarball: candidate.tarball,
             fixtureRoot,
             oracle: {
@@ -857,6 +862,7 @@ describe('release compatibility process fixture group B', () => {
 
         assert.throws(() =>
           runReleaseCompatibility({
+            candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
             candidateTarball: candidate.tarball,
             fixtureRoot,
             oracle: {
@@ -888,6 +894,7 @@ describe('release compatibility process fixture group B', () => {
 
       assert.throws(() =>
         runReleaseCompatibility({
+          candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
           candidateTarball: candidate.tarball,
           fixtureRoot,
           oracle: {
@@ -923,6 +930,7 @@ describe('release compatibility process fixture group B', () => {
       assert.throws(
         () =>
           runReleaseCompatibility({
+            candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
             candidateTarball: candidate.tarball,
             fixtureRoot,
             oracle: {
@@ -957,6 +965,7 @@ describe('release compatibility process fixture group C', () => {
       assert.throws(
         () =>
           runReleaseCompatibility({
+            candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
             candidateTarball: candidate.tarball,
             fixtureRoot,
             oracle: {
@@ -989,6 +998,7 @@ describe('release compatibility process fixture group C', () => {
       assert.throws(
         () =>
           runReleaseCompatibility({
+            candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
             candidateTarball: candidate.tarball,
             fixtureRoot,
             oracle: {
@@ -1021,6 +1031,7 @@ describe('release compatibility process fixture group C', () => {
       assert.throws(
         () =>
           runReleaseCompatibility({
+            candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
             candidateTarball: candidate.tarball,
             fixtureRoot,
             oracle: {
@@ -1052,6 +1063,7 @@ describe('release compatibility process fixture group C', () => {
 
       assert.doesNotThrow(() =>
         runReleaseCompatibility({
+          candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
           candidateTarball: candidate.tarball,
           fixtureRoot,
           oracle: {
@@ -1091,6 +1103,7 @@ describe('release compatibility process fixture group A preloads', () => {
 
       assert.doesNotThrow(() =>
         runReleaseCompatibility({
+          candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
           candidateTarball: candidate.tarball,
           fixtureRoot,
           oracle: {
@@ -1132,6 +1145,7 @@ describe('release compatibility process fixture group A preloads', () => {
 
       assert.doesNotThrow(() =>
         runReleaseCompatibility({
+          candidateCorpusLimits: ORACLE_CORPUS_LIMITS,
           candidateTarball: candidate.tarball,
           fixtureRoot,
           oracle: {

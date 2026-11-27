@@ -233,7 +233,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-const [root, packagePhase, packageEntry] = process.argv.slice(2)
+const [root, packagePhase, packageEntry, corpusLimitsJson] = process.argv.slice(2)
 const trustedJsonParse = JSON.parse.bind(JSON)
 const trustedJsonStringify = JSON.stringify.bind(JSON)
 const trustedObjectEntries = Object.entries.bind(Object)
@@ -258,11 +258,7 @@ if (packagePhase === 'candidate') Object.getOwnPropertyDescriptors = observedGet
 const api = await import(packageEntry)
 if (packagePhase === 'candidate') Object.getOwnPropertyDescriptors = observedGetOwnPropertyDescriptors
 const cli = resolve(root, 'node_modules', 'encephalon', 'dist', 'cli.mjs')
-// The candidate raised the corpus ceilings; the published oracle keeps its own.
-const corpusLimits =
-  packagePhase === 'candidate'
-    ? { artifacts: 10_000, bytes: 128 * 1024 * 1024, edges: 50_000, records: 50_000 }
-    : { artifacts: 1000, bytes: 8 * 1024 * 1024, edges: 1000, records: 1000 }
+const corpusLimits = trustedJsonParse(corpusLimitsJson)
 const MAX_CANONICAL_BYTES = corpusLimits.bytes
 const MAX_RECORD_BYTES = 1024 * 1024
 const fail = stage => { throw Object.assign(new Error(stage), { stage }) }

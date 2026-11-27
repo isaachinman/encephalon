@@ -19,6 +19,7 @@ const classification = {
   'test/check-package-arguments.test.ts': 'platform',
   'test/ci-workflow.test.ts': 'tooling',
   'test/cli.test.ts': 'package',
+  'test/corpus-limits.test.ts': 'source',
   'test/directory-witness.test.ts': 'platform',
   'test/errors.test.ts': 'source',
   'test/filesystem-entry.test.ts': 'platform',

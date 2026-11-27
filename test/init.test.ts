@@ -33,7 +33,7 @@ import { initEncephalonWithHooks } from '../src/init.ts'
 import { applyInstructionChanges, planInstructionChanges } from '../src/instructions.ts'
 import { OPERATION_BUDGETS } from '../src/operation-budgets.ts'
 import { ordinalStringCompare } from '../src/order.ts'
-import { MAX_CANONICAL_RECORD_BYTES, MAX_CANONICAL_RECORDS, type RecordWriteHooks } from '../src/records.ts'
+import type { RecordWriteHooks } from '../src/records.ts'
 import { validateAddRecordInput } from '../src/schema.ts'
 import { createOwnedStagingName } from '../src/staging.ts'
 import type { BrainRecord, BrainRecordFile } from '../src/types.ts'
@@ -1511,61 +1511,6 @@ describe('initialisation', () => {
     assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
   })
 
-  test('preserves a stable batch-limit failure after a complete replan', () => {
-    const root = createRoot()
-    for (const index of Array.from({ length: MAX_CANONICAL_RECORDS - 3 }, (_, value) => value)) {
-      const suffix = String(index).padStart(5, '0')
-      writeRecordFile(root, {
-        createdAt: '2026-01-01T00:00:00.000Z',
-        id: `existing-init-record-${suffix}`,
-        kind: 'decision',
-        payload: {},
-        source: 'test',
-        subject: `existing.init-record-${suffix}`,
-      })
-    }
-    let changed = false
-
-    assert.throws(
-      () =>
-        initEncephalonWithHooks(
-          { root },
-          {
-            recordWriteHooks: {
-              fault: point => {
-                if (point === 'before-publication' && !changed) {
-                  changed = true
-                  writeRecordFile(root, {
-                    createdAt: '2026-01-01T00:00:00.001Z',
-                    id: 'concurrent-init-record-limit',
-                    kind: 'decision',
-                    payload: {},
-                    source: 'test',
-                    subject: 'concurrent.init-record-limit',
-                  })
-                }
-              },
-            },
-          },
-        ),
-      error => {
-        const actual = error as EncephalonError
-        assert.equal(actual.code, 'VALIDATION_FAILED')
-        assert.equal(
-          (actual.details.errors as Array<{ code?: unknown }>).some(issue => issue.code === 'CORPUS_RECORD_LIMIT'),
-          true,
-        )
-        return true
-      },
-    )
-
-    assert.equal(changed, true)
-    assert.deepEqual(committedBaselineIds(root), [])
-    assert.equal(existsSync(join(root, 'node_modules', '.cache', 'encephalon', 'brain.sqlite')), false)
-    assert.equal(existsSync(join(root, 'AGENTS.md')), false)
-    assert.equal(existsSync(join(root, 'CLAUDE.md')), false)
-  })
-
   test('classifies existing artifact mutation during init validation before publication', () => {
     const root = createRoot()
     const artifact = '_artifacts/decision/existing-init-artifact/evidence.txt'
@@ -2094,54 +2039,6 @@ describe('initialisation', () => {
       graphValidations: 1,
       hydrations: 1,
     })
-  })
-
-  test('uses disk hydration when baseline additions exceed actual corpus bytes', () => {
-    const root = createRoot()
-    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'actual-byte-overflow' }))
-    const directory = join(root, 'encephalon', 'context')
-    mkdirSync(directory, { recursive: true })
-    // Near-maximum padded records leave 640 bytes of the corpus byte budget, less than the baseline records need.
-    const paddingRecords = MAX_CANONICAL_RECORD_BYTES / 1_048_576
-    const bytesPerRecord = 1_048_571
-    for (const index of Array.from({ length: paddingRecords }, (_, value) => value)) {
-      const id = `padding-${index}`
-      const json = JSON.stringify({
-        createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
-        id,
-        kind: 'context',
-        payload: {},
-        source: 'test',
-        subject: `padding.${index}`,
-      })
-      assert.equal(Buffer.byteLength(json, 'utf8') < bytesPerRecord, true)
-      writeFileSync(join(directory, `${id}.json`), `${json}${' '.repeat(bytesPerRecord - Buffer.byteLength(json))}`)
-    }
-    assert.equal(bytesPerRecord * paddingRecords, MAX_CANONICAL_RECORD_BYTES - 640)
-    assert.equal(api.validateRecords({ root }).valid, true)
-
-    assert.throws(
-      () => api.initEncephalon({ root }),
-      (error: unknown) => {
-        const actual = error as {
-          code?: unknown
-          details?: { initProgress?: { cacheState?: unknown; committedRecordIds?: unknown; phase?: unknown } }
-          message?: unknown
-        }
-        assert.equal(actual.code, 'VALIDATION_FAILED')
-        assert.equal(actual.message, 'Canonical records are invalid.')
-        assert.equal(actual.details?.initProgress?.phase, 'cachePreparation')
-        assert.equal(actual.details?.initProgress?.cacheState, 'disposable')
-        assert.equal(
-          Array.isArray(actual.details?.initProgress?.committedRecordIds) &&
-            actual.details.initProgress.committedRecordIds.length,
-          3,
-        )
-        return true
-      },
-    )
-    assert.equal(api.validateRecords({ root }).valid, false)
-    assertErrorCode(() => api.prepare({ root }), 'VALIDATION_FAILED')
   })
 
   test('refreshes one or three changed generated subjects with one planning scan', () => {
