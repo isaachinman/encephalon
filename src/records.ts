@@ -545,8 +545,7 @@ const wallClockNanoseconds = () => BigInt(Date.now()) * 1_000_000n
 
 // A rewrite within one filesystem timestamp tick of the content read can keep every stat field. FAT stores mtime in
 // 2 s units and Windows ticks are ~16 ms, so 2 s covers the coarsest supported clock (git calls these "racily clean").
-/** @internal */
-export const RACY_TIMESTAMP_WINDOW_NANOSECONDS = 2_000_000_000n
+const RACY_TIMESTAMP_WINDOW_NANOSECONDS = 2_000_000_000n
 
 /** True when matching file metadata alone cannot prove that content read after `contentReadAfter` is unchanged. */
 const isRacy = (metadata: BigIntStats, contentReadAfterNanoseconds: bigint) => {

@@ -21,7 +21,6 @@ import { cpus, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { hydrate, listRecords, prepare } from '../src/index.ts'
-import { RACY_TIMESTAMP_WINDOW_NANOSECONDS } from '../src/records.ts'
 import { formatRecordFile, MAX_RECORD_BYTES } from '../src/schema.ts'
 import type { BrainRecordFile } from '../src/types.ts'
 import {
@@ -449,12 +448,14 @@ const prepareOperationSample = (operation: BenchmarkOperation, templates: CaseTe
   }
 }
 
-// A restored sample's files are newer than the racy window, so the first read after it passes rehashes them and
-// clears their cache flags. Doing that once here keeps every reused measured read from writing the shared cache.
+// A restored sample's files are newer than the cache's 2 s racy window, so the first read after it passes rehashes
+// them and clears their cache flags. Doing that once here keeps every reused measured read from writing the shared
+// cache. Paired comparisons run this script against the base revision's source, so it may not import cache internals.
+const RACY_WINDOW_SETTLE_MILLISECONDS = 2100
+
 const settleRacyCacheRecords = (templates: CaseTemplates) => {
   if (templates.corpus.records > 0) {
-    const windowMilliseconds = Number(RACY_TIMESTAMP_WINDOW_NANOSECONDS / 1_000_000n)
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, windowMilliseconds + 100)
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RACY_WINDOW_SETTLE_MILLISECONDS)
     listRecords({ limit: 1, root: templates.sampleRoot })
   }
 }
