@@ -25,8 +25,8 @@ import { MAX_RECORD_BYTES } from '../src/schema.ts'
 import type { BrainRecordFile } from '../src/types.ts'
 import { createTestRepository, ensureParent, removeTestRepository } from '../test/helpers.ts'
 
-// Each test here builds a corpus at one of the canonical limits: tens of thousands of files or about 128 MiB of
-// records. They are classified `source` so they run once on Linux, where that costs seconds rather than minutes.
+// Each test here fills a canonical corpus limit: tens of thousands of files or about 128 MiB of records.
+// `scripts/test-selection.ts` classifies this file `linux-source`, so it never runs on the Windows or macOS jobs.
 
 const roots: string[] = []
 

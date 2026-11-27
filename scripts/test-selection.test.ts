@@ -48,4 +48,10 @@ test('keeps platform-sensitive files and partitions Windows cache work without s
   assert.ok(!platform.includes('test/package.test.ts'))
   assert.deepEqual(selectTestFiles('history', discovered), ['scripts/release-compatibility-process.test.ts'])
   assert.ok(selectTestFiles('platform', discovered, ['test/order.test.ts']).includes('test/order.test.ts'))
+  for (const group of ['platform', 'platform-core']) {
+    assert.ok(
+      !selectTestFiles(group, discovered, ['test/corpus-limits.test.ts']).includes('test/corpus-limits.test.ts'),
+    )
+  }
+  assert.ok(selectTestFiles('source', discovered).includes('test/corpus-limits.test.ts'))
 })
