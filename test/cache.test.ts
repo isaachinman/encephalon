@@ -47,7 +47,7 @@ import { PACKAGE_VERSION } from '../src/generated/version.ts'
 import * as api from '../src/index.ts'
 import { withOperationLock } from '../src/lock.ts'
 import { ordinalStringCompare } from '../src/order.ts'
-import { recordWriteTestHooks } from '../src/records.ts'
+import { MAX_CANONICAL_RECORD_BYTES, MAX_CANONICAL_RECORDS, recordWriteTestHooks } from '../src/records.ts'
 import { repositoryTestHooks } from '../src/repository.ts'
 import { responseBudgetTestHooks } from '../src/response-budget.ts'
 import type { BrainRecord } from '../src/types.ts'
@@ -57,6 +57,7 @@ import {
   ensureParent,
   mutateObservably,
   removeTestRepository,
+  restoreTimesWithNewCtime,
 } from '../test/helpers.ts'
 
 const roots: string[] = []
@@ -154,6 +155,7 @@ afterEach(() => {
   cacheLocationTestHooks.fsyncOwnedDirectory = undefined
   cacheLocationTestHooks.regularFileRealpath = undefined
   cacheReadTestHooks.afterCanonicalCacheEqualityValidation = undefined
+  cacheReadTestHooks.requireCanonicalCacheEquality = undefined
   cacheReadTestHooks.afterCanonicalValidation = undefined
   cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = undefined
   cacheReadTestHooks.afterGatherSearchEvaluation = undefined
@@ -170,6 +172,7 @@ afterEach(() => {
   cacheReadTestHooks.recordReadHooks = undefined
   responseBudgetTestHooks.afterCharge = undefined
   recordWriteTestHooks.fault = undefined
+  recordWriteTestHooks.requireCanonicalPlanning = undefined
   repositoryTestHooks.afterGitMarkerDecision = undefined
   cacheLocationTestHooks.releaseCloseSafetyLatchesForTests?.()
   roots.splice(0).forEach(removeTestRepository)
@@ -316,6 +319,7 @@ const addCacheRecord = (root: string) =>
   })
 
 test('writes validated mutation snapshots equivalently and falls back after identity changes', () => {
+  const planningModes = ['canonical', 'trusted'] as const
   const cases = [
     { kind: 'stable', name: 'stable snapshot' },
     { kind: 'corrupt', name: 'corrupt cache recovery' },
@@ -324,7 +328,8 @@ test('writes validated mutation snapshots equivalently and falls back after iden
     { kind: 'artifact', name: 'artifact replacement' },
   ] as const
 
-  for (const entry of cases) {
+  for (const [planning, entry] of planningModes.flatMap(mode => cases.map(item => [mode, item] as const))) {
+    recordWriteTestHooks.requireCanonicalPlanning = planning === 'canonical'
     const root = createRoot()
     const seedId = `snapshot-seed-${entry.kind}`
     const artifact = `_artifacts/decision/${seedId}/evidence.txt`
@@ -417,11 +422,17 @@ test('writes validated mutation snapshots equivalently and falls back after iden
       })
     }
 
-    assert.equal(
-      diskCacheValidations,
-      entry.kind === 'record' || entry.kind === 'writer-record' || entry.kind === 'artifact' ? 1 : 0,
-      entry.name,
-    )
+    // Without full planning's validated snapshot to reuse, the trusted fallback validates the disk again after
+    // quarantining a predecessor whose cached digest no longer matches the replaced record.
+    const replacedRecordValidations = planning === 'trusted' ? 2 : 1
+    const expectedValidations = {
+      artifact: 1,
+      corrupt: 0,
+      record: replacedRecordValidations,
+      stable: 0,
+      'writer-record': replacedRecordValidations,
+    }[entry.kind]
+    assert.equal(diskCacheValidations, expectedValidations, `${planning} ${entry.name}`)
     if (entry.kind === 'record' || entry.kind === 'writer-record') {
       const shown = api.showRecord({ activeOnly: false, id: seedId, root })
       assert.ok(shown)
@@ -2785,7 +2796,7 @@ describe('SQLite cache and reads', () => {
           .prepare("SELECT name FROM pragma_table_info('records')")
           .all()
           .map(row => row.name),
-        ['rowid', 'id', 'kind', 'subject', 'created_at', 'active'],
+        ['rowid', 'id', 'kind', 'subject', 'created_at', 'active', 'digest', 'racy', 'bytes', 'edges', 'artifacts'],
       )
       database.exec(`
         UPDATE records SET rowid = 9223372036854775807;
@@ -2873,6 +2884,7 @@ describe('SQLite cache and reads', () => {
 
   for (const entry of canonicalCacheEquivalenceCases) {
     test(`rebuilds an internally consistent forged cache corpus before ${entry.name}`, () => {
+      cacheReadTestHooks.requireCanonicalCacheEquality = true
       const root = createRoot()
       const canonical = installInternallyConsistentForgedCacheRecord(root)
 
@@ -2933,6 +2945,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('fails closed when canonical JSON changes after cache equality validation', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     const canonical = addCacheRecord(root)
     const canonicalPath = join(root, ...canonical.path.split('/'))
@@ -2962,6 +2975,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('allows only one rebuild when canonical cache equivalence fails repeatedly', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     const canonical = addCacheRecord(root)
     overwriteCacheWithInternallyConsistentForgery(root, canonical)
@@ -2990,6 +3004,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('preserves stable canonical validation failures after a transient rebuild race', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     const canonical = addCacheRecord(root)
     const canonicalPath = join(root, ...canonical.path.split('/'))
@@ -3018,6 +3033,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('reuses the rebuilt canonical snapshot for the final proven read', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     const canonical = addCacheRecord(root)
     overwriteCacheWithInternallyConsistentForgery(root, canonical)
@@ -3762,7 +3778,7 @@ describe('SQLite cache and reads', () => {
         writerInitialisations += 1
       }
     }
-    for (const version of ['1', '2', '3']) {
+    for (const version of ['1', '2', '3', '4']) {
       mutateCache(root, old => {
         old.exec(`
           CREATE TEMP TABLE previous_search AS SELECT records.id, text FROM record_search JOIN records ON records.rowid = record_search.rowid;
@@ -3781,7 +3797,7 @@ describe('SQLite cache and reads', () => {
       )
       assert.equal(writerInitialisations, Number(version))
       const upgraded = logicalCacheProjection(root).metadata
-      assert.equal(upgraded.find(row => row.key === 'schemaVersion')?.value, '4')
+      assert.equal(upgraded.find(row => row.key === 'schemaVersion')?.value, '5')
       assert.match(String(upgraded.find(row => row.key === 'recordFingerprint')?.value), /^[0-9a-f]{64}$/u)
       assert.deepEqual(prepare({ root }), { hydrated: false, recordsIndexed: 1 })
       assert.deepEqual(api.listRecords({ root }), [canonical])
@@ -4674,10 +4690,10 @@ describe('SQLite cache and reads', () => {
           database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(secondId)
           database
             .prepare(`
-              INSERT INTO records(id, kind, subject, created_at, active)
-              VALUES (?, ?, ?, ?, ?)
+              INSERT INTO records(id, kind, subject, created_at, active, digest, racy, bytes, edges, artifacts)
+              VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0)
             `)
-            .run(replacement.id, replacement.kind, replacement.subject, replacement.createdAt, 1)
+            .run(replacement.id, replacement.kind, replacement.subject, replacement.createdAt, 1, '0'.repeat(64))
           database
             .prepare(
               'INSERT INTO record_search(rowid, text) VALUES ((SELECT rowid FROM records WHERE rowid = (SELECT rowid FROM records WHERE id = ?)), ?)',
@@ -4749,10 +4765,10 @@ describe('SQLite cache and reads', () => {
           database.prepare('UPDATE records SET active = 0 WHERE id = ?').run(firstId)
           database
             .prepare(`
-              INSERT INTO records(id, kind, subject, created_at, active)
-              VALUES (?, ?, ?, ?, ?)
+              INSERT INTO records(id, kind, subject, created_at, active, digest, racy, bytes, edges, artifacts)
+              VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0)
             `)
-            .run(replacement.id, replacement.kind, replacement.subject, replacement.createdAt, 1)
+            .run(replacement.id, replacement.kind, replacement.subject, replacement.createdAt, 1, '0'.repeat(64))
           database
             .prepare(
               'INSERT INTO record_search(rowid, text) VALUES ((SELECT rowid FROM records WHERE rowid = (SELECT rowid FROM records WHERE id = ?)), ?)',
@@ -6503,7 +6519,7 @@ describe('SQLite cache and reads', () => {
     assert.equal(writerInitialisations, 1)
   })
 
-  test('validates each fresh cache generation once per public read', () => {
+  test('answers each fresh public read without rescanning canonical records or re-proving the cache', () => {
     const root = createRoot()
     const record = addCacheRecord(root)
     const cases = [
@@ -6563,15 +6579,206 @@ describe('SQLite cache and reads', () => {
 
     for (const entry of cases) {
       let validationPasses = 0
+      let canonicalScans = 0
       cacheReadTestHooks.afterIntegrityProbe = observation => {
         if (observation.name === 'record-search') {
           validationPasses += 1
         }
       }
+      cacheReadTestHooks.recordReadHooks = {
+        canonicalScan: () => {
+          canonicalScans += 1
+        },
+      }
       const result = entry.read()
       assert.deepEqual(result, entry.result, entry.name)
-      assert.equal(validationPasses, 1, entry.name)
+      assert.equal(validationPasses, 0, entry.name)
+      assert.equal(canonicalScans, 0, entry.name)
     }
+  })
+
+  test('serves an in-place canonical edit that restores its mtime from the edited file', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    assert.deepEqual(api.listRecords({ root }), [record])
+    const path = join(root, ...record.path.split('/'))
+    const { atime, mtime } = statSync(path)
+    const { ctimeNs } = statSync(path, { bigint: true })
+    const original = readFileSync(path, 'utf8')
+    const edited = original.replace('"Cache record"', '"Cache recorX"')
+    assert.notEqual(edited, original)
+    assert.equal(Buffer.byteLength(edited), Buffer.byteLength(original))
+    writeFileSync(path, edited)
+    restoreTimesWithNewCtime(path, atime, mtime, ctimeNs)
+
+    const shown = api.showRecord({ id: record.id, root })
+    assert.ok(shown)
+    assert.equal((shown.payload as { summary?: unknown }).summary, 'Cache recorX')
+  })
+
+  test('rebuilds a cache whose stored digest no longer matches a selected canonical record', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    mutateCache(root, forged => {
+      forged.prepare('UPDATE records SET digest = ? WHERE id = ?').run('0'.repeat(64), record.id)
+    })
+    let rebuilds = 0
+    cacheReadTestHooks.afterDisposableCacheRecoveryRebuild = () => {
+      rebuilds += 1
+    }
+
+    assert.deepEqual(api.listRecords({ root }), [record])
+    assert.equal(rebuilds, 1)
+    const database = new DatabaseSync(cacheDatabasePath(root), { readOnly: true })
+    try {
+      assert.notEqual(
+        database.prepare('SELECT digest FROM records WHERE id = ?').get(record.id)?.digest,
+        '0'.repeat(64),
+      )
+    } finally {
+      database.close()
+    }
+  })
+
+  test('reflects canonical records added or removed outside Encephalon on the next read', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    assert.deepEqual(api.listRecords({ root }), [record])
+    const { path: _path, ...file } = record
+    const external = {
+      ...file,
+      createdAt: new Date(Date.parse(record.createdAt) + 1000).toISOString(),
+      id: 'external-record',
+      subject: 'cache.external',
+    }
+    writeFileSync(join(root, 'encephalon', 'context', 'external-record.json'), `${JSON.stringify(external, null, 2)}\n`)
+
+    assert.deepEqual(
+      api.listRecords({ root }).map(listed => listed.id),
+      ['external-record', record.id],
+    )
+    rmSync(join(root, ...record.path.split('/')))
+    assert.deepEqual(
+      api.listRecords({ root }).map(listed => listed.id),
+      ['external-record'],
+    )
+  })
+
+  test('adds to a current cache without scanning canonical records and matches a full rebuild', () => {
+    const root = createRoot()
+    const first = addCacheRecord(root)
+    let canonicalScans = 0
+    recordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        canonicalScans += 1
+      },
+    }
+    const second = api.addRecord({
+      kind: 'context',
+      payload: { summary: 'Second cache record' },
+      root,
+      source: 'agent',
+      subject: 'cache.validation',
+      supersedes: [first.id],
+    })
+    recordWriteTestHooks.readHooks = undefined
+
+    assert.equal(canonicalScans, 0)
+    assert.deepEqual(api.listRecords({ root }), [second])
+    // Full validation compares every cached digest, size and graph count, so it must accept the appended row as-is.
+    assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 2 })
+    const appended = logicalCacheProjection(root)
+    assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 2 })
+    assert.deepEqual(logicalCacheProjection(root), appended)
+  })
+
+  test('appends a record with an artifact that full validation accepts unchanged', () => {
+    const root = createRoot()
+    // A first `_artifacts` directory changes the brain root's metadata, which correctly makes the cache stale.
+    mkdirSync(join(root, 'encephalon', '_artifacts'), { recursive: true })
+    addCacheRecord(root)
+    const id = 'appended-artifact-record'
+    const artifact = `_artifacts/context/${id}/evidence.txt`
+    const artifactPath = join(root, 'encephalon', ...artifact.split('/'))
+    ensureParent(artifactPath)
+    writeFileSync(artifactPath, 'appended evidence')
+    let canonicalScans = 0
+    recordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        canonicalScans += 1
+      },
+    }
+    const added = api.addRecord({
+      artifacts: [artifact],
+      id,
+      kind: 'context',
+      payload: { summary: 'Appended artifact record' },
+      root,
+      source: 'agent',
+      subject: 'cache.appended-artifact',
+    })
+    recordWriteTestHooks.readHooks = undefined
+
+    assert.equal(canonicalScans, 0)
+    assert.deepEqual(api.showRecord({ id, root }), added)
+    assert.deepEqual(api.prepare({ root }), { hydrated: false, recordsIndexed: 2 })
+    renameSync(artifactPath, `${artifactPath}.displaced`)
+    writeFileSync(artifactPath, 'replaced evidence')
+    assert.deepEqual(api.prepare({ root }), { hydrated: true, recordsIndexed: 2 })
+  })
+
+  test('plans an add from canonical records after an external edit makes the cache stale', () => {
+    const root = createRoot()
+    const first = addCacheRecord(root)
+    const path = join(root, ...first.path.split('/'))
+    mutateObservably(path, () =>
+      writeFileSync(path, readFileSync(path, 'utf8').replace('"Cache record"', '"Edited record"')),
+    )
+    let canonicalScans = 0
+    recordWriteTestHooks.readHooks = {
+      canonicalScan: () => {
+        canonicalScans += 1
+      },
+    }
+    api.addRecord({
+      kind: 'context',
+      payload: { summary: 'Second cache record' },
+      root,
+      source: 'agent',
+      subject: 'cache.validation',
+      supersedes: [first.id],
+    })
+    recordWriteTestHooks.readHooks = undefined
+
+    assert.equal(canonicalScans, 1)
+    const edited = api.showRecord({ activeOnly: false, id: first.id, root })
+    assert.ok(edited)
+    assert.equal((edited.payload as { summary?: unknown }).summary, 'Edited record')
+  })
+
+  test('settles a racy record once its timestamps are older than the racy window', () => {
+    const root = createRoot()
+    const record = addCacheRecord(root)
+    const racy = () => {
+      const database = new DatabaseSync(cacheDatabasePath(root), { readOnly: true })
+      try {
+        return database.prepare('SELECT racy FROM records WHERE id = ?').get(record.id)?.racy
+      } finally {
+        database.close()
+      }
+    }
+    assert.equal(racy(), 1)
+    assert.deepEqual(api.listRecords({ root }), [record])
+    assert.equal(racy(), 1)
+
+    const realNow = Date.now
+    mock.method(Date, 'now', () => realNow() + 10_000)
+    try {
+      assert.deepEqual(api.listRecords({ root }), [record])
+    } finally {
+      mock.restoreAll()
+    }
+    assert.equal(racy(), 0)
   })
 
   test('validates a forced gather rebuild once before materialising its result', () => {
@@ -6662,6 +6869,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('preserves a stale successor installed after corrupt-cache recovery', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const cases = [
       {
         name: 'automatic list',
@@ -7051,6 +7259,7 @@ describe('SQLite cache and reads', () => {
   }
 
   test('quarantines one exact corrupt cache generation before rebuilding', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     const record = addCacheRecord(root)
     mutateCache(root, database => {
@@ -7080,6 +7289,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('bounds failed cache recovery without serving private cache content', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     const record = addCacheRecord(root)
     mutateCache(root, database => {
@@ -7127,6 +7337,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('normalises forged cache subjects throughout a terminal retry cause chain', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     const record = addCacheRecord(root)
     mutateCache(root, database => {
@@ -7431,7 +7642,7 @@ describe('SQLite cache and reads', () => {
   test('bounds schema and metadata before transferring untrusted text', () => {
     const cases = [
       {
-        expectedProbe: { name: 'schema', rows: 11 },
+        expectedProbe: { name: 'schema', rows: 12 },
         mutate: (database: DatabaseSync) => {
           database.exec(`
             CREATE TABLE replacement_metadata(key TEXT, private_metadata_sentinel TEXT);
@@ -7442,7 +7653,7 @@ describe('SQLite cache and reads', () => {
         name: 'oversized metadata column name',
       },
       {
-        expectedProbe: { name: 'schema', rows: 12 },
+        expectedProbe: { name: 'schema', rows: 13 },
         mutate: (database: DatabaseSync) => {
           database.enableDefensive(false)
           database.exec(`
@@ -7567,6 +7778,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('recovers a missing ordering-index entry while canonical rows and FTS remain intact', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     const expected = addCacheRecord(root)
     const before = logicalCacheProjection(root)
@@ -7680,19 +7892,19 @@ describe('SQLite cache and reads', () => {
   test('bounds cached record validation before transferring untrusted rows', () => {
     const cases = [
       {
-        expectedRows: 1001,
+        expectedRows: MAX_CANONICAL_RECORDS + 1,
         mutate: (database: DatabaseSync) => {
           database.exec(`
             DELETE FROM records;
             WITH RECURSIVE generated(value) AS (
-              SELECT 1 UNION ALL SELECT value + 1 FROM generated WHERE value < 1001
+              SELECT 1 UNION ALL SELECT value + 1 FROM generated WHERE value < ${MAX_CANONICAL_RECORDS + 1}
             )
-            INSERT INTO records(id, kind, subject, created_at, active)
-            SELECT printf('overflow-%04d', value), 'context', 'cache.overflow',
-              '2026-08-16T00:00:00.000Z', 1 FROM generated;
+            INSERT INTO records(id, kind, subject, created_at, active, digest, racy, bytes, edges, artifacts)
+            SELECT printf('overflow-%06d', value), 'context', 'cache.overflow',
+              '2026-08-16T00:00:00.000Z', 1, printf('%064d', 0), 0, 0, 0, 0 FROM generated;
           `)
         },
-        name: '1,001 rows',
+        name: 'one row above the corpus record limit',
       },
       {
         expectedRows: 1,
@@ -7702,20 +7914,21 @@ describe('SQLite cache and reads', () => {
         name: 'oversized scalar containing NUL',
       },
       {
-        expectedRows: 9,
+        expectedRows: MAX_CANONICAL_RECORD_BYTES / 1_048_576 + 1,
         mutate: (database: DatabaseSync) => {
+          const rows = MAX_CANONICAL_RECORD_BYTES / 1_048_576 + 1
           database.exec(`
             DELETE FROM records;
             WITH RECURSIVE generated(value) AS (
-              SELECT 1 UNION ALL SELECT value + 1 FROM generated WHERE value < 9
+              SELECT 1 UNION ALL SELECT value + 1 FROM generated WHERE value < ${rows}
             )
-            INSERT INTO records(id, kind, subject, created_at, active)
+            INSERT INTO records(id, kind, subject, created_at, active, digest, racy, bytes, edges, artifacts)
             SELECT printf('aggregate-%04d', value), 'context', CAST(zeroblob(1048576) AS TEXT),
-              '2026-08-16T00:00:00.000Z', 1 FROM generated;
-            UPDATE metadata SET value = '9' WHERE key = 'recordsIndexed';
+              '2026-08-16T00:00:00.000Z', 1, printf('%064d', 0), 0, 0, 0, 0 FROM generated;
+            UPDATE metadata SET value = '${rows}' WHERE key = 'recordsIndexed';
           `)
         },
-        name: 'aggregate scalar text above 8 MiB',
+        name: 'aggregate scalar text above the corpus byte limit',
       },
       {
         expectedRows: 1,
@@ -7762,24 +7975,23 @@ describe('SQLite cache and reads', () => {
       expectedRows: number
       mutate: (database: DatabaseSync) => void
       name: string
-      setup?: ((root: string) => BrainRecord) | undefined
     }[] = [
       {
-        expectedRows: 1001,
+        expectedRows: MAX_CANONICAL_RECORDS + 1,
         mutate: (database: DatabaseSync) => {
           database.exec(`
             DELETE FROM record_search;
             WITH RECURSIVE generated(value) AS (
               SELECT 1
               UNION ALL
-              SELECT value + 1 FROM generated WHERE value < 1001
+              SELECT value + 1 FROM generated WHERE value < ${MAX_CANONICAL_RECORDS + 1}
             )
             INSERT INTO record_search(rowid, text, preview)
             SELECT value, 'overflow search text', 'overflow preview'
             FROM generated;
           `)
         },
-        name: '1,001 rows',
+        name: 'one row above the corpus record limit',
       },
       {
         expectedRows: 1,
@@ -7809,57 +8021,17 @@ describe('SQLite cache and reads', () => {
         },
         name: 'non-text full document',
       },
-      {
-        expectedRows: 12,
-        mutate: (database: DatabaseSync) => {
-          database.exec(`
-            DELETE FROM record_search;
-            WITH RECURSIVE generated(value) AS (
-              SELECT 1
-              UNION ALL
-              SELECT value + 1 FROM generated WHERE value < 12
-            )
-            INSERT INTO record_search(rowid, text, preview)
-            SELECT value, CAST(zeroblob(6242305) AS TEXT), 'bounded preview'
-            FROM generated;
-          `)
-        },
-        name: 'aggregate FTS text above its normalized projection bound',
-        setup: root => {
-          const kindDirectory = join(root, 'encephalon', 'context')
-          mkdirSync(kindDirectory, { recursive: true })
-          for (const value of Array.from({ length: 12 }, (_, index) => index + 1)) {
-            const id = `cache-record-${String(value).padStart(2, '0')}`
-            writeFileSync(
-              join(kindDirectory, `${id}.json`),
-              `${JSON.stringify({
-                createdAt: `2026-08-16T00:00:${String(value).padStart(2, '0')}.000Z`,
-                id,
-                kind: 'context',
-                payload: {},
-                source: 'test',
-                subject: `cache.aggregate-fts.${String(value).padStart(2, '0')}`,
-              })}\n`,
-            )
-          }
-          assert.deepEqual(api.hydrate({ root }), { recordsIndexed: 12 })
-          const latest = api.listRecords({ root }).find(record => record.id === 'cache-record-12')
-          assert.ok(latest)
-          return latest
-        },
-      },
     ]
 
-    for (const { expectedRows, mutate, name, setup } of cases) {
+    for (const { expectedRows, mutate, name } of cases) {
       const root = createRoot()
-      const record = setup === undefined ? addCacheRecord(root) : setup(root)
-      const expectedRecordsIndexed = setup === undefined ? 1 : 12
+      const record = addCacheRecord(root)
       mutateCache(root, mutate)
       const observations = observeCacheIntegrity()
 
       assert.deepEqual(
         functionFromApi<(input: Record<string, unknown>) => unknown>('prepare')({ root }),
-        { hydrated: true, recordsIndexed: expectedRecordsIndexed },
+        { hydrated: true, recordsIndexed: 1 },
         name,
       )
       const probeIndex = observations.findIndex(
@@ -7907,6 +8079,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('bounds exact aggregate, row-count, and recordsIndexed values before semantic recovery', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     addCacheRecord(root)
     mutateCache(root, database => {
@@ -7916,10 +8089,10 @@ describe('SQLite cache and reads', () => {
         WITH RECURSIVE generated(value) AS (
           SELECT 1 UNION ALL SELECT value + 1 FROM generated WHERE value < 1000
         )
-        INSERT INTO records(id, kind, subject, created_at, active)
+        INSERT INTO records(id, kind, subject, created_at, active, digest, racy, bytes, edges, artifacts)
         SELECT printf('boundary-%04d', value), 'context',
           replace(hex(zeroblob(CASE WHEN value <= 608 THEN 8345 ELSE 8344 END)), '00', 'x'),
-          '2026-08-16T00:00:00.000Z', 1 FROM generated;
+          '2026-08-16T00:00:00.000Z', 1, printf('%064d', 0), 0, 0, 0, 0 FROM generated;
         UPDATE metadata SET value = '1000' WHERE key = 'recordsIndexed';
       `)
       assert.equal(
@@ -8052,6 +8225,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('recovers a non-canonical FTS projection during a representative public read', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     const record = addCacheRecord(root)
     const databasePath = cacheDatabasePath(root)
@@ -8260,6 +8434,7 @@ describe('SQLite cache and reads', () => {
   })
 
   test('compares preview bytes exactly before serving a recovered search result', () => {
+    cacheReadTestHooks.requireCanonicalCacheEquality = true
     const root = createRoot()
     const record = api.addRecord({
       id: 'preview-integrity',

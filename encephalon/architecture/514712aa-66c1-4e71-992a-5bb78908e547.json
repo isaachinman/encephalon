@@ -1,0 +1,29 @@
+{
+  "createdAt": "2026-11-23T20:38:48.719Z",
+  "id": "514712aa-66c1-4e71-992a-5bb78908e547",
+  "kind": "architecture",
+  "payload": {
+    "summary": "Trust a cache generation for reads and adds while every recorded canonical observation is unchanged. Prove full canonical cache equality only in prepare, rebuilds and recovery.",
+    "problem": "Each read reread, hashed, parsed and validated every canonical record and then proved the whole cache against them, so every operation cost O(corpus bytes). At 10,000 records a list took about 1.1 s and an add about 2.9 s, so the corpus was capped at 1,000 records.",
+    "cache": [
+      "Schema 5 records rows add digest (SHA-256 of the canonical bytes), racy, bytes, edges and artifacts. The metadata manifest hashes the size, mtime, ctime and type of the brain root, every kind directory, every record file and every referenced artifact.",
+      "A trusted read recomputes that manifest from readdir and lstat only. When it matches, the read resolves only the selected IDs from canonical files and accepts each one only if its bytes hash to the stored digest. A mismatch, a missing file or text SQLite cannot store faithfully sends the read to full validation.",
+      "A record is racy when its mtime or ctime is within 2 s of the read that hashed it. Trusted reads rehash racy records; once a rehash proves one whose timestamps are older than the window, a non-waiting write clears its flag while the manifest is unchanged.",
+      "Full validation, used by prepare, stale reads, rebuilds and recovery, keeps the streamed canonical equality proof, now including digest, bytes and graph counts. requireCanonicalCacheEquality is the test hook that forces it for forged-cache tests."
+    ],
+    "add": [
+      "With a current cache, an add validates the candidate with SQL against cached facts: identity and case collisions, supersession targets, active heads of its subject, record, byte, edge and artifact budgets, and the latest createdAt. It inspects only the candidate artifacts.",
+      "Publication reuses the guarded pipeline with an authority built from lstat metadata. Cheap checks cover directory generations, artifacts and the published record; every record and existing artifact is compared only before the link, before the cache vouches for the new manifest, and at the end.",
+      "The cache append inserts one row, deactivates superseded rows and writes the new manifest and fingerprint after the currentness proof. Any failure falls back to a disk rebuild; any planning failure or rejection falls back to full canonical planning with its usual errors."
+    ],
+    "scope": [
+      "Ordinary reads no longer prove search, ordering or index rows. The cache lives under node_modules, so a writer able to forge it can already change executable code.",
+      "Reads and adds remain O(n) in metadata syscalls: about 35 ms and 0.3 s at 10,000 records, 160 ms and 1.5 s at 50,000.",
+      "Corpus limits: 50,000 records, 128 MiB record JSON, 50,000 kind entries, 50,000 supersession edges, 10,000 artifact references. Result limits, the per-add supersedes limit and response budgets are unchanged."
+    ]
+  },
+  "searchText": "trusted cache manifest lstat digest racy settle schema 5 incremental append scale 50000 records",
+  "source": "agent",
+  "subject": "canonical.verified-corpus",
+  "supersedes": ["07a820c8-c399-4c7c-8bbc-7a20be8683f0"]
+}

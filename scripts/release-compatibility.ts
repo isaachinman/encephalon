@@ -346,7 +346,25 @@ type SuppliedOracle = Readonly<{
   tarball: string
 }>
 
+/** Canonical corpus ceilings that the budget probe fills exactly and then exceeds by one. */
+export type CorpusLimits = Readonly<{ artifacts: number; bytes: number; edges: number; records: number }>
+
+export const ORACLE_CORPUS_LIMITS: CorpusLimits = Object.freeze({
+  artifacts: 1000,
+  bytes: 8 * 1024 * 1024,
+  edges: 1000,
+  records: 1000,
+})
+
+export const CANDIDATE_CORPUS_LIMITS: CorpusLimits = Object.freeze({
+  artifacts: 10_000,
+  bytes: 128 * 1024 * 1024,
+  edges: 50_000,
+  records: 50_000,
+})
+
 export type ReleaseCompatibilityOptions = Readonly<{
+  candidateCorpusLimits?: CorpusLimits
   candidateTarball: string
   fixtureRoot?: string
   hooks?: Readonly<{ beforeOracleDowngrade?: (oracleSnapshot: string) => void }>
@@ -395,7 +413,7 @@ export type ReleaseCompatibilityReport = Readonly<{
     instructions: 'original-bytes-and-absence-restored'
     legacyBaseline: 'published-language-and-file-count-fields-preserved'
     payloadOnlySnippet: string
-    schemas: readonly ['2', '4', '2']
+    schemas: readonly ['2', '5', '2']
   }> | null
   oracle: Readonly<{
     digests: PackageTarballDigests
@@ -918,13 +936,18 @@ const runBudgetProbe = (
   fixtureRoot: string,
   packagePhase: 'candidate' | 'oracle',
   redactions: readonly Buffer[],
+  corpusLimits: CorpusLimits,
 ) => {
   const result = runFixturePhase(fixtureRoot, () =>
-    runTrustedProbe(probe, [fixtureRoot, packagePhase, installedPackageEntry(fixtureRoot)], {
-      cwd: fixtureRoot,
-      label: 'The independent public budget probe',
-      redactions,
-    }),
+    runTrustedProbe(
+      probe,
+      [fixtureRoot, packagePhase, installedPackageEntry(fixtureRoot), JSON.stringify(corpusLimits)],
+      {
+        cwd: fixtureRoot,
+        label: 'The independent public budget probe',
+        redactions,
+      },
+    ),
   )
   if (result.stderr !== '') {
     throw new Error('The independent public budget probe wrote unexpected stderr.')
@@ -962,7 +985,7 @@ const validationBoundaryFailure = (code: string, message: string): BudgetObserva
     }),
   })
 
-const commonCandidateBudgetEvidence = Object.freeze({
+const commonCandidateBudgetEvidence = (limits: CorpusLimits) => ({
   compactQueryBytes: budgetBoundary(
     budgetFailure('queryBytes', 'query', 1024, 'query must contain at most 1024 UTF-8 bytes.'),
   ),
@@ -973,10 +996,13 @@ const commonCandidateBudgetEvidence = Object.freeze({
     budgetFailure('compactResponseBytes', 'response', 4 * 1024 * 1024, 'response may contain at most 4194304 bytes.'),
   ),
   corpusBytes: budgetBoundary(
-    validationFailure('CORPUS_BYTE_LIMIT', 'Canonical corpus may contain at most 8388608 bytes of record JSON.'),
+    validationFailure(
+      'CORPUS_BYTE_LIMIT',
+      `Canonical corpus may contain at most ${limits.bytes} bytes of record JSON.`,
+    ),
   ),
   corpusRecords: budgetBoundary(
-    validationFailure('CORPUS_RECORD_LIMIT', 'Canonical corpus may contain at most 1000 records.'),
+    validationFailure('CORPUS_RECORD_LIMIT', `Canonical corpus may contain at most ${limits.records} records.`),
   ),
   fullResponseBytes: budgetBoundary(
     budgetFailure(
@@ -1009,9 +1035,9 @@ const commonCandidateBudgetEvidence = Object.freeze({
   queryTerms: budgetBoundary(budgetFailure('queryTerms', 'query', 32, 'query may contain at most 32 literal terms.')),
 })
 
-const candidateBudgetEvidence = Object.freeze({
-  api: Object.freeze({
-    ...commonCandidateBudgetEvidence,
+const candidateBudgetEvidence = (limits: CorpusLimits) => ({
+  api: {
+    ...commonCandidateBudgetEvidence(limits),
     allocationWork: Object.freeze({
       descriptorMapCalls: 0,
       oversizedArray: Object.freeze({
@@ -1036,45 +1062,46 @@ const candidateBudgetEvidence = Object.freeze({
     corpusArtifactReferences: budgetBoundary(
       validationBoundaryFailure(
         'CORPUS_ARTIFACT_LIMIT',
-        'Canonical corpus may contain at most 1000 artifact references.',
+        `Canonical corpus may contain at most ${limits.artifacts} artifact references.`,
       ),
     ),
     corpusSupersessionEdges: budgetBoundary(
       validationBoundaryFailure(
         'CORPUS_SUPERSEDES_LIMIT',
-        'Canonical corpus may contain at most 1000 supersession edges.',
+        `Canonical corpus may contain at most ${limits.edges} supersession edges.`,
       ),
     ),
     supersessionEdges: budgetBoundary(
       budgetFailure('supersessionEdges', 'supersedes', 1000, 'supersedes may contain at most 1000 record ids.'),
       fieldFailure('supersedes must be a non-empty array of unique strings.', 'supersedes'),
     ),
-  }),
-  cli: Object.freeze({
-    ...commonCandidateBudgetEvidence,
+  },
+  cli: {
+    ...commonCandidateBudgetEvidence(limits),
     corpusArtifactReferences: budgetBoundary(
       validationBoundaryFailure(
         'CORPUS_ARTIFACT_LIMIT',
-        'Canonical corpus may contain at most 1000 artifact references.',
+        `Canonical corpus may contain at most ${limits.artifacts} artifact references.`,
       ),
     ),
     corpusSupersessionEdges: budgetBoundary(
       validationBoundaryFailure(
         'CORPUS_SUPERSEDES_LIMIT',
-        'Canonical corpus may contain at most 1000 supersession edges.',
+        `Canonical corpus may contain at most ${limits.edges} supersession edges.`,
       ),
     ),
     supersessionEdges: budgetBoundary(
       budgetFailure('supersessionEdges', 'supersedes', 1000, '--supersedes may be supplied at most 1000 times.'),
       fieldFailure('supersedes must be a non-empty array of unique strings.', 'supersedes'),
     ),
-  }),
+  },
 })
 
-const assertCandidateIndependentBudgets = (actual: IndependentBudgetReport) => {
-  if (!isDeepStrictEqual(candidateBudgetEvidence, actual)) {
+const assertCandidateIndependentBudgets = (actual: IndependentBudgetReport, limits: CorpusLimits) => {
+  const expectedEvidence = candidateBudgetEvidence(limits)
+  if (!isDeepStrictEqual(expectedEvidence, actual)) {
     const differences = (['api', 'cli'] as const).flatMap(channel =>
-      Object.entries(candidateBudgetEvidence[channel]).flatMap(([budget, expected]) =>
+      Object.entries(expectedEvidence[channel]).flatMap(([budget, expected]) =>
         isDeepStrictEqual(expected, actual[channel]?.[budget])
           ? []
           : publicSurfaceDifferencePaths(expected, actual[channel]?.[budget], `${channel}.${budget}`),
@@ -1406,7 +1433,13 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     }))
     const oracleCliSurface = initialCli.surface
     const oracleCliLimits = initialCli.limits
-    const oracleIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, 'oracle', predecessorRedactions)
+    const oracleIndependentBudgets = runBudgetProbe(
+      probes.budgetProbe,
+      fixtureRoot,
+      'oracle',
+      predecessorRedactions,
+      ORACLE_CORPUS_LIMITS,
+    )
     const oraclePublicSurface = publicSurfaceDigests(initial.surface, oracleCliSurface)
     const durable = captureDurableSnapshot(fixtureRoot)
     const redactions = durableRedactions(durable)
@@ -1428,13 +1461,20 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     const upgradeApi = runApiProbe(probes.apiProbe, 'upgrade', fixtureRoot, redactions)
     assertLimitReport(upgradeApi.limits, resultLimitMaximums, 'The candidate API phase')
     const upgradeCli = runCliSurface(fixtureRoot, candidateImport.version, redactions)
-    const upgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, 'candidate', redactions)
+    const candidateCorpusLimits = options.candidateCorpusLimits ?? CANDIDATE_CORPUS_LIMITS
+    const upgradeIndependentBudgets = runBudgetProbe(
+      probes.budgetProbe,
+      fixtureRoot,
+      'candidate',
+      redactions,
+      candidateCorpusLimits,
+    )
     assertStablePublicSurface(initial.surface, upgradeApi.surface, 'The candidate API', true)
     assertStablePublicSurface(oracleCliSurface, upgradeCli.surface, 'The candidate CLI', true)
-    assertCandidateIndependentBudgets(upgradeIndependentBudgets)
+    assertCandidateIndependentBudgets(upgradeIndependentBudgets, candidateCorpusLimits)
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
-    if (upgradeApi.schemaBefore !== '2' || upgradeApi.schemaAfter !== '4') {
-      throw new Error('The candidate package did not rebuild cache schema 2 as schema 4.')
+    if (upgradeApi.schemaBefore !== '2' || upgradeApi.schemaAfter !== '5') {
+      throw new Error('The candidate package did not rebuild cache schema 2 as schema 5.')
     }
 
     if (publishedOracle) {
@@ -1473,7 +1513,7 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
           (change.kind === 'links' && (change.path === '.' || change.path === '@witness:.')),
       )
       assertRestoredInstructions(evolutionRoot)
-      assert.equal(removed.schema, '4')
+      assert.equal(removed.schema, '5')
       assert.deepEqual(removed.records, refreshed.records)
       evolvedRecords = removed.records
       evolvedDurable = captureDurableSnapshot(evolutionRoot)
@@ -1484,7 +1524,7 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
         instructions: 'original-bytes-and-absence-restored',
         legacyBaseline: 'published-language-and-file-count-fields-preserved',
         payloadOnlySnippet: states[0]?.snippet ?? '',
-        schemas: ['2', '4', '2'] as const,
+        schemas: ['2', '5', '2'] as const,
       })
     }
 
@@ -1502,7 +1542,13 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
     const downgradeApi = runApiProbe(probes.apiProbe, 'downgrade', fixtureRoot, redactions)
     assertLimitReport(downgradeApi.limits, resultLimitMaximums, 'The downgraded oracle API phase')
     const downgradeCli = runCliSurface(fixtureRoot, downgradeImport.version, redactions)
-    const downgradeIndependentBudgets = runBudgetProbe(probes.budgetProbe, fixtureRoot, 'oracle', redactions)
+    const downgradeIndependentBudgets = runBudgetProbe(
+      probes.budgetProbe,
+      fixtureRoot,
+      'oracle',
+      redactions,
+      ORACLE_CORPUS_LIMITS,
+    )
     assertStablePublicSurface(initial.surface, downgradeApi.surface, 'The downgraded oracle API')
     assertStablePublicSurface(oracleCliSurface, downgradeCli.surface, 'The downgraded oracle CLI')
     assertStablePublicSurface(
@@ -1511,8 +1557,8 @@ export const runReleaseCompatibility = (options: ReleaseCompatibilityOptions): R
       'The downgraded oracle independent budget evidence',
     )
     assertDurableSnapshotsEqual(durable, captureDurableSnapshot(fixtureRoot))
-    if (downgradeApi.schemaBefore !== '4' || downgradeApi.schemaAfter !== '2') {
-      throw new Error('The published oracle did not rebuild cache schema 4 as schema 2 after downgrade.')
+    if (downgradeApi.schemaBefore !== '5' || downgradeApi.schemaAfter !== '2') {
+      throw new Error('The published oracle did not rebuild cache schema 5 as schema 2 after downgrade.')
     }
     if (initialImport.version !== initial.version || downgradeImport.version !== initial.version) {
       throw new Error('The published oracle process did not execute the installed oracle package version.')

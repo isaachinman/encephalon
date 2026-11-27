@@ -1,5 +1,6 @@
 import { type Dirent, opendirSync } from 'node:fs'
 import { type DirectoryReader, readBoundedDirectoryEntries } from './bounded-directory.ts'
+import { CANONICAL_BUDGETS } from './canonical-budgets.ts'
 import {
   captureDirectoryWitness,
   type DirectoryWitness,
@@ -11,7 +12,7 @@ import { ordinalStringCompare } from './order.ts'
 
 export const MAX_CANONICAL_BRAIN_ROOT_ENTRIES = 1002
 export const MAX_CANONICAL_KIND_DIRECTORIES = 1000
-export const MAX_CANONICAL_KIND_ENTRIES = 1000
+export const MAX_CANONICAL_KIND_ENTRIES = CANONICAL_BUDGETS.kindEntries
 export const ARTIFACTS_DIRECTORY_NAME = '_artifacts'
 export const STAGING_DIRECTORY_NAME = '_staging'
 

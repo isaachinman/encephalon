@@ -67,7 +67,7 @@ Parallel pull requests can each supersede, or each start, the same kind and subj
 - List and search return 20 results by default; `--limit` accepts **1–1,000**.
 - One gather accepts **16 searches and 64 shows**.
 - Search input accepts **1,024 UTF-8 bytes and 32 literal terms**.
-- A canonical corpus accepts **1,000 records and 8 MiB of record JSON**, with at most **1 MiB per record**.
+- A canonical corpus accepts **50,000 records and 128 MiB of record JSON**, with at most **1 MiB per record**.
 - Full, compact and complete gather responses each have an independent **4 MiB** budget. Duplicates count on every occurrence. Oversized results fail instead of being silently truncated.
 
 Use narrower queries, compact search or smaller limits when a response exceeds its budget. The [Public contract](https://github.com/isaachinman/encephalon/blob/main/docs/contract.md) defines all field, payload, corpus, path and response limits and their accounting rules.

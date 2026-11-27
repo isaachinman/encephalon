@@ -1,4 +1,6 @@
 // Every new file needs a deliberate coverage decision; filesystem/process coverage is the conservative default.
+// `linux-source` files run only in the Linux source jobs, even when changed, because they fill a corpus limit and
+// take minutes on the Windows and macOS runners.
 const classification = {
   'scripts/benchmark-command.test.ts': 'platform',
   'scripts/benchmark-comparison.test.ts': 'tooling',
@@ -19,6 +21,7 @@ const classification = {
   'test/check-package-arguments.test.ts': 'platform',
   'test/ci-workflow.test.ts': 'tooling',
   'test/cli.test.ts': 'package',
+  'test/corpus-limits.test.ts': 'linux-source',
   'test/directory-witness.test.ts': 'platform',
   'test/errors.test.ts': 'source',
   'test/filesystem-entry.test.ts': 'platform',
@@ -70,7 +73,7 @@ export const selectTestFiles = (
     return entries
       .filter(([path, category]) => {
         if (group === 'source') {
-          return category === 'source' || category === 'platform'
+          return category === 'source' || category === 'platform' || category === 'linux-source'
         }
         if (group === 'platform' || group === 'platform-core') {
           const platform = category === 'platform' || (category === 'source' && changedTests.includes(path))

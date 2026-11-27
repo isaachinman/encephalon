@@ -24,8 +24,10 @@ import {
   inspectArtifactFiles,
 } from './artifact-inspection.ts'
 import {
+  appendTrustedCacheRecord,
   hydrateResolvedMutationSnapshot,
   hydrateResolvedRepository,
+  readTrustedAppendPlan,
   type ValidatedMutationCacheSnapshot,
 } from './cache.ts'
 import { assertCacheLocation, type CacheLocation } from './cache-location.ts'
@@ -92,6 +94,8 @@ type RecordScan = {
 }
 
 type RecordObservation = {
+  /** Wall-clock time taken before `digest`'s bytes were read; `0n` means no read proves the content. */
+  contentReadAfterNanoseconds: bigint
   digest: string
   metadata: BigIntStats
   path: string
@@ -202,6 +206,8 @@ export type RecordWriteHooks = {
 type AddRecordTestHooks = RecordWriteHooks & {
   afterOperationLock?: (() => void) | undefined
   beforeOperationLock?: (() => void) | undefined
+  /** Plans every add from a full canonical scan, as an add without a current cache does. */
+  requireCanonicalPlanning?: boolean | undefined
   gateClose?: NonNullable<Parameters<typeof withOperationLock>[2]>['gateClose']
   readHooks?: RecordReadHooks | undefined
 }
@@ -216,6 +222,7 @@ type RecordReadFault =
   | 'after-record-read'
   | 'before-kind-lstat'
   | 'before-parent-lstat'
+  | 'before-record-currentness-lstat'
   | 'before-record-lstat'
   | 'before-record-open'
   | 'before-rejected-record-read'
@@ -430,9 +437,9 @@ export const MAX_CANONICAL_RECORDS = CANONICAL_BUDGETS.records
 /** @internal */
 export const MAX_CANONICAL_RECORD_BYTES = CANONICAL_BUDGETS.recordJsonBytes
 /** @internal */
-export const MAX_SUPERSESSION_EDGES = OPERATION_BUDGETS.supersessionEdges.maximum
+export const MAX_SUPERSESSION_EDGES = CANONICAL_BUDGETS.supersessionEdges
 /** @internal */
-export const MAX_ARTIFACT_REFERENCES = 1000
+export const MAX_ARTIFACT_REFERENCES = CANONICAL_BUDGETS.artifactReferences
 /** @internal */
 export const MAX_VALIDATION_ISSUES = 100
 const decoder = new TextDecoder('utf-8', { fatal: true })
@@ -533,6 +540,21 @@ const readFault = (hooks: RecordReadHooks | undefined, point: RecordReadFault, p
 }
 
 const recordDigest = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex')
+
+const wallClockNanoseconds = () => BigInt(Date.now()) * 1_000_000n
+
+// A rewrite within one filesystem timestamp tick of the content read can keep every stat field. FAT stores mtime in
+// 2 s units and Windows ticks are ~16 ms, so 2 s covers the coarsest supported clock (git calls these "racily clean").
+const RACY_TIMESTAMP_WINDOW_NANOSECONDS = 2_000_000_000n
+
+/** True when matching file metadata alone cannot prove that content read after `contentReadAfter` is unchanged. */
+const isRacy = (metadata: BigIntStats, contentReadAfterNanoseconds: bigint) => {
+  const earliestSafe = contentReadAfterNanoseconds - RACY_TIMESTAMP_WINDOW_NANOSECONDS
+  return metadata.mtimeNs >= earliestSafe || metadata.ctimeNs >= earliestSafe
+}
+
+const isRacyObservation = (observation: RecordObservation) =>
+  isRacy(observation.metadata, observation.contentReadAfterNanoseconds)
 
 const assertRealDirectory = (root: string, path: string) => {
   const metadata = lstatSync(path, { bigint: true })
@@ -819,6 +841,7 @@ const readRecord = (
       }
     }
     readFault(hooks, 'after-record-fstat', path)
+    const contentReadAfterNanoseconds = wallClockNanoseconds()
     const bytes = readBoundedDescriptor(descriptor, descriptorMetadata.size, canonicalGenerationChanged)
     const finalMetadata = fstatSync(descriptor, { bigint: true })
     if (!sameStableEntryMetadata(descriptorMetadata, finalMetadata)) {
@@ -828,6 +851,7 @@ const readRecord = (
       bytes,
       kind: 'accepted',
       observation: Object.freeze({
+        contentReadAfterNanoseconds,
         digest: recordDigest(bytes),
         metadata: Object.freeze(finalMetadata),
         path,
@@ -1546,52 +1570,16 @@ const assertRecordObservationCurrent = (
   changed: () => never,
   hooks: RecordReadHooks,
 ) => {
-  let descriptor: number | undefined
-  let primaryError: unknown
-  try {
-    const pathMetadata = currentRecordPathMetadata(observation.path, changed)
-    if (
-      !pathMetadata.isFile() ||
-      pathMetadata.isSymbolicLink() ||
-      !sameStableEntryMetadata(observation.metadata, pathMetadata)
-    ) {
-      changed()
-    }
-    const { descriptor: openedDescriptor, metadata: descriptorMetadata } = openObservedRecordDescriptor(
-      observation.path,
-      pathMetadata,
-      changed,
-      hooks,
-    )
-    descriptor = openedDescriptor
-    const finalPathMetadata = currentRecordPathMetadata(observation.path, changed)
-    if (
-      !(
-        sameStableEntryMetadata(observation.metadata, descriptorMetadata) &&
-        sameStableEntryMetadata(descriptorMetadata, finalPathMetadata)
-      )
-    ) {
-      changed()
-    }
-  } catch (error) {
-    primaryError = error
-  }
-  let closeError: unknown
-  if (descriptor !== undefined) {
-    try {
-      closeSync(descriptor)
-    } catch (error) {
-      closeError = error
-    }
-  }
-  if (primaryError !== undefined) {
-    if (isCanonicalDirectoryReplacementError(primaryError)) {
-      return changed()
-    }
-    throw primaryError
-  }
-  if (closeError !== undefined) {
-    throw closeError
+  // Any rewrite, replacement, permission change or symlink swap changes the no-follow lstat metadata, so opening the
+  // file again would only repeat this comparison at the cost of three more syscalls per record.
+  readFault(hooks, 'before-record-currentness-lstat', observation.path)
+  const pathMetadata = currentRecordPathMetadata(observation.path, changed)
+  if (
+    !pathMetadata.isFile() ||
+    pathMetadata.isSymbolicLink() ||
+    !sameStableEntryMetadata(observation.metadata, pathMetadata)
+  ) {
+    changed()
   }
 }
 
@@ -1839,6 +1827,7 @@ const createVerifiedCorpus = (
             metadata: Object.freeze(observation.metadata),
             path: record.path,
             projection: recordProjection(record),
+            racy: isRacyObservation(observation),
           }),
         ] as const
       }
@@ -1916,6 +1905,7 @@ const canonicalPublicationAuthority = (
       )
       descriptor = openedDescriptor
       readFault(hooks, 'after-record-fstat', observation.path)
+      const contentReadAfterNanoseconds = wallClockNanoseconds()
       const bytes = readBoundedDescriptor(descriptor, descriptorMetadata.size, changed)
       const finalDescriptorMetadata = fstatSync(descriptor, { bigint: true })
       const finalPathMetadata = currentObservationMetadata(observation.path)
@@ -1929,6 +1919,7 @@ const canonicalPublicationAuthority = (
         changed()
       }
       result = {
+        contentReadAfterNanoseconds,
         digest: observation.digest,
         metadata: finalDescriptorMetadata,
         path: observation.path,
@@ -2049,6 +2040,7 @@ const canonicalPublicationAuthority = (
         observations = [
           ...observations,
           {
+            contentReadAfterNanoseconds: 0n,
             digest,
             metadata: pathMetadata,
             path: recordPath,
@@ -2224,6 +2216,55 @@ export const withRecordPlanningSnapshotRetryResolved = <Result>(
 /** @internal */
 export const readRecordsResolved = (root: string, hooks: RecordReadHooks = {}) =>
   readRecordScanResolved(root, hooks).index.records
+
+class DigestVerifiedRecordChanged extends Error {}
+
+const digestVerifiedRecordChanged = (): never => {
+  throw new DigestVerifiedRecordChanged()
+}
+
+/**
+ * @internal
+ * Reads one canonical record from a cache-trusted path. `undefined` means its bytes no longer hash to `digest`.
+ * `racy` is false once the file's metadata alone again proves this content.
+ */
+export const readDigestVerifiedRecord = (
+  root: string,
+  kind: string,
+  id: string,
+  digest: string,
+): Readonly<{ racy: boolean; record: BrainRecord }> | undefined => {
+  const path = join(root, 'encephalon', kind, `${id}.json`)
+  let descriptor: number
+  try {
+    descriptor = openSync(path, recordOpenFlags)
+  } catch (error) {
+    const { code } = error as NodeJS.ErrnoException
+    if (code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR' || isRecordReadabilityError(error)) {
+      return
+    }
+    throw pathSafeRecordOperationalError(error)
+  }
+  try {
+    const metadata = fstatSync(descriptor, { bigint: true })
+    if (!metadata.isFile() || metadata.size > BigInt(MAX_RECORD_BYTES)) {
+      return
+    }
+    const contentReadAfterNanoseconds = wallClockNanoseconds()
+    const bytes = readBoundedDescriptor(descriptor, metadata.size, digestVerifiedRecordChanged)
+    if (recordDigest(bytes) !== digest || !sameStableEntryMetadata(metadata, fstatSync(descriptor, { bigint: true }))) {
+      return
+    }
+    return { racy: isRacy(metadata, contentReadAfterNanoseconds), record: parseObservedRecord(root, path, bytes) }
+  } catch (error) {
+    if (error instanceof DigestVerifiedRecordChanged) {
+      return
+    }
+    throw preserveRecordAuthorityError(error)
+  } finally {
+    closeSync(descriptor)
+  }
+}
 
 /** @internal */
 export const readValidatedRecordSnapshotResolved = (root: string, hooks: RecordReadHooks = {}) => {
@@ -2412,9 +2453,15 @@ const discardStagingFile = (descriptor: number, stagingPath: string) => {
 const publishPlannedRecordInternal = (
   root: string,
   plan: PlannedRecord,
-  options: { authority: CanonicalPublicationAuthority; hooks?: RecordWriteHooks },
+  options: {
+    authority: CanonicalPublicationAuthority
+    /** Proves the whole corpus is unchanged immediately before the link; defaults to `authority.assertCurrent`. */
+    assertCurrentBeforeLink?: () => void
+    hooks?: RecordWriteHooks
+  },
 ): PublishResult => {
   const { authority, hooks } = options
+  const assertCurrentBeforeLink = options.assertCurrentBeforeLink ?? authority.assertCurrent
   const { formatted, path, record, recordFile, relativePath } = plan
   const brainDirectory = resolve(root, 'encephalon')
   const kindDirectory = resolve(brainDirectory, recordFile.kind)
@@ -2452,7 +2499,7 @@ const publishPlannedRecordInternal = (
     fsyncSync(descriptor)
     fault(hooks, 'before-publication')
     fault(hooks, 'before-canonical-link')
-    authority.assertCurrent()
+    assertCurrentBeforeLink()
     linkSync(stagingPath, path)
   } catch (error) {
     discardStagingFile(descriptor, stagingPath)
@@ -2533,6 +2580,276 @@ export const publishPlannedRecordOutcome = (
   options: { authority: CanonicalPublicationAuthority; hooks?: RecordWriteHooks },
 ): PublishResult => publishPlannedRecordInternal(root, plan, options)
 
+/**
+ * Brings the cache up to date after `published` is committed and reports post-commit failures without undoing the
+ * link. `hydrate` updates a cache that still holds the predecessor; any committed error forces a full rebuild.
+ */
+const completeCommittedAdd = (
+  root: string,
+  published: PublishResult,
+  assertCurrent: () => void,
+  options: AddRecordOptions,
+  hydrate: (cacheLocation: CacheLocation) => void,
+): BrainRecord => {
+  let { committedError, committedErrorPhase } = published
+  const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
+    const capturedPhase = error instanceof CanonicalGenerationChanged ? 'publicationVerification' : phase
+    if (
+      committedErrorPhase === undefined ||
+      postCommitPriority[capturedPhase] > postCommitPriority[committedErrorPhase]
+    ) {
+      committedError =
+        error instanceof CanonicalGenerationChanged
+          ? publicationVerificationError(published.record, error)
+          : postCommitError(published.record, capturedPhase, error)
+      committedErrorPhase = capturedPhase
+    }
+  }
+  if (committedErrorPhase !== 'publicationFlush' && options.hydrate !== false) {
+    try {
+      fault(options.hooks, 'during-hydration')
+      if (options.cacheLocation === undefined || committedErrorPhase !== undefined) {
+        hydrateResolvedRepository(root, 'held', options.cacheLocation)
+      } else {
+        hydrate(options.cacheLocation)
+      }
+      fault(options.hooks, 'after-hydration')
+      if (committedErrorPhase === undefined) {
+        assertCurrent()
+      }
+    } catch (error) {
+      let capturedError = error
+      if (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED') {
+        try {
+          assertCurrent()
+        } catch (authorityError) {
+          if (authorityError instanceof CanonicalGenerationChanged) {
+            capturedError = new CanonicalGenerationChanged('Canonical generation changed during cache hydration.', {
+              cause: error,
+            })
+          }
+        }
+      }
+      capturePostCommitError('cacheHydration', capturedError)
+    }
+  }
+  if (committedError !== undefined) {
+    throw committedError
+  }
+  return published.record
+}
+
+/**
+ * Captures the canonical layout and every record's metadata without reading record bytes, pairing each file with
+ * the cache's digest for it. `undefined` means the files no longer match the cache that `plan` describes.
+ */
+const scanTrustedCanonicalMetadata = (
+  root: string,
+  plan: NonNullable<ReturnType<typeof readTrustedAppendPlan>>,
+): Readonly<{ artifacts: readonly ArtifactObservation[]; scan: RecordScan }> | undefined => {
+  const brainDirectory = resolve(root, 'encephalon')
+  try {
+    const rootSnapshot = captureCanonicalDirectory(brainDirectory, MAX_CANONICAL_BRAIN_ROOT_ENTRIES)
+    if (rootSnapshot.overflow) {
+      return
+    }
+    const kinds = new Map<string, CanonicalDirectorySnapshot>()
+    const observations: RecordObservation[] = []
+    for (const kindEntry of rootSnapshot.entries) {
+      if (isCanonicalReservedDirectory(kindEntry.name)) {
+        continue
+      }
+      if (!isCanonicalKindDirectoryEntry(kindEntry)) {
+        return
+      }
+      const kindPath = join(brainDirectory, kindEntry.name)
+      const kindSnapshot = captureCanonicalDirectory(kindPath, MAX_CANONICAL_KIND_ENTRIES)
+      if (kindSnapshot.overflow) {
+        return
+      }
+      kinds.set(kindEntry.name, kindSnapshot)
+      for (const recordEntry of kindSnapshot.entries) {
+        const path = join(kindPath, recordEntry.name)
+        const evidence = plan.records.get(posixRelative(root, path))
+        const metadata = lstatSync(path, { bigint: true })
+        if (evidence === undefined || !metadata.isFile() || metadata.isSymbolicLink()) {
+          return
+        }
+        // These observations only bound publication currentness; cache facts for them are never derived here.
+        observations.push({ contentReadAfterNanoseconds: 0n, digest: evidence.digest, metadata, path })
+      }
+      revalidateCanonicalDirectory(kindSnapshot)
+    }
+    revalidateCanonicalDirectory(rootSnapshot)
+    if (observations.length !== plan.records.size) {
+      return
+    }
+    const scan: RecordScan = {
+      bytes: observations.reduce((total, observation) => total + Number(observation.metadata.size), 0),
+      errors: [],
+      layout: { kinds, root: rootSnapshot },
+      observations,
+      records: [],
+      rejections: [],
+    }
+    const artifacts = plan.artifactPaths.map(path => ({
+      metadata: lstatSync(join(brainDirectory, path), { bigint: true }),
+      path,
+    }))
+    const observationsByPath = new Map(
+      observations.map(observation => [posixRelative(root, observation.path), observation]),
+    )
+    const manifest = canonicalCacheManifest(
+      canonicalRecordCacheManifestEntries(root, scan, observationsByPath),
+      artifacts,
+    )
+    return manifest === plan.manifest ? { artifacts, scan } : undefined
+  } catch (error) {
+    const { code } = error as NodeJS.ErrnoException
+    if (
+      error instanceof CanonicalDirectoryChangedError ||
+      error instanceof EncephalonError ||
+      code === 'ELOOP' ||
+      code === 'ENOENT' ||
+      code === 'ENOTDIR'
+    ) {
+      return
+    }
+    throw error
+  }
+}
+
+/**
+ * Adds a record using a current cache's facts instead of reading every canonical record. It reads only the cache
+ * rows, the metadata of each file and the candidate's artifacts. `undefined` means nothing was committed and full
+ * canonical planning must run, so every rejection keeps its usual error.
+ */
+const addRecordWithTrustedCache = (
+  root: string,
+  recordDraft: ValidatedAddRecordInput,
+  options: AddRecordOptions,
+): BrainRecord | undefined => {
+  const { cacheLocation } = options
+  if (cacheLocation === undefined || options.hydrate === false || recordWriteTestHooks.requireCanonicalPlanning) {
+    return
+  }
+  const relativePath = `encephalon/${recordDraft.kind}/${recordDraft.id}.json`
+  const validationRecordFile = createRecordFile(recordDraft, '2000-01-01T00:00:00.000Z')
+  const validationRecord: BrainRecord = { ...validationRecordFile, path: relativePath }
+  const candidateBytes = Buffer.byteLength(formatRecordFile(validationRecordFile), 'utf8')
+  const plan = readTrustedAppendPlan(root, cacheLocation, validationRecord, candidateBytes)
+  if (plan === undefined) {
+    return
+  }
+  const trustedScan = scanTrustedCanonicalMetadata(root, plan)
+  if (trustedScan === undefined) {
+    return
+  }
+  const { scan } = trustedScan
+  const { layout } = scan
+  if (layout === undefined || layout.root === null) {
+    return
+  }
+  const rootSnapshot = layout.root
+  const kindCollision = rootSnapshot.entries.some(
+    entry =>
+      entry.name !== recordDraft.kind &&
+      !isCanonicalReservedDirectory(entry.name) &&
+      entry.name.normalize('NFC').toLowerCase() === recordDraft.kind.normalize('NFC').toLowerCase(),
+  )
+  const candidateArtifacts = [...new Set(recordDraft.artifacts ?? [])].sort(ordinalStringCompare)
+  const artifactValidation =
+    candidateArtifacts.length === 0
+      ? undefined
+      : validatedArtifactIssues(
+          root,
+          { artifactCount: candidateArtifacts.length, artifactPaths: candidateArtifacts, records: [validationRecord] },
+          canonicalGenerationChanged,
+        )
+  if (kindCollision || (artifactValidation !== undefined && artifactValidation.errors.length > 0)) {
+    return
+  }
+  const recordFile = createRecordFile(
+    recordDraft,
+    nextRecordCreatedAt(plan.latestCreatedAt === undefined ? [] : [{ createdAt: plan.latestCreatedAt }]),
+  )
+  const record: BrainRecord = { ...recordFile, path: relativePath }
+  const formatted = formatRecordFile(recordFile)
+  const plannedRecord: PlannedRecord = {
+    formatted,
+    path: resolve(root, ...relativePath.split('/')),
+    record,
+    recordFile,
+    relativePath,
+  }
+  fault(options.hooks, 'after-scan-validation')
+  const readHooks = options.readHooks ?? {}
+  let published: PublishResult
+  let authority: CanonicalPublicationAuthority
+  // The authority itself checks directory generations, artifacts and the published record, which catches any added,
+  // removed or renamed record. Comparing every existing record's metadata is O(n), so it runs only where it decides
+  // correctness: immediately before the link, before the cache vouches for the new manifest, and at the end.
+  const assertCorpusCurrent = () => {
+    authority.assertCurrent()
+    for (const observation of scan.observations) {
+      assertRecordObservationCurrent(observation, canonicalGenerationChanged, readHooks)
+    }
+    for (const artifact of trustedScan.artifacts) {
+      assertPathObservationCurrent(
+        { metadata: artifact.metadata, path: resolve(root, 'encephalon', artifact.path) },
+        canonicalGenerationChanged,
+      )
+    }
+  }
+  try {
+    authority = assertCanonicalLayoutAdditions(
+      [record.kind],
+      canonicalPublicationAuthority(
+        root,
+        layout,
+        [],
+        [],
+        cacheLocation,
+        canonicalGenerationChanged,
+        artifactValidation?.evidence,
+        readHooks,
+      ),
+    )
+    published = publishPlannedRecordInternal(root, plannedRecord, {
+      assertCurrentBeforeLink: assertCorpusCurrent,
+      authority,
+      ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
+    })
+  } catch (error) {
+    // Nothing was linked, so full planning can retry from scratch and report any rejection itself.
+    if (error instanceof CanonicalGenerationChanged || error instanceof EncephalonError) {
+      return
+    }
+    throw error
+  }
+  const artifactPaths = [...new Set([...plan.artifactPaths, ...candidateArtifacts])].sort(ordinalStringCompare)
+  return completeCommittedAdd(root, published, assertCorpusCurrent, options, heldLocation => {
+    let appended = false
+    try {
+      appended = appendTrustedCacheRecord(root, heldLocation, {
+        artifactPaths,
+        assertCurrent: assertCorpusCurrent,
+        bytes: Buffer.byteLength(formatted, 'utf8'),
+        digest: recordDigest(formatted),
+        expectedManifest: plan.manifest,
+        record: published.record,
+        settled: plan.settled,
+      })
+    } catch {
+      // As in full planning, the disk rebuild indexes whatever changed and recovers a failed cache; the final
+      // currentness check in completeCommittedAdd still reports a concurrent change as committed.
+    }
+    if (!appended) {
+      hydrateResolvedRepository(root, 'held', heldLocation)
+    }
+  })
+}
+
 const addRecordFileResolved = (
   root: string,
   recordDraft: ValidatedAddRecordInput,
@@ -2547,6 +2864,10 @@ const addRecordFileResolved = (
     return fail('RECORD_EXISTS', `Record ${recordDraft.id} already exists.`, {
       path: relativePath,
     })
+  }
+  const trusted = addRecordWithTrustedCache(root, recordDraft, options)
+  if (trusted !== undefined) {
+    return trusted
   }
 
   return withRecordPlanningSnapshotRetryResolved(
@@ -2593,70 +2914,33 @@ const addRecordFileResolved = (
         ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
       }
       const published = publishPlannedRecordInternal(root, plan, publishOptions)
-      let { committedError, committedErrorPhase } = published
-      const capturePostCommitError = (phase: PostCommitPhase, error: unknown) => {
-        const capturedPhase = error instanceof CanonicalGenerationChanged ? 'publicationVerification' : phase
-        if (
-          committedErrorPhase === undefined ||
-          postCommitPriority[capturedPhase] > postCommitPriority[committedErrorPhase]
-        ) {
-          committedError =
-            error instanceof CanonicalGenerationChanged
-              ? publicationVerificationError(published.record, error)
-              : postCommitError(published.record, capturedPhase, error)
-          committedErrorPhase = capturedPhase
-        }
-      }
-      if (committedErrorPhase !== 'publicationFlush' && options.hydrate !== false) {
-        try {
-          fault(options.hooks, 'during-hydration')
-          if (options.cacheLocation === undefined || committedErrorPhase !== undefined) {
-            hydrateResolvedRepository(root, 'held', options.cacheLocation)
-          } else {
-            const corpus = authority.verifiedCorpus(validated.index, validated.artifacts, [
-              ...planning.records,
-              published.record,
-            ])
-            const snapshot: ValidatedMutationCacheSnapshot = Object.freeze({
-              ...corpus,
-              assertCurrent: () => {
-                try {
-                  corpus.assertCurrent()
-                } catch (error) {
-                  if (error instanceof CanonicalGenerationChanged) {
-                    throw repositoryChangedBeforePublicationError()
-                  }
-                  throw error
+      return completeCommittedAdd(
+        root,
+        published,
+        () => authority.assertCurrent(),
+        options,
+        cacheLocation => {
+          const corpus = authority.verifiedCorpus(validated.index, validated.artifacts, [
+            ...planning.records,
+            published.record,
+          ])
+          const snapshot: ValidatedMutationCacheSnapshot = Object.freeze({
+            ...corpus,
+            assertCurrent: () => {
+              try {
+                corpus.assertCurrent()
+              } catch (error) {
+                if (error instanceof CanonicalGenerationChanged) {
+                  throw repositoryChangedBeforePublicationError()
                 }
-              },
-              repositoryRealpath: options.cacheLocation.repository,
-            })
-            hydrateResolvedMutationSnapshot(root, snapshot, 'held', options.cacheLocation)
-          }
-          fault(options.hooks, 'after-hydration')
-          if (committedErrorPhase === undefined) {
-            authority.assertCurrent()
-          }
-        } catch (error) {
-          let capturedError = error
-          if (error instanceof EncephalonError && error.code === 'REPOSITORY_CHANGED') {
-            try {
-              authority.assertCurrent()
-            } catch (authorityError) {
-              if (authorityError instanceof CanonicalGenerationChanged) {
-                capturedError = new CanonicalGenerationChanged('Canonical generation changed during cache hydration.', {
-                  cause: error,
-                })
+                throw error
               }
-            }
-          }
-          capturePostCommitError('cacheHydration', capturedError)
-        }
-      }
-      if (committedError !== undefined) {
-        throw committedError
-      }
-      return published.record
+            },
+            repositoryRealpath: cacheLocation.repository,
+          })
+          hydrateResolvedMutationSnapshot(root, snapshot, 'held', cacheLocation)
+        },
+      )
     },
     options.readHooks,
     options.cacheLocation,
